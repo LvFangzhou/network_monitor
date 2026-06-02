@@ -275,6 +275,7 @@ services:
 
   # TACACS+ 认证与命令审计服务
   tacacs:
+    build: ./tacacs
     image: my_build_tacacs:latest
     container_name: nm-tacacs
     restart: unless-stopped

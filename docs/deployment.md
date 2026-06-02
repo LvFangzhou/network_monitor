@@ -93,19 +93,18 @@ sudo chown -R "$USER:$USER" /opt/network_monitor_data /opt/network_monitor_backu
 
 不要把 `data/`、`.env`、日志、数据库文件提交到 GitHub。
 
-## 5. TACACS+ 镜像准备
+## 5. TACACS+ 镜像构建
 
-Compose 文件中 TACACS+ 服务使用镜像：
+Compose 文件中 TACACS+ 服务会从仓库内的 Dockerfile 构建：
+
+```text
+tacacs/Dockerfile
+```
+
+构建后的镜像名仍为：
 
 ```text
 my_build_tacacs:latest
-```
-
-如果服务器本地没有这个镜像，需要先导入：
-
-```bash
-docker load -i /path/to/my_build_tacacs.tar
-docker image ls | grep my_build_tacacs
 ```
 
 系统会通过 Web 界面生成并维护 TACACS+ 配置文件，配置和日志默认放在：
@@ -303,6 +302,7 @@ sudo tcpdump -ni any udp port 2055
 
 TACACS+ 不可用：
 
+- 确认 `tacacs/Dockerfile` 可以正常构建
 - 确认 `my_build_tacacs:latest` 镜像存在
 - 确认 `${DATA_ROOT}/tacacs/tac_plus.cfg` 已生成
 - 确认交换机 key 与系统配置一致
