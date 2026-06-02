@@ -27,9 +27,11 @@ LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 CHECK_ALERTS_LOCK_KEY = "alerts:check_alerts:lock"
 FAST_CHECK_ALERTS_LOCK_KEY = "alerts:check_fast_alerts:lock"
 PROTOCOL_CHECK_ALERTS_LOCK_KEY = "alerts:check_protocol_alerts:lock"
+DEVICE_HEALTH_CHECK_ALERTS_LOCK_KEY = "alerts:check_device_health_alerts:lock"
 CHECK_ALERTS_LOCK_TTL_SECONDS = 900
 FAST_CHECK_ALERTS_LOCK_TTL_SECONDS = 60
 PROTOCOL_CHECK_ALERTS_LOCK_TTL_SECONDS = 180
+DEVICE_HEALTH_CHECK_ALERTS_LOCK_TTL_SECONDS = 120
 EXPORTER_SCRAPE_CACHE_TTL_SECONDS = 5
 ROBOT_NOTIFICATION_INTERVAL_SECONDS = 2
 PENDING_ALERT_TTL_SECONDS = 7200
@@ -173,6 +175,13 @@ METRIC_VALUE_LABELS = {
 
 FAST_ALERT_METRIC_TYPES = {
     "interface_admin_up_oper_down",
+}
+
+DEVICE_HEALTH_ALERT_METRIC_TYPES = {
+    "snmp_cpu",
+    "snmp_memory",
+    "device_temperature",
+    "snmp_temperature",
 }
 
 SEVERITY_LABELS = {
@@ -844,6 +853,19 @@ def check_protocol_alerts():
 
 
 @shared_task
+def check_device_health_alerts():
+    """
+    独立检查设备基础健康告警，避免CPU/内存/温度恢复被全量慢规则延迟。
+    """
+    return _run_alert_checks(
+        lock_key=DEVICE_HEALTH_CHECK_ALERTS_LOCK_KEY,
+        lock_ttl_seconds=DEVICE_HEALTH_CHECK_ALERTS_LOCK_TTL_SECONDS,
+        metric_types=DEVICE_HEALTH_ALERT_METRIC_TYPES,
+        task_label="设备健康告警检查",
+    )
+
+
+@shared_task
 def check_alerts():
     """
     检查常规告警规则
@@ -852,7 +874,7 @@ def check_alerts():
     return _run_alert_checks(
         lock_key=CHECK_ALERTS_LOCK_KEY,
         lock_ttl_seconds=CHECK_ALERTS_LOCK_TTL_SECONDS,
-        exclude_metric_types=FAST_ALERT_METRIC_TYPES | PROTOCOL_METRIC_TYPES,
+        exclude_metric_types=FAST_ALERT_METRIC_TYPES | PROTOCOL_METRIC_TYPES | DEVICE_HEALTH_ALERT_METRIC_TYPES,
         task_label="常规告警检查",
     )
 

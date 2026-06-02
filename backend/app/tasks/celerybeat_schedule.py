@@ -78,6 +78,15 @@ beat_schedule = {
         }
     },
 
+    # 设备基础健康告警检查 - 每30秒执行一次，避免CPU/内存/温度恢复被全量慢规则拖住
+    'check-device-health-alerts-every-30s': {
+        'task': 'app.tasks.alert_tasks.check_device_health_alerts',
+        'schedule': 30.0,
+        'options': {
+            'expires': 25.0,
+        }
+    },
+
     # 常规告警检查 - 每60秒执行一次，避免较慢规则拖住关键接口告警
     'check-alerts-every-60s': {
         'task': 'app.tasks.alert_tasks.check_alerts',

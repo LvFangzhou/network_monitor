@@ -61,8 +61,10 @@ const AlertHistory = () => {
   const canModify = Boolean(token && !currentUser?.read_only)
   const initialAlertId = new URLSearchParams(window.location.search).get('alert_id')
 
-  const fetchData = async (nextPage = page, nextPageSize = pageSize) => {
-    setLoading(true)
+  const fetchData = async (nextPage = page, nextPageSize = pageSize, silent = false) => {
+    if (!silent) {
+      setLoading(true)
+    }
     try {
       const [historyResult, statsResult] = await Promise.all([
         getAlertHistory({
@@ -79,9 +81,13 @@ const AlertHistory = () => {
       setTotal(historyResult.total)
       setStats(statsResult)
     } catch (error) {
-      message.error('获取告警历史失败')
+      if (!silent) {
+        message.error('获取告警历史失败')
+      }
     } finally {
-      setLoading(false)
+      if (!silent) {
+        setLoading(false)
+      }
     }
   }
 
@@ -97,6 +103,14 @@ const AlertHistory = () => {
     return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statusFilter, severityFilter, searchText])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      fetchData(page, pageSize, true)
+    }, 10000)
+    return () => window.clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, pageSize, statusFilter, severityFilter, searchText])
 
   const handleResetFilters = () => {
     setStatusFilter(undefined)
