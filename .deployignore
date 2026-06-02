@@ -1,0 +1,15 @@
+# 持久化数据绝不能通过代码同步覆盖或删除
+data/
+
+# 运行时和本机配置
+.env
+*.log
+logs/
+__pycache__/
+.DS_Store
+
+# 前端/后端构建缓存
+node_modules/
+dist/
+build/
+.cache/

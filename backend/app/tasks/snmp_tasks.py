@@ -1,0 +1,1263 @@
+"""
+SNMP 采集任务 - Celery定时任务
+"""
+from celery import shared_task
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
+from sqlalchemy import or_
+import asyncio
+import json
+import re
+import subprocess
+import time
+
+from app.database import SessionLocal
+from app.models import Device, Circuit
+from app.collectors import snmp_collector
+from app.core import get_logger
+from app.utils import redis_client, influx_client
+from app.utils.asternos_exporter_client import asternos_exporter_client
+
+logger = get_logger(__name__)
+
+SNMP_TASK_LOCK_TTL_SECONDS = 330
+SNMP_VERIFY_OID = "1.3.6.1.2.1.1.3.0"
+SNMP_FAILURE_THRESHOLD = 3
+SNMP_STATUS_REACHABLE = "reachable"
+SNMP_STATUS_UNREACHABLE = "unreachable"
+SNMP_STATUS_UNKNOWN = "unknown"
+ICMP_PING_PACKETS = 5
+ICMP_PING_TIMEOUT_SECONDS = 2
+MONITOR_CACHE_TTL_SECONDS = 180
+ASTERNOS_TASK_LOCK_TTL_SECONDS = 55
+INTERFACE_REALTIME_LOCK_TTL_SECONDS = 30
+ASTERNOS_COUNTER_METRICS = [
+    {
+        "field": "queue_egress_dropped_pkts_delta",
+        "metric_base": "queue_egress_dropped_pkts",
+        "label": "队列出方向丢包增长",
+        "match_label": "port",
+        "target_labels": ["port", "queue"],
+    },
+    {
+        "field": "queue_ingress_dropped_pkts_delta",
+        "metric_base": "queue_ingress_dropped_pkts",
+        "label": "队列入方向丢包增长",
+        "match_label": "port",
+        "target_labels": ["port", "queue"],
+    },
+    {
+        "field": "pfc_rx_pkts_delta",
+        "metric_base": "pfc_rx_pkts",
+        "label": "PFC RX包增长",
+        "match_label": "port",
+        "target_labels": ["port", "prio"],
+    },
+    {
+        "field": "pfc_tx_pkts_delta",
+        "metric_base": "pfc_tx_pkts",
+        "label": "PFC TX包增长",
+        "match_label": "port",
+        "target_labels": ["port", "prio"],
+    },
+    {
+        "field": "ecn_marked_pkts_delta",
+        "metric_base": "ecn_marked_pkts",
+        "label": "ECN标记包增长",
+        "match_label": "port",
+        "target_labels": ["port", "queue"],
+    },
+]
+
+
+def _monitor_cache_key(kind: str, device_id: int, suffix: str = "") -> str:
+    return f"monitor:cache:{kind}:{device_id}{suffix}"
+
+
+def _asternos_lock_key(device_id: int) -> str:
+    return f"asternos_collect:lock:{device_id}"
+
+
+def _interface_realtime_lock_key() -> str:
+    return "interface_realtime_collect:lock"
+
+
+def _try_lock_asternos_device(device_id: int) -> bool:
+    return bool(redis_client.set(_asternos_lock_key(device_id), "1", ex=ASTERNOS_TASK_LOCK_TTL_SECONDS, nx=True))
+
+
+def _release_asternos_device_lock(device_id: int) -> None:
+    redis_client.delete(_asternos_lock_key(device_id))
+
+
+def _try_lock_interface_realtime() -> bool:
+    return bool(redis_client.set(_interface_realtime_lock_key(), "1", ex=INTERFACE_REALTIME_LOCK_TTL_SECONDS, nx=True))
+
+
+def _release_interface_realtime_lock() -> None:
+    redis_client.delete(_interface_realtime_lock_key())
+
+
+def _set_monitor_cache(kind: str, device_id: int, payload: Any, suffix: str = "") -> None:
+    redis_client.setex(
+        _monitor_cache_key(kind, device_id, suffix),
+        MONITOR_CACHE_TTL_SECONDS,
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_percent(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    return round(value * 100, 1) if 0 <= value <= 1 else round(value, 1)
+
+
+def _max_metric_value(rows: List[Dict[str, Any]]) -> Optional[float]:
+    values = [_safe_float(row.get("value")) for row in rows]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def _label_text(row: Dict[str, Any], keys: List[str]) -> str:
+    labels = row.get("metric") or {}
+    normalized_labels = {str(key).lower(): value for key, value in labels.items()}
+    for key in keys:
+        value = normalized_labels.get(key.lower())
+        if value is not None:
+            return str(value).lower()
+    return ""
+
+
+def _summarize_exporter_protocol(rows: List[Dict[str, Any]], up_keywords: List[str]) -> Dict[str, int]:
+    total = len(rows)
+    up = 0
+    for row in rows:
+        text = _label_text(row, ["status", "state", "state_text", "session_state", "oper_state"])
+        value = _safe_float(row.get("value"))
+        if any(keyword in text for keyword in up_keywords) or (value is not None and value > 0):
+            up += 1
+    return {"total": total, "up": up, "down": max(total - up, 0)}
+
+
+def _state_is_up(protocol: str, state_text: str, value: Optional[float]) -> bool:
+    text = (state_text or "").lower()
+    if protocol == "bgp":
+        return "established" in text or (value is not None and value >= 1)
+    if protocol == "ospf":
+        return "full" in text or (value is not None and value >= 1)
+    return value is not None and value >= 1
+
+
+def _parse_duration_text(text: str | None) -> Optional[int]:
+    if not text:
+        return None
+    total = 0
+    for value, unit in re.findall(r"(\d+)\s*(w|d|h|m|s)", str(text), flags=re.IGNORECASE):
+        amount = int(value)
+        unit = unit.lower()
+        if unit == "w":
+            total += amount * 7 * 24 * 3600
+        elif unit == "d":
+            total += amount * 24 * 3600
+        elif unit == "h":
+            total += amount * 3600
+        elif unit == "m":
+            total += amount * 60
+        elif unit == "s":
+            total += amount
+    return total or None
+
+
+def _exporter_uptime_map(metrics: Dict[str, List[Dict[str, Any]]], base_names: List[str]) -> Dict[str, float]:
+    mapping: Dict[str, float] = {}
+    for base_name in base_names:
+        for row in asternos_exporter_client._rows(metrics, base_name):
+            labels = row.get("metric") or {}
+            peer = labels.get("peer") or labels.get("neighbor") or labels.get("Neighbor")
+            value = _safe_float(row.get("value"))
+            if peer and value is not None:
+                mapping[str(peer)] = value
+    return mapping
+
+
+def _build_exporter_protocol_neighbors(metrics: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
+    bgp_uptimes = _exporter_uptime_map(metrics, ["bgp_peer_uptime", "bgp_peer_uptime_seconds"])
+    bgp_neighbors = []
+    for row in asternos_exporter_client._rows(metrics, "bgp_status"):
+        labels = row.get("metric") or {}
+        peer = str(labels.get("peer") or labels.get("neighbor") or labels.get("Neighbor") or "")
+        state_text = str(labels.get("status") or labels.get("state") or "")
+        is_up = _state_is_up("bgp", state_text, _safe_float(row.get("value")))
+        bgp_neighbors.append({
+            "protocol": "bgp",
+            "peer": peer,
+            "neighbor": labels.get("neighbor") or labels.get("Neighbor") or peer,
+            "remote_as": labels.get("remote_as"),
+            "interface": labels.get("interface") or labels.get("Interface"),
+            "state": state_text or "-",
+            "status": "up" if is_up else "down",
+            "duration_seconds": _safe_float(bgp_uptimes.get(peer)),
+            "duration_text": None,
+            "source": "exporter",
+        })
+
+    ospf_neighbors = []
+    for row in asternos_exporter_client._rows(metrics, "ospf_status"):
+        labels = row.get("metric") or {}
+        peer = str(labels.get("Neighbor") or labels.get("neighbor") or labels.get("peer") or labels.get("Address") or "")
+        state_text = str(labels.get("State") or labels.get("state") or "")
+        is_up = _state_is_up("ospf", state_text, _safe_float(row.get("value")))
+        uptime_text = labels.get("Uptime") or labels.get("uptime")
+        ospf_neighbors.append({
+            "protocol": "ospf",
+            "peer": peer,
+            "neighbor": peer,
+            "remote_as": None,
+            "interface": labels.get("Interface") or labels.get("interface"),
+            "state": state_text or "-",
+            "status": "up" if is_up else "down",
+            "duration_seconds": _parse_duration_text(uptime_text),
+            "duration_text": uptime_text,
+            "source": "exporter",
+        })
+
+    return {"bgp": bgp_neighbors, "ospf": ospf_neighbors}
+
+
+def _counter_cache_key(device_id: int, metric_base: str, target_key: str) -> str:
+    return f"monitor:asternos_counter:{device_id}:{metric_base}:{target_key}"
+
+
+def _build_counter_target_key(labels: Dict[str, Any], target_labels: List[str]) -> str:
+    return "|".join(f"{key}={labels.get(key, '')}" for key in target_labels)
+
+
+def _get_asternos_counter_deltas(device_id: int, metrics: Dict[str, List[Dict[str, Any]]], interface_name: str) -> Dict[str, Any]:
+    counters: List[Dict[str, Any]] = []
+    totals: Dict[str, float] = {}
+
+    for config in ASTERNOS_COUNTER_METRICS:
+        metric_base = str(config["metric_base"])
+        field = str(config["field"])
+        target_labels = list(config["target_labels"])
+        match_label = str(config["match_label"])
+        total_delta = 0.0
+        for row in asternos_exporter_client._rows(metrics, metric_base):
+            labels = row.get("metric", {}) or {}
+            if str(labels.get(match_label) or "") != str(interface_name):
+                continue
+            current = row.get("value")
+            if current is None:
+                continue
+            current_value = float(current)
+            target_key = _build_counter_target_key(labels, target_labels)
+            cache_key = _counter_cache_key(device_id, metric_base, target_key)
+            previous_raw = redis_client.get(cache_key)
+            previous_value = None
+            if previous_raw:
+                try:
+                    previous_value = float(json.loads(previous_raw).get("value"))
+                except Exception:
+                    previous_value = None
+            delta = None
+            if previous_value is not None:
+                raw_delta = current_value - previous_value
+                delta = raw_delta if raw_delta >= 0 else current_value
+                total_delta += delta
+            redis_client.setex(
+                cache_key,
+                86400,
+                json.dumps({"value": current_value, "time": datetime.now(timezone.utc).isoformat()}),
+            )
+            counters.append({
+                "field": field,
+                "metric_base": metric_base,
+                "label": config["label"],
+                "target": target_key,
+                "labels": labels,
+                "current": current_value,
+                "previous": previous_value,
+                "delta": delta,
+            })
+        totals[field] = total_delta
+
+    return {"counters": counters, "totals": totals}
+
+
+def _build_asternos_interfaces(metrics: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    rows = asternos_exporter_client._rows(metrics, "interface_info")
+    interfaces: List[Dict[str, Any]] = []
+    for position, row in enumerate(rows, start=1):
+        labels = row.get("metric", {}) or {}
+        interface_name = labels.get("device")
+        if not interface_name:
+            continue
+        try:
+            index = int(labels.get("index") or position)
+        except ValueError:
+            index = position
+        speed_bps = None
+        speed_mbps = labels.get("speed")
+        if speed_mbps not in (None, ""):
+            try:
+                speed_bps = float(speed_mbps) * 1_000_000
+            except ValueError:
+                speed_bps = None
+        interfaces.append({
+            "index": index,
+            "name": interface_name,
+            "description": labels.get("description") or labels.get("alias") or interface_name,
+            "alias": labels.get("alias") or None,
+            "admin_status": "up" if labels.get("admin_status") == "up" else "down",
+            "oper_status": "up" if labels.get("operational_status") == "up" else "down",
+            "speed_bps": speed_bps,
+        })
+    interfaces.sort(key=lambda item: item["index"])
+    return interfaces
+
+
+def _by_base_metric_label(metrics: Dict[str, List[Dict[str, Any]]], base_name: str, label: str, value: str) -> Optional[Dict[str, Any]]:
+    return asternos_exporter_client._by_base_metric_label(metrics, base_name, label, value)
+
+
+def _build_asternos_interface_stats(
+    device_id: int,
+    metrics: Dict[str, List[Dict[str, Any]]],
+    interface: Dict[str, Any],
+    include_counters: bool = True,
+) -> Dict[str, Any]:
+    interface_name = str(interface["name"])
+    result: Dict[str, Any] = dict(interface)
+    metric_map = {
+        "in_octets": "interface_receive_bytes_total",
+        "out_octets": "interface_transmit_bytes_total",
+        "in_bps": "interface_receive_rate_bps",
+        "out_bps": "interface_transmit_rate_bps",
+        "in_errors": "interface_receive_errs_total",
+        "out_errors": "interface_transmit_errs_total",
+        "in_discards": "interface_receive_drops_total",
+        "out_discards": "interface_transmit_drops_total",
+        "in_utilization_percent": "interface_receive_util",
+        "out_utilization_percent": "interface_transmit_util",
+    }
+    for field, metric_base in metric_map.items():
+        row = _by_base_metric_label(metrics, metric_base, "device", interface_name)
+        if row:
+            result[field] = row.get("value")
+
+    for field, metric_base in {
+        "rx_power": "dom_optic_rx_power",
+        "tx_power": "dom_optic_tx_power",
+        "optic_temperature": "dom_optic_tempt",
+    }.items():
+        row = _by_base_metric_label(metrics, metric_base, "interface", interface_name)
+        if row:
+            result[field] = row.get("value")
+
+    if include_counters:
+        counter_deltas = _get_asternos_counter_deltas(device_id, metrics, interface_name)
+        result["asternos_counters"] = counter_deltas["counters"]
+        result.update(counter_deltas["totals"])
+    return result
+
+
+def _octet_rate_cache_key(device_id: int, interface_index: int) -> str:
+    return f"monitor:interface_octets:{device_id}:{interface_index}"
+
+
+def _apply_octet_rates(device_id: int, stats: Dict[str, Any], timestamp: datetime) -> None:
+    interface_index = stats.get("index")
+    if interface_index is None:
+        return
+
+    current_in = stats.get("in_octets")
+    current_out = stats.get("out_octets")
+    if current_in is None and current_out is None:
+        return
+
+    cache_key = _octet_rate_cache_key(device_id, int(interface_index))
+    previous_raw = redis_client.get(cache_key)
+    previous = None
+    if previous_raw:
+        try:
+            previous = json.loads(previous_raw)
+        except Exception:
+            previous = None
+
+    next_cache = {
+        "in_octets": current_in,
+        "out_octets": current_out,
+        "time": timestamp.replace(tzinfo=timezone.utc).isoformat(),
+    }
+
+    if previous:
+        try:
+            previous_time = datetime.fromisoformat(str(previous.get("time")))
+        except Exception:
+            previous_time = None
+
+        for octet_key, bps_key, time_key in [("in_octets", "in_bps", "in_time"), ("out_octets", "out_bps", "out_time")]:
+            current_value = stats.get(octet_key)
+            previous_value = previous.get(octet_key)
+            if current_value is None or previous_value is None:
+                continue
+            try:
+                field_previous_time = datetime.fromisoformat(str(previous.get(time_key) or previous.get("time")))
+            except Exception:
+                field_previous_time = previous_time
+            elapsed = max((timestamp.replace(tzinfo=timezone.utc) - field_previous_time).total_seconds(), 0.0) if field_previous_time else 0.0
+            delta = float(current_value) - float(previous_value)
+            if 0.5 <= elapsed <= 300:
+                if delta > 0:
+                    stats[bps_key] = round((delta * 8) / elapsed, 2)
+                    stats.setdefault("_octet_rate_fields", []).append(bps_key)
+                    next_cache[time_key] = timestamp.replace(tzinfo=timezone.utc).isoformat()
+                elif delta == 0:
+                    next_cache[octet_key] = previous_value
+                    next_cache[time_key] = previous.get(time_key) or previous.get("time")
+                else:
+                    next_cache[time_key] = timestamp.replace(tzinfo=timezone.utc).isoformat()
+                stats["sample_seconds"] = round(elapsed, 2)
+
+    if "in_time" not in next_cache:
+        next_cache["in_time"] = timestamp.replace(tzinfo=timezone.utc).isoformat()
+    if "out_time" not in next_cache:
+        next_cache["out_time"] = timestamp.replace(tzinfo=timezone.utc).isoformat()
+
+    redis_client.setex(
+        cache_key,
+        86400,
+        json.dumps(next_cache),
+    )
+
+
+def _interface_point(device: Device, stats: Dict[str, Any], timestamp: datetime) -> Optional[Dict[str, Any]]:
+    interface_index = stats.get("index")
+    if interface_index is None:
+        return None
+
+    _apply_octet_rates(device.id, stats, timestamp)
+    preserve_exporter_rates = str(device.monitor_source or "snmp") == "asternos_exporter"
+
+    return {
+        "measurement": "interface_monitoring",
+        "tags": {
+            "device_id": str(device.id),
+            "device_name": device.name,
+            "interface_index": str(interface_index),
+            "interface_name": stats.get("name"),
+        },
+        "fields": {
+            "in_bps": stats.get("in_bps") if (
+                "in_bps" in stats.get("_octet_rate_fields", [])
+                or stats.get("in_octets") is None
+                or (preserve_exporter_rates and stats.get("in_bps") is not None)
+            ) else None,
+            "out_bps": stats.get("out_bps") if (
+                "out_bps" in stats.get("_octet_rate_fields", [])
+                or stats.get("out_octets") is None
+                or (preserve_exporter_rates and stats.get("out_bps") is not None)
+            ) else None,
+            "in_octets": stats.get("in_octets"),
+            "out_octets": stats.get("out_octets"),
+            "in_utilization_percent": stats.get("in_utilization_percent"),
+            "out_utilization_percent": stats.get("out_utilization_percent"),
+            "in_discards": stats.get("in_discards"),
+            "out_discards": stats.get("out_discards"),
+            "in_discards_delta": stats.get("in_discards_delta"),
+            "out_discards_delta": stats.get("out_discards_delta"),
+            "in_errors": stats.get("in_errors"),
+            "out_errors": stats.get("out_errors"),
+            "in_errors_delta": stats.get("in_errors_delta"),
+            "out_errors_delta": stats.get("out_errors_delta"),
+            "queue_egress_dropped_pkts_delta": stats.get("queue_egress_dropped_pkts_delta"),
+            "queue_ingress_dropped_pkts_delta": stats.get("queue_ingress_dropped_pkts_delta"),
+            "pfc_rx_pkts_delta": stats.get("pfc_rx_pkts_delta"),
+            "pfc_tx_pkts_delta": stats.get("pfc_tx_pkts_delta"),
+            "ecn_marked_pkts_delta": stats.get("ecn_marked_pkts_delta"),
+            "buffer_usage": stats.get("buffer_usage"),
+            "queue_length": stats.get("queue_length"),
+            "speed_bps": stats.get("speed_bps"),
+            "sample_seconds": stats.get("sample_seconds"),
+            "admin_status": 1.0 if stats.get("admin_status") == "up" else 0.0,
+            "oper_status": 1.0 if stats.get("oper_status") == "up" else 0.0,
+            "admin_up_oper_down": 1.0 if stats.get("admin_status") == "up" and stats.get("oper_status") != "up" else 0.0,
+        },
+        "timestamp": timestamp,
+    }
+
+
+def _asternos_queue_detail_points(device: Device, stats: Dict[str, Any], timestamp: datetime) -> List[Dict[str, Any]]:
+    interface_index = stats.get("index")
+    interface_name = stats.get("name")
+    if interface_index is None or not interface_name:
+        return []
+
+    points: List[Dict[str, Any]] = []
+    for counter in stats.get("asternos_counters") or []:
+        labels = counter.get("labels") or {}
+        metric_base = counter.get("metric_base")
+        field = counter.get("field")
+        target = counter.get("target")
+        if not metric_base or not field or not target:
+            continue
+
+        queue = labels.get("queue")
+        prio = labels.get("prio")
+        points.append({
+            "measurement": "queue_monitoring",
+            "tags": {
+                "device_id": str(device.id),
+                "device_name": device.name,
+                "interface_index": str(interface_index),
+                "interface_name": interface_name,
+                "metric_base": str(metric_base),
+                "field": str(field),
+                "target": str(target),
+                "queue": str(queue) if queue is not None else None,
+                "prio": str(prio) if prio is not None else None,
+            },
+            "fields": {
+                "current": counter.get("current"),
+                "previous": counter.get("previous"),
+                "delta": counter.get("delta"),
+            },
+            "timestamp": timestamp,
+        })
+    return points
+
+
+def _cache_interface_stats(device_id: int, stats: Dict[str, Any], collected_at: str) -> None:
+    interface_index = stats.get("index")
+    if interface_index is None:
+        return
+    _set_monitor_cache("interface_stats", device_id, {
+        "interface": stats,
+        "collected_at": collected_at,
+    }, suffix=f":{interface_index}")
+
+
+def _device_lock_key(device_id: int) -> str:
+    return f"snmp_collect:lock:{device_id}"
+
+
+def _device_failure_key(device_id: int) -> str:
+    return f"snmp_collect:failure:{device_id}"
+
+
+def _device_status_key(device_id: int) -> str:
+    return f"snmp_collect:status:{device_id}"
+
+
+def _try_lock_device(device_id: int) -> bool:
+    return bool(redis_client.set(_device_lock_key(device_id), "1", ex=SNMP_TASK_LOCK_TTL_SECONDS, nx=True))
+
+
+def _release_device_lock(device_id: int) -> None:
+    redis_client.delete(_device_lock_key(device_id))
+
+
+def _get_device_status(device_id: int) -> str:
+    return redis_client.get(_device_status_key(device_id)) or SNMP_STATUS_UNKNOWN
+
+
+def _mark_device_reachable(device_id: int) -> None:
+    redis_client.set(_device_status_key(device_id), SNMP_STATUS_REACHABLE)
+    redis_client.delete(_device_failure_key(device_id))
+
+
+def _record_device_failure(device_id: int) -> int:
+    failures = redis_client.incr(_device_failure_key(device_id))
+    redis_client.expire(_device_failure_key(device_id), 86400)
+    if failures >= SNMP_FAILURE_THRESHOLD:
+        redis_client.set(_device_status_key(device_id), SNMP_STATUS_UNREACHABLE)
+    elif _get_device_status(device_id) != SNMP_STATUS_REACHABLE:
+        redis_client.set(_device_status_key(device_id), SNMP_STATUS_UNKNOWN)
+    return failures
+
+
+def _clear_device_failure_state(device_id: int) -> None:
+    _mark_device_reachable(device_id)
+
+
+def _snmp_is_reachable(device: Device) -> bool:
+    return snmp_collector.snmp_get(device, SNMP_VERIFY_OID) is not None
+
+
+def _collect_icmp_reachability(device: Device) -> Dict[str, Any]:
+    command = [
+        "ping",
+        "-c",
+        str(ICMP_PING_PACKETS),
+        "-W",
+        str(ICMP_PING_TIMEOUT_SECONDS),
+        device.ip_address,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(ICMP_PING_PACKETS * ICMP_PING_TIMEOUT_SECONDS + 3, 8),
+            check=False,
+        )
+    except Exception as exc:
+        logger.warning("ICMP探测执行失败", device_id=device.id, ip=device.ip_address, error=str(exc))
+        return {
+            "reachable": 0.0,
+            "sent_packets": float(ICMP_PING_PACKETS),
+            "success_packets": 0.0,
+            "packet_loss_percent": 100.0,
+            "avg_latency_ms": None,
+        }
+
+    output = f"{result.stdout}\n{result.stderr}".strip()
+    transmitted = float(ICMP_PING_PACKETS)
+    received = 0.0
+    loss_percent = 100.0
+    avg_latency_ms = None
+
+    match = re.search(r"(\d+)\s+packets transmitted,\s+(\d+)\s+(?:packets\s+)?received", output)
+    if match:
+        transmitted = float(match.group(1))
+        received = float(match.group(2))
+
+    loss_match = re.search(r"(\d+(?:\.\d+)?)%\s+packet loss", output)
+    if loss_match:
+        loss_percent = float(loss_match.group(1))
+    elif transmitted > 0:
+        loss_percent = round(((transmitted - received) / transmitted) * 100, 2)
+
+    rtt_match = re.search(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)/", output)
+    if rtt_match:
+        avg_latency_ms = float(rtt_match.group(2))
+
+    return {
+        "reachable": 1.0 if received > 0 and loss_percent < 100 else 0.0,
+        "sent_packets": transmitted,
+        "success_packets": received,
+        "packet_loss_percent": loss_percent,
+        "avg_latency_ms": avg_latency_ms,
+    }
+
+
+@shared_task(bind=True)
+def collect_snmp_for_device(self, device_id: int):
+    """
+    采集单个设备的SNMP数据
+    
+    Args:
+        device_id: 设备ID
+    """
+    db = SessionLocal()
+    try:
+        if not redis_client.exists(_device_lock_key(device_id)):
+            _try_lock_device(device_id)
+
+        device = db.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            logger.warning("设备不存在", device_id=device_id)
+            return {"error": "设备不存在"}
+
+        if not device.is_monitored or device.status not in {"active", "online"}:
+            logger.debug("设备未加入监控或未上线，跳过采集", device_id=device_id)
+            return {"skipped": True, "reason": "未加入监控或未上线"}
+        if (device.monitor_source or "snmp") != "snmp":
+            logger.debug("设备监控方式非SNMP，跳过SNMP采集", device_id=device_id)
+            return {"skipped": True, "reason": "监控方式非SNMP"}
+        
+        if not device.snmp_version:
+            logger.debug("设备未配置SNMP", device_id=device_id)
+            return {"skipped": True, "reason": "未配置SNMP"}
+        
+        logger.debug("开始SNMP采集", device_id=device_id, ip=device.ip_address)
+        
+        result: Dict[str, Any] = {}
+        interface_history_result: Dict[str, Any] = {}
+        protocol_status_result: Dict[str, Any] = {}
+        optical_result: Dict[str, Any] = {}
+
+        try:
+            result = snmp_collector.collect_device(device)
+        except Exception as exc:
+            logger.error("设备SNMP指标采集失败，继续采集接口历史", device_id=device_id, error=str(exc))
+
+        try:
+            interface_history_result = snmp_collector.collect_interface_monitoring(device)
+        except Exception as exc:
+            logger.error("接口历史采集失败", device_id=device_id, error=str(exc))
+
+        try:
+            protocol_status_result = snmp_collector.collect_protocol_status(device)
+        except Exception as exc:
+            logger.error("协议状态采集失败", device_id=device_id, error=str(exc))
+
+        try:
+            optical_result = snmp_collector.collect_optical_monitoring(device)
+        except Exception as exc:
+            logger.error("光模块指标采集失败", device_id=device_id, error=str(exc))
+
+        logger.info(
+            "SNMP采集完成",
+            device_id=device_id,
+            points=result.get("points_written", 0),
+            interface_points=interface_history_result.get("points_written", 0),
+            protocol_points=protocol_status_result.get("points_written", 0),
+            optical_points=optical_result.get("points_written", 0),
+        )
+
+        total_points_written = (
+            int(result.get("points_written") or 0)
+            + int(interface_history_result.get("points_written") or 0)
+            + int(protocol_status_result.get("points_written") or 0)
+            + int(optical_result.get("points_written") or 0)
+        )
+        if total_points_written == 0 and not _snmp_is_reachable(device):
+            failures = _record_device_failure(device_id)
+            logger.warning(
+                "SNMP采集无数据且连通性验证失败",
+                device_id=device_id,
+                ip=device.ip_address,
+                failures=failures,
+                status=_get_device_status(device_id),
+            )
+            return {
+                "device_id": device_id,
+                "success": False,
+                "error": "SNMP无响应或无可采集数据",
+                "failures": failures,
+                "status": _get_device_status(device_id),
+                "points_written": 0,
+                "interface_points_written": 0,
+                "interfaces_monitored": 0,
+                "protocol_points_written": 0,
+                "optical_points_written": 0,
+            }
+
+        _clear_device_failure_state(device_id)
+        
+        return {
+            "device_id": device_id,
+            "success": True,
+            "cpu": result.get("cpu"),
+            "memory": result.get("memory"),
+            "interfaces": result.get("interfaces_count"),
+            "points_written": result.get("points_written"),
+            "interface_points_written": interface_history_result.get("points_written", 0),
+            "interfaces_monitored": interface_history_result.get("interfaces_monitored", 0),
+            "protocol_points_written": protocol_status_result.get("points_written", 0),
+            "optical_points_written": optical_result.get("points_written", 0),
+        }
+        
+    except Exception as exc:
+        logger.error("SNMP采集失败", device_id=device_id, error=str(exc))
+        failures = _record_device_failure(device_id)
+        return {
+            "device_id": device_id,
+            "success": False,
+            "error": str(exc),
+            "failures": failures,
+            "status": _get_device_status(device_id),
+        }
+    finally:
+        _release_device_lock(device_id)
+        db.close()
+
+
+@shared_task
+def collect_all_snmp():
+    """
+    采集所有设备的SNMP数据
+    由Celery Beat定时调度
+    """
+    db = SessionLocal()
+    try:
+        # 获取所有启用了SNMP的设备
+        devices = db.query(Device).filter(
+            Device.snmp_version.isnot(None),
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+            or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
+        ).all()
+        
+        logger.info(f"开始批量SNMP采集，共{len(devices)}个设备")
+        
+        # 为每个设备创建采集任务
+        task_ids = []
+        skipped_locked = 0
+        skipped_unreachable = 0
+        for device in devices:
+            if _get_device_status(device.id) == SNMP_STATUS_UNREACHABLE:
+                skipped_unreachable += 1
+                continue
+            if not _try_lock_device(device.id):
+                skipped_locked += 1
+                continue
+            task = collect_snmp_for_device.delay(device.id)
+            task_ids.append({
+                "device_id": device.id,
+                "task_id": task.id
+            })
+        
+        return {
+            "total_devices": len(devices),
+            "tasks_created": len(task_ids),
+            "skipped_locked": skipped_locked,
+            "skipped_unreachable": skipped_unreachable,
+        }
+        
+    except Exception as e:
+        logger.error("批量SNMP采集失败", error=str(e))
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@shared_task(bind=True)
+def collect_asternos_for_device(self, device_id: int):
+    """采集单台 AsterNOS Exporter 设备，并缓存总览/端口/邻居快照。"""
+    db = SessionLocal()
+    try:
+        if not redis_client.exists(_asternos_lock_key(device_id)):
+            _try_lock_asternos_device(device_id)
+
+        device = db.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            return {"error": "设备不存在"}
+        if not device.is_monitored or device.status not in {"active", "online"}:
+            return {"skipped": True, "reason": "未加入监控或未上线"}
+
+        metrics = asyncio.run(asternos_exporter_client.scrape(device))
+        interfaces = _build_asternos_interfaces(metrics)
+        now = datetime.utcnow()
+        collected_at = datetime.now(timezone.utc).isoformat()
+        points = []
+
+        for interface in interfaces:
+            stats = _build_asternos_interface_stats(device.id, metrics, interface)
+            _cache_interface_stats(device.id, stats, collected_at)
+            point = _interface_point(device, stats, now)
+            if point:
+                points.append(point)
+            points.extend(_asternos_queue_detail_points(device, stats, now))
+
+        if points:
+            influx_client.write_points(points, sync=False)
+
+        neighbors = _build_exporter_protocol_neighbors(metrics)
+        overview = {
+            "connectivity": {
+                "type": "exporter",
+                "status": "reachable",
+                "message": f"http://{device.ip_address}:8101/metrics",
+            },
+            "resources": {
+                "cpu_percent": _normalize_percent(_safe_float(asternos_exporter_client._first(metrics, "device_cpu_usage"))),
+                "memory_percent": _normalize_percent(_safe_float(asternos_exporter_client._first(metrics, "device_memory_usage"))),
+                "temperature": _max_metric_value(asternos_exporter_client._rows(metrics, "device_sensor_tempt")),
+                "storage_percent": None,
+            },
+            "sessions": {"current": None, "total": None, "usage_percent": None},
+            "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
+            "protocols": {
+                "bgp": _summarize_exporter_protocol(
+                    asternos_exporter_client._rows(metrics, "bgp_status"),
+                    ["established", "up"],
+                ),
+                "ospf": _summarize_exporter_protocol(
+                    asternos_exporter_client._rows(metrics, "ospf_status"),
+                    ["full", "established", "up"],
+                ),
+            },
+            "collected_at": collected_at,
+        }
+        _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at})
+        _set_monitor_cache("overview", device.id, overview)
+        _set_monitor_cache("protocol_neighbors", device.id, {"neighbors": neighbors, "collected_at": collected_at})
+        redis_client.set(f"asternos_collect:status:{device.id}", "reachable")
+
+        return {
+            "device_id": device.id,
+            "success": True,
+            "interfaces": len(interfaces),
+            "points_written": len(points),
+        }
+    except Exception as exc:
+        logger.error("AsterNOS Exporter采集失败", device_id=device_id, error=str(exc))
+        redis_client.set(f"asternos_collect:status:{device_id}", "unreachable")
+        _set_monitor_cache("overview", device_id, {
+            "connectivity": {"type": "exporter", "status": "unreachable", "message": str(exc)},
+            "resources": {"cpu_percent": None, "memory_percent": None, "temperature": None, "storage_percent": None},
+            "sessions": {"current": None, "total": None, "usage_percent": None},
+            "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
+            "protocols": {"bgp": {"total": 0, "up": 0, "down": 0}, "ospf": {"total": 0, "up": 0, "down": 0}},
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return {"device_id": device_id, "success": False, "error": str(exc)}
+    finally:
+        _release_asternos_device_lock(device_id)
+        db.close()
+
+
+@shared_task
+def collect_all_asternos_exporter():
+    """周期采集所有 AsterNOS Exporter 直连设备。"""
+    db = SessionLocal()
+    try:
+        devices = db.query(Device).filter(
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+        ).all()
+        scheduled = 0
+        skipped_locked = 0
+        for device in devices:
+            vendor = str(device.vendor or "").lower()
+            monitor_source = str(device.monitor_source or "")
+            if not (
+                monitor_source == "asternos_exporter"
+                or any(marker in vendor for marker in ["asternos", "asterfusion", "asteros", "星融元"])
+            ):
+                continue
+            if not _try_lock_asternos_device(device.id):
+                skipped_locked += 1
+                continue
+            collect_asternos_for_device.delay(device.id)
+            scheduled += 1
+        return {"scheduled": scheduled, "skipped_locked": skipped_locked}
+    except Exception as exc:
+        logger.error("批量AsterNOS Exporter采集失败", error=str(exc))
+        return {"error": str(exc)}
+    finally:
+        db.close()
+
+
+@shared_task
+def collect_all_asternos_interface_realtime():
+    """高频采集所有 AsterNOS 监控设备的端口基础指标，用于端口流量连续曲线。"""
+    if not _try_lock_interface_realtime():
+        return {"skipped": True, "reason": "上一轮AsterNOS端口高频采集未完成"}
+
+    db = SessionLocal()
+    try:
+        all_devices = db.query(Device).filter(
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+        ).all()
+        devices = []
+        for device in all_devices:
+            vendor = str(device.vendor or "").lower()
+            monitor_source = str(device.monitor_source or "")
+            if (
+                monitor_source == "asternos_exporter"
+                or any(marker in vendor for marker in ["asternos", "asterfusion", "asteros", "星融元"])
+            ):
+                devices.append(device)
+
+        now = datetime.utcnow()
+        collected_at = datetime.now(timezone.utc).isoformat()
+        points: List[Dict[str, Any]] = []
+        device_count = 0
+        interface_count = 0
+
+        async def scrape_device(device: Device):
+            try:
+                return device, await asternos_exporter_client.scrape(device), None
+            except Exception as exc:
+                return device, None, exc
+
+        async def scrape_devices():
+            return await asyncio.gather(*(scrape_device(device) for device in devices))
+
+        scrape_results = asyncio.run(scrape_devices()) if devices else []
+        for device, metrics, error in scrape_results:
+            if error:
+                logger.warning("AsterNOS端口高频采集失败", device_id=device.id, ip=device.ip_address, error=str(error))
+                continue
+            try:
+                interfaces = _build_asternos_interfaces(metrics)
+                _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at})
+                device_count += 1
+
+                for interface in interfaces:
+                    stats = _build_asternos_interface_stats(device.id, metrics, interface, include_counters=False)
+                    point = _interface_point(device, stats, now)
+                    if not point:
+                        continue
+                    points.append(point)
+                    interface_count += 1
+                    _cache_interface_stats(device.id, stats, collected_at)
+            except Exception as exc:
+                logger.warning("AsterNOS端口高频采集失败", device_id=device.id, ip=device.ip_address, error=str(exc))
+
+        if points:
+            influx_client.write_points(points, sync=False)
+
+        logger.info(
+            "AsterNOS端口高频采集完成",
+            devices=device_count,
+            interfaces=interface_count,
+            points_written=len(points),
+        )
+        return {"devices": device_count, "interfaces": interface_count, "points_written": len(points)}
+    except Exception as exc:
+        logger.error("AsterNOS端口高频采集批量失败", error=str(exc))
+        return {"error": str(exc)}
+    finally:
+        _release_interface_realtime_lock()
+        db.close()
+
+
+@shared_task
+def collect_circuit_interface_realtime():
+    """轻量采集线路绑定端口，避免全设备扫描较慢造成端口历史断点。"""
+    if not _try_lock_interface_realtime():
+        return {"skipped": True, "reason": "上一轮线路端口采集未完成"}
+
+    db = SessionLocal()
+    try:
+        circuits = db.query(Circuit).filter(Circuit.status == "active").all()
+        target_map: Dict[int, set[str]] = {}
+        for circuit in circuits:
+            if circuit.primary_device_id and circuit.primary_port_name:
+                target_map.setdefault(circuit.primary_device_id, set()).add(str(circuit.primary_port_name))
+            if circuit.access_mode == "dual" and circuit.secondary_device_id and circuit.secondary_port_name:
+                target_map.setdefault(circuit.secondary_device_id, set()).add(str(circuit.secondary_port_name))
+
+        if not target_map:
+            return {"devices": 0, "points_written": 0}
+
+        devices = db.query(Device).filter(
+            Device.id.in_(target_map.keys()),
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+        ).all()
+        now = datetime.utcnow()
+        collected_at = datetime.now(timezone.utc).isoformat()
+        points: List[Dict[str, Any]] = []
+        matched_ports = 0
+
+        for device in devices:
+            monitor_source = str(device.monitor_source or "snmp")
+            port_names = target_map.get(device.id, set())
+            if not port_names:
+                continue
+
+            if monitor_source == "asternos_exporter":
+                metrics = asyncio.run(asternos_exporter_client.scrape(device))
+                interfaces = _build_asternos_interfaces(metrics)
+                _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at})
+                for interface in interfaces:
+                    names = {str(interface.get("name") or ""), str(interface.get("description") or ""), str(interface.get("alias") or "")}
+                    if not names.intersection(port_names):
+                        continue
+                    stats = _build_asternos_interface_stats(device.id, metrics, interface)
+                    point = _interface_point(device, stats, now)
+                    if point:
+                        points.append(point)
+                        points.extend(_asternos_queue_detail_points(device, stats, now))
+                        matched_ports += 1
+                        _cache_interface_stats(device.id, stats, collected_at)
+                continue
+
+            if not device.snmp_version:
+                continue
+            interfaces = snmp_collector.list_interfaces(device)
+            for interface in interfaces:
+                names = {str(interface.get("name") or ""), str(interface.get("description") or ""), str(interface.get("alias") or "")}
+                if not names.intersection(port_names):
+                    continue
+                stats = snmp_collector.get_interface_metrics(device, int(interface["index"]))
+                point = _interface_point(device, stats, now)
+                if point:
+                    points.append(point)
+                    matched_ports += 1
+                    _cache_interface_stats(device.id, stats, collected_at)
+
+        if points:
+            influx_client.write_points(points, sync=False)
+
+        logger.info(
+            "线路绑定端口实时采集完成",
+            devices=len(devices),
+            matched_ports=matched_ports,
+            points_written=len(points),
+        )
+        return {"devices": len(devices), "matched_ports": matched_ports, "points_written": len(points)}
+    except Exception as exc:
+        logger.error("线路绑定端口实时采集失败", error=str(exc))
+        return {"error": str(exc)}
+    finally:
+        _release_interface_realtime_lock()
+        db.close()
+
+
+@shared_task
+def collect_device_reachability():
+    """每30秒对已上线设备执行 ICMP 探测并写入时序库。"""
+    db = SessionLocal()
+    try:
+        devices = db.query(Device).filter(
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+        ).all()
+
+        points = []
+        now = datetime.utcnow()
+        for device in devices:
+            if not device.ip_address:
+                continue
+            metrics = _collect_icmp_reachability(device)
+            points.append({
+                "measurement": "device_reachability",
+                "tags": {
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                    "device_ip": device.ip_address,
+                },
+                "fields": metrics,
+                "timestamp": now,
+            })
+
+        if points:
+            influx_client.write_points(points, sync=False)
+
+        logger.info("设备ICMP探测完成", total_devices=len(devices), points_written=len(points))
+        return {"total_devices": len(devices), "points_written": len(points)}
+    except Exception as exc:
+        logger.error("设备ICMP探测失败", error=str(exc))
+        return {"error": str(exc)}
+    finally:
+        db.close()
+
+
+@shared_task(bind=True)
+def verify_snmp_reachability(self, device_id: int):
+    """轻量验证单台设备SNMP是否可达"""
+    db = SessionLocal()
+    try:
+        if not redis_client.exists(_device_lock_key(device_id)):
+            _try_lock_device(device_id)
+
+        device = db.query(Device).filter(Device.id == device_id).first()
+        if not device or not device.snmp_version:
+            return {"device_id": device_id, "verified": False, "reason": "设备不存在或未配置SNMP"}
+
+        reachable = _snmp_is_reachable(device)
+        if reachable:
+            _mark_device_reachable(device_id)
+            return {"device_id": device_id, "verified": True, "reachable": True}
+
+        failures = _record_device_failure(device_id)
+        return {
+            "device_id": device_id,
+            "verified": True,
+            "reachable": False,
+            "failures": failures,
+            "status": _get_device_status(device_id),
+        }
+    finally:
+        _release_device_lock(device_id)
+        db.close()
+
+
+@shared_task
+def verify_unreachable_snmp_devices():
+    """每分钟只验证已判定不可达的设备是否恢复"""
+    db = SessionLocal()
+    try:
+        devices = db.query(Device).filter(
+            Device.snmp_version.isnot(None),
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+            or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
+        ).all()
+
+        scheduled = 0
+        for device in devices:
+            if _get_device_status(device.id) != SNMP_STATUS_UNREACHABLE:
+                continue
+            if not _try_lock_device(device.id):
+                continue
+            verify_snmp_reachability.delay(device.id)
+            scheduled += 1
+
+        return {"scheduled": scheduled}
+    finally:
+        db.close()
+
+
+@shared_task
+def sync_gnmi_devices():
+    """
+    同步gNMI设备到gNMI管理器
+    由Celery Beat定时调度
+    """
+    import asyncio
+    from app.collectors import gnmi_manager, DeviceGNMIConfig
+    
+    db = SessionLocal()
+    try:
+        # 获取所有启用了gNMI的设备
+        devices = db.query(Device).filter(
+            Device.gnmi_enabled == 1
+        ).all()
+        
+        logger.info(f"同步gNMI设备，共{len(devices)}个设备")
+        
+        # 构建设备配置列表
+        device_configs = []
+        for device in devices:
+            config = DeviceGNMIConfig(
+                device_id=device.id,
+                ip_address=device.ip_address,
+                port=device.gnmi_port or 57400,
+                username=device.gnmi_username,
+                password=device.gnmi_password,
+                tls_enabled=bool(device.gnmi_tls_enabled),
+                tls_cert=device.gnmi_tls_cert,
+                skip_verify=bool(device.gnmi_skip_verify),
+                subscriptions=device.gnmi_subscriptions or []
+            )
+            device_configs.append(config)
+        
+        # 异步同步设备
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(gnmi_manager.sync_devices(device_configs))
+        finally:
+            loop.close()
+        
+        return {
+            "total_devices": len(devices),
+            "synced": len(device_configs)
+        }
+        
+    except Exception as e:
+        logger.error("同步gNMI设备失败", error=str(e))
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@shared_task
+def update_ping_monitor():
+    """
+    库存模式下不再主动同步Ping监控
+    """
+    logger.info("库存模式下跳过Ping监控同步")
+    return {
+        "total_devices": 0,
+        "added": 0,
+        "removed": 0,
+        "skipped": True,
+    }

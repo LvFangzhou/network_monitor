@@ -1,0 +1,49 @@
+# Runtime data and local configuration
+data/
+.env
+*.env
+!.env.example
+*.log
+logs/
+backups/
+*.bak
+*.backup
+
+# Database and local state
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.rdb
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.cache/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Docker / OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Certificates and private keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx

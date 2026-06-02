@@ -1,0 +1,1229 @@
+"""
+设备管理路由
+"""
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
+from typing import List, Optional
+from datetime import datetime
+from pydantic import BaseModel
+import re
+
+from app.database import get_db
+from app.models import Device, DeviceGroup, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
+from app.collectors.snmp_collector import SNMPCollector
+from app.schemas import (
+    DeviceCreate, DeviceUpdate, DeviceResponse,
+    DeviceGroupCreate, DeviceGroupUpdate, DeviceGroupResponse,
+    DeviceStatusUpdate,
+    DatacenterCreate, DatacenterUpdate, DatacenterResponse,
+    DeviceTypeCreate, DeviceTypeUpdate, DeviceTypeResponse,
+    DeviceRoleCreate, DeviceRoleUpdate, DeviceRoleResponse,
+    DeviceVendorCreate, DeviceVendorUpdate, DeviceVendorResponse
+)
+from app.core import get_logger
+
+logger = get_logger(__name__)
+router = APIRouter()
+
+
+def normalize_monitoring_config(
+    monitor_source: str,
+    ip_address: str,
+    prometheus_url: str | None,
+    prometheus_job: str | None,
+    prometheus_instance: str | None,
+    custom_fields: dict | None,
+) -> tuple[str | None, str | None, str | None, dict]:
+    """归一化不同监控源的设备参数，AsterNOS 直连复用 URL 字段存储 Exporter 地址。"""
+    custom_fields = dict(custom_fields or {})
+    if monitor_source != "asternos_exporter":
+        return prometheus_url, prometheus_job, prometheus_instance, custom_fields
+
+    exporter_url = (prometheus_url or "").strip()
+    if not exporter_url:
+        exporter_url = f"http://{ip_address}:8101"
+    elif not exporter_url.startswith(("http://", "https://")):
+        exporter_url = f"http://{exporter_url}"
+    exporter_url = exporter_url.rstrip("/")
+
+    monitoring = custom_fields.get("monitoring")
+    if not isinstance(monitoring, dict):
+        monitoring = {}
+    monitoring.update(
+        {
+            "exporter_profile": "asternos",
+            "exporter_url": exporter_url,
+            "exporter_port": 8101,
+        }
+    )
+    custom_fields["monitoring"] = monitoring
+    return exporter_url, None, None, custom_fields
+
+
+def is_asternos_vendor(vendor: str | None) -> bool:
+    value = (vendor or "").strip().lower()
+    return any(marker in value for marker in ["asternos", "asterfusion", "asteros", "星融元"])
+
+
+def resolve_monitor_source_by_vendor(vendor: str | None, requested_source: str | None) -> str:
+    if is_asternos_vendor(vendor):
+        return "asternos_exporter"
+    return "snmp"
+
+
+class DeviceConnectionTestRequest(BaseModel):
+    type: str
+
+
+class DeviceBatchDeleteRequest(BaseModel):
+    device_ids: List[int]
+
+
+class DeviceBatchUpdateRequest(BaseModel):
+    device_ids: List[int]
+    field: str
+    value: Optional[str] = None
+    value_id: Optional[int] = None
+
+
+def normalize_dictionary_name(raw_name: Optional[str]) -> str:
+    return (raw_name or "").strip()
+
+
+def normalize_inventory_status(raw_status: Optional[str]) -> str:
+    value = (raw_status or "in_stock").strip().lower()
+    status_aliases = {
+        "启用": "active",
+        "停用": "inactive",
+        "库存": "in_stock",
+        "上架": "deployed",
+        "在线": "active",
+        "离线": "inactive",
+        "active": "active",
+        "inactive": "inactive",
+        "in_stock": "in_stock",
+        "deployed": "deployed",
+        "online": "active",
+        "offline": "inactive",
+    }
+    return status_aliases.get(value, "in_stock")
+
+
+def get_or_create_device_type(db: Session, raw_name: Optional[str]) -> tuple[Optional[int], Optional[str]]:
+    name = normalize_dictionary_name(raw_name)
+    if not name:
+        return None, None
+
+    device_type = (
+        db.query(DeviceType)
+        .filter((func.lower(DeviceType.name) == name.lower()) | (func.lower(DeviceType.display_name) == name.lower()))
+        .first()
+    )
+    if not device_type:
+        device_type = DeviceType(name=name, display_name=name, is_active=True)
+        db.add(device_type)
+        db.flush()
+
+    return device_type.id, device_type.name
+
+
+def ensure_device_role_catalog(db: Session, raw_name: Optional[str]) -> Optional[str]:
+    name = normalize_dictionary_name(raw_name)
+    if not name:
+        return None
+
+    device_role = db.query(DeviceRole).filter(func.lower(DeviceRole.name) == name.lower()).first()
+    if not device_role:
+        device_role = DeviceRole(name=name, display_name=name, is_active=True)
+        db.add(device_role)
+        db.flush()
+    return device_role.name
+
+
+def ensure_device_vendor_catalog(db: Session, raw_name: Optional[str]) -> Optional[str]:
+    name = normalize_dictionary_name(raw_name)
+    if not name:
+        return None
+
+    device_vendor = db.query(DeviceVendor).filter(func.lower(DeviceVendor.name) == name.lower()).first()
+    if not device_vendor:
+        device_vendor = DeviceVendor(name=name, display_name=name, is_active=True)
+        db.add(device_vendor)
+        db.flush()
+    return device_vendor.name
+
+
+def infer_device_vendor(raw_vendor: Optional[str], *hints: Optional[str]) -> Optional[str]:
+    """Infer vendor from model/name when the UI payload misses the vendor field."""
+    vendor = normalize_dictionary_name(raw_vendor)
+    if vendor:
+        return vendor
+
+    text = " ".join(str(hint or "") for hint in hints).lower()
+    if any(marker in text for marker in ["h3c", "comware", "新华三", "华三"]):
+        return "H3C"
+    if re.search(r"\b(?:s|ce|ls)-(?:s)?\d{4}", text) or re.search(r"\bs(?:51|55|58|65|68)\d{2}", text):
+        return "H3C"
+    if any(marker in text for marker in ["asternos", "asterfusion", "cx308", "cx532", "cx564", "cx664"]):
+        return "Asteros"
+    if any(marker in text for marker in ["hillstone", "sg-6000", "山石"]):
+        return "Hillstone"
+    if any(marker in text for marker in ["ruijie", "锐捷"]):
+        return "Ruijie"
+    return None
+
+
+@router.get("", response_model=dict)
+async def list_devices(
+    db: Session = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    group_id: Optional[int] = None,
+    status: Optional[str] = None,
+    device_type: Optional[str] = None,
+    device_type_id: Optional[int] = None,
+    device_role: Optional[str] = None,
+    vendor: Optional[str] = None,
+    datacenter_id: Optional[int] = None,
+    network_owner: Optional[str] = None,
+    ops_owner: Optional[str] = None,
+    business_type: Optional[str] = None,
+    is_monitored: Optional[bool] = None,
+    search: Optional[str] = None,
+    search_mode: str = Query("fuzzy", pattern="^(fuzzy|regex)$")
+):
+    """获取设备列表"""
+    query = db.query(Device).options(
+        joinedload(Device.tags),
+        joinedload(Device.datacenter_ref),
+        joinedload(Device.device_type_ref)
+    )
+    
+    if group_id:
+        query = query.filter(Device.group_id == group_id)
+    if status:
+        if status == "active":
+            query = query.filter(Device.status.in_(["active", "online"]))
+        elif status == "inactive":
+            query = query.filter(Device.status.in_(["inactive", "offline"]))
+        else:
+            query = query.filter(Device.status == status)
+    if device_type:
+        query = query.filter(Device.device_type == device_type)
+    if device_type_id:
+        query = query.filter(Device.device_type_id == device_type_id)
+    if device_role:
+        query = query.filter(Device.device_role.ilike(f"%{device_role}%"))
+    if vendor:
+        query = query.filter(Device.vendor.ilike(f"%{vendor}%"))
+    if datacenter_id:
+        query = query.filter(Device.datacenter_id == datacenter_id)
+    if network_owner:
+        query = query.filter(Device.network_owner.ilike(f"%{network_owner}%"))
+    if ops_owner:
+        query = query.filter(Device.ops_owner.ilike(f"%{ops_owner}%"))
+    if business_type:
+        query = query.filter(Device.business_type.ilike(f"%{business_type}%"))
+    if is_monitored is not None:
+        query = query.filter(Device.is_monitored == is_monitored)
+    if search:
+        if search_mode == "regex":
+            try:
+                re.compile(search)
+            except re.error:
+                raise HTTPException(status_code=400, detail="正则表达式格式无效")
+            query = query.filter(
+                Device.name.op("~*")(search) |
+                Device.ip_address.op("~*")(search) |
+                Device.hostname.op("~*")(search) |
+                Device.serial_number.op("~*")(search) |
+                Device.model.op("~*")(search) |
+                Device.vendor.op("~*")(search) |
+                Device.device_role.op("~*")(search) |
+                Device.device_type.op("~*")(search) |
+                Device.description.op("~*")(search) |
+                Device.location.op("~*")(search) |
+                Device.datacenter_ref.has(
+                    Datacenter.name.op("~*")(search) |
+                    Datacenter.code.op("~*")(search) |
+                    Datacenter.location.op("~*")(search)
+                )
+            )
+        else:
+            query = query.filter(
+                (Device.name.ilike(f"%{search}%")) |
+                (Device.ip_address.ilike(f"%{search}%")) |
+                (Device.hostname.ilike(f"%{search}%")) |
+                (Device.serial_number.ilike(f"%{search}%")) |
+                (Device.model.ilike(f"%{search}%")) |
+                (Device.vendor.ilike(f"%{search}%")) |
+                (Device.device_role.ilike(f"%{search}%")) |
+                (Device.device_type.ilike(f"%{search}%")) |
+                (Device.description.ilike(f"%{search}%")) |
+                (Device.location.ilike(f"%{search}%")) |
+                Device.datacenter_ref.has(
+                    Datacenter.name.ilike(f"%{search}%") |
+                    Datacenter.code.ilike(f"%{search}%") |
+                    Datacenter.location.ilike(f"%{search}%")
+                )
+            )
+    
+    total = query.count()
+    devices = query.offset(skip).limit(limit).all()
+    
+    return {
+        "total": total,
+        "items": [device.to_dict() for device in devices]
+    }
+
+
+@router.get("/filters/options", response_model=dict)
+async def get_filter_options(db: Session = Depends(get_db)):
+    """获取设备筛选选项（从已录入设备中提取）"""
+    # 获取机房列表
+    datacenters = db.query(Datacenter).filter(Datacenter.is_active == True).all()
+    datacenter_options = [{
+        "id": dc.id,
+        "name": dc.name,
+        "code": dc.code,
+        "location": dc.location,
+        "contact_person": dc.contact_person,
+    } for dc in datacenters]
+    
+    # 获取设备类型列表
+    device_types = db.query(DeviceType).filter(DeviceType.is_active == True).all()
+    device_type_options = [{"id": dt.id, "name": dt.name, "display_name": dt.display_name} for dt in device_types]
+    
+    # 获取其他选项
+    vendors = sorted({
+        *[r[0] for r in db.query(Device.vendor).distinct().filter(Device.vendor != None).filter(Device.vendor != '').all()],
+        *[vendor.name for vendor in db.query(DeviceVendor).filter(DeviceVendor.is_active == True).all()],
+    })
+    device_roles = sorted({
+        *[r[0] for r in db.query(Device.device_role).distinct().filter(Device.device_role != None).filter(Device.device_role != '').all()],
+        *[role.name for role in db.query(DeviceRole).filter(DeviceRole.is_active == True).all()],
+    })
+    network_owners = [r[0] for r in db.query(Device.network_owner).distinct().filter(Device.network_owner != None).filter(Device.network_owner != '').all()]
+    ops_owners = [r[0] for r in db.query(Device.ops_owner).distinct().filter(Device.ops_owner != None).filter(Device.ops_owner != '').all()]
+    business_types = [r[0] for r in db.query(Device.business_type).distinct().filter(Device.business_type != None).filter(Device.business_type != '').all()]
+    
+    # 运行状态：active(上线), inactive(离线), in_stock(库存), deployed(上架)
+    statuses = ['active', 'inactive', 'in_stock', 'deployed']
+    
+    return {
+        "datacenters": datacenter_options,
+        "device_types": device_type_options,
+        "device_roles": device_roles,
+        "vendors": vendors,
+        "network_owners": sorted(network_owners),
+        "ops_owners": sorted(ops_owners),
+        "business_types": sorted(business_types),
+        "statuses": statuses,
+    }
+
+
+@router.get("/datacenters", response_model=List[DatacenterResponse])
+async def list_datacenters(db: Session = Depends(get_db)):
+    """获取机房列表"""
+    datacenters = db.query(Datacenter).all()
+    return datacenters
+
+
+@router.post("/datacenters", response_model=DatacenterResponse, status_code=status.HTTP_201_CREATED)
+async def create_datacenter(datacenter: DatacenterCreate, db: Session = Depends(get_db)):
+    """创建机房"""
+    existing = db.query(Datacenter).filter(Datacenter.name == datacenter.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="机房名称已存在")
+    if datacenter.code:
+        existing_code = db.query(Datacenter).filter(Datacenter.code == datacenter.code).first()
+        if existing_code:
+            raise HTTPException(status_code=400, detail="机房编号已存在")
+    
+    db_datacenter = Datacenter(
+        code=datacenter.code,
+        name=datacenter.name,
+        location=datacenter.location,
+        address=datacenter.address,
+        contact_person=datacenter.contact_person,
+        contact_phone=datacenter.contact_phone,
+        contact_email=datacenter.contact_email,
+        build_date=datacenter.build_date,
+        description=datacenter.description,
+        is_active=datacenter.is_active
+    )
+    db.add(db_datacenter)
+    db.commit()
+    db.refresh(db_datacenter)
+    
+    return db_datacenter
+
+
+@router.put("/datacenters/{datacenter_id}", response_model=DatacenterResponse)
+async def update_datacenter(
+    datacenter_id: int,
+    datacenter: DatacenterUpdate,
+    db: Session = Depends(get_db)
+):
+    """更新机房"""
+    db_datacenter = db.query(Datacenter).filter(Datacenter.id == datacenter_id).first()
+    if not db_datacenter:
+        raise HTTPException(status_code=404, detail="机房不存在")
+
+    if datacenter.name and datacenter.name != db_datacenter.name:
+        existing_name = db.query(Datacenter).filter(Datacenter.name == datacenter.name).first()
+        if existing_name:
+            raise HTTPException(status_code=400, detail="机房名称已存在")
+
+    if datacenter.code and datacenter.code != db_datacenter.code:
+        existing_code = db.query(Datacenter).filter(Datacenter.code == datacenter.code).first()
+        if existing_code:
+            raise HTTPException(status_code=400, detail="机房编号已存在")
+    
+    update_data = datacenter.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_datacenter, key, value)
+    
+    db.commit()
+    db.refresh(db_datacenter)
+    return db_datacenter
+
+
+@router.delete("/datacenters/{datacenter_id}")
+async def delete_datacenter(datacenter_id: int, db: Session = Depends(get_db)):
+    """删除机房"""
+    datacenter = db.query(Datacenter).filter(Datacenter.id == datacenter_id).first()
+    if not datacenter:
+        raise HTTPException(status_code=404, detail="机房不存在")
+    
+    device_count = db.query(Device).filter(Device.datacenter_id == datacenter_id).count()
+    if device_count > 0:
+        raise HTTPException(status_code=400, detail=f"该机房下有{device_count}个设备，无法删除")
+    
+    db.delete(datacenter)
+    db.commit()
+    return {"message": "机房已删除"}
+
+
+@router.get("/device-types", response_model=List[DeviceTypeResponse])
+async def list_device_types(db: Session = Depends(get_db)):
+    """获取设备类型列表"""
+    existing_names = {normalize_dictionary_name(item.name).lower() for item in db.query(DeviceType).all()}
+    historical_names = [
+        normalize_dictionary_name(value[0])
+        for value in db.query(Device.device_type).distinct().filter(Device.device_type != None).filter(Device.device_type != '').all()
+        if normalize_dictionary_name(value[0])
+    ]
+    missing_names = [name for name in historical_names if name.lower() not in existing_names]
+    for name in missing_names:
+        db.add(DeviceType(name=name, display_name=name, is_active=True))
+    if missing_names:
+        db.commit()
+    device_types = db.query(DeviceType).order_by(DeviceType.name.asc()).all()
+    return device_types
+
+
+@router.post("/device-types", response_model=DeviceTypeResponse, status_code=status.HTTP_201_CREATED)
+async def create_device_type(device_type: DeviceTypeCreate, db: Session = Depends(get_db)):
+    """创建设备类型"""
+    normalized_name = normalize_dictionary_name(device_type.name)
+    existing = db.query(DeviceType).filter(func.lower(DeviceType.name) == normalized_name.lower()).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="设备类型名称已存在")
+    
+    db_device_type = DeviceType(
+        name=normalized_name,
+        display_name=device_type.display_name or normalized_name,
+        icon=device_type.icon,
+        description=device_type.description,
+        is_active=device_type.is_active
+    )
+    db.add(db_device_type)
+    db.commit()
+    db.refresh(db_device_type)
+    
+    return db_device_type
+
+
+@router.get("/device-roles", response_model=List[DeviceRoleResponse])
+async def list_device_roles(db: Session = Depends(get_db)):
+    """获取设备角色列表"""
+    existing_names = {normalize_dictionary_name(item.name).lower() for item in db.query(DeviceRole).all()}
+    historical_names = [
+        normalize_dictionary_name(value[0])
+        for value in db.query(Device.device_role).distinct().filter(Device.device_role != None).filter(Device.device_role != '').all()
+        if normalize_dictionary_name(value[0])
+    ]
+    missing_names = [name for name in historical_names if name.lower() not in existing_names]
+    for name in missing_names:
+        db.add(DeviceRole(name=name, display_name=name, is_active=True))
+    if missing_names:
+        db.commit()
+    return db.query(DeviceRole).order_by(DeviceRole.name.asc()).all()
+
+
+@router.post("/device-roles", response_model=DeviceRoleResponse, status_code=status.HTTP_201_CREATED)
+async def create_device_role(device_role: DeviceRoleCreate, db: Session = Depends(get_db)):
+    normalized_name = normalize_dictionary_name(device_role.name)
+    existing = db.query(DeviceRole).filter(func.lower(DeviceRole.name) == normalized_name.lower()).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="设备角色名称已存在")
+
+    db_device_role = DeviceRole(
+        name=normalized_name,
+        display_name=device_role.display_name or normalized_name,
+        description=device_role.description,
+        is_active=device_role.is_active,
+    )
+    db.add(db_device_role)
+    db.commit()
+    db.refresh(db_device_role)
+    return db_device_role
+
+
+@router.put("/device-roles/{device_role_id}", response_model=DeviceRoleResponse)
+async def update_device_role(device_role_id: int, device_role: DeviceRoleUpdate, db: Session = Depends(get_db)):
+    db_device_role = db.query(DeviceRole).filter(DeviceRole.id == device_role_id).first()
+    if not db_device_role:
+        raise HTTPException(status_code=404, detail="设备角色不存在")
+
+    update_data = device_role.model_dump(exclude_unset=True)
+    if "name" in update_data and update_data["name"] != db_device_role.name:
+        normalized_name = normalize_dictionary_name(update_data["name"])
+        existing = db.query(DeviceRole).filter(func.lower(DeviceRole.name) == normalized_name.lower()).first()
+        if existing and existing.id != db_device_role.id:
+            raise HTTPException(status_code=400, detail="设备角色名称已存在")
+        db.query(Device).filter(func.lower(Device.device_role) == db_device_role.name.lower()).update({Device.device_role: normalized_name})
+        update_data["name"] = normalized_name
+        if not update_data.get("display_name"):
+            update_data["display_name"] = normalized_name
+
+    for key, value in update_data.items():
+        setattr(db_device_role, key, value)
+
+    db.commit()
+    db.refresh(db_device_role)
+    return db_device_role
+
+
+@router.delete("/device-roles/{device_role_id}")
+async def delete_device_role(device_role_id: int, db: Session = Depends(get_db)):
+    db_device_role = db.query(DeviceRole).filter(DeviceRole.id == device_role_id).first()
+    if not db_device_role:
+        raise HTTPException(status_code=404, detail="设备角色不存在")
+
+    device_count = db.query(Device).filter(func.lower(Device.device_role) == db_device_role.name.lower()).count()
+    if device_count > 0:
+        raise HTTPException(status_code=400, detail=f"该角色下有{device_count}个设备，无法删除")
+
+    db.delete(db_device_role)
+    db.commit()
+    return {"message": "设备角色已删除"}
+
+
+@router.get("/device-vendors", response_model=List[DeviceVendorResponse])
+async def list_device_vendors(db: Session = Depends(get_db)):
+    """获取设备厂商列表"""
+    existing_names = {normalize_dictionary_name(item.name).lower() for item in db.query(DeviceVendor).all()}
+    historical_names = [
+        normalize_dictionary_name(value[0])
+        for value in db.query(Device.vendor).distinct().filter(Device.vendor != None).filter(Device.vendor != '').all()
+        if normalize_dictionary_name(value[0])
+    ]
+    missing_names = [name for name in historical_names if name.lower() not in existing_names]
+    for name in missing_names:
+        db.add(DeviceVendor(name=name, display_name=name, is_active=True))
+    if missing_names:
+        db.commit()
+    return db.query(DeviceVendor).order_by(DeviceVendor.name.asc()).all()
+
+
+@router.post("/device-vendors", response_model=DeviceVendorResponse, status_code=status.HTTP_201_CREATED)
+async def create_device_vendor(device_vendor: DeviceVendorCreate, db: Session = Depends(get_db)):
+    normalized_name = normalize_dictionary_name(device_vendor.name)
+    existing = db.query(DeviceVendor).filter(func.lower(DeviceVendor.name) == normalized_name.lower()).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="设备厂商名称已存在")
+
+    db_device_vendor = DeviceVendor(
+        name=normalized_name,
+        display_name=device_vendor.display_name or normalized_name,
+        description=device_vendor.description,
+        is_active=device_vendor.is_active,
+    )
+    db.add(db_device_vendor)
+    db.commit()
+    db.refresh(db_device_vendor)
+    return db_device_vendor
+
+
+@router.put("/device-vendors/{device_vendor_id}", response_model=DeviceVendorResponse)
+async def update_device_vendor(device_vendor_id: int, device_vendor: DeviceVendorUpdate, db: Session = Depends(get_db)):
+    db_device_vendor = db.query(DeviceVendor).filter(DeviceVendor.id == device_vendor_id).first()
+    if not db_device_vendor:
+        raise HTTPException(status_code=404, detail="设备厂商不存在")
+
+    update_data = device_vendor.model_dump(exclude_unset=True)
+    if "name" in update_data and update_data["name"] != db_device_vendor.name:
+        normalized_name = normalize_dictionary_name(update_data["name"])
+        existing = db.query(DeviceVendor).filter(func.lower(DeviceVendor.name) == normalized_name.lower()).first()
+        if existing and existing.id != db_device_vendor.id:
+            raise HTTPException(status_code=400, detail="设备厂商名称已存在")
+        db.query(Device).filter(func.lower(Device.vendor) == db_device_vendor.name.lower()).update({Device.vendor: normalized_name})
+        update_data["name"] = normalized_name
+        if not update_data.get("display_name"):
+            update_data["display_name"] = normalized_name
+
+    for key, value in update_data.items():
+        setattr(db_device_vendor, key, value)
+
+    db.commit()
+    db.refresh(db_device_vendor)
+    return db_device_vendor
+
+
+@router.delete("/device-vendors/{device_vendor_id}")
+async def delete_device_vendor(device_vendor_id: int, db: Session = Depends(get_db)):
+    db_device_vendor = db.query(DeviceVendor).filter(DeviceVendor.id == device_vendor_id).first()
+    if not db_device_vendor:
+        raise HTTPException(status_code=404, detail="设备厂商不存在")
+
+    device_count = db.query(Device).filter(func.lower(Device.vendor) == db_device_vendor.name.lower()).count()
+    if device_count > 0:
+        raise HTTPException(status_code=400, detail=f"该厂商下有{device_count}个设备，无法删除")
+
+    db.delete(db_device_vendor)
+    db.commit()
+    return {"message": "设备厂商已删除"}
+
+
+@router.put("/device-types/{device_type_id}", response_model=DeviceTypeResponse)
+async def update_device_type(
+    device_type_id: int,
+    device_type: DeviceTypeUpdate,
+    db: Session = Depends(get_db)
+):
+    """更新设备类型"""
+    db_device_type = db.query(DeviceType).filter(DeviceType.id == device_type_id).first()
+    if not db_device_type:
+        raise HTTPException(status_code=404, detail="设备类型不存在")
+    
+    update_data = device_type.model_dump(exclude_unset=True)
+    if "name" in update_data:
+        normalized_name = normalize_dictionary_name(update_data["name"])
+        if normalized_name.lower() != db_device_type.name.lower():
+            existing = db.query(DeviceType).filter(func.lower(DeviceType.name) == normalized_name.lower()).first()
+            if existing and existing.id != db_device_type.id:
+                raise HTTPException(status_code=400, detail="设备类型名称已存在")
+            db.query(Device).filter(func.lower(Device.device_type) == db_device_type.name.lower()).update({Device.device_type: normalized_name})
+        update_data["name"] = normalized_name
+        if not update_data.get("display_name"):
+            update_data["display_name"] = normalized_name
+    for key, value in update_data.items():
+        setattr(db_device_type, key, value)
+    
+    db.commit()
+    db.refresh(db_device_type)
+    return db_device_type
+
+
+@router.delete("/device-types/{device_type_id}")
+async def delete_device_type(device_type_id: int, db: Session = Depends(get_db)):
+    """删除设备类型"""
+    device_type = db.query(DeviceType).filter(DeviceType.id == device_type_id).first()
+    if not device_type:
+        raise HTTPException(status_code=404, detail="设备类型不存在")
+    
+    device_count = db.query(Device).filter(
+        (Device.device_type_id == device_type_id) |
+        (func.lower(Device.device_type) == device_type.name.lower())
+    ).count()
+    if device_count > 0:
+        raise HTTPException(status_code=400, detail=f"该类型下有{device_count}个设备，无法删除")
+    
+    db.delete(device_type)
+    db.commit()
+    return {"message": "设备类型已删除"}
+
+
+@router.get("/{device_id}", response_model=dict)
+async def get_device(device_id: int, db: Session = Depends(get_db)):
+    """获取设备详情"""
+    device = db.query(Device).options(joinedload(Device.tags)).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    return device.to_dict()
+
+
+@router.post("", response_model=dict, status_code=status.HTTP_201_CREATED)
+async def create_device(device: DeviceCreate, db: Session = Depends(get_db)):
+    """创建设备"""
+    # 检查IP是否已存在
+    existing = db.query(Device).filter(Device.ip_address == device.ip_address).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="设备IP已存在")
+    
+    datacenter_id = device.datacenter_id
+    if datacenter_id is None and device.datacenter:
+        datacenter = db.query(Datacenter).filter(Datacenter.name == device.datacenter).first()
+        if not datacenter:
+            datacenter = Datacenter(name=device.datacenter, is_active=True)
+            db.add(datacenter)
+            db.flush()
+        datacenter_id = datacenter.id
+
+    device_type_id = device.device_type_id
+    device_type_name = (device.device_type or "").strip() or None
+    if device_type_id:
+        db_device_type = db.query(DeviceType).filter(DeviceType.id == device_type_id).first()
+        if not db_device_type:
+            raise HTTPException(status_code=400, detail="设备类型不存在")
+        device_type_name = db_device_type.name
+    else:
+        device_type_id, device_type_name = get_or_create_device_type(db, device_type_name)
+
+    monitor_source = resolve_monitor_source_by_vendor(device.vendor, device.monitor_source)
+    prometheus_url, prometheus_job, prometheus_instance, custom_fields = normalize_monitoring_config(
+        monitor_source,
+        device.ip_address,
+        device.prometheus_url,
+        device.prometheus_job,
+        device.prometheus_instance,
+        device.custom_fields,
+    )
+    device_role_name = ensure_device_role_catalog(db, device.device_role)
+    inferred_vendor = infer_device_vendor(
+        device.vendor or ("Asterfusion" if monitor_source == "asternos_exporter" else None),
+        device.model,
+        device.name,
+        device.hostname,
+    )
+    vendor_name = ensure_device_vendor_catalog(db, inferred_vendor)
+
+    # 创建设备
+    db_device = Device(
+        name=device.name,
+        ip_address=device.ip_address,
+        hostname=device.hostname,
+        device_type=device_type_name or "unknown",
+        device_role=device_role_name,
+        vendor=vendor_name,
+        model=device.model,
+        serial_number=device.serial_number,
+        location=device.location,
+        latitude=device.latitude,
+        longitude=device.longitude,
+        rack=device.rack,
+        # 机房信息
+        datacenter_id=datacenter_id,
+        # 设备类型
+        device_type_id=device_type_id,
+        # 责任人信息
+        network_owner=device.network_owner,
+        ops_owner=device.ops_owner,
+        contact_phone=device.contact_phone,
+        contact_email=device.contact_email,
+        business_type=device.business_type,
+        is_monitored=device.is_monitored,
+        monitor_source=monitor_source,
+        prometheus_url=prometheus_url,
+        prometheus_job=prometheus_job,
+        prometheus_instance=prometheus_instance,
+        description=device.description,
+        group_id=device.group_id,
+        custom_fields=custom_fields,
+        # 设备状态由台账录入指定，不主动探测
+        status=normalize_inventory_status(device.status),
+        last_seen=None,
+        # SNMP配置
+        snmp_version=device.snmp.version,
+        snmp_port=device.snmp.port,
+        snmp_community=device.snmp.community,
+        snmp_username=device.snmp.username,
+        snmp_auth_protocol=device.snmp.auth_protocol,
+        snmp_auth_password=device.snmp.auth_password,
+        snmp_priv_protocol=device.snmp.priv_protocol,
+        snmp_priv_password=device.snmp.priv_password,
+        snmp_security_level=device.snmp.security_level,
+        # gNMI配置
+        gnmi_enabled=1 if device.gnmi.enabled else 0,
+        gnmi_port=device.gnmi.port,
+        gnmi_username=device.gnmi.username,
+        gnmi_password=device.gnmi.password,
+        gnmi_tls_enabled=1 if device.gnmi.tls_enabled else 0,
+        gnmi_tls_cert=device.gnmi.tls_cert,
+        gnmi_skip_verify=1 if device.gnmi.skip_verify else 0,
+        gnmi_subscriptions=device.gnmi.subscriptions,
+        # SSH配置
+        ssh_port=device.ssh.port,
+        ssh_username=device.ssh.username,
+        ssh_password=device.ssh.password,
+        ssh_key=device.ssh.key,
+    )
+    
+    # 处理标签
+    if device.tags:
+        for tag_name in device.tags:
+            tag = db.query(Tag).filter(Tag.name == tag_name).first()
+            if not tag:
+                tag = Tag(name=tag_name)
+                db.add(tag)
+            db_device.tags.append(tag)
+    
+    db.add(db_device)
+    db.commit()
+    db.refresh(db_device)
+    
+    logger.info("设备创建成功", device_id=db_device.id, name=db_device.name)
+    return db_device.to_dict()
+
+
+@router.put("/{device_id}", response_model=dict)
+async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depends(get_db)):
+    """更新设备"""
+    db_device = db.query(Device).filter(Device.id == device_id).first()
+    if not db_device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    
+    # 更新基本字段
+    update_data = device.model_dump(exclude_unset=True)
+    
+    # 处理SNMP配置
+    if "snmp" in update_data and update_data["snmp"]:
+        snmp = update_data.pop("snmp")
+        db_device.snmp_version = snmp.get("version", db_device.snmp_version)
+        db_device.snmp_port = snmp.get("port", db_device.snmp_port)
+        db_device.snmp_community = snmp.get("community", db_device.snmp_community)
+        db_device.snmp_username = snmp.get("username", db_device.snmp_username)
+        db_device.snmp_auth_protocol = snmp.get("auth_protocol", db_device.snmp_auth_protocol)
+        db_device.snmp_auth_password = snmp.get("auth_password", db_device.snmp_auth_password)
+        db_device.snmp_priv_protocol = snmp.get("priv_protocol", db_device.snmp_priv_protocol)
+        db_device.snmp_priv_password = snmp.get("priv_password", db_device.snmp_priv_password)
+        db_device.snmp_security_level = snmp.get("security_level", db_device.snmp_security_level)
+    
+    # 处理gNMI配置
+    if "gnmi" in update_data and update_data["gnmi"]:
+        gnmi = update_data.pop("gnmi")
+        db_device.gnmi_enabled = 1 if gnmi.get("enabled") else 0
+        db_device.gnmi_port = gnmi.get("port", db_device.gnmi_port)
+        db_device.gnmi_username = gnmi.get("username", db_device.gnmi_username)
+        db_device.gnmi_password = gnmi.get("password", db_device.gnmi_password)
+        db_device.gnmi_tls_enabled = 1 if gnmi.get("tls_enabled") else 0
+        db_device.gnmi_tls_cert = gnmi.get("tls_cert", db_device.gnmi_tls_cert)
+        db_device.gnmi_skip_verify = 1 if gnmi.get("skip_verify") else 0
+        db_device.gnmi_subscriptions = gnmi.get("subscriptions", db_device.gnmi_subscriptions)
+    
+    # 处理标签
+    if "tags" in update_data and update_data["tags"] is not None:
+        tag_names = update_data.pop("tags")
+        db_device.tags = []
+        for tag_name in tag_names:
+            tag = db.query(Tag).filter(Tag.name == tag_name).first()
+            if not tag:
+                tag = Tag(name=tag_name)
+                db.add(tag)
+            db_device.tags.append(tag)
+
+    if "status" in update_data and update_data["status"] is not None:
+        update_data["status"] = normalize_inventory_status(update_data["status"])
+
+    if "monitor_source" in update_data and not update_data.get("monitor_source"):
+        update_data["monitor_source"] = "snmp"
+
+    effective_vendor = infer_device_vendor(
+        update_data.get("vendor", db_device.vendor),
+        update_data.get("model", db_device.model),
+        update_data.get("name", db_device.name),
+        update_data.get("hostname", db_device.hostname),
+    )
+    effective_monitor_source = resolve_monitor_source_by_vendor(
+        effective_vendor,
+        update_data.get("monitor_source", db_device.monitor_source or "snmp"),
+    )
+    update_data["monitor_source"] = effective_monitor_source
+    if effective_monitor_source == "asternos_exporter":
+        next_url, next_job, next_instance, next_custom_fields = normalize_monitoring_config(
+            effective_monitor_source,
+            update_data.get("ip_address", db_device.ip_address),
+            update_data.get("prometheus_url", db_device.prometheus_url),
+            update_data.get("prometheus_job", db_device.prometheus_job),
+            update_data.get("prometheus_instance", db_device.prometheus_instance),
+            update_data.get("custom_fields", db_device.custom_fields),
+        )
+        update_data["monitor_source"] = effective_monitor_source
+        update_data["prometheus_url"] = next_url
+        update_data["prometheus_job"] = next_job
+        update_data["prometheus_instance"] = next_instance
+        update_data["custom_fields"] = next_custom_fields
+    elif "monitor_source" in update_data or "vendor" in update_data:
+        update_data["prometheus_url"] = None
+        update_data["prometheus_job"] = None
+        update_data["prometheus_instance"] = None
+
+    if "device_type_id" in update_data or "device_type" in update_data:
+        device_type_id = update_data.get("device_type_id", db_device.device_type_id)
+        device_type_name = update_data.get("device_type", db_device.device_type)
+        if device_type_id:
+            db_device_type = db.query(DeviceType).filter(DeviceType.id == device_type_id).first()
+            if not db_device_type:
+                raise HTTPException(status_code=400, detail="设备类型不存在")
+            update_data["device_type_id"] = db_device_type.id
+            update_data["device_type"] = db_device_type.name
+        else:
+            next_type_id, next_type_name = get_or_create_device_type(db, device_type_name)
+            update_data["device_type_id"] = next_type_id
+            update_data["device_type"] = next_type_name or db_device.device_type
+
+    if "device_role" in update_data:
+        update_data["device_role"] = ensure_device_role_catalog(db, update_data["device_role"])
+
+    if "vendor" in update_data or (effective_vendor and not db_device.vendor):
+        update_data["vendor"] = ensure_device_vendor_catalog(db, effective_vendor)
+    elif effective_monitor_source == "asternos_exporter" and not db_device.vendor:
+        update_data["vendor"] = ensure_device_vendor_catalog(db, "Asterfusion")
+    
+    # 更新其他字段
+    for key, value in update_data.items():
+        if value is not None and hasattr(db_device, key):
+            setattr(db_device, key, value)
+    
+    db_device.updated_at = datetime.now()
+    db.commit()
+    db.refresh(db_device)
+    
+    logger.info("设备更新成功", device_id=device_id)
+    return db_device.to_dict()
+
+
+@router.delete("/{device_id}")
+async def delete_device(device_id: int, db: Session = Depends(get_db)):
+    """删除设备"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    
+    db.delete(device)
+    db.commit()
+    
+    logger.info("设备删除成功", device_id=device_id)
+    return {"message": "设备已删除"}
+
+
+@router.post("/bulk/delete")
+async def batch_delete_devices(payload: DeviceBatchDeleteRequest, db: Session = Depends(get_db)):
+    """批量删除设备"""
+    device_ids = list(dict.fromkeys(payload.device_ids))
+    if not device_ids:
+        raise HTTPException(status_code=400, detail="请选择需要删除的设备")
+
+    devices = db.query(Device).filter(Device.id.in_(device_ids)).all()
+    existing_ids = {device.id for device in devices}
+    missing_ids = [device_id for device_id in device_ids if device_id not in existing_ids]
+
+    for device in devices:
+        db.delete(device)
+
+    db.commit()
+
+    logger.info("设备批量删除成功", deleted_count=len(devices), missing_count=len(missing_ids))
+    return {
+        "deleted": len(devices),
+        "missing_ids": missing_ids,
+    }
+
+
+@router.post("/bulk/update")
+async def batch_update_devices(payload: DeviceBatchUpdateRequest, db: Session = Depends(get_db)):
+    """批量更新设备单个字段"""
+    device_ids = list(dict.fromkeys(payload.device_ids))
+    if not device_ids:
+        raise HTTPException(status_code=400, detail="请选择需要修改的设备")
+
+    supported_fields = {
+        "status",
+        "datacenter_id",
+        "device_type",
+        "device_role",
+        "vendor",
+        "model",
+        "serial_number",
+    }
+    if payload.field not in supported_fields:
+        raise HTTPException(status_code=400, detail="不支持批量修改该字段")
+
+    devices = db.query(Device).filter(Device.id.in_(device_ids)).all()
+    existing_ids = {device.id for device in devices}
+    missing_ids = [device_id for device_id in device_ids if device_id not in existing_ids]
+    if not devices:
+        raise HTTPException(status_code=404, detail="选中的设备不存在")
+
+    update_kwargs: dict[str, object] = {}
+    if payload.field == "status":
+        update_kwargs["status"] = normalize_inventory_status(payload.value)
+    elif payload.field == "datacenter_id":
+        if payload.value_id is None:
+            raise HTTPException(status_code=400, detail="请选择机房")
+        datacenter = db.query(Datacenter).filter(Datacenter.id == payload.value_id).first()
+        if not datacenter:
+            raise HTTPException(status_code=400, detail="机房不存在")
+        update_kwargs["datacenter_id"] = datacenter.id
+    elif payload.field == "device_type":
+        if payload.value_id is not None:
+            db_device_type = db.query(DeviceType).filter(DeviceType.id == payload.value_id).first()
+            if not db_device_type:
+                raise HTTPException(status_code=400, detail="设备类型不存在")
+            update_kwargs["device_type_id"] = db_device_type.id
+            update_kwargs["device_type"] = db_device_type.name
+        else:
+            next_type_id, next_type_name = get_or_create_device_type(db, payload.value)
+            update_kwargs["device_type_id"] = next_type_id
+            update_kwargs["device_type"] = next_type_name or "unknown"
+    elif payload.field == "device_role":
+        update_kwargs["device_role"] = ensure_device_role_catalog(db, payload.value)
+    elif payload.field == "vendor":
+        update_kwargs["vendor"] = ensure_device_vendor_catalog(db, payload.value)
+    elif payload.field in {"model", "serial_number"}:
+        update_kwargs[payload.field] = (payload.value or "").strip() or None
+
+    for device in devices:
+        for key, value in update_kwargs.items():
+            setattr(device, key, value)
+        device.updated_at = datetime.now()
+
+    db.commit()
+
+    logger.info("设备批量更新成功", updated_count=len(devices), field=payload.field, missing_count=len(missing_ids))
+    return {
+        "updated": len(devices),
+        "missing_ids": missing_ids,
+    }
+
+
+@router.patch("/{device_id}/status")
+async def update_device_status(
+    device_id: int, 
+    status_update: DeviceStatusUpdate, 
+    db: Session = Depends(get_db)
+):
+    """更新设备状态"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    
+    device.status = status_update.status
+    if status_update.last_seen:
+        device.last_seen = status_update.last_seen
+    else:
+        device.last_seen = datetime.now()
+    
+    db.commit()
+    return device.to_dict()
+
+
+@router.post("/{device_id}/probe", response_model=dict)
+async def probe_device(device_id: int, db: Session = Depends(get_db)):
+    """库存模式下不主动探测设备连通性"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+
+    return {
+        "device_id": device_id,
+        "ip_address": device.ip_address,
+        "ping_success": None,
+        "ping_latency": None,
+        "old_status": device.status,
+        "new_status": device.status,
+        "error": "库存模式下不主动探测连通性"
+    }
+
+
+@router.post("/{device_id}/test-connection", response_model=dict)
+async def test_device_connection(
+    device_id: int,
+    payload: DeviceConnectionTestRequest,
+    db: Session = Depends(get_db)
+):
+    """测试设备连接"""
+    import asyncio
+
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+
+    test_type = payload.type.lower()
+
+    if test_type == "ping":
+        try:
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    "ping", "-c", "1", "-W", "2", device.ip_address,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                ),
+                timeout=5.0
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            if proc.returncode == 0:
+                latency = None
+                output = stdout.decode()
+                if "time=" in output:
+                    time_part = output.split("time=")[1].split()[0]
+                    latency = float(time_part.replace("ms", ""))
+                return {
+                    "success": True,
+                    "message": "Ping 测试成功",
+                    "latency": latency,
+                    "details": {"ip_address": device.ip_address}
+                }
+            return {
+                "success": False,
+                "message": stderr.decode().strip() or "Ping 测试失败",
+                "details": {"ip_address": device.ip_address}
+            }
+        except Exception as e:
+            return {"success": False, "message": f"Ping 测试失败: {str(e)}"}
+
+    if test_type == "snmp":
+        collector = SNMPCollector()
+        try:
+            value = collector.snmp_get(device, "1.3.6.1.2.1.1.1.0")
+            if value is not None:
+                return {
+                    "success": True,
+                    "message": "SNMP 连接成功",
+                    "details": {"sysDescr": str(value)}
+                }
+            return {"success": False, "message": "SNMP 无响应，请检查团体字或版本配置"}
+        except Exception as e:
+            return {"success": False, "message": f"SNMP 测试失败: {str(e)}"}
+
+    if test_type in {"gnmi", "ssh"}:
+        port = device.gnmi_port if test_type == "gnmi" else device.ssh_port
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(device.ip_address, port),
+                timeout=5.0
+            )
+            writer.close()
+            await writer.wait_closed()
+            return {
+                "success": True,
+                "message": f"{test_type.upper()} 端口连接成功",
+                "details": {"ip_address": device.ip_address, "port": port}
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"{test_type.upper()} 连接失败: {str(e)}",
+                "details": {"ip_address": device.ip_address, "port": port}
+            }
+
+    raise HTTPException(status_code=400, detail="不支持的测试类型")
+
+
+# ========== 设备分组管理 ==========
+
+@router.get("/groups/list", response_model=List[DeviceGroupResponse])
+async def list_device_groups(db: Session = Depends(get_db)):
+    """获取设备分组列表"""
+    groups = db.query(DeviceGroup).all()
+    result = []
+    for group in groups:
+        device_count = db.query(Device).filter(Device.group_id == group.id).count()
+        group_dict = {
+            "id": group.id,
+            "name": group.name,
+            "description": group.description,
+            "parent_id": group.parent_id,
+            "created_at": group.created_at,
+            "updated_at": group.updated_at,
+            "device_count": device_count
+        }
+        result.append(group_dict)
+    return result
+
+
+@router.post("/groups", response_model=DeviceGroupResponse, status_code=status.HTTP_201_CREATED)
+async def create_device_group(group: DeviceGroupCreate, db: Session = Depends(get_db)):
+    """创建设备分组"""
+    existing = db.query(DeviceGroup).filter(DeviceGroup.name == group.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="分组名称已存在")
+    
+    db_group = DeviceGroup(
+        name=group.name,
+        description=group.description,
+        parent_id=group.parent_id
+    )
+    db.add(db_group)
+    db.commit()
+    db.refresh(db_group)
+    
+    return {
+        "id": db_group.id,
+        "name": db_group.name,
+        "description": db_group.description,
+        "parent_id": db_group.parent_id,
+        "created_at": db_group.created_at,
+        "updated_at": db_group.updated_at,
+        "device_count": 0
+    }
+
+
+@router.put("/groups/{group_id}", response_model=DeviceGroupResponse)
+async def update_device_group(
+    group_id: int, 
+    group: DeviceGroupUpdate, 
+    db: Session = Depends(get_db)
+):
+    """更新设备分组"""
+    db_group = db.query(DeviceGroup).filter(DeviceGroup.id == group_id).first()
+    if not db_group:
+        raise HTTPException(status_code=404, detail="分组不存在")
+    
+    if group.name:
+        existing = db.query(DeviceGroup).filter(
+            DeviceGroup.name == group.name,
+            DeviceGroup.id != group_id
+        ).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="分组名称已存在")
+        db_group.name = group.name
+    
+    if group.description is not None:
+        db_group.description = group.description
+    if group.parent_id is not None:
+        db_group.parent_id = group.parent_id
+    
+    db.commit()
+    db.refresh(db_group)
+    
+    device_count = db.query(Device).filter(Device.group_id == group_id).count()
+    return {
+        "id": db_group.id,
+        "name": db_group.name,
+        "description": db_group.description,
+        "parent_id": db_group.parent_id,
+        "created_at": db_group.created_at,
+        "updated_at": db_group.updated_at,
+        "device_count": device_count
+    }
+
+
+@router.delete("/groups/{group_id}")
+async def delete_device_group(group_id: int, db: Session = Depends(get_db)):
+    """删除设备分组"""
+    group = db.query(DeviceGroup).filter(DeviceGroup.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="分组不存在")
+    
+    # 检查是否有设备在使用该分组
+    device_count = db.query(Device).filter(Device.group_id == group_id).count()
+    if device_count > 0:
+        raise HTTPException(status_code=400, detail=f"该分组下有{device_count}个设备，无法删除")
+    
+    db.delete(group)
+    db.commit()
+    return {"message": "分组已删除"}
