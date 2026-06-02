@@ -93,9 +93,11 @@ sudo chown -R "$USER:$USER" /opt/network_monitor_data /opt/network_monitor_backu
 
 不要把 `data/`、`.env`、日志、数据库文件提交到 GitHub。
 
-## 5. TACACS+ 镜像构建
+## 5. TACACS+ 操作说明
 
-Compose 文件中 TACACS+ 服务会从仓库内的 Dockerfile 构建：
+系统已经内置 TACACS+ 镜像构建文件，不再需要手工上传或导入 `my_build_tacacs.tar`。
+
+Compose 文件中 `tacacs` 服务会从仓库内的 Dockerfile 构建：
 
 ```text
 tacacs/Dockerfile
@@ -107,10 +109,109 @@ tacacs/Dockerfile
 my_build_tacacs:latest
 ```
 
-系统会通过 Web 界面生成并维护 TACACS+ 配置文件，配置和日志默认放在：
+### 5.1 构建镜像
+
+单独构建 TACACS+ 镜像：
+
+```bash
+docker compose build tacacs
+```
+
+全量构建系统时也会自动构建 TACACS+ 镜像：
+
+```bash
+docker compose up -d --build
+```
+
+### 5.2 启动和重启
+
+启动或重建 TACACS+ 容器：
+
+```bash
+docker compose up -d tacacs
+```
+
+只重启 TACACS+ 容器：
+
+```bash
+docker compose restart tacacs
+```
+
+Web 前端的 `Tacacs管理 -> 配置管理 -> 重启Tacacs容器` 按钮也会执行容器重启。
+
+### 5.3 配置文件和日志
+
+系统会通过 Web 界面生成并维护 TACACS+ 配置文件。
+
+| 宿主机路径 | 容器路径 | 作用 |
+| --- | --- | --- |
+| `${DATA_ROOT}/tacacs/tac_plus.cfg` | `/etc/tacacs+/tac_plus.cfg` | TACACS+ 配置文件 |
+| `${DATA_ROOT}/tacacs/logs` | `/var/log/tacacs+` | TACACS+ 日志目录 |
+
+默认路径示例：
 
 ```text
-${DATA_ROOT}/tacacs/
+/opt/network_monitor_data/tacacs/tac_plus.cfg
+/opt/network_monitor_data/tacacs/logs/tacacs.log
+```
+
+### 5.4 Web 界面操作
+
+进入 `Tacacs管理 -> 配置管理` 后，可以维护：
+
+- 账号、密码、所属组
+- 用户组和权限级别
+- 允许/拒绝的命令规则
+- 机器人通知 Webhook
+
+保存配置后，系统会生成 `tac_plus.cfg`。如果修改了账号、组、Key、命令权限等会影响认证的配置，需要重启 TACACS+ 容器后生效。
+
+进入 `Tacacs管理 -> 操作日志` 后，可以查询：
+
+- 操作时间
+- 设备 IP
+- 用户
+- 命令
+
+### 5.5 交换机侧配置要点
+
+交换机侧需要确认：
+
+- TACACS+ server 地址指向本系统服务器 IP
+- TACACS+ key 与 Web 界面生成的配置一致
+- 设备到服务器 TCP/UDP 49 端口可达
+- 已开启 command authorization / command accounting，命令审计才会有日志
+
+### 5.6 验证命令
+
+查看 TACACS+ 容器状态：
+
+```bash
+docker compose ps tacacs
+```
+
+查看 TACACS+ 容器日志：
+
+```bash
+docker compose logs -f tacacs
+```
+
+查看 TACACS+ accounting 日志：
+
+```bash
+tail -f /opt/network_monitor_data/tacacs/logs/tacacs.log
+```
+
+确认 `tac_plus` 进程：
+
+```bash
+docker exec nm-tacacs ps -ef | grep tac_plus
+```
+
+确认服务监听 49 端口：
+
+```bash
+sudo ss -lntup | grep ':49'
 ```
 
 ## 6. 启动系统
@@ -302,13 +403,12 @@ sudo tcpdump -ni any udp port 2055
 
 TACACS+ 不可用：
 
-- 确认 `tacacs/Dockerfile` 可以正常构建
-- 确认 `my_build_tacacs:latest` 镜像存在
-- 确认 `${DATA_ROOT}/tacacs/tac_plus.cfg` 已生成
-- 确认交换机 key 与系统配置一致
-- 查看日志：
+- 按第 5 节确认镜像、容器、配置文件、key、49 端口和日志。
+- 如果前端保存了配置但认证不生效，重启 TACACS+ 容器。
+- 如果命令审计没有日志，确认交换机已经开启 command accounting。
 
 ```bash
+docker compose ps tacacs
 docker compose logs -f tacacs
 tail -f /opt/network_monitor_data/tacacs/logs/tacacs.log
 ```
