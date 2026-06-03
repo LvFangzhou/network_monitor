@@ -1306,7 +1306,7 @@ async def get_monitor_device_interface_history(
         range_clause = f'start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}'
         traffic_start_time = start_time.timestamp() - rate_window_seconds
         traffic_range_clause = f'start: {_flux_time(datetime.fromtimestamp(traffic_start_time, timezone.utc))}, stop: {_flux_time(end_time)}'
-        cache_suffix = f":v6:{interface_index}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}"
+        cache_suffix = f":v7:{interface_index}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}"
         logger.info(
             "端口历史绝对时间查询",
             device_id=device_id,
@@ -1320,7 +1320,7 @@ async def get_monitor_device_interface_history(
     else:
         range_clause = f"start: {range}"
         traffic_range_clause = f"start: -{traffic_start}"
-        cache_suffix = f":v6:{interface_index}:{range}:{interval}"
+        cache_suffix = f":v7:{interface_index}:{range}:{interval}"
     cached_response = _load_monitor_cache("interface_history", device_id, suffix=cache_suffix)
     if isinstance(cached_response, dict):
         return cached_response

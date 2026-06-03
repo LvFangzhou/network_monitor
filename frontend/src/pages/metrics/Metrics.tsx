@@ -103,7 +103,7 @@ type ZoomRange = {
 }
 
 const DEVICE_SEARCH_DEBOUNCE_MS = 300
-const MONITOR_HISTORY_CACHE_KEY = 'monitor_center_history_v5'
+const MONITOR_HISTORY_CACHE_KEY = 'monitor_center_history_v6'
 const MONITOR_CENTER_STATE_KEY = 'monitor_center_state_v1'
 const HISTORY_CACHE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const HISTORY_REQUEST_CACHE_MS = 8 * 1000
@@ -1158,16 +1158,9 @@ const Metrics = () => {
       const zoomedData = zoomRange?.start && zoomRange?.end
         ? rawData.filter((point) => point.timestamp >= zoomRange.start! && point.timestamp <= zoomRange.end!)
         : rawData
-      const xTimestamps = zoomedData
-        .filter((point) => hasSeriesValue(point, series))
-        .map((point) => point.timestamp)
-      const dataStart = xTimestamps.length ? Math.min(...xTimestamps) : rangeStart
-      const dataEnd = xTimestamps.length ? Math.max(...xTimestamps) : now
       const xDomain: [number, number] = zoomRange?.start && zoomRange?.end
         ? [zoomRange.start, zoomRange.end]
-        : dataStart === dataEnd
-          ? [dataStart - 30 * 1000, dataEnd + 30 * 1000]
-          : [dataStart, dataEnd]
+        : [rangeStart, now]
       const gapValue = null
       const data = insertCollectionGaps(zoomedData, series, gapThresholdMs, gapValue)
       const pointCount = data.filter((point) => hasSeriesValue(point, series)).length
