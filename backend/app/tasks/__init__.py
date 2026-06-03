@@ -30,6 +30,7 @@ celery_app.conf.update(
     task_routes={
         "app.tasks.snmp_tasks.collect_all_snmp": {"queue": "snmp_realtime"},
         "app.tasks.snmp_tasks.collect_snmp_for_device": {"queue": "snmp_realtime"},
+        "app.tasks.snmp_tasks.collect_circuit_interface_realtime": {"queue": "snmp_realtime"},
         "app.tasks.alert_tasks.check_fast_alerts": {"queue": "snmp_realtime"},
         "app.tasks.snmp_tasks.collect_all_asternos_interface_realtime": {"queue": "asternos_realtime"},
         "app.tasks.snmp_tasks.collect_all_asternos_exporter": {"queue": "asternos"},

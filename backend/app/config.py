@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     SNMP_DEFAULT_TIMEOUT: int = 5
     SNMP_DEFAULT_RETRIES: int = 3
     SNMP_DEFAULT_PORT: int = 161
+    # 全量 SNMP 端口采集按批次分摊：Beat 每 10 秒调度一批，每台设备约 60 秒完整采集一轮。
+    # 300-500 台 128 口交换机时，避免所有设备在同一个 10 秒窗口内集中 walk。
+    SNMP_SCHEDULER_INTERVAL_SECONDS: int = 10
+    SNMP_FULL_COLLECTION_INTERVAL_SECONDS: int = 60
+    SNMP_MAX_DEVICES_PER_TICK: int = 100
     
     # gNMI配置
     GNMI_DEFAULT_PORT: int = 57400

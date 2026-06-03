@@ -5,9 +5,17 @@ from celery.schedules import crontab
 
 # 定时任务配置
 beat_schedule = {
-    # SNMP采集 - 每10秒执行一次
+    # SNMP全量采集调度 - 每10秒调度一批设备，每台设备约60秒完整采集一轮
     'collect-snmp-every-10s': {
         'task': 'app.tasks.snmp_tasks.collect_all_snmp',
+        'schedule': 10.0,
+        'options': {
+            'expires': 8.0,
+        }
+    },
+    # 线路绑定端口轻量采集 - 重点公网/专线端口保持10秒级曲线
+    'collect-circuit-interface-realtime-every-10s': {
+        'task': 'app.tasks.snmp_tasks.collect_circuit_interface_realtime',
         'schedule': 10.0,
         'options': {
             'expires': 8.0,

@@ -7,10 +7,12 @@ from datetime import datetime, timezone
 from sqlalchemy import or_
 import asyncio
 import json
+import math
 import re
 import subprocess
 import time
 
+from app.config import settings
 from app.database import SessionLocal
 from app.models import Device, Circuit
 from app.collectors import snmp_collector
@@ -20,7 +22,17 @@ from app.utils.asternos_exporter_client import asternos_exporter_client
 
 logger = get_logger(__name__)
 
-SNMP_TASK_LOCK_TTL_SECONDS = 330
+SNMP_SCHEDULER_INTERVAL_SECONDS = max(1, int(settings.SNMP_SCHEDULER_INTERVAL_SECONDS))
+SNMP_FULL_COLLECTION_INTERVAL_SECONDS = max(
+    SNMP_SCHEDULER_INTERVAL_SECONDS,
+    int(settings.SNMP_FULL_COLLECTION_INTERVAL_SECONDS),
+)
+SNMP_BATCH_COUNT = max(
+    1,
+    math.ceil(SNMP_FULL_COLLECTION_INTERVAL_SECONDS / SNMP_SCHEDULER_INTERVAL_SECONDS),
+)
+SNMP_MAX_DEVICES_PER_TICK = max(1, int(settings.SNMP_MAX_DEVICES_PER_TICK))
+SNMP_TASK_LOCK_TTL_SECONDS = max(180, min(600, SNMP_FULL_COLLECTION_INTERVAL_SECONDS * 3))
 SNMP_VERIFY_OID = "1.3.6.1.2.1.1.3.0"
 SNMP_FAILURE_THRESHOLD = 3
 SNMP_STATUS_REACHABLE = "reachable"
@@ -78,8 +90,8 @@ def _asternos_lock_key(device_id: int) -> str:
     return f"asternos_collect:lock:{device_id}"
 
 
-def _interface_realtime_lock_key() -> str:
-    return "interface_realtime_collect:lock"
+def _interface_realtime_lock_key(kind: str = "asternos") -> str:
+    return f"interface_realtime_collect:{kind}:lock"
 
 
 def _try_lock_asternos_device(device_id: int) -> bool:
@@ -90,12 +102,12 @@ def _release_asternos_device_lock(device_id: int) -> None:
     redis_client.delete(_asternos_lock_key(device_id))
 
 
-def _try_lock_interface_realtime() -> bool:
-    return bool(redis_client.set(_interface_realtime_lock_key(), "1", ex=INTERFACE_REALTIME_LOCK_TTL_SECONDS, nx=True))
+def _try_lock_interface_realtime(kind: str = "asternos") -> bool:
+    return bool(redis_client.set(_interface_realtime_lock_key(kind), "1", ex=INTERFACE_REALTIME_LOCK_TTL_SECONDS, nx=True))
 
 
-def _release_interface_realtime_lock() -> None:
-    redis_client.delete(_interface_realtime_lock_key())
+def _release_interface_realtime_lock(kind: str = "asternos") -> None:
+    redis_client.delete(_interface_realtime_lock_key(kind))
 
 
 def _set_monitor_cache(kind: str, device_id: int, payload: Any, suffix: str = "") -> None:
@@ -776,8 +788,8 @@ def collect_snmp_for_device(self, device_id: int):
 @shared_task
 def collect_all_snmp():
     """
-    采集所有设备的SNMP数据
-    由Celery Beat定时调度
+    分批采集所有 SNMP 设备。
+    Beat 仍按 10 秒醒一次，但每次只调度一个稳定分桶，避免 128 口设备规模扩大后集中 walk。
     """
     db = SessionLocal()
     try:
@@ -787,15 +799,30 @@ def collect_all_snmp():
             Device.status.in_(["active", "online"]),
             Device.is_monitored == True,
             or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
-        ).all()
-        
-        logger.info(f"开始批量SNMP采集，共{len(devices)}个设备")
+        ).order_by(Device.id.asc()).all()
+
+        current_bucket = int(time.time() // SNMP_SCHEDULER_INTERVAL_SECONDS) % SNMP_BATCH_COUNT
+        devices_in_bucket = [
+            device for device in devices
+            if int(device.id or 0) % SNMP_BATCH_COUNT == current_bucket
+        ]
+        if len(devices_in_bucket) > SNMP_MAX_DEVICES_PER_TICK:
+            devices_in_bucket = devices_in_bucket[:SNMP_MAX_DEVICES_PER_TICK]
+
+        logger.info(
+            "开始批量SNMP采集",
+            total_devices=len(devices),
+            bucket=current_bucket,
+            bucket_count=SNMP_BATCH_COUNT,
+            devices_in_bucket=len(devices_in_bucket),
+            target_interval_seconds=SNMP_FULL_COLLECTION_INTERVAL_SECONDS,
+        )
         
         # 为每个设备创建采集任务
         task_ids = []
         skipped_locked = 0
         skipped_unreachable = 0
-        for device in devices:
+        for device in devices_in_bucket:
             if _get_device_status(device.id) == SNMP_STATUS_UNREACHABLE:
                 skipped_unreachable += 1
                 continue
@@ -810,6 +837,10 @@ def collect_all_snmp():
         
         return {
             "total_devices": len(devices),
+            "bucket": current_bucket,
+            "bucket_count": SNMP_BATCH_COUNT,
+            "devices_in_bucket": len(devices_in_bucket),
+            "target_interval_seconds": SNMP_FULL_COLLECTION_INTERVAL_SECONDS,
             "tasks_created": len(task_ids),
             "skipped_locked": skipped_locked,
             "skipped_unreachable": skipped_unreachable,
@@ -943,7 +974,7 @@ def collect_all_asternos_exporter():
 @shared_task
 def collect_all_asternos_interface_realtime():
     """高频采集所有 AsterNOS 监控设备的端口基础指标，用于端口流量连续曲线。"""
-    if not _try_lock_interface_realtime():
+    if not _try_lock_interface_realtime("asternos"):
         return {"skipped": True, "reason": "上一轮AsterNOS端口高频采集未完成"}
 
     db = SessionLocal()
@@ -1012,14 +1043,14 @@ def collect_all_asternos_interface_realtime():
         logger.error("AsterNOS端口高频采集批量失败", error=str(exc))
         return {"error": str(exc)}
     finally:
-        _release_interface_realtime_lock()
+        _release_interface_realtime_lock("asternos")
         db.close()
 
 
 @shared_task
 def collect_circuit_interface_realtime():
     """轻量采集线路绑定端口，避免全设备扫描较慢造成端口历史断点。"""
-    if not _try_lock_interface_realtime():
+    if not _try_lock_interface_realtime("circuit"):
         return {"skipped": True, "reason": "上一轮线路端口采集未完成"}
 
     db = SessionLocal()
@@ -1096,7 +1127,7 @@ def collect_circuit_interface_realtime():
         logger.error("线路绑定端口实时采集失败", error=str(exc))
         return {"error": str(exc)}
     finally:
-        _release_interface_realtime_lock()
+        _release_interface_realtime_lock("circuit")
         db.close()
 
 

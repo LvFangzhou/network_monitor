@@ -148,6 +148,9 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
       - LOG_FORMAT=json
     volumes:
@@ -200,6 +203,9 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -241,6 +247,9 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -288,6 +297,9 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
