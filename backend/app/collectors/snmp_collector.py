@@ -810,8 +810,13 @@ class SNMPCollector(LoggerMixin):
     def _interface_snapshot_cache_key(self, device_id: int, interface_index: int) -> str:
         return f"interface_monitoring:last:{device_id}:{interface_index}"
 
-    def collect_interface_monitoring(self, device: Any) -> Dict[str, Any]:
+    def collect_interface_monitoring(
+        self,
+        device: Any,
+        suppress_rate_interface_names: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
         """批量采集接口历史监控数据，并基于上一次快照计算速率"""
+        suppress_rate_interface_names = suppress_rate_interface_names or set()
         walk_jobs = {
             "if_name_map": ("1.3.6.1.2.1.31.1.1.1.1", str),
             "if_descr_map": ("1.3.6.1.2.1.2.2.1.2", str),
@@ -947,6 +952,13 @@ class SNMPCollector(LoggerMixin):
             out_broadcast_pps = round((out_broadcast_delta or 0.0) / elapsed, 2) if out_broadcast_delta is not None else None
 
             monitored_count += 1
+            rate_suppressed = name in suppress_rate_interface_names or walk_results["if_descr_map"].get(index) in suppress_rate_interface_names
+            if rate_suppressed:
+                in_bps = None
+                out_bps = None
+                sample_seconds = None
+            else:
+                sample_seconds = round(elapsed, 2)
             in_utilization = round((in_bps / speed_bps) * 100, 2) if in_bps is not None and speed_bps else None
             out_utilization = round((out_bps / speed_bps) * 100, 2) if out_bps is not None and speed_bps else None
             admin_status_text = status_map.get(walk_results["admin_status_map"].get(index), "unknown")
@@ -987,7 +999,7 @@ class SNMPCollector(LoggerMixin):
                     "admin_status": 1.0 if admin_status_up else 0.0,
                     "oper_status": 1.0 if oper_status_up else 0.0,
                     "admin_up_oper_down": 1.0 if admin_status_up and not oper_status_up else 0.0,
-                    "sample_seconds": round(elapsed, 2),
+                    "sample_seconds": sample_seconds,
                 },
                 "timestamp": now,
             })

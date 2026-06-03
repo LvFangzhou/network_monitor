@@ -434,8 +434,9 @@ def _apply_octet_rates(device_id: int, stats: Dict[str, Any], timestamp: datetim
                     stats.setdefault("_octet_rate_fields", []).append(bps_key)
                     next_cache[time_key] = timestamp.replace(tzinfo=timezone.utc).isoformat()
                 elif delta == 0:
-                    next_cache[octet_key] = previous_value
-                    next_cache[time_key] = previous.get(time_key) or previous.get("time")
+                    stats[bps_key] = 0.0
+                    stats.setdefault("_octet_rate_fields", []).append(bps_key)
+                    next_cache[time_key] = timestamp.replace(tzinfo=timezone.utc).isoformat()
                 else:
                     next_cache[time_key] = timestamp.replace(tzinfo=timezone.utc).isoformat()
                 stats["sample_seconds"] = round(elapsed, 2)
@@ -506,6 +507,17 @@ def _interface_point(device: Device, stats: Dict[str, Any], timestamp: datetime)
         },
         "timestamp": timestamp,
     }
+
+
+def _circuit_port_names_for_device(db, device_id: int) -> set[str]:
+    circuits = db.query(Circuit).filter(Circuit.status == "active").all()
+    port_names: set[str] = set()
+    for circuit in circuits:
+        if circuit.primary_device_id == device_id and circuit.primary_port_name:
+            port_names.add(str(circuit.primary_port_name))
+        if circuit.secondary_device_id == device_id and circuit.secondary_port_name:
+            port_names.add(str(circuit.secondary_port_name))
+    return port_names
 
 
 def _asternos_queue_detail_points(device: Device, stats: Dict[str, Any], timestamp: datetime) -> List[Dict[str, Any]]:
@@ -704,7 +716,10 @@ def collect_snmp_for_device(self, device_id: int):
             logger.error("设备SNMP指标采集失败，继续采集接口历史", device_id=device_id, error=str(exc))
 
         try:
-            interface_history_result = snmp_collector.collect_interface_monitoring(device)
+            interface_history_result = snmp_collector.collect_interface_monitoring(
+                device,
+                suppress_rate_interface_names=_circuit_port_names_for_device(db, device.id),
+            )
         except Exception as exc:
             logger.error("接口历史采集失败", device_id=device_id, error=str(exc))
 
@@ -1106,7 +1121,7 @@ def collect_circuit_interface_realtime():
                 names = {str(interface.get("name") or ""), str(interface.get("description") or ""), str(interface.get("alias") or "")}
                 if not names.intersection(port_names):
                     continue
-                stats = snmp_collector.get_interface_metrics(device, int(interface["index"]))
+                stats = snmp_collector.get_interface_snapshot(device, int(interface["index"]))
                 point = _interface_point(device, stats, now)
                 if point:
                     points.append(point)

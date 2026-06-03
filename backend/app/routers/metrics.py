@@ -484,7 +484,7 @@ def _history_rate_window_seconds(interval_seconds: int) -> int:
 
 
 def _mark_stale_rate_samples(rows: List[Dict[str, Any]], interval_seconds: int, max_sample_seconds: int = 75) -> None:
-    """Treat collection gaps as zero traffic without changing normal low-rate samples."""
+    """Mark stale collection samples as missing instead of pretending traffic dropped to zero."""
     timed_rows = [(row, _parse_history_time(row)) for row in rows]
     timed_rows = [(row, row_time) for row, row_time in timed_rows if row_time is not None]
     timed_rows.sort(key=lambda item: item[1])
@@ -501,7 +501,7 @@ def _mark_stale_rate_samples(rows: List[Dict[str, Any]], interval_seconds: int, 
         sample_is_stale = sample_seconds is not None and sample_seconds > max_sample_seconds
         if sample_is_stale or elapsed_is_stale:
             for key in ["in_bps", "out_bps", "in_utilization_percent", "out_utilization_percent"]:
-                row[key] = 0
+                row[key] = None
         previous_time = row_time
 
 

@@ -1168,7 +1168,7 @@ const Metrics = () => {
         : dataStart === dataEnd
           ? [dataStart - 30 * 1000, dataEnd + 30 * 1000]
           : [dataStart, dataEnd]
-      const gapValue = selectedMonitorGroup.key === 'traffic' || selectedMonitorGroup.key === 'utilization' ? 0 : null
+      const gapValue = null
       const data = insertCollectionGaps(zoomedData, series, gapThresholdMs, gapValue)
       const pointCount = data.filter((point) => hasSeriesValue(point, series)).length
       const dotStride = getChartDotStride(effectiveRangeValue, pointCount)
