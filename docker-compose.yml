@@ -217,7 +217,7 @@ services:
   celery-worker:
     build: ./backend
     container_name: nm-celery-worker
-    command: celery -A app.tasks worker -l info --pool=threads -c 64 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q celery,default,alerts,asternos,asternos_realtime,tacacs,resource,system -n worker-background@%h --pool=prefork -c 4 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=450000
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -258,6 +258,53 @@ services:
       resources:
         limits:
           cpus: '2'
+          memory: 2G
+
+  # Celery Worker 高频 SNMP 采集
+  celery-worker-snmp:
+    build: ./backend
+    container_name: nm-celery-worker-snmp
+    command: celery -A app.tasks worker -l info -Q snmp_realtime -n worker-snmp@%h --pool=threads -c 24 --prefetch-multiplier=1 -Ofair
+    environment:
+      - DEBUG=false
+      - SECRET_KEY=your-secret-key-change-in-production
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=network_monitor
+      - POSTGRES_PASSWORD=network_monitor
+      - POSTGRES_DB=network_monitor
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_ORG=network-monitor
+      - INFLUXDB_BUCKET=network_metrics
+      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_DATA_PATH=/host-data/influxdb
+      - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
+      - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
+      - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASSWORD=guest
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./backend/app:/app/app
+      - ${DATA_ROOT:-./data}/tacacs:/app/data/tacacs
+      - ${DATA_ROOT:-./data}/influxdb:/host-data/influxdb:ro
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+      - influxdb
+    networks:
+      - network-monitor
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '3'
           memory: 2G
 
   # 前端 Web 应用
