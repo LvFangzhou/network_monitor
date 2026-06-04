@@ -70,17 +70,26 @@ def _severity_filter_values(value: Optional[str]) -> List[str]:
     return reverse_map.get(normalized, [normalized])
 
 
-def _get_silence_matched_alerts(db: Session, silence: AlertSilence) -> List[AlertHistory]:
-    active_alerts = (
+SILENCE_ACTIVE_STATUSES = ["firing", "acknowledged", "ignored", "snoozed"]
+
+
+def _get_silence_matched_alerts(
+    db: Session,
+    silence: AlertSilence,
+    *,
+    active_only: bool = True,
+) -> List[AlertHistory]:
+    alerts_query = (
         db.query(AlertHistory)
         .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
         .join(Device, Device.id == AlertHistory.device_id)
-        .filter(AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]))
         .order_by(AlertHistory.started_at.desc())
-        .all()
     )
+    if active_only:
+        alerts_query = alerts_query.filter(AlertHistory.status.in_(SILENCE_ACTIVE_STATUSES))
+    alerts = alerts_query.all()
     matched = []
-    for alert in active_alerts:
+    for alert in alerts:
         if not alert.rule or not alert.device:
             continue
         target = {
@@ -97,7 +106,6 @@ def _get_silence_matched_alerts(db: Session, silence: AlertSilence) -> List[Aler
 
 def _count_silence_matches(db: Session, silence: AlertSilence) -> int:
     return len(_get_silence_matched_alerts(db, silence))
-    return matched
 
 
 def _serialize_notification_channels(channels):
@@ -808,6 +816,7 @@ async def list_alert_silences(
     for item in items:
         data = item.to_dict()
         data["matched_active_alerts"] = _count_silence_matches(db, item)
+        data["matched_total_alerts"] = len(_get_silence_matched_alerts(db, item, active_only=False))
         response_items.append(data)
     return {"total": total, "items": response_items}
 
@@ -818,11 +827,12 @@ async def list_alert_silence_matches(
     db: Session = Depends(get_db),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=200),
+    active_only: bool = Query(False, description="只查看当前触发中的命中告警"),
 ):
     silence = db.query(AlertSilence).filter(AlertSilence.id == silence_id).first()
     if not silence:
         raise HTTPException(status_code=404, detail="告警屏蔽不存在")
-    matched_alerts = _get_silence_matched_alerts(db, silence)
+    matched_alerts = _get_silence_matched_alerts(db, silence, active_only=active_only)
     return {
         "total": len(matched_alerts),
         "items": [alert.to_dict() for alert in matched_alerts[skip: skip + limit]],

@@ -152,6 +152,7 @@ const AlertSilences = () => {
       const result = await getAlertSilenceMatches(silence.id, {
         skip: (nextPage - 1) * nextPageSize,
         limit: nextPageSize,
+        active_only: false,
       })
       setMatches(result.items)
       setMatchesTotal(result.total)
@@ -221,18 +222,23 @@ const AlertSilences = () => {
           },
           {
             title: '命中告警',
-            dataIndex: 'matched_active_alerts',
-            render: (value: number | undefined, record: AlertSilence) => {
-              const count = value || 0
+            render: (_: unknown, record: AlertSilence) => {
+              const activeCount = record.matched_active_alerts || 0
+              const totalCount = record.matched_total_alerts || 0
               return (
-                <Space size={4}>
-                  <Tag color={count > 0 ? 'red' : 'default'}>{count} 条</Tag>
-                  <Tooltip title="查看命中告警">
+                <Space size={6}>
+                  <Tooltip title="当前仍处于触发、确认、忽略或暂缓状态的命中告警">
+                    <Tag color={activeCount > 0 ? 'red' : 'default'}>当前 {activeCount} 条</Tag>
+                  </Tooltip>
+                  <Tooltip title="历史上匹配过这条屏蔽规则的告警">
+                    <Tag color={totalCount > 0 ? 'blue' : 'default'}>历史 {totalCount} 条</Tag>
+                  </Tooltip>
+                  <Tooltip title="查看历史命中告警">
                     <Button
                       type="text"
                       size="small"
                       icon={<EyeOutlined />}
-                      disabled={count === 0}
+                      disabled={totalCount === 0}
                       onClick={() => openMatches(record)}
                     />
                   </Tooltip>
