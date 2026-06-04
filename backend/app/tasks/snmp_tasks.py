@@ -33,6 +33,16 @@ SNMP_BATCH_COUNT = max(
 )
 SNMP_MAX_DEVICES_PER_TICK = max(1, int(settings.SNMP_MAX_DEVICES_PER_TICK))
 SNMP_TASK_LOCK_TTL_SECONDS = max(180, min(600, SNMP_FULL_COLLECTION_INTERVAL_SECONDS * 3))
+ASTERNOS_SCHEDULER_INTERVAL_SECONDS = max(1, int(settings.ASTERNOS_SCHEDULER_INTERVAL_SECONDS))
+ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS = max(
+    ASTERNOS_SCHEDULER_INTERVAL_SECONDS,
+    int(settings.ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS),
+)
+ASTERNOS_BATCH_COUNT = max(
+    1,
+    math.ceil(ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS / ASTERNOS_SCHEDULER_INTERVAL_SECONDS),
+)
+ASTERNOS_MAX_DEVICES_PER_TICK = max(1, int(settings.ASTERNOS_MAX_DEVICES_PER_TICK))
 SNMP_VERIFY_OID = "1.3.6.1.2.1.1.3.0"
 SNMP_FAILURE_THRESHOLD = 3
 SNMP_STATUS_REACHABLE = "reachable"
@@ -41,7 +51,7 @@ SNMP_STATUS_UNKNOWN = "unknown"
 ICMP_PING_PACKETS = 5
 ICMP_PING_TIMEOUT_SECONDS = 2
 MONITOR_CACHE_TTL_SECONDS = 180
-ASTERNOS_TASK_LOCK_TTL_SECONDS = 55
+ASTERNOS_TASK_LOCK_TTL_SECONDS = max(45, min(180, ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS * 2))
 INTERFACE_REALTIME_LOCK_TTL_SECONDS = 30
 ASTERNOS_COUNTER_METRICS = [
     {
@@ -959,26 +969,45 @@ def collect_all_asternos_exporter():
     """周期采集所有 AsterNOS Exporter 直连设备。"""
     db = SessionLocal()
     try:
-        devices = db.query(Device).filter(
+        all_devices = db.query(Device).filter(
             Device.status.in_(["active", "online"]),
             Device.is_monitored == True,
-        ).all()
-        scheduled = 0
-        skipped_locked = 0
-        for device in devices:
+        ).order_by(Device.id.asc()).all()
+        devices = []
+        for device in all_devices:
             vendor = str(device.vendor or "").lower()
             monitor_source = str(device.monitor_source or "")
-            if not (
+            if (
                 monitor_source == "asternos_exporter"
                 or any(marker in vendor for marker in ["asternos", "asterfusion", "asteros", "星融元"])
             ):
-                continue
+                devices.append(device)
+
+        current_bucket = int(time.time() // ASTERNOS_SCHEDULER_INTERVAL_SECONDS) % ASTERNOS_BATCH_COUNT
+        devices_in_bucket = [
+            device for device in devices
+            if int(device.id or 0) % ASTERNOS_BATCH_COUNT == current_bucket
+        ]
+        if len(devices_in_bucket) > ASTERNOS_MAX_DEVICES_PER_TICK:
+            devices_in_bucket = devices_in_bucket[:ASTERNOS_MAX_DEVICES_PER_TICK]
+
+        scheduled = 0
+        skipped_locked = 0
+        for device in devices_in_bucket:
             if not _try_lock_asternos_device(device.id):
                 skipped_locked += 1
                 continue
             collect_asternos_for_device.delay(device.id)
             scheduled += 1
-        return {"scheduled": scheduled, "skipped_locked": skipped_locked}
+        return {
+            "total_devices": len(devices),
+            "bucket": current_bucket,
+            "bucket_count": ASTERNOS_BATCH_COUNT,
+            "devices_in_bucket": len(devices_in_bucket),
+            "target_interval_seconds": ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS,
+            "scheduled": scheduled,
+            "skipped_locked": skipped_locked,
+        }
     except Exception as exc:
         logger.error("批量AsterNOS Exporter采集失败", error=str(exc))
         return {"error": str(exc)}

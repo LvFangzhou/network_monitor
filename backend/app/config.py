@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     SNMP_SCHEDULER_INTERVAL_SECONDS: int = 10
     SNMP_FULL_COLLECTION_INTERVAL_SECONDS: int = 60
     SNMP_MAX_DEVICES_PER_TICK: int = 100
+    # Asteros Exporter 全量资源/协议/队列指标也按批次分摊，避免和 10 秒端口流量采集抢队列。
+    ASTERNOS_SCHEDULER_INTERVAL_SECONDS: int = 10
+    ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS: int = 60
+    ASTERNOS_MAX_DEVICES_PER_TICK: int = 50
     
     # gNMI配置
     GNMI_DEFAULT_PORT: int = 57400

@@ -28,11 +28,11 @@ beat_schedule = {
             'expires': 8.0,
         }
     },
-    'collect-asternos-exporter-every-60s': {
+    'collect-asternos-exporter-every-10s': {
         'task': 'app.tasks.snmp_tasks.collect_all_asternos_exporter',
-        'schedule': 60.0,
+        'schedule': 10.0,
         'options': {
-            'expires': 50.0,
+            'expires': 8.0,
         }
     },
     'verify-unreachable-snmp-every-1m': {

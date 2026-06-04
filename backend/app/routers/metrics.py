@@ -1844,6 +1844,14 @@ async def get_monitor_devices_overview(
                         "message": f"http://{device.ip_address}:8101/metrics",
                     }
                     item["collected_at"] = _cache_collected_at(interfaces_cache) or item.get("collected_at")
+                    try:
+                        from app.tasks.snmp_tasks import collect_asternos_for_device
+
+                        refresh_lock = f"monitor:overview_refresh:asternos:{device.id}"
+                        if redis_client.set(refresh_lock, "1", ex=30, nx=True):
+                            collect_asternos_for_device.delay(device.id)
+                    except Exception as exc:
+                        logger.warning("AsterNOS总览补采任务提交失败", device_id=device.id, error=str(exc))
                 else:
                     try:
                         overview = await _build_asternos_overview(device)
