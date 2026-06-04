@@ -1072,8 +1072,8 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
 
             if should_alert:
                 if _is_silenced(db, rule, device, target):
-                    _clear_pending_alert(rule, device, target)
                     if existing:
+                        _clear_pending_alert(rule, device, target)
                         existing.alert_value = float(value)
                         existing.updated_at = _utc_now()
                         existing.message = _build_alert_message(rule, device, float(value), target)
@@ -1085,6 +1085,36 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                             existing.ignored_by = "alert_silence"
                             existing.ignored_at = _utc_now()
                         db.commit()
+                    else:
+                        if not _duration_confirmed(rule, device, target, float(value)):
+                            continue
+                        _clear_pending_alert(rule, device, target)
+                        alert = AlertHistory(
+                            rule_id=rule.id,
+                            device_id=device.id,
+                            alert_value=float(value),
+                            threshold=rule.threshold,
+                            message=_build_alert_message(rule, device, float(value), target),
+                            alert_target_type=target.get("target_type"),
+                            alert_target_key=target.get("target_key"),
+                            alert_target_name=target.get("target_name"),
+                            status="ignored",
+                            ignored_by="alert_silence",
+                            ignored_at=_utc_now(),
+                            started_at=_utc_now(),
+                        )
+                        db.add(alert)
+                        db.commit()
+                        db.refresh(alert)
+                        _ensure_alarm_id(db, alert)
+                        logger.info(
+                            "告警命中屏蔽规则，已记录为忽略",
+                            rule_id=rule.id,
+                            alert_id=alert.id,
+                            device_id=device.id,
+                            target=target.get("target_name"),
+                            value=value,
+                        )
                     continue
                 if existing:
                     existing.alert_value = float(value)
