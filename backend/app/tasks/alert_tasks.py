@@ -775,6 +775,7 @@ def _run_alert_checks(
 
     db = SessionLocal()
     try:
+        _resolve_alerts_for_disabled_rules(db)
         query = db.query(AlertRule).filter(AlertRule.enabled == 1)
         if metric_types:
             query = query.filter(AlertRule.metric_type.in_(list(metric_types)))
@@ -824,6 +825,32 @@ def _run_alert_checks(
         db.close()
         if redis_client.get(lock_key) == lock_value:
             redis_client.delete(lock_key)
+
+
+def _resolve_alerts_for_disabled_rules(db: Session) -> int:
+    """Resolve active alerts whose rule has been disabled."""
+    active_alerts = (
+        db.query(AlertHistory)
+        .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+        .filter(
+            AlertRule.enabled != 1,
+            AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+        )
+        .all()
+    )
+    if not active_alerts:
+        return 0
+
+    now = _utc_now()
+    for alert in active_alerts:
+        alert.status = "resolved"
+        alert.resolved_at = now
+        alert.resolved_by = "rule_disabled"
+        alert.resolution_note = "告警规则已停用，系统自动恢复活动告警"
+        alert.updated_at = now
+    db.commit()
+    logger.info("已自动恢复停用规则关联的活动告警", count=len(active_alerts))
+    return len(active_alerts)
 
 
 @shared_task

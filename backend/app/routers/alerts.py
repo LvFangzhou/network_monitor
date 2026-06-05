@@ -3,6 +3,7 @@
 """
 import hashlib
 import json
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
@@ -79,33 +80,102 @@ def _get_silence_matched_alerts(
     *,
     active_only: bool = True,
 ) -> List[AlertHistory]:
-    alerts_query = (
-        db.query(AlertHistory)
-        .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
-        .join(Device, Device.id == AlertHistory.device_id)
-        .order_by(AlertHistory.started_at.desc())
-    )
-    if active_only:
-        alerts_query = alerts_query.filter(AlertHistory.status.in_(SILENCE_ACTIVE_STATUSES))
-    alerts = alerts_query.all()
+    alerts_query = _build_silence_candidate_query(db, silence, active_only=active_only)
+    alerts = alerts_query.order_by(AlertHistory.started_at.desc()).all()
     matched = []
     for alert in alerts:
-        if not alert.rule or not alert.device:
-            continue
-        target = {
-            "target_type": alert.alert_target_type,
-            "target_key": alert.alert_target_key,
-            "target_name": alert.alert_target_name,
-            "value": alert.alert_value,
-            "alarm_id": alert.alarm_id,
-        }
-        if _silence_matches(silence, alert.rule, alert.device, target):
+        if _alert_matches_silence(silence, alert):
             matched.append(alert)
     return matched
 
 
+def _alert_matches_silence(silence: AlertSilence, alert: AlertHistory) -> bool:
+    if not alert.rule or not alert.device:
+        return False
+    target = {
+        "target_type": alert.alert_target_type,
+        "target_key": alert.alert_target_key,
+        "target_name": alert.alert_target_name,
+        "value": alert.alert_value,
+        "alarm_id": alert.alarm_id,
+    }
+    return _silence_matches(silence, alert.rule, alert.device, target)
+
+
+def _split_silence_values(value: Optional[str]) -> List[str]:
+    return [item.strip() for item in re.split(r"[,，;；\n\r]+", value or "") if item.strip()]
+
+
+def _build_silence_candidate_query(
+    db: Session,
+    silence: AlertSilence,
+    *,
+    active_only: bool,
+):
+    alerts_query = (
+        db.query(AlertHistory)
+        .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+        .join(Device, Device.id == AlertHistory.device_id)
+    )
+    if active_only:
+        alerts_query = alerts_query.filter(AlertHistory.status.in_(SILENCE_ACTIVE_STATUSES))
+    if silence.rule_id:
+        alerts_query = alerts_query.filter(AlertHistory.rule_id == silence.rule_id)
+    if silence.device_id:
+        alerts_query = alerts_query.filter(AlertHistory.device_id == silence.device_id)
+    if silence.starts_at:
+        alerts_query = alerts_query.filter(AlertHistory.started_at >= silence.starts_at)
+    if silence.expires_at:
+        alerts_query = alerts_query.filter(AlertHistory.started_at <= silence.expires_at)
+
+    for condition in silence.conditions or []:
+        field_name = str((condition or {}).get("field") or "").strip()
+        operator = str((condition or {}).get("operator") or "contains").strip()
+        values = _split_silence_values(str((condition or {}).get("value") or ""))
+        if not values or operator in {"not_contains", "not_equals", "not_regex", "regex"}:
+            continue
+        if field_name in {"ip", "device_ip"}:
+            alerts_query = alerts_query.filter(or_(*[Device.ip_address == value for value in values]))
+        elif field_name in {"interface"}:
+            alerts_query = alerts_query.filter(
+                or_(
+                    *[
+                        or_(
+                            AlertHistory.alert_target_name.ilike(f"%{value}%"),
+                            AlertHistory.alert_target_key.ilike(f"%{value}%"),
+                        )
+                        for value in values
+                    ]
+                )
+            )
+        elif field_name == "alarm_id":
+            alerts_query = alerts_query.filter(or_(*[AlertHistory.alarm_id == value for value in values]))
+    return alerts_query
+
+
 def _count_silence_matches(db: Session, silence: AlertSilence) -> int:
     return len(_get_silence_matched_alerts(db, silence))
+
+
+def _resolve_active_alerts_for_disabled_rule(db: Session, rule_id: int) -> int:
+    active_alerts = (
+        db.query(AlertHistory)
+        .filter(
+            AlertHistory.rule_id == rule_id,
+            AlertHistory.status.in_(SILENCE_ACTIVE_STATUSES),
+        )
+        .all()
+    )
+    if not active_alerts:
+        return 0
+    now = _utc_now()
+    for alert in active_alerts:
+        alert.status = "resolved"
+        alert.resolved_at = now
+        alert.resolved_by = "rule_disabled"
+        alert.resolution_note = "告警规则已停用，系统自动恢复活动告警"
+        alert.updated_at = now
+    return len(active_alerts)
 
 
 def _serialize_notification_channels(channels):
@@ -539,10 +609,13 @@ async def update_alert_rule(
             setattr(db_rule, key, value)
     
     db_rule.updated_at = _utc_now()
+    resolved_count = 0
+    if "enabled" in update_data and update_data["enabled"] == 0:
+        resolved_count = _resolve_active_alerts_for_disabled_rule(db, db_rule.id)
     db.commit()
     db.refresh(db_rule)
     
-    logger.info("告警规则更新成功", rule_id=rule_id)
+    logger.info("告警规则更新成功", rule_id=rule_id, resolved_active_alerts=resolved_count)
     return _serialize_rule(db_rule)
 
 
