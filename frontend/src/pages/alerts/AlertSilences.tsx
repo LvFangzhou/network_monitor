@@ -302,7 +302,7 @@ const AlertSilences = () => {
 
       <Modal
         title={editingItem ? '编辑告警屏蔽' : '新建告警屏蔽'}
-        width={720}
+        width={1040}
         open={modalOpen}
         onCancel={() => setModalOpen(false)}
         onOk={handleSubmit}
@@ -324,40 +324,118 @@ const AlertSilences = () => {
         ]}
       >
         <Form form={form} layout="vertical">
-          <Form.Item name="name" label="屏蔽名称" rules={[{ required: true, message: '请输入屏蔽名称' }]}>
-            <Input />
-          </Form.Item>
-          <Form.Item name="starts_at" label="开始时间" rules={[{ required: true, message: '请选择开始时间' }]}>
-            <DatePicker
-              showTime
-              allowClear
-              style={{ width: '100%' }}
-              placeholder="选择屏蔽开始时间"
-              format="YYYY-MM-DD HH:mm:ss"
-            />
-          </Form.Item>
-          <Form.Item name="expires_at" label="失效时间（留空表示永久）">
-            <DatePicker
-              showTime
-              allowClear
-              style={{ width: '100%' }}
-              placeholder="留空表示永久有效"
-              format="YYYY-MM-DD HH:mm:ss"
-            />
-          </Form.Item>
-          <Form.Item name="reason" label="备注" rules={[{ required: true, message: '请输入备注' }]}>
-            <Input.TextArea rows={4} />
-          </Form.Item>
-          <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-            过滤条件（条件之间是 AND 的关系）
-          </Typography.Text>
-          <div style={{ border: '1px solid var(--ant-color-border)', borderRadius: 6, padding: 12, marginBottom: 16 }}>
-            <Typography.Text strong>填写示例</Typography.Text>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginTop: 10 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 300px', gap: 16, alignItems: 'start' }}>
+            <div>
+              <Form.Item name="name" label="屏蔽名称" rules={[{ required: true, message: '请输入屏蔽名称' }]}>
+                <Input />
+              </Form.Item>
+              <Form.Item name="starts_at" label="开始时间" rules={[{ required: true, message: '请选择开始时间' }]}>
+                <DatePicker
+                  showTime
+                  allowClear
+                  style={{ width: '100%' }}
+                  placeholder="选择屏蔽开始时间"
+                  format="YYYY-MM-DD HH:mm:ss"
+                />
+              </Form.Item>
+              <Form.Item name="expires_at" label="失效时间（留空表示永久）">
+                <DatePicker
+                  showTime
+                  needConfirm
+                  allowClear
+                  style={{ width: '100%' }}
+                  placeholder="留空表示永久有效"
+                  format="YYYY-MM-DD HH:mm:ss"
+                />
+              </Form.Item>
+              <Form.Item name="reason" label="备注" rules={[{ required: true, message: '请输入备注' }]}>
+                <Input.TextArea rows={4} />
+              </Form.Item>
+              <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+                过滤条件（条件之间是 AND 的关系）
+              </Typography.Text>
+              <Form.List name="conditions">
+                {(fields, { add, remove }) => (
+                  <Space direction="vertical" style={{ width: '100%' }} size={16}>
+                    {fields.map((field, index) => (
+                      <Card
+                        key={field.key}
+                        size="small"
+                        title={`过滤条件 #${index + 1}`}
+                        extra={fields.length > 1 ? (
+                          <Tooltip title="删除过滤条件">
+                            <Button type="text" danger icon={<DeleteOutlined />} onClick={() => remove(field.name)} />
+                          </Tooltip>
+                        ) : null}
+                      >
+                        {index === 0 ? (
+                          <div style={{ display: 'grid', gridTemplateColumns: '120px 180px 1fr', gap: 12, marginBottom: 8, color: '#8c8c8c', fontSize: 12 }}>
+                            <span>字段</span>
+                            <span>比较符</span>
+                            <span>值</span>
+                          </div>
+                        ) : null}
+                        <div style={{ display: 'grid', gridTemplateColumns: '120px 180px 1fr', gap: 12, alignItems: 'start' }}>
+                          <Form.Item
+                            {...field}
+                            name={[field.name, 'field']}
+                            rules={[{ required: true, message: '请选择字段' }]}
+                            style={{ marginBottom: 0 }}
+                          >
+                            <Select
+                              options={[
+                                { value: 'ip', label: 'IP' },
+                                { value: 'interface', label: '接口' },
+                                { value: 'message', label: '消息内容' },
+                                { value: 'alarm_id', label: 'Alarm ID' },
+                              ]}
+                            />
+                          </Form.Item>
+                          <Form.Item
+                            {...field}
+                            name={[field.name, 'operator']}
+                            rules={[{ required: true, message: '请选择比较符' }]}
+                            style={{ marginBottom: 0 }}
+                          >
+                            <Select
+                              options={[
+                                { value: 'contains', label: '包含其中任一' },
+                                { value: 'not_contains', label: '不包含其中任一' },
+                                { value: 'regex', label: '正则匹配' },
+                                { value: 'not_regex', label: '正则不匹配' },
+                                { value: 'equals', label: '等于其中任一' },
+                                { value: 'not_equals', label: '不等于全部' },
+                              ]}
+                            />
+                          </Form.Item>
+                          <Form.Item
+                            {...field}
+                            name={[field.name, 'value']}
+                            rules={[{ required: true, message: '请输入匹配值' }]}
+                            style={{ marginBottom: 0 }}
+                          >
+                            <Input.TextArea rows={3} placeholder="多个值可用逗号、分号或换行分隔" />
+                          </Form.Item>
+                        </div>
+                      </Card>
+                    ))}
+                    <Tooltip title="新增过滤条件">
+                      <Button icon={<PlusOutlined />} onClick={() => add({ field: 'ip', operator: 'contains', value: '' })}>
+                      新增过滤条件
+                      </Button>
+                    </Tooltip>
+                  </Space>
+                )}
+              </Form.List>
+              <Form.Item name="enabled" label="启用" valuePropName="checked">
+                <Switch />
+              </Form.Item>
+            </div>
+            <div style={{ display: 'grid', gap: 10 }}>
+              <Typography.Text strong>填写示例</Typography.Text>
               {silenceExamples.map((example) => (
-                <div key={example.title} style={{ border: '1px solid var(--ant-color-border-secondary)', borderRadius: 6, padding: 10 }}>
-                  <Typography.Text strong>{example.title}</Typography.Text>
-                  <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+                <Card key={example.title} size="small" title={example.title} bodyStyle={{ padding: 10 }}>
+                  <div style={{ display: 'grid', gap: 6 }}>
                     {example.rows.map(([field, operator, value]) => (
                       <div key={`${example.title}-${field}`} style={{ fontSize: 12, lineHeight: 1.6 }}>
                         <Tag color="blue" style={{ marginInlineEnd: 4 }}>{field}</Tag>
@@ -371,86 +449,10 @@ const AlertSilences = () => {
                       {example.note}
                     </Typography.Text>
                   ) : null}
-                </div>
+                </Card>
               ))}
             </div>
           </div>
-          <Form.List name="conditions">
-            {(fields, { add, remove }) => (
-              <Space direction="vertical" style={{ width: '100%' }} size={16}>
-                {fields.map((field, index) => (
-                  <Card
-                    key={field.key}
-                    size="small"
-                    title={`过滤条件 #${index + 1}`}
-                    extra={fields.length > 1 ? (
-                      <Tooltip title="删除过滤条件">
-                        <Button type="text" danger icon={<DeleteOutlined />} onClick={() => remove(field.name)} />
-                      </Tooltip>
-                    ) : null}
-                  >
-                    {index === 0 ? (
-                      <div style={{ display: 'grid', gridTemplateColumns: '120px 180px 1fr', gap: 12, marginBottom: 8, color: '#8c8c8c', fontSize: 12 }}>
-                        <span>字段</span>
-                        <span>比较符</span>
-                        <span>值</span>
-                      </div>
-                    ) : null}
-                    <div style={{ display: 'grid', gridTemplateColumns: '120px 180px 1fr', gap: 12, alignItems: 'start' }}>
-                      <Form.Item
-                        {...field}
-                        name={[field.name, 'field']}
-                        rules={[{ required: true, message: '请选择字段' }]}
-                        style={{ marginBottom: 0 }}
-                      >
-                        <Select
-                          options={[
-                            { value: 'ip', label: 'IP' },
-                            { value: 'interface', label: '接口' },
-                            { value: 'message', label: '消息内容' },
-                            { value: 'alarm_id', label: 'Alarm ID' },
-                          ]}
-                        />
-                      </Form.Item>
-                      <Form.Item
-                        {...field}
-                        name={[field.name, 'operator']}
-                        rules={[{ required: true, message: '请选择比较符' }]}
-                        style={{ marginBottom: 0 }}
-                      >
-                        <Select
-                          options={[
-                            { value: 'contains', label: '包含其中任一' },
-                            { value: 'not_contains', label: '不包含其中任一' },
-                            { value: 'regex', label: '正则匹配' },
-                            { value: 'not_regex', label: '正则不匹配' },
-                            { value: 'equals', label: '等于其中任一' },
-                            { value: 'not_equals', label: '不等于全部' },
-                          ]}
-                        />
-                      </Form.Item>
-                      <Form.Item
-                        {...field}
-                        name={[field.name, 'value']}
-                        rules={[{ required: true, message: '请输入匹配值' }]}
-                        style={{ marginBottom: 0 }}
-                      >
-                        <Input.TextArea rows={3} placeholder="多个值可用逗号、分号或换行分隔" />
-                      </Form.Item>
-                    </div>
-                  </Card>
-                ))}
-                <Tooltip title="新增过滤条件">
-                  <Button icon={<PlusOutlined />} onClick={() => add({ field: 'ip', operator: 'contains', value: '' })}>
-                  新增过滤条件
-                  </Button>
-                </Tooltip>
-              </Space>
-            )}
-          </Form.List>
-          <Form.Item name="enabled" label="启用" valuePropName="checked">
-            <Switch />
-          </Form.Item>
         </Form>
       </Modal>
 
