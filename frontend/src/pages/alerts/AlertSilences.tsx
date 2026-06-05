@@ -44,6 +44,38 @@ const statusColors: Record<string, string> = {
   resolved: 'green',
 }
 
+const silenceExamples = [
+  {
+    title: '屏蔽单个端口',
+    rows: [
+      ['IP', '包含其中任一', '10.254.1.92'],
+      ['接口', '包含其中任一', '0/116'],
+    ],
+  },
+  {
+    title: '屏蔽很多接口',
+    rows: [
+      ['IP', '包含其中任一', '10.242.2.17\n10.242.2.18\n10.242.2.19'],
+      ['接口', '正则匹配', '(^|[^0-9])0/([0-9]|[1-3][0-9]|4[0-7])([^0-9]|$)'],
+    ],
+    note: '这个例子表示屏蔽 0/0 到 0/47 接口。',
+  },
+  {
+    title: '屏蔽整机',
+    rows: [
+      ['IP', '包含其中任一', '10.254.1.65'],
+    ],
+    note: '只填 IP，不填接口，就会匹配这台设备的所有告警。',
+  },
+  {
+    title: '屏蔽 BGP 告警',
+    rows: [
+      ['IP', '包含其中任一', '10.242.2.11\n10.242.2.12'],
+      ['消息内容', '包含其中任一', 'BGP'],
+    ],
+  },
+]
+
 const statusLabels: Record<string, string> = {
   firing: '触发中',
   acknowledged: '已确认',
@@ -319,6 +351,30 @@ const AlertSilences = () => {
           <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
             过滤条件（条件之间是 AND 的关系）
           </Typography.Text>
+          <div style={{ border: '1px solid var(--ant-color-border)', borderRadius: 6, padding: 12, marginBottom: 16 }}>
+            <Typography.Text strong>填写示例</Typography.Text>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginTop: 10 }}>
+              {silenceExamples.map((example) => (
+                <div key={example.title} style={{ border: '1px solid var(--ant-color-border-secondary)', borderRadius: 6, padding: 10 }}>
+                  <Typography.Text strong>{example.title}</Typography.Text>
+                  <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+                    {example.rows.map(([field, operator, value]) => (
+                      <div key={`${example.title}-${field}`} style={{ fontSize: 12, lineHeight: 1.6 }}>
+                        <Tag color="blue" style={{ marginInlineEnd: 4 }}>{field}</Tag>
+                        <Tag style={{ marginInlineEnd: 4 }}>{operator}</Tag>
+                        <Typography.Text code style={{ whiteSpace: 'pre-wrap' }}>{value}</Typography.Text>
+                      </div>
+                    ))}
+                  </div>
+                  {example.note ? (
+                    <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+                      {example.note}
+                    </Typography.Text>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </div>
           <Form.List name="conditions">
             {(fields, { add, remove }) => (
               <Space direction="vertical" style={{ width: '100%' }} size={16}>
