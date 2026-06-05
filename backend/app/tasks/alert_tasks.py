@@ -845,8 +845,8 @@ def _resolve_alerts_for_disabled_rules(db: Session) -> int:
     for alert in active_alerts:
         alert.status = "resolved"
         alert.resolved_at = now
-        alert.resolved_by = "rule_disabled"
-        alert.resolution_note = "告警规则已停用，系统自动恢复活动告警"
+        alert.resolved_by = None
+        alert.resolution_note = "告警规则已停用，系统静默恢复活动告警"
         alert.updated_at = now
     db.commit()
     logger.info("已自动恢复停用规则关联的活动告警", count=len(active_alerts))

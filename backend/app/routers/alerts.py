@@ -172,8 +172,8 @@ def _resolve_active_alerts_for_disabled_rule(db: Session, rule_id: int) -> int:
     for alert in active_alerts:
         alert.status = "resolved"
         alert.resolved_at = now
-        alert.resolved_by = "rule_disabled"
-        alert.resolution_note = "告警规则已停用，系统自动恢复活动告警"
+        alert.resolved_by = None
+        alert.resolution_note = "告警规则已停用，系统静默恢复活动告警"
         alert.updated_at = now
     return len(active_alerts)
 
