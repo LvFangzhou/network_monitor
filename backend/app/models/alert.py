@@ -122,15 +122,16 @@ class AlertHistory(Base):
                 mention_users = [item.strip() for item in raw_mentions.split(",") if item.strip()]
             elif isinstance(raw_mentions, list):
                 mention_users = [str(item).strip() for item in raw_mentions if str(item).strip()]
+        resolved_by = None if self.resolved_by == "rule_disabled" else self.resolved_by
         current_handler = None
         if self.status == "acknowledged":
             current_handler = self.acknowledged_by
         elif self.status == "ignored":
             current_handler = self.ignored_by
         elif self.status == "snoozed":
-            current_handler = self.resolved_by or self.acknowledged_by
+            current_handler = resolved_by or self.acknowledged_by
         elif self.status == "resolved":
-            current_handler = self.resolved_by or self.acknowledged_by
+            current_handler = resolved_by or self.acknowledged_by
         elif mention_users:
             current_handler = "、".join(mention_users)
         return {

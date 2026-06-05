@@ -303,12 +303,13 @@ def _device_datacenter_text(device: Device) -> str:
 
 
 def _current_handler_text(alert: AlertHistory) -> str:
+    resolved_by = None if alert.resolved_by == "rule_disabled" else alert.resolved_by
     if alert.status == "acknowledged" and alert.acknowledged_by:
         return alert.acknowledged_by
     if alert.status == "ignored" and alert.ignored_by:
         return alert.ignored_by
-    if alert.status == "resolved" and (alert.resolved_by or alert.acknowledged_by):
-        return alert.resolved_by or alert.acknowledged_by or "-"
+    if alert.status == "resolved" and (resolved_by or alert.acknowledged_by):
+        return resolved_by or alert.acknowledged_by or "-"
     mention_users = _get_mention_users(alert.rule) if alert.rule else []
     return "、".join(mention_users) if mention_users else "待分配"
 
@@ -2541,6 +2542,14 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
     try:
         alert = db.query(AlertHistory).filter(AlertHistory.id == alert_id).first()
         if not alert:
+            return
+        if event_type == "firing" and alert.status != "firing":
+            logger.info(
+                "跳过已非触发状态的故障通知",
+                alert_id=alert_id,
+                status=alert.status,
+                event_type=event_type,
+            )
             return
         
         rule = alert.rule
