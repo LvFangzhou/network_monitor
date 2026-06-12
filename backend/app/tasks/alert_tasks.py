@@ -191,6 +191,7 @@ SEVERITY_LABELS = {
     "P0": "P0",
     "P1": "P1",
     "P2": "P2",
+    "P3": "P3",
 }
 
 
@@ -237,6 +238,11 @@ def _format_local_time(value: Optional[datetime]) -> str:
 
 def _normalize_severity_label(value: Optional[str]) -> str:
     return SEVERITY_LABELS.get((value or "").strip(), "P1")
+
+
+def _is_operation_notification(rule: Optional[AlertRule]) -> bool:
+    """P3 当前用于配置变更等操作记录类事件，不按故障通知展示。"""
+    return _normalize_severity_label(rule.severity if rule else None) == "P3"
 
 
 def _build_short_alarm_id(alert: AlertHistory) -> str:
@@ -334,6 +340,10 @@ def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[
     severity = _normalize_severity_label(rule.severity)
     mentions = _get_mention_users(rule)
     mention_suffix = f"@{'、'.join(mentions)}" if mentions else ""
+    if _is_operation_notification(rule):
+        if event_type == "ignored":
+            return f"{actor or '有人'}忽略了1条配置变更记录"
+        return f"{severity}-配置变更记录{mention_suffix}"
     if event_type == "ignored":
         return f"{actor or '有人'}忽略了1条故障"
     if event_type == "auto_resolved":
@@ -341,6 +351,29 @@ def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[
             return f"{severity}-设备重新可达，已恢复{mention_suffix}"
         return f"{severity}-自动恢复通知{mention_suffix}"
     return f"{severity}-故障通知{mention_suffix}"
+
+
+def _extract_trap_content_from_message(message: Optional[str]) -> str:
+    text = (message or "").strip()
+    marker = "Trap内容:"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text
+
+
+def _clean_operation_detail(alert: AlertHistory) -> str:
+    detail = _extract_trap_content_from_message(alert.message)
+    device_name = (alert.device.name if alert.device else "") or ""
+    if device_name and detail.startswith(device_name):
+        detail = detail[len(device_name):].lstrip(" /")
+    if " / " in detail:
+        parts = [part.strip() for part in detail.split(" / ") if part.strip()]
+        detail = next((part for part in parts if part != device_name), parts[-1] if parts else detail)
+    if device_name and detail == device_name:
+        detail = ""
+    if not detail and alert.alert_target_name and alert.alert_target_name != device_name:
+        detail = alert.alert_target_name
+    return (detail or "配置变更").strip()
 
 
 def _build_notification_content(
@@ -358,18 +391,23 @@ def _build_notification_content(
     occurrence_count = _get_recent_occurrence_count(db, alert)
     detail_url = _build_detail_url(alert)
     fault_title = rule.name or rule.metric_type
+    is_operation = _is_operation_notification(rule)
     target_line = _target_label(rule, alert)
     started_at_text = _format_local_time(alert.started_at)
 
     lines = []
     if event_type == "ignored":
         lines.append(f"【{fault_title}】")
+    elif is_operation:
+        lines.append(f"记录类型：【{fault_title}】")
     else:
         lines.append(f"故障标题：【{fault_title}】")
     lines.append(f"交换机：{device.name}")
     lines.append(f"管理地址：{device.ip_address}")
-    if target_line:
+    if target_line and not is_operation:
         lines.append(target_line)
+    if is_operation:
+        lines.append(f"变更内容：{_clean_operation_detail(alert)}")
     numeric_detail = _build_numeric_detail_row(alert)
     if numeric_detail:
         lines.append(f"{numeric_detail['label']}：{numeric_detail['value']}")
@@ -381,27 +419,31 @@ def _build_notification_content(
         occurrence_label = "过去1小时掉底次数"
     else:
         occurrence_label = "过去1小时触发次数"
-    lines.append(f"{occurrence_label}：{occurrence_count}次")
+    if not is_operation:
+        lines.append(f"{occurrence_label}：{occurrence_count}次")
     lines.append(f"Alarm ID：{alarm_id}")
 
     if event_type == "firing":
-        lines.append(f"发生时间：{started_at_text}")
-        lines.append(f"当前处理人：{_current_handler_text(alert)}")
+        lines.append(f"{'记录时间' if is_operation else '发生时间'}：{started_at_text}")
+        if not is_operation:
+            lines.append(f"当前处理人：{_current_handler_text(alert)}")
         lines.append("")
-        lines.append(f"故障详情：{detail_url}")
+        lines.append(f"{'记录详情' if is_operation else '故障详情'}：{detail_url}")
     elif event_type == "ignored":
         if actor:
-            lines.insert(0, f"{actor}忽略了1条故障：")
+            lines.insert(0, f"{actor}忽略了1条{'操作记录' if is_operation else '故障'}：")
     elif event_type == "auto_resolved":
         resolved_at_text = _format_local_time(alert.resolved_at)
-        if rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
+        if is_operation:
+            return ""
+        elif rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
             lines[0] = "故障标题：【设备重新可达，已恢复】"
         lines.append(f"发生时间：{started_at_text}")
         lines.append(f"恢复时间：{resolved_at_text}")
         lines.append(f"持续时间：{_format_duration(alert.started_at, alert.resolved_at)}")
         lines.append(f"当前处理人：{_current_handler_text(alert)}")
         lines.append("")
-        lines.append(f"故障详情：{detail_url}")
+        lines.append(f"{'操作详情' if is_operation else '故障详情'}：{detail_url}")
 
     return "\n".join(lines)
 
@@ -420,6 +462,7 @@ def _build_notification_card_data(
     alarm_id = _ensure_alarm_id(db, alert)
     occurrence_count = _get_recent_occurrence_count(db, alert)
     severity = _normalize_severity_label(rule.severity)
+    is_operation = _is_operation_notification(rule)
     started_at_text = _format_local_time(alert.started_at)
     resolved_at_text = _format_local_time(alert.resolved_at)
 
@@ -433,36 +476,34 @@ def _build_notification_card_data(
         occurrence_label = "过去1小时触发次数"
 
     rows = [
-        {"label": "故障标题", "value": f"【{rule.name or rule.metric_type}】"},
+        {"label": "记录类型" if is_operation else "故障标题", "value": f"【{rule.name or rule.metric_type}】"},
         {"label": "交换机", "value": device.name},
         {"label": "管理地址", "value": device.ip_address},
     ]
-    if alert.alert_target_name:
-        target_label = "接口" if rule.metric_type in INTERFACE_METRIC_TYPES else "对象"
+    if is_operation:
+        rows.append({"label": "变更内容", "value": _clean_operation_detail(alert)})
+    elif alert.alert_target_name:
+        target_label = "变更内容" if is_operation else ("接口" if rule.metric_type in INTERFACE_METRIC_TYPES else "对象")
         if rule.metric_type in CIRCUIT_METRIC_TYPES:
             target_label = "线路接口"
         rows.append({"label": target_label, "value": alert.alert_target_name})
     numeric_detail = _build_numeric_detail_row(alert)
     if numeric_detail:
         rows.append(numeric_detail)
-    rows.extend(
-        [
-            {"label": occurrence_label, "value": f"{occurrence_count}次"},
-            {"label": "Alarm ID", "value": alarm_id},
-        ]
-    )
+    if not is_operation:
+        rows.append({"label": occurrence_label, "value": f"{occurrence_count}次"})
+    rows.append({"label": "Alarm ID", "value": alarm_id})
 
     if event_type == "firing":
-        rows.extend(
-            [
-                {"label": "发生时间", "value": started_at_text},
-                {"label": "当前处理人", "value": _current_handler_text(alert)},
-            ]
-        )
+        rows.append({"label": "记录时间" if is_operation else "发生时间", "value": started_at_text})
+        if not is_operation:
+            rows.append({"label": "当前处理人", "value": _current_handler_text(alert)})
     elif event_type == "ignored":
-        rows.insert(0, {"label": "处理动作", "value": f"{actor or '有人'}忽略了1条故障"})
+        rows.insert(0, {"label": "处理动作", "value": f"{actor or '有人'}忽略了1条{'操作记录' if is_operation else '故障'}"})
     elif event_type == "auto_resolved":
-        if rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
+        if is_operation:
+            return {}
+        elif rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
             rows[0] = {"label": "故障标题", "value": "【设备重新可达，已恢复】"}
         rows.extend(
             [
@@ -482,6 +523,7 @@ def _build_notification_card_data(
         "rows": rows,
         "detail_url": _build_detail_url(alert),
         "event_type": event_type,
+        "notification_kind": "operation" if is_operation else "alert",
     }
 
 
@@ -573,8 +615,17 @@ def _pending_alert_key(rule: AlertRule, device: Device, target: Dict[str, Any]) 
     return f"alerts:pending:{rule.id}:{device.id}:{target_key}"
 
 
+def _pending_recovery_key(rule: AlertRule, device: Device, target: Dict[str, Any]) -> str:
+    target_key = str(target.get("target_key") or "device")
+    return f"alerts:recovery_pending:{rule.id}:{device.id}:{target_key}"
+
+
 def _clear_pending_alert(rule: AlertRule, device: Device, target: Dict[str, Any]) -> None:
     redis_client.delete(_pending_alert_key(rule, device, target))
+
+
+def _clear_pending_recovery(rule: AlertRule, device: Device, target: Dict[str, Any]) -> None:
+    redis_client.delete(_pending_recovery_key(rule, device, target))
 
 
 def _duration_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any], value: float) -> bool:
@@ -617,6 +668,57 @@ def _duration_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
         )
 
     return (now - first_seen) >= duration_seconds
+
+
+def _requires_recovery_confirmation(rule: AlertRule) -> bool:
+    return (
+        rule.metric_type == "interface_admin_up_oper_down"
+        or rule.metric_type in PROTOCOL_METRIC_TYPES
+        or rule.metric_type in CIRCUIT_METRIC_TYPES
+    )
+
+
+def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any], value: float) -> bool:
+    if not _requires_recovery_confirmation(rule):
+        return True
+
+    duration_seconds = max(int(rule.duration or 0), 0)
+    confirm_seconds = max(60, duration_seconds)
+    now = time.time()
+    key = _pending_recovery_key(rule, device, target)
+    pending_raw = redis_client.get(key)
+    first_seen = now
+    if pending_raw:
+        try:
+            first_seen = float(json.loads(pending_raw).get("first_seen") or now)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            first_seen = now
+    else:
+        redis_client.set(
+            key,
+            json.dumps(
+                {
+                    "first_seen": first_seen,
+                    "rule_id": rule.id,
+                    "device_id": device.id,
+                    "target_key": target.get("target_key"),
+                    "target_name": target.get("target_name"),
+                    "value": value,
+                },
+                ensure_ascii=False,
+            ),
+            ex=max(confirm_seconds * 3, confirm_seconds + 60, PENDING_ALERT_TTL_SECONDS),
+        )
+        logger.info(
+            "告警进入恢复确认",
+            rule_id=rule.id,
+            device_id=device.id,
+            target=target.get("target_name"),
+            confirm_seconds=confirm_seconds,
+            value=value,
+        )
+
+    return (now - first_seen) >= confirm_seconds
 
 
 def _silence_matches(silence: AlertSilence, rule: AlertRule, device: Device, target: Dict[str, Any]) -> bool:
@@ -748,6 +850,25 @@ def _is_silenced(db: Session, rule: AlertRule, device: Device, target: Dict[str,
     silences = db.query(AlertSilence).filter(AlertSilence.enabled == 1).all()
     for silence in silences:
         if _silence_matches(silence, rule, device, target):
+            return True
+    return False
+
+
+def _target_from_alert_history(alert: AlertHistory) -> Dict[str, Any]:
+    return {
+        "target_type": alert.alert_target_type,
+        "target_key": alert.alert_target_key,
+        "target_name": alert.alert_target_name,
+        "value": alert.alert_value,
+        "alarm_id": alert.alarm_id,
+    }
+
+
+def _has_successful_firing_notification(alert: AlertHistory) -> bool:
+    for item in alert.notifications_sent or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("event_type") == "firing" and item.get("success"):
             return True
     return False
 
@@ -1099,6 +1220,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
             existing = existing_query.first()
 
             if should_alert:
+                _clear_pending_recovery(rule, device, target)
                 if _is_silenced(db, rule, device, target):
                     if existing:
                         _clear_pending_alert(rule, device, target)
@@ -1220,6 +1342,10 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
             else:
                 _clear_pending_alert(rule, device, target)
                 if existing and existing.status in {"firing", "acknowledged", "ignored", "snoozed"}:
+                    if not _recovery_confirmed(rule, device, target, float(value)):
+                        continue
+                    _clear_pending_recovery(rule, device, target)
+                    was_silenced_ignored = existing.status == "ignored" and existing.ignored_by == "alert_silence"
                     existing.alert_value = float(value)
                     existing.message = _build_alert_message(rule, device, float(value), target)
                     existing.alert_target_type = target.get("target_type")
@@ -1229,12 +1355,14 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                     existing.resolved_at = _utc_now()
                     existing.resolved_by = "system"
                     db.commit()
-                    _send_alert_event_notification.delay(existing.id, "auto_resolved", "system")
+                    if not was_silenced_ignored:
+                        _send_alert_event_notification.delay(existing.id, "auto_resolved", "system")
                     logger.info(
                         "告警恢复",
                         rule_id=rule.id,
                         device_id=device.id,
                         target=target.get("target_name"),
+                        was_silenced_ignored=was_silenced_ignored,
                     )
     
     return triggered
@@ -2551,9 +2679,30 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
                 event_type=event_type,
             )
             return
+        if event_type == "auto_resolved" and not _has_successful_firing_notification(alert):
+            logger.info(
+                "跳过未发送过故障通知的恢复通知",
+                alert_id=alert_id,
+                alarm_id=alert.alarm_id,
+                status=alert.status,
+            )
+            return
         
         rule = alert.rule
         if not rule or not rule.notification_channels:
+            return
+        if event_type == "auto_resolved" and _is_operation_notification(rule):
+            logger.info("跳过P3配置变更记录的恢复通知", alert_id=alert_id, alarm_id=alert.alarm_id)
+            return
+        if alert.device and _is_silenced(db, rule, alert.device, _target_from_alert_history(alert)):
+            logger.info(
+                "跳过命中屏蔽规则的告警通知",
+                alert_id=alert.id,
+                alarm_id=alert.alarm_id,
+                event_type=event_type,
+                device_id=alert.device_id,
+                target=alert.alert_target_name,
+            )
             return
         title = _build_notification_title(rule, event_type, actor)
         datacenter_text = _device_datacenter_text(alert.device) if alert.device else "-"

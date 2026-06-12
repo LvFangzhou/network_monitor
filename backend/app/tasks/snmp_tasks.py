@@ -5,12 +5,14 @@ from celery import shared_task
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from sqlalchemy import or_
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 import json
 import math
 import re
 import subprocess
 import time
+import uuid
 
 from app.config import settings
 from app.database import SessionLocal
@@ -52,7 +54,9 @@ ICMP_PING_PACKETS = 5
 ICMP_PING_TIMEOUT_SECONDS = 2
 MONITOR_CACHE_TTL_SECONDS = 180
 ASTERNOS_TASK_LOCK_TTL_SECONDS = max(45, min(180, ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS * 2))
-INTERFACE_REALTIME_LOCK_TTL_SECONDS = 30
+INTERFACE_REALTIME_LOCK_TTL_SECONDS = 120
+INTERFACE_REALTIME_MAX_WORKERS = 4
+INTERFACE_RATE_CAP_MULTIPLIER = 1.03
 ASTERNOS_COUNTER_METRICS = [
     {
         "field": "queue_egress_dropped_pkts_delta",
@@ -112,12 +116,25 @@ def _release_asternos_device_lock(device_id: int) -> None:
     redis_client.delete(_asternos_lock_key(device_id))
 
 
-def _try_lock_interface_realtime(kind: str = "asternos") -> bool:
-    return bool(redis_client.set(_interface_realtime_lock_key(kind), "1", ex=INTERFACE_REALTIME_LOCK_TTL_SECONDS, nx=True))
+def _try_lock_interface_realtime(kind: str = "asternos") -> Optional[str]:
+    token = uuid.uuid4().hex
+    locked = redis_client.set(
+        _interface_realtime_lock_key(kind),
+        token,
+        ex=INTERFACE_REALTIME_LOCK_TTL_SECONDS,
+        nx=True,
+    )
+    return token if locked else None
 
 
-def _release_interface_realtime_lock(kind: str = "asternos") -> None:
-    redis_client.delete(_interface_realtime_lock_key(kind))
+def _release_interface_realtime_lock(kind: str = "asternos", token: Optional[str] = None) -> None:
+    key = _interface_realtime_lock_key(kind)
+    current = redis_client.get(key)
+    if isinstance(current, bytes):
+        current = current.decode("utf-8", errors="ignore")
+    if token and current != token:
+        return
+    redis_client.delete(key)
 
 
 def _set_monitor_cache(kind: str, device_id: int, payload: Any, suffix: str = "") -> None:
@@ -257,6 +274,30 @@ def _build_exporter_protocol_neighbors(metrics: Dict[str, List[Dict[str, Any]]])
 
 def _counter_cache_key(device_id: int, metric_base: str, target_key: str) -> str:
     return f"monitor:asternos_counter:{device_id}:{metric_base}:{target_key}"
+
+
+def _sanitize_interface_rates(stats: Dict[str, Any]) -> None:
+    speed_bps = stats.get("speed_bps")
+    try:
+        speed_value = float(speed_bps)
+    except (TypeError, ValueError):
+        return
+    if speed_value <= 0:
+        return
+    for bps_key, utilization_key in [
+        ("in_bps", "in_utilization_percent"),
+        ("out_bps", "out_utilization_percent"),
+    ]:
+        value = stats.get(bps_key)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric < 0:
+            stats[bps_key] = None
+            stats[utilization_key] = None
+        elif numeric > speed_value:
+            stats[bps_key] = speed_value
 
 
 def _build_counter_target_key(labels: Dict[str, Any], target_labels: List[str]) -> str:
@@ -469,6 +510,7 @@ def _interface_point(device: Device, stats: Dict[str, Any], timestamp: datetime)
         return None
 
     _apply_octet_rates(device.id, stats, timestamp)
+    _sanitize_interface_rates(stats)
     preserve_exporter_rates = str(device.monitor_source or "snmp") == "asternos_exporter"
 
     return {
@@ -1094,7 +1136,8 @@ def collect_all_asternos_interface_realtime():
 @shared_task
 def collect_circuit_interface_realtime():
     """轻量采集线路绑定端口，避免全设备扫描较慢造成端口历史断点。"""
-    if not _try_lock_interface_realtime("circuit"):
+    lock_token = _try_lock_interface_realtime("circuit")
+    if not lock_token:
         return {"skipped": True, "reason": "上一轮线路端口采集未完成"}
 
     db = SessionLocal()
@@ -1117,14 +1160,15 @@ def collect_circuit_interface_realtime():
         ).all()
         now = datetime.utcnow()
         collected_at = datetime.now(timezone.utc).isoformat()
-        points: List[Dict[str, Any]] = []
-        matched_ports = 0
+        collection_started = time.monotonic()
 
-        for device in devices:
+        def collect_device_ports(device: Device) -> Dict[str, Any]:
             monitor_source = str(device.monitor_source or "snmp")
             port_names = target_map.get(device.id, set())
+            device_points: List[Dict[str, Any]] = []
+            matched = 0
             if not port_names:
-                continue
+                return {"points": device_points, "matched_ports": matched}
 
             if monitor_source == "asternos_exporter":
                 metrics = asyncio.run(asternos_exporter_client.scrape(device))
@@ -1137,14 +1181,14 @@ def collect_circuit_interface_realtime():
                     stats = _build_asternos_interface_stats(device.id, metrics, interface)
                     point = _interface_point(device, stats, now)
                     if point:
-                        points.append(point)
-                        points.extend(_asternos_queue_detail_points(device, stats, now))
-                        matched_ports += 1
+                        device_points.append(point)
+                        device_points.extend(_asternos_queue_detail_points(device, stats, now))
+                        matched += 1
                         _cache_interface_stats(device.id, stats, collected_at)
-                continue
+                return {"points": device_points, "matched_ports": matched}
 
             if not device.snmp_version:
-                continue
+                return {"points": device_points, "matched_ports": matched}
             interfaces = snmp_collector.list_interfaces(device)
             for interface in interfaces:
                 names = {str(interface.get("name") or ""), str(interface.get("description") or ""), str(interface.get("alias") or "")}
@@ -1153,9 +1197,30 @@ def collect_circuit_interface_realtime():
                 stats = snmp_collector.get_interface_snapshot(device, int(interface["index"]))
                 point = _interface_point(device, stats, now)
                 if point:
-                    points.append(point)
-                    matched_ports += 1
+                    device_points.append(point)
+                    matched += 1
                     _cache_interface_stats(device.id, stats, collected_at)
+            return {"points": device_points, "matched_ports": matched}
+
+        points: List[Dict[str, Any]] = []
+        matched_ports = 0
+        workers = min(INTERFACE_REALTIME_MAX_WORKERS, max(1, len(devices)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(collect_device_ports, device): device for device in devices}
+            for future in as_completed(futures):
+                device = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    logger.warning(
+                        "线路绑定端口实时采集设备失败",
+                        device_id=device.id,
+                        ip_address=device.ip_address,
+                        error=str(exc),
+                    )
+                    continue
+                points.extend(result.get("points") or [])
+                matched_ports += int(result.get("matched_ports") or 0)
 
         if points:
             influx_client.write_points(points, sync=False)
@@ -1165,13 +1230,20 @@ def collect_circuit_interface_realtime():
             devices=len(devices),
             matched_ports=matched_ports,
             points_written=len(points),
+            elapsed_seconds=round(time.monotonic() - collection_started, 3),
+            workers=workers,
         )
-        return {"devices": len(devices), "matched_ports": matched_ports, "points_written": len(points)}
+        return {
+            "devices": len(devices),
+            "matched_ports": matched_ports,
+            "points_written": len(points),
+            "elapsed_seconds": round(time.monotonic() - collection_started, 3),
+        }
     except Exception as exc:
         logger.error("线路绑定端口实时采集失败", error=str(exc))
         return {"error": str(exc)}
     finally:
-        _release_interface_realtime_lock("circuit")
+        _release_interface_realtime_lock("circuit", lock_token)
         db.close()
 
 

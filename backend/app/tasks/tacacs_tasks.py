@@ -25,7 +25,7 @@ LOCK_TTL_SECONDS = 55
 BUFFER_KEY = "tacacs:log:buffer"
 BUFFER_FIRST_SEEN_KEY = "tacacs:log:buffer:first_seen"
 BATCH_DELAY_SECONDS = 20
-LOG_PATTERN = re.compile(r"(\w+ \d+ \d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
+LOG_PATTERN = re.compile(r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
 MONTH_MAP = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,

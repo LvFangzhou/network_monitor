@@ -21,6 +21,7 @@ from app.collectors import gnmi_manager
 from app.models import AuditLog, User
 from app.services.syslog_listener import syslog_listener
 from app.services.flow_listener import flow_listener
+from app.services.snmp_trap_listener import snmp_trap_listener
 from app.utils import (
     build_idempotency_key,
     build_rate_limit_key,
@@ -182,6 +183,7 @@ async def lifespan(app: FastAPI):
     await gnmi_manager.start()
     await syslog_listener.start()
     await flow_listener.start()
+    await snmp_trap_listener.start()
     
     logger.info("应用启动完成")
     
@@ -194,6 +196,7 @@ async def lifespan(app: FastAPI):
     await gnmi_manager.stop()
     await syslog_listener.stop()
     await flow_listener.stop()
+    await snmp_trap_listener.stop()
     
     logger.info("应用已关闭")
 
@@ -432,6 +435,8 @@ async def health_check():
         "gnmi_connected": gnmi_manager.get_connected_count(),
         "syslog_enabled": settings.SYSLOG_ENABLED,
         "syslog_port": settings.SYSLOG_LISTEN_PORT,
+        "snmp_trap_enabled": settings.SNMP_TRAP_ENABLED,
+        "snmp_trap_port": settings.SNMP_TRAP_LISTEN_PORT,
     }
 
 

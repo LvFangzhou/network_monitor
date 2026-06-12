@@ -36,6 +36,9 @@ MONITOR_CACHE_STALE_SECONDS = 180
 MAX_INTERFACE_HISTORY_SECONDS = 7 * 24 * 60 * 60
 RATE_FALLBACK_MAX_SECONDS = 5 * 60
 HISTORY_REQUEST_CACHE_SECONDS = 8
+FRESH_INTERFACE_SAMPLE_LOCK_SECONDS = 8
+FRESH_INTERFACE_SAMPLE_MAX_RANGE_SECONDS = 60 * 60
+INTERFACE_RATE_CAP_MULTIPLIER = 1.03
 ASTERNOS_COUNTER_METRICS = [
     {
         "field": "queue_egress_dropped_pkts_delta",
@@ -184,6 +187,7 @@ def persist_interface_metrics(device: Device, interface_metrics: dict, sync: boo
         fields["admin_up_oper_down"] = (
             1.0 if interface_metrics.get("admin_status") == "up" and interface_metrics.get("oper_status") != "up" else 0.0
         )
+    _sanitize_impossible_interface_rates(fields)
 
     influx_client.write_point(
         measurement="interface_monitoring",
@@ -408,19 +412,25 @@ def _apply_windowed_octet_rates(rows: List[Dict[str, Any]], window_seconds: int)
             cutoff = row_time.timestamp() - window_seconds
             candidates = [(time_value, value) for time_value, value in candidates if time_value.timestamp() >= cutoff]
             previous = candidates[0] if candidates else last_seen
-            if previous and _safe_float(row.get(bps_key)) is None:
+            if previous:
                 previous_time, previous_value = previous
                 elapsed = (row_time - previous_time).total_seconds()
                 delta = current_value - previous_value
-                if 0 < elapsed <= RATE_FALLBACK_MAX_SECONDS and delta > 0:
+                if 0 < elapsed <= RATE_FALLBACK_MAX_SECONDS and delta >= 0:
                     row[bps_key] = round((delta * 8) / elapsed, 2)
                     row["sample_seconds"] = round(elapsed, 2)
             candidates.append((row_time, current_value))
             last_seen = (row_time, current_value)
 
 
-def _apply_windowed_bps_average(rows: List[Dict[str, Any]], window_seconds: int, interval_seconds: int) -> None:
+def _apply_windowed_bps_average(rows: List[Dict[str, Any]], window_seconds: int, interval_seconds: int, range_seconds: int) -> None:
     if interval_seconds >= window_seconds:
+        return
+
+    # Short-range views are used for troubleshooting and traffic tests. SNMP
+    # already stores a per-sample counter delta in *_bps, so applying another
+    # five-minute moving average here makes sudden traffic look like a slow ramp.
+    if range_seconds <= 60 * 60:
         return
 
     timed_rows = [(row, _parse_history_time(row)) for row in rows]
@@ -443,6 +453,7 @@ def _apply_windowed_bps_average(rows: List[Dict[str, Any]], window_seconds: int,
 def _recalculate_utilization_from_display_rates(rows: List[Dict[str, Any]]) -> None:
     """Keep utilization charts aligned with the displayed traffic rate window."""
     for row in rows:
+        _sanitize_impossible_interface_rates(row)
         speed_bps = _safe_float(row.get("speed_bps"))
         if not speed_bps or speed_bps <= 0:
             continue
@@ -505,15 +516,19 @@ def _mark_stale_rate_samples(rows: List[Dict[str, Any]], interval_seconds: int, 
         previous_time = row_time
 
 
-async def _persist_fresh_interface_sample(device: Device, interface_index: int, range_seconds: int) -> None:
-    if range_seconds > 6 * 60 * 60:
-        return
+async def _persist_fresh_interface_sample(device: Device, interface_index: int, range_seconds: int) -> bool:
+    if range_seconds > FRESH_INTERFACE_SAMPLE_MAX_RANGE_SECONDS:
+        return False
+    lock_key = _monitor_cache_key("interface_fresh_sample_lock", device.id, suffix=f":{interface_index}")
+    if not redis_client.set(lock_key, "1", ex=FRESH_INTERFACE_SAMPLE_LOCK_SECONDS, nx=True):
+        return False
     try:
         interface_metrics = await collect_current_interface_metrics(device, interface_index, allow_cache=False)
         if interface_metrics and interface_metrics.get("name"):
             persist_interface_metrics(device, interface_metrics, sync=True)
             if get_effective_monitor_source(device) == "asternos_exporter":
                 persist_asternos_queue_detail_metrics(device, interface_metrics, sync=True)
+            return True
     except Exception as exc:
         logger.warning(
             "端口历史查询实时采集失败",
@@ -521,6 +536,7 @@ async def _persist_fresh_interface_sample(device: Device, interface_index: int, 
             interface_index=interface_index,
             error=str(exc),
         )
+    return False
 
 
 def interface_metrics_to_history_point(interface_metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -733,6 +749,24 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _sanitize_impossible_interface_rates(row: Dict[str, Any]) -> None:
+    speed_bps = _safe_float(row.get("speed_bps"))
+    if not speed_bps or speed_bps <= 0:
+        return
+    for bps_key, utilization_key in [
+        ("in_bps", "in_utilization_percent"),
+        ("out_bps", "out_utilization_percent"),
+    ]:
+        value = _safe_float(row.get(bps_key))
+        if value is None:
+            continue
+        if value < 0:
+            row[bps_key] = None
+            row[utilization_key] = None
+        elif value > speed_bps:
+            row[bps_key] = speed_bps
 
 
 def _latest_numeric(device_id: int, measurement: str, fields: List[str]) -> Optional[float]:
@@ -1278,6 +1312,7 @@ async def get_monitor_device_interface_history(
     interface_index: int,
     range: str = Query("-10m", description="历史时间范围"),
     interval: str = Query("30s", description="聚合间隔"),
+    group: str = Query("traffic", description="监控项分组"),
     start: Optional[str] = Query(None, description="绝对开始时间"),
     end: Optional[str] = Query(None, description="绝对结束时间"),
     start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
@@ -1306,7 +1341,8 @@ async def get_monitor_device_interface_history(
         range_clause = f'start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}'
         traffic_start_time = start_time.timestamp() - rate_window_seconds
         traffic_range_clause = f'start: {_flux_time(datetime.fromtimestamp(traffic_start_time, timezone.utc))}, stop: {_flux_time(end_time)}'
-        cache_suffix = f":v7:{interface_index}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}"
+        normalized_group = (group or "traffic").strip() or "traffic"
+        cache_suffix = f":v8:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}"
         logger.info(
             "端口历史绝对时间查询",
             device_id=device_id,
@@ -1318,10 +1354,15 @@ async def get_monitor_device_interface_history(
             interval=interval,
         )
     else:
+        normalized_group = (group or "traffic").strip() or "traffic"
         range_clause = f"start: {range}"
         traffic_range_clause = f"start: -{traffic_start}"
-        cache_suffix = f":v7:{interface_index}:{range}:{interval}"
-    cached_response = _load_monitor_cache("interface_history", device_id, suffix=cache_suffix)
+        cache_suffix = f":v8:{interface_index}:{normalized_group}:{range}:{interval}"
+    is_traffic_only = normalized_group == "traffic"
+    fresh_sample_written = False
+    if not is_traffic_only:
+        fresh_sample_written = await _persist_fresh_interface_sample(device, interface_index, range_seconds)
+    cached_response = None if fresh_sample_written else _load_monitor_cache("interface_history", device_id, suffix=cache_suffix)
     if isinstance(cached_response, dict):
         return cached_response
 
@@ -1330,6 +1371,30 @@ async def get_monitor_device_interface_history(
         lookup = await _resolve_asternos_interface_lookup(device, interface_index)
         interface_names = lookup["interface_names"]
     interface_filter = _interface_history_filter(interface_index, interface_names)
+
+    other_field_filter = '''
+        r._field == "speed_bps" or
+        r._field == "sample_seconds"
+    ''' if is_traffic_only else '''
+        r._field == "in_utilization_percent" or
+        r._field == "out_utilization_percent" or
+        r._field == "in_discards" or
+        r._field == "out_discards" or
+        r._field == "in_discards_delta" or
+        r._field == "out_discards_delta" or
+        r._field == "in_errors" or
+        r._field == "out_errors" or
+        r._field == "in_errors_delta" or
+        r._field == "out_errors_delta" or
+        r._field == "queue_egress_dropped_pkts_delta" or
+        r._field == "queue_ingress_dropped_pkts_delta" or
+        r._field == "pfc_rx_pkts_delta" or
+        r._field == "pfc_tx_pkts_delta" or
+        r._field == "ecn_marked_pkts_delta" or
+        r._field == "buffer_usage" or
+        r._field == "speed_bps" or
+        r._field == "sample_seconds"
+    '''
 
     flux = f'''
     rates = from(bucket: "{influx_client.bucket}")
@@ -1360,24 +1425,7 @@ async def get_monitor_device_interface_history(
       |> filter(fn: (r) => r.device_id == "{device_id}")
       |> filter(fn: (r) => {interface_filter})
       |> filter(fn: (r) =>
-        r._field == "in_utilization_percent" or
-        r._field == "out_utilization_percent" or
-        r._field == "in_discards" or
-        r._field == "out_discards" or
-        r._field == "in_discards_delta" or
-        r._field == "out_discards_delta" or
-        r._field == "in_errors" or
-        r._field == "out_errors" or
-        r._field == "in_errors_delta" or
-        r._field == "out_errors_delta" or
-        r._field == "queue_egress_dropped_pkts_delta" or
-        r._field == "queue_ingress_dropped_pkts_delta" or
-        r._field == "pfc_rx_pkts_delta" or
-        r._field == "pfc_tx_pkts_delta" or
-        r._field == "ecn_marked_pkts_delta" or
-        r._field == "buffer_usage" or
-        r._field == "speed_bps" or
-        r._field == "sample_seconds"
+        {other_field_filter}
       )
       |> aggregateWindow(every: {interval}, fn: max, createEmpty: false)
 
@@ -1396,11 +1444,15 @@ async def get_monitor_device_interface_history(
             interval=interval,
         )
     _apply_windowed_octet_rates(history, rate_window_seconds)
-    _apply_windowed_bps_average(history, rate_window_seconds, interval_seconds)
+    _apply_windowed_bps_average(history, rate_window_seconds, interval_seconds, range_seconds)
     if get_effective_monitor_source(device) == "asternos_exporter":
         _fill_short_rate_gaps(history)
     _recalculate_utilization_from_display_rates(history)
-    _mark_stale_rate_samples(history, interval_seconds)
+    _mark_stale_rate_samples(
+        history,
+        interval_seconds,
+        max_sample_seconds=max(75, rate_window_seconds + interval_seconds),
+    )
     cutoff = (start_time.timestamp() if use_absolute_range and start_time else datetime.now(timezone.utc).timestamp() - range_seconds)
     stop_ts = end_time.timestamp() if use_absolute_range else None
     history = [
@@ -1411,7 +1463,7 @@ async def get_monitor_device_interface_history(
             (stop_ts is None or _parse_history_time(row).timestamp() <= stop_ts)
         )
     ]
-    if not history:
+    if not history and not is_traffic_only:
         interface_metrics = await collect_current_interface_metrics(device, interface_index)
         if interface_metrics and interface_metrics.get("name"):
             persist_interface_metrics(device, interface_metrics, sync=True)

@@ -24,7 +24,7 @@ TACACS_SETTINGS_FILE = TACACS_DATA_DIR / "settings.json"
 TACACS_CONTAINER_NAME = "nm-tacacs"
 DOCKER_SOCKET = "/var/run/docker.sock"
 
-LOG_PATTERN = re.compile(r"(\w+ \d+ \d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
+LOG_PATTERN = re.compile(r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
 MONTH_MAP = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,

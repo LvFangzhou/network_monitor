@@ -23,7 +23,7 @@ class AlertRuleBase(BaseModel):
     duration: int = Field(default=0, ge=0)
     change_rate_threshold: Optional[float] = None
     change_rate_window: Optional[int] = None
-    severity: str = Field(default="P1", pattern="^(critical|warning|info|P0|P1|P2)$")
+    severity: str = Field(default="P1", pattern="^(critical|warning|info|P0|P1|P2|P3)$")
     suppress_duration: int = Field(default=300, ge=0)
     enabled: bool = True
     device_group_id: Optional[int] = None
@@ -47,7 +47,7 @@ class AlertRuleUpdate(BaseModel):
     duration: Optional[int] = Field(None, ge=0)
     change_rate_threshold: Optional[float] = None
     change_rate_window: Optional[int] = None
-    severity: Optional[str] = Field(None, pattern="^(critical|warning|info|P0|P1|P2)$")
+    severity: Optional[str] = Field(None, pattern="^(critical|warning|info|P0|P1|P2|P3)$")
     suppress_duration: Optional[int] = Field(None, ge=0)
     enabled: Optional[bool] = None
     notification_channels: Optional[List[NotificationChannel]] = None

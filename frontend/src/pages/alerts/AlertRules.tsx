@@ -77,6 +77,7 @@ const severityColors: Record<string, string> = {
   P0: 'red',
   P1: 'gold',
   P2: 'blue',
+  P3: 'default',
   critical: 'red',
   warning: 'gold',
   info: 'blue',
@@ -86,6 +87,7 @@ const severityLabels: Record<string, string> = {
   P0: 'P0',
   P1: 'P1',
   P2: 'P2',
+  P3: 'P3',
   critical: 'P0',
   warning: 'P1',
   info: 'P2',
@@ -450,6 +452,7 @@ const AlertRules = () => {
               { value: 'P0', label: 'P0' },
               { value: 'P1', label: 'P1' },
               { value: 'P2', label: 'P2' },
+              { value: 'P3', label: 'P3' },
             ]}
           />
           <Tooltip title="重置筛选">
@@ -795,6 +798,7 @@ const AlertRules = () => {
                 { value: 'P0', label: 'P0' },
                 { value: 'P1', label: 'P1' },
                 { value: 'P2', label: 'P2' },
+                { value: 'P3', label: 'P3' },
               ]}
             />
           </Form.Item>

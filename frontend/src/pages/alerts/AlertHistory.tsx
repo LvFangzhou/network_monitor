@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Button, Card, Col, Input, Row, Select, Space, Statistic, Table, Tag, Tooltip, message } from 'antd'
+import { useEffect, useState, type CSSProperties } from 'react'
+import { Button, Card, Col, Input, Row, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message } from 'antd'
 import { CheckOutlined, EyeInvisibleOutlined, ReloadOutlined } from '@ant-design/icons'
 import {
   acknowledgeAlert,
@@ -32,6 +32,7 @@ const severityLabels: Record<string, string> = {
   P0: 'P0',
   P1: 'P1',
   P2: 'P2',
+  P3: 'P3',
   critical: 'P0',
   warning: 'P1',
   info: 'P2',
@@ -41,10 +42,134 @@ const severityColors: Record<string, string> = {
   P0: 'red',
   P1: 'gold',
   P2: 'blue',
+  P3: 'default',
   critical: 'red',
   warning: 'gold',
   info: 'blue',
 }
+
+const compactTextStyle: CSSProperties = {
+  display: 'block',
+  maxWidth: '100%',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+}
+
+const multiLineTextStyle: CSSProperties = {
+  display: 'block',
+  maxWidth: '100%',
+  maxHeight: 60,
+  overflow: 'hidden',
+  wordBreak: 'break-word',
+  overflowWrap: 'anywhere',
+  whiteSpace: 'normal',
+  lineHeight: '20px',
+  fontWeight: 500,
+}
+
+const operationMessageStyle: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+  maxWidth: '100%',
+  fontSize: 12,
+  lineHeight: '20px',
+  fontWeight: 500,
+}
+
+const operationLabelStyle: CSSProperties = {
+  color: '#666',
+  fontWeight: 600,
+}
+
+const operationValueStyle: CSSProperties = {
+  display: 'inline',
+  wordBreak: 'break-word',
+  overflowWrap: 'anywhere',
+}
+
+const operationContentStyle: CSSProperties = {
+  ...multiLineTextStyle,
+  maxHeight: 40,
+  fontSize: 12,
+  color: '#222',
+}
+
+const decodeHexText = (value: string) => {
+  const text = value.trim()
+  if (!/^0x[0-9a-fA-F]+$/.test(text) || text.length % 2 !== 0) return ''
+  try {
+    const bytes = new Uint8Array((text.length - 2) / 2)
+    for (let i = 2, index = 0; i < text.length; i += 2, index += 1) {
+      bytes[index] = parseInt(text.slice(i, i + 2), 16)
+    }
+    return new TextDecoder('utf-8').decode(bytes).trim()
+  } catch {
+    return ''
+  }
+}
+
+const normalizeTrapText = (value?: string | null) => {
+  const text = (value || '').trim()
+  if (!text) return ''
+  return text.replace(/0x[0-9a-fA-F]+/g, (match) => decodeHexText(match) || match)
+}
+
+const extractTrapContent = (value?: string | null) => {
+  const normalized = normalizeTrapText(value)
+  const marker = 'Trap内容:'
+  const index = normalized.indexOf(marker)
+  if (index >= 0) return normalized.slice(index + marker.length).trim()
+  return normalized
+}
+
+const cleanOperationContent = (content: string, deviceName?: string | null) => {
+  let text = (content || '').trim()
+  const name = (deviceName || '').trim()
+  if (name && text.startsWith(name)) {
+    text = text.slice(name.length).replace(/^[\s/]+/, '')
+  }
+  if (text.includes(' / ')) {
+    const parts = text.split(' / ').map((item) => item.trim()).filter(Boolean)
+    text = parts.find((item) => item !== name) || parts[parts.length - 1] || text
+  }
+  if (name && text === name) {
+    text = ''
+  }
+  return text || '配置变更'
+}
+
+const extractTrapField = (text: string, label: string, nextLabels: string[]) => {
+  const start = text.indexOf(label)
+  if (start < 0) return ''
+  const valueStart = start + label.length
+  const end = nextLabels
+    .map((nextLabel) => text.indexOf(nextLabel, valueStart))
+    .filter((index) => index >= 0)
+    .sort((a, b) => a - b)[0]
+  return text.slice(valueStart, end ?? undefined).trim()
+}
+
+const operationMessageInfo = (record: AlertHistoryItem) => {
+  const text = normalizeTrapText(record.message || '')
+  const rawContent = extractTrapContent(text)
+  return {
+    fullText: text,
+    ruleName: extractTrapField(text, '规则:', ['Trap OID:', 'Trap级别:', '设备时间:', 'Trap内容:']),
+    trapTime: extractTrapField(text, '设备时间:', ['Trap内容:']),
+    content: cleanOperationContent(rawContent, record.device_name),
+  }
+}
+
+const displayTargetName = (record: AlertHistoryItem) => {
+  if (record.severity === 'P3' || record.alert_target_type === 'snmp_trap') {
+    return ''
+  }
+  return record.alert_target_name || ''
+}
+
+const isOperationRecord = (record: AlertHistoryItem) => record.severity === 'P3'
 
 const AlertHistory = () => {
   const [items, setItems] = useState<AlertHistoryItem[]>([])
@@ -197,6 +322,7 @@ const AlertHistory = () => {
                 { value: 'P0', label: 'P0' },
                 { value: 'P1', label: 'P1' },
                 { value: 'P2', label: 'P2' },
+                { value: 'P3', label: 'P3' },
               ]}
             />
             <Input
@@ -215,6 +341,8 @@ const AlertHistory = () => {
       >
         <Table
           rowKey="id"
+          tableLayout="fixed"
+          scroll={{ x: 1180 }}
           loading={loading}
           dataSource={items}
           pagination={{
@@ -234,16 +362,26 @@ const AlertHistory = () => {
             {
               title: 'Alarm ID',
               dataIndex: 'alarm_id',
+              width: 92,
+              onCell: () => ({ style: { verticalAlign: 'top' } }),
               render: (value?: string | null) => value || '-',
             },
             {
               title: '设备',
+              width: 300,
+              onCell: () => ({ style: { verticalAlign: 'top' } }),
               render: (_: unknown, record: AlertHistoryItem) => (
                 <Space direction="vertical" size={0}>
-                  <span>{record.device_name || `设备 ${record.device_id}`}</span>
+                  <Tooltip title={record.device_name || `设备 ${record.device_id}`}>
+                    <Typography.Text style={compactTextStyle}>{record.device_name || `设备 ${record.device_id}`}</Typography.Text>
+                  </Tooltip>
                   <span style={{ color: '#666', fontSize: 12 }}>{record.device_ip || '-'}</span>
-                  {record.alert_target_name ? (
-                    <span style={{ color: '#999', fontSize: 12 }}>{record.alert_target_name}</span>
+                  {displayTargetName(record) ? (
+                    <Tooltip title={displayTargetName(record)}>
+                      <Typography.Text style={{ ...compactTextStyle, color: '#999', fontSize: 12 }}>
+                        {displayTargetName(record)}
+                      </Typography.Text>
+                    </Tooltip>
                   ) : null}
                 </Space>
               ),
@@ -251,24 +389,69 @@ const AlertHistory = () => {
             {
               title: '消息',
               dataIndex: 'message',
+              width: 520,
+              onCell: () => ({ style: { verticalAlign: 'top' } }),
+              render: (value?: string | null, record?: AlertHistoryItem) => {
+                if (record && isOperationRecord(record)) {
+                  const info = operationMessageInfo(record)
+                  return (
+                    <Tooltip title={<span style={{ whiteSpace: 'pre-wrap' }}>{info.fullText}</span>}>
+                      <div style={operationMessageStyle}>
+                        <div style={compactTextStyle}>
+                          <span style={operationLabelStyle}>记录类型：</span>
+                          <span style={operationValueStyle}>{info.ruleName || '山石配置变更Trap'}</span>
+                        </div>
+                        {info.trapTime ? (
+                          <div style={compactTextStyle}>
+                            <span style={operationLabelStyle}>设备时间：</span>
+                            <span style={operationValueStyle}>{info.trapTime}</span>
+                          </div>
+                        ) : null}
+                        <div style={operationContentStyle}>
+                          <span style={operationLabelStyle}>变更内容：</span>
+                          <span>{info.content || '-'}</span>
+                        </div>
+                      </div>
+                    </Tooltip>
+                  )
+                }
+                const text = value || '-'
+                return (
+                  <Tooltip title={<span style={{ whiteSpace: 'pre-wrap' }}>{text}</span>}>
+                    <Typography.Text style={multiLineTextStyle}>{text}</Typography.Text>
+                  </Tooltip>
+                )
+              },
             },
             {
               title: '级别',
               dataIndex: 'severity',
+              width: 76,
+              onCell: () => ({ style: { verticalAlign: 'top' } }),
               render: (value?: string | null) => <Tag color={value ? severityColors[value] || 'default' : 'default'}>{value ? severityLabels[value] || value : '-'}</Tag>,
             },
             {
               title: '状态',
               dataIndex: 'status',
-              render: (value: string) => <Tag color={statusColors[value] || 'default'}>{statusLabels[value] || value}</Tag>,
+              width: 88,
+              onCell: () => ({ style: { verticalAlign: 'top' } }),
+              render: (value: string, record: AlertHistoryItem) => (
+                isOperationRecord(record)
+                  ? <Tag color="default">变更记录</Tag>
+                  : <Tag color={statusColors[value] || 'default'}>{statusLabels[value] || value}</Tag>
+              ),
             },
             {
               title: '处理人',
+              width: 90,
+              onCell: () => ({ style: { verticalAlign: 'top' } }),
               render: (_: unknown, record: AlertHistoryItem) => record.current_handler || '-',
             },
             {
               title: '开始时间',
               dataIndex: 'started_at',
+              width: 170,
+              onCell: () => ({ style: { verticalAlign: 'top' } }),
               render: (value?: string | null) => value ? new Date(value).toLocaleString() : '-',
             },
             canModify ? {
@@ -276,21 +459,21 @@ const AlertHistory = () => {
               width: 160,
               render: (_: unknown, record: AlertHistoryItem) => (
                 <Space>
-                  {record.status === 'firing' && (
+                  {!isOperationRecord(record) && record.status === 'firing' && (
                     <Tooltip title="确认告警">
                       <Button size="small" icon={<CheckOutlined />} onClick={() => handleAcknowledge(record.id)}>
                       确认
                       </Button>
                     </Tooltip>
                   )}
-                  {record.status === 'firing' && (
+                  {!isOperationRecord(record) && record.status === 'firing' && (
                     <Tooltip title="忽略告警">
                       <Button size="small" icon={<EyeInvisibleOutlined />} onClick={() => handleIgnore(record.id)}>
                       忽略
                       </Button>
                     </Tooltip>
                   )}
-                  {record.status !== 'resolved' && record.status !== 'snoozed' && (
+                  {!isOperationRecord(record) && record.status !== 'resolved' && record.status !== 'snoozed' && (
                     <Tooltip title="暂停复查一小时">
                       <Button size="small" type="primary" onClick={() => handleResolve(record.id)}>
                       解决

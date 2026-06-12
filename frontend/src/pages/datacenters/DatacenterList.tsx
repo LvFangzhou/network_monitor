@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import {
   Button,
   Card,
+  Checkbox,
+  Dropdown,
   Form,
   Input,
   Modal,
@@ -15,7 +17,7 @@ import {
   DatePicker,
 } from 'antd'
 import dayjs from 'dayjs'
-import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons'
+import { DeleteOutlined, EditOutlined, PlusOutlined, SettingOutlined } from '@ant-design/icons'
 import {
   createDatacenter,
   deleteDatacenter,
@@ -32,6 +34,18 @@ const tablePagination = {
   showTotal: (total: number, range: [number, number]) => `第 ${range[0]}-${range[1]} 条 / 共 ${total} 条`,
 }
 
+const VISIBLE_COLUMNS_STORAGE_KEY = 'datacenter-visible-columns'
+const defaultVisibleColumns = [
+  'name',
+  'code',
+  'location',
+  'address',
+  'contact_person',
+  'contact_phone',
+  'build_date',
+  'is_active',
+]
+
 const DatacenterList = () => {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
@@ -39,6 +53,20 @@ const DatacenterList = () => {
   const [open, setOpen] = useState(false)
   const [datacenters, setDatacenters] = useState<Datacenter[]>([])
   const [editingDatacenter, setEditingDatacenter] = useState<Datacenter | null>(null)
+  const [visibleColumns, setVisibleColumns] = useState<string[]>(() => {
+    try {
+      const storedColumns = window.localStorage.getItem(VISIBLE_COLUMNS_STORAGE_KEY)
+      if (storedColumns) {
+        const parsed = JSON.parse(storedColumns)
+        if (Array.isArray(parsed)) {
+          return parsed
+        }
+      }
+    } catch {
+      // Ignore invalid localStorage values and use the default column set.
+    }
+    return defaultVisibleColumns
+  })
   const canModify = !useAuthStore((state) => state.user?.read_only)
 
   const fetchDatacenters = async () => {
@@ -56,6 +84,10 @@ const DatacenterList = () => {
   useEffect(() => {
     fetchDatacenters()
   }, [])
+
+  useEffect(() => {
+    window.localStorage.setItem(VISIBLE_COLUMNS_STORAGE_KEY, JSON.stringify(visibleColumns))
+  }, [visibleColumns])
 
   const handleCreate = () => {
     setEditingDatacenter(null)
@@ -113,97 +145,144 @@ const DatacenterList = () => {
     }
   }
 
+  const allColumns = [
+    {
+      title: '机房名称',
+      dataIndex: 'name',
+      key: 'name',
+    },
+    {
+      title: '机房编号',
+      dataIndex: 'code',
+      key: 'code',
+      render: (value: string) => value || '-',
+    },
+    {
+      title: '位置',
+      dataIndex: 'location',
+      key: 'location',
+      render: (value: string) => value || '-',
+    },
+    {
+      title: '详细地址',
+      dataIndex: 'address',
+      key: 'address',
+      render: (value: string) => value || '-',
+    },
+    {
+      title: '负责人',
+      dataIndex: 'contact_person',
+      key: 'contact_person',
+      render: (value: string) => value || '-',
+    },
+    {
+      title: '负责人电话',
+      dataIndex: 'contact_phone',
+      key: 'contact_phone',
+      render: (value: string) => value || '-',
+    },
+    {
+      title: '负责人邮箱',
+      dataIndex: 'contact_email',
+      key: 'contact_email',
+      render: (value: string) => value || '-',
+    },
+    {
+      title: '建设时间',
+      dataIndex: 'build_date',
+      key: 'build_date',
+      render: (value: string) => (value ? dayjs(value).format('YYYY-MM-DD') : '-'),
+    },
+    {
+      title: '状态',
+      dataIndex: 'is_active',
+      key: 'is_active',
+      render: (value: boolean) => (
+        <Tag color={value ? 'success' : 'default'}>
+          {value ? '启用' : '停用'}
+        </Tag>
+      ),
+    },
+    {
+      title: '操作',
+      key: 'action',
+      render: (_: unknown, record: Datacenter) => (
+        <Space>
+          <Tooltip title="编辑">
+            <Button type="text" icon={<EditOutlined />} onClick={() => handleEdit(record)} />
+          </Tooltip>
+          <Popconfirm
+            title="确认删除该机房吗？"
+            onConfirm={() => handleDelete(record.id)}
+            okText="删除"
+            cancelText="取消"
+          >
+            <Tooltip title="删除">
+              <Button type="text" danger icon={<DeleteOutlined />} />
+            </Tooltip>
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ]
+
+  const tableColumns = allColumns.filter((column) => {
+    if (column.key === 'action') {
+      return canModify
+    }
+    return visibleColumns.includes(String(column.key))
+  })
+
   return (
     <Card
       title="机房管理"
-      extra={canModify ? (
-        <Tooltip title="新增机房">
-          <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>
-            新增机房
-          </Button>
-        </Tooltip>
-      ) : null}
+      extra={(
+        <Space>
+          <Dropdown
+            trigger={['click']}
+            menu={{
+              items: [
+                {
+                  key: 'visible-columns',
+                  label: (
+                    <Checkbox.Group
+                      value={visibleColumns}
+                      onChange={(values) => setVisibleColumns(values as string[])}
+                      style={{ display: 'grid', rowGap: 8 }}
+                    >
+                      {allColumns
+                        .filter((column) => column.key !== 'action')
+                        .map((column) => (
+                          <Checkbox key={String(column.key)} value={String(column.key)}>
+                            {String(column.title)}
+                          </Checkbox>
+                        ))}
+                    </Checkbox.Group>
+                  ),
+                },
+              ],
+            }}
+          >
+            <Tooltip title="显示或隐藏列">
+              <Button icon={<SettingOutlined />}>显示/隐藏列</Button>
+            </Tooltip>
+          </Dropdown>
+          {canModify ? (
+            <Tooltip title="新增机房">
+              <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>
+                新增机房
+              </Button>
+            </Tooltip>
+          ) : null}
+        </Space>
+      )}
     >
       <Table
         rowKey="id"
         loading={loading}
         dataSource={datacenters}
         pagination={tablePagination}
-        columns={[
-          {
-            title: '机房名称',
-            dataIndex: 'name',
-            key: 'name',
-          },
-          {
-            title: '机房编号',
-            dataIndex: 'code',
-            key: 'code',
-            render: (value: string) => value || '-',
-          },
-          {
-            title: '位置',
-            dataIndex: 'location',
-            key: 'location',
-            render: (value: string) => value || '-',
-          },
-          {
-            title: '负责人',
-            dataIndex: 'contact_person',
-            key: 'contact_person',
-            render: (value: string) => value || '-',
-          },
-          {
-            title: '负责人电话',
-            dataIndex: 'contact_phone',
-            key: 'contact_phone',
-            render: (value: string) => value || '-',
-          },
-          {
-            title: '负责人邮箱',
-            dataIndex: 'contact_email',
-            key: 'contact_email',
-            render: (value: string) => value || '-',
-          },
-          {
-            title: '建设时间',
-            dataIndex: 'build_date',
-            key: 'build_date',
-            render: (value: string) => (value ? dayjs(value).format('YYYY-MM-DD') : '-'),
-          },
-          {
-            title: '状态',
-            dataIndex: 'is_active',
-            key: 'is_active',
-            render: (value: boolean) => (
-              <Tag color={value ? 'success' : 'default'}>
-                {value ? '启用' : '停用'}
-              </Tag>
-            ),
-          },
-          {
-            title: '操作',
-            key: 'action',
-            render: (_: unknown, record: Datacenter) => (
-              <Space>
-                <Tooltip title="编辑">
-                  <Button type="text" icon={<EditOutlined />} onClick={() => handleEdit(record)} />
-                </Tooltip>
-                <Popconfirm
-                  title="确认删除该机房吗？"
-                  onConfirm={() => handleDelete(record.id)}
-                  okText="删除"
-                  cancelText="取消"
-                >
-                  <Tooltip title="删除">
-                    <Button type="text" danger icon={<DeleteOutlined />} />
-                  </Tooltip>
-                </Popconfirm>
-              </Space>
-            ),
-            hidden: !canModify,
-          },
-        ]}
+        columns={tableColumns}
       />
 
       <Modal

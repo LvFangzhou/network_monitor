@@ -54,7 +54,7 @@ const SORT_OPTIONS = [
   { value: 'temperature_desc', label: '温度从高到低' },
   { value: 'storage_desc', label: '存储从高到低' },
   { value: 'hardware_down_desc', label: '硬件异常优先' },
-  { value: 'protocol_down_desc', label: '协议失败优先' },
+  { value: 'protocol_down_desc', label: 'BGP/OSPF 异常优先' },
   { value: 'vendor_asc', label: '厂商 A-Z' },
   { value: 'model_asc', label: '型号 A-Z' },
 ]
@@ -68,7 +68,7 @@ const ipToNumber = (ip?: string) => {
 const normalizePercent = (value?: number | null) => {
   if (value === undefined || value === null) return null
   const numeric = Number(value)
-  return numeric <= 1 ? numeric * 100 : numeric
+  return numeric
 }
 
 const formatPercent = (value?: number | null) => {
@@ -111,7 +111,7 @@ const ProtocolCell = ({ data }: { data: DeviceProtocolSummary }) => {
   return (
     <Space size={4}>
       <Tag color={color}>{data.up}/{data.total}</Tag>
-      {data.down > 0 ? <Text type="danger">失败 {data.down}</Text> : null}
+      {data.down > 0 ? <Text type="danger">异常 {data.down}</Text> : null}
     </Space>
   )
 }
@@ -264,8 +264,9 @@ const DeviceOverview = () => {
 
   const stats = useMemo(() => {
     const reachable = items.filter((item) => item.connectivity.status === 'reachable').length
-    const protocolDown = items.reduce((sum, item) => sum + item.protocols.bgp.down + item.protocols.ospf.down, 0)
-    return { total: items.length, reachable, protocolDown }
+    const bgpDown = items.reduce((sum, item) => sum + item.protocols.bgp.down, 0)
+    const ospfDown = items.reduce((sum, item) => sum + item.protocols.ospf.down, 0)
+    return { total: items.length, reachable, bgpDown, ospfDown }
   }, [items])
 
   const openDetail = async (item: DeviceOverviewItem) => {
@@ -499,7 +500,12 @@ const DeviceOverview = () => {
         <Space wrap style={{ marginTop: 12 }}>
           <Tag color="blue">设备 {stats.total}</Tag>
           <Tag color="green">连通 {stats.reachable}</Tag>
-          <Tag color={stats.protocolDown > 0 ? 'red' : 'default'}>协议失败 {stats.protocolDown}</Tag>
+          <Tooltip title="BGP 邻居状态不是 established 的总数">
+            <Tag color={stats.bgpDown > 0 ? 'red' : 'default'}>BGP 异常 {stats.bgpDown}</Tag>
+          </Tooltip>
+          <Tooltip title="OSPF 邻居状态不是 full 的总数">
+            <Tag color={stats.ospfDown > 0 ? 'red' : 'default'}>OSPF 异常 {stats.ospfDown}</Tag>
+          </Tooltip>
         </Space>
       </Card>
 

@@ -139,29 +139,42 @@ class NotificationManager:
                 "feishu": "blue",
                 "wechat_desc_color": 0,
             },
+            "P3": {
+                "label": "P3",
+                "hex": "#8C8C8C",
+                "feishu": "grey",
+                "wechat_desc_color": 0,
+            },
         }
         return mapping.get(severity, mapping["P1"])
 
     def _build_card_rows_markdown(self, card_data: Optional[Dict[str, Any]]) -> str:
         rows = (card_data or {}).get("rows") or []
         lines = []
+        is_operation = card_data and card_data.get("notification_kind") == "operation"
         for row in rows:
             label = str(row.get("label") or "").strip()
             value = str(row.get("value") or "")
             if not label or not value.strip():
                 continue
+            if is_operation and label == "变更内容" and len(value) > 300:
+                value = value[:300] + "..."
             lines.append(f"**{label}：**{value}")
         if card_data and card_data.get("detail_url"):
-            lines.append(f"[故障详情]({card_data['detail_url']})")
+            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "故障详情"
+            lines.append(f"[{detail_label}]({card_data['detail_url']})")
         return "\n".join(lines)
 
     def _build_compact_rows_markdown(self, card_data: Optional[Dict[str, Any]]) -> str:
         rows = (card_data or {}).get("rows") or []
         lines = []
+        is_operation = card_data and card_data.get("notification_kind") == "operation"
         for row in rows:
             label = str(row.get("label") or "").strip()
             value = str(row.get("value") or "")
             if label and value.strip():
+                if is_operation and label == "变更内容" and len(value) > 300:
+                    value = value[:300] + "..."
                 lines.append(f"**{label}：**{value}")
         return "\n".join(lines)
 
@@ -179,6 +192,8 @@ class NotificationManager:
         elif severity == "P1":
             color = "#FA8C16"
         elif severity == "P2":
+            color = "comment"
+        elif severity == "P3":
             color = "comment"
         else:
             color = "warning"
@@ -248,6 +263,7 @@ class NotificationManager:
 
         if card_data:
             severity_style = self._severity_style(card_data)
+            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "故障详情"
             markdown_lines = [
                 f"## <font color=\"{severity_style['hex']}\">{title}</font>",
             ]
@@ -255,15 +271,17 @@ class NotificationManager:
                 label = str(row.get("label") or "").strip()
                 value = str(row.get("value") or "").strip()
                 if label and value:
+                    if card_data.get("notification_kind") == "operation" and label == "变更内容" and len(value) > 300:
+                        value = value[:300] + "..."
                     markdown_lines.append(f"**{label}：**{value}")
             if card_data.get("detail_url"):
-                markdown_lines.append(f"[故障详情]({card_data['detail_url']})")
+                markdown_lines.append(f"[{detail_label}]({card_data['detail_url']})")
                 message = {
                     "msgtype": "actionCard",
                     "actionCard": {
                         "title": title,
                         "text": "\n".join(markdown_lines),
-                        "singleTitle": "故障详情",
+                        "singleTitle": detail_label,
                         "singleURL": card_data["detail_url"],
                         "btnOrientation": "0",
                     },
@@ -325,6 +343,7 @@ class NotificationManager:
 
         if card_data:
             severity_style = self._severity_style(card_data)
+            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "故障详情"
             elements = [{
                 "tag": "div",
                 "text": {
@@ -341,7 +360,7 @@ class NotificationManager:
                             "type": "primary",
                             "text": {
                                 "tag": "plain_text",
-                                "content": "故障详情",
+                                "content": detail_label,
                             },
                             "url": card_data["detail_url"],
                         }

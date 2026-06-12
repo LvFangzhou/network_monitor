@@ -86,6 +86,7 @@ type ChartPoint = {
   pfc_tx_pkts_delta?: number | null
   ecn_marked_pkts_delta?: number | null
   buffer_usage?: number | null
+  speed_bps?: number | null
   [key: string]: number | string | null | undefined
 }
 
@@ -103,7 +104,7 @@ type ZoomRange = {
 }
 
 const DEVICE_SEARCH_DEBOUNCE_MS = 300
-const MONITOR_HISTORY_CACHE_KEY = 'monitor_center_history_v6'
+const MONITOR_HISTORY_CACHE_KEY = 'monitor_center_history_v7'
 const MONITOR_CENTER_STATE_KEY = 'monitor_center_state_v1'
 const HISTORY_CACHE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const HISTORY_REQUEST_CACHE_MS = 8 * 1000
@@ -293,37 +294,27 @@ const formatAxisTick = (
   return `${scaledValue.toFixed(precision)}`
 }
 
-const getChartDomain = (values: number[]) => {
-  if (!values.length) {
-    return [0, 1]
+const getLinearYAxisTicks = (values: number[], divisions = 5, fixedMax?: number | null) => {
+  const numericValues = values.filter((value) => Number.isFinite(value) && value >= 0)
+  const dataMax = numericValues.length ? Math.max(...numericValues) : 1
+  const niceMax = Math.max(getNiceAxisMax(dataMax), 1)
+  const maxTick = fixedMax && fixedMax > 0 ? Math.min(niceMax, fixedMax) : niceMax
+  const step = maxTick / divisions
+  const ticks = Array.from({ length: divisions + 1 }, (_, index) => Number((step * index).toFixed(6)))
+  return {
+    ticks,
+    domain: [0, maxTick] as [number, number],
   }
+}
 
-  const max = Math.max(...values)
-  const positiveValues = values.filter((value) => value > 0)
-
-  if (max <= 0) {
-    return [0, 1]
-  }
-
-  if (!positiveValues.length) {
-    return [0, Math.max(max * 1.2, 1)]
-  }
-
-  const minPositive = Math.min(...positiveValues)
-  const paddedMax = max * 1.1
-
-  if (positiveValues.length === 1) {
-    return [0, Math.max(paddedMax, minPositive * 1.5, 1)]
-  }
-
-  const dynamicMin = minPositive * 0.9
-  const spread = max - minPositive
-
-  if (spread <= max * 0.2) {
-    return [Math.max(0, dynamicMin), Math.max(paddedMax, minPositive * 1.05)]
-  }
-
-  return [0, Math.max(paddedMax, 1)]
+const getNiceAxisMax = (value: number) => {
+  if (!Number.isFinite(value) || value <= 0) return 1
+  const target = value * 1.08
+  const exponent = Math.floor(Math.log10(target))
+  const base = 10 ** exponent
+  const normalized = target / base
+  const niceNormalized = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10
+  return niceNormalized * base
 }
 
 const toChartPoint = (item: MonitorHistoryPoint | { _time?: string } & Record<string, any>): ChartPoint => {
@@ -356,6 +347,7 @@ const toChartPoint = (item: MonitorHistoryPoint | { _time?: string } & Record<st
     pfc_tx_pkts_delta: item.pfc_tx_pkts_delta ?? null,
     ecn_marked_pkts_delta: item.ecn_marked_pkts_delta ?? null,
     buffer_usage: item.buffer_usage ?? null,
+    speed_bps: item.speed_bps ?? null,
   }
 }
 
@@ -385,6 +377,16 @@ const getXAxisTickCount = (rangeValue: string) => {
   if (rangeValue === '-12h') return 9
   if (rangeValue === '-24h') return 9
   return 8
+}
+
+const getLinearXAxisTicks = (domain: [number, number], rangeValue: string) => {
+  const [start, end] = domain
+  const count = getXAxisTickCount(rangeValue)
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || count <= 1) {
+    return []
+  }
+  const step = (end - start) / (count - 1)
+  return Array.from({ length: count }, (_, index) => Math.round(start + step * index))
 }
 
 const getRangeWindowMs = (rangeValue: string) => {
@@ -508,13 +510,106 @@ const insertCollectionGaps = (
   const result: ChartPoint[] = []
   for (const point of validPoints) {
     const previous = result[result.length - 1]
-    if (previous && point.timestamp - previous.timestamp > gapThresholdMs) {
+    const previousSampleMs = typeof previous?.sample_seconds === 'number' ? previous.sample_seconds * 1000 : 0
+    const currentSampleMs = typeof point.sample_seconds === 'number' ? point.sample_seconds * 1000 : 0
+    const dynamicGapThresholdMs = Math.max(gapThresholdMs, previousSampleMs * 1.6, currentSampleMs * 1.6)
+    if (previous && point.timestamp - previous.timestamp > dynamicGapThresholdMs) {
       result.push(buildGapPoint(previous.timestamp + 1, series, gapValue))
       result.push(buildGapPoint(point.timestamp - 1, series, gapValue))
     }
     result.push(point)
   }
   return result
+}
+
+const interpolateValue = (
+  before: ChartPoint | undefined,
+  after: ChartPoint | undefined,
+  timestamp: number,
+  key: string,
+  gapThresholdMs: number
+) => {
+  const beforeValue = before?.[key]
+  const afterValue = after?.[key]
+  const beforeNumber = typeof beforeValue === 'number' ? beforeValue : null
+  const afterNumber = typeof afterValue === 'number' ? afterValue : null
+
+  if (before && Math.abs(timestamp - before.timestamp) <= 1 && beforeNumber !== null) {
+    return beforeNumber
+  }
+  if (after && Math.abs(after.timestamp - timestamp) <= 1 && afterNumber !== null) {
+    return afterNumber
+  }
+  if (
+    before &&
+    after &&
+    before.timestamp < timestamp &&
+    after.timestamp > timestamp &&
+    after.timestamp - before.timestamp <= gapThresholdMs &&
+    beforeNumber !== null &&
+    afterNumber !== null
+  ) {
+    const ratio = (timestamp - before.timestamp) / (after.timestamp - before.timestamp)
+    return beforeNumber + (afterNumber - beforeNumber) * ratio
+  }
+  if (before && timestamp - before.timestamp <= gapThresholdMs && beforeNumber !== null) {
+    return beforeNumber
+  }
+  if (after && after.timestamp - timestamp <= gapThresholdMs && afterNumber !== null) {
+    return afterNumber
+  }
+  return 0
+}
+
+const resampleChartData = (
+  points: ChartPoint[],
+  series: MonitorGroup['series'],
+  domain: [number, number],
+  interval: string,
+  gapThresholdMs: number,
+  unit: MonitorGroup['unit']
+) => {
+  if (unit !== 'bps') {
+    return insertCollectionGaps(points, series, gapThresholdMs, null)
+  }
+
+  const validPoints = points
+    .filter((point) => hasSeriesValue(point, series))
+    .sort((a, b) => a.timestamp - b.timestamp)
+  if (!validPoints.length) return []
+
+  const stepMs = parseIntervalMs(interval)
+  const start = Math.max(domain[0], Math.ceil(validPoints[0].timestamp / stepMs) * stepMs)
+  const end = Math.min(domain[1], Math.floor(validPoints[validPoints.length - 1].timestamp / stepMs) * stepMs)
+  if (end < start) return validPoints
+
+  const pointsByTimestamp = new Map(validPoints.map((point) => [point.timestamp, point]))
+  const sampled: ChartPoint[] = []
+  let cursor = 0
+
+  for (let timestamp = start; timestamp <= end; timestamp += stepMs) {
+    while (cursor < validPoints.length && validPoints[cursor].timestamp < timestamp) {
+      cursor += 1
+    }
+    const exact = pointsByTimestamp.get(timestamp)
+    const before = exact || validPoints[cursor - 1]
+    const after = exact || validPoints[cursor]
+    const point: ChartPoint = {
+      timestamp,
+      sample_seconds: exact?.sample_seconds ?? before?.sample_seconds ?? after?.sample_seconds ?? null,
+      speed_bps: exact?.speed_bps ?? before?.speed_bps ?? after?.speed_bps ?? null,
+    }
+
+    for (const serie of series) {
+      point[serie.key] = exact && typeof exact[serie.key] === 'number'
+        ? exact[serie.key] as number
+        : interpolateValue(before, after, timestamp, serie.key, gapThresholdMs)
+    }
+
+    sampled.push(point)
+  }
+
+  return sampled
 }
 
 const trimChartPointsToRange = (points: ChartPoint[], rangeValue: string, now = Date.now()) => {
@@ -845,6 +940,7 @@ const Metrics = () => {
             : getMonitorInterfaceHistory(target.device.id, target.interface.index, {
                 range: rangeConfig.value,
                 interval,
+                group: selectedMonitorKey,
               }).then((history) => [cacheKey, fallbackKey, history.data.map(toChartPoint)] as const)
 
           historyPendingRef.current[cacheKey] = pending
@@ -1001,16 +1097,13 @@ const Metrics = () => {
       const end = Math.max(current.start, current.end)
       const zoomRangeValue = getRangeValueForWindowMs(end - start)
       const zoomInterval = getAdaptiveInterval(zoomRangeValue)
-      setZoomRanges((previous) => ({
-        ...previous,
-        [targetKeyValue]: { start, end, rangeValue: zoomRangeValue, interval: zoomInterval },
-      }))
       const target = selectedTargets.find((item) => item.key === targetKeyValue)
       if (target && !isQueueDetailGroup(selectedMonitorKey)) {
         const cacheKey = zoomHistoryCacheKey(target.key, start, end, zoomInterval, selectedMonitorKey)
         void getMonitorInterfaceHistory(target.device.id, target.interface.index, {
           range: zoomRangeValue,
           interval: zoomInterval,
+          group: selectedMonitorKey,
           start_ts: start,
           end_ts: end,
         }).then((history) => {
@@ -1019,9 +1112,18 @@ const Metrics = () => {
             [cacheKey]: history.data.map(toChartPoint),
           }))
           historyFetchedAtRef.current[cacheKey] = Date.now()
+          setZoomRanges((previous) => ({
+            ...previous,
+            [targetKeyValue]: { start, end, rangeValue: zoomRangeValue, interval: zoomInterval },
+          }))
         }).catch((error: any) => {
           message.error(error?.response?.data?.detail || '加载缩放区间数据失败')
         })
+      } else {
+        setZoomRanges((previous) => ({
+          ...previous,
+          [targetKeyValue]: { start, end, rangeValue: zoomRangeValue, interval: zoomInterval },
+        }))
       }
 
       const next = { ...prev }
@@ -1044,22 +1146,6 @@ const Metrics = () => {
   }
 
   const handleRangeChange = (nextRange: string) => {
-    const nextRangeConfig = RANGE_OPTIONS.find((item) => item.value === nextRange) || RANGE_OPTIONS[0]
-    const nextInterval = getAdaptiveInterval(nextRangeConfig.value)
-    const currentCacheKey = historyCacheKey('', rangeValue, selectedRange.interval, selectedMonitorKey)
-    setHistoryMap((prev) => {
-      const next = { ...prev }
-      for (const target of selectedTargets) {
-        const targetNextKey = historyCacheKey(target.key, nextRangeConfig.value, nextInterval, selectedMonitorKey)
-        if (next[targetNextKey]?.length) continue
-        const targetCurrentKey = `${target.key}${currentCacheKey}`
-        const fallbackPoints = next[targetCurrentKey] || next[target.key]
-        if (fallbackPoints?.length) {
-          next[targetNextKey] = fallbackPoints
-        }
-      }
-      return next
-    })
     setRangeValue(nextRange)
     setZoomRanges({})
     setDragSelections({})
@@ -1151,7 +1237,7 @@ const Metrics = () => {
       const series = isQueueDetailGroup(selectedMonitorKey)
         ? (queueSeriesMap[currentHistoryKey] || [])
         : selectedMonitorGroup.series
-      const baseHistory = historyMap[currentHistoryKey] || (!isQueueDetailGroup(selectedMonitorKey) ? historyMap[target.key] : undefined) || []
+      const baseHistory = historyMap[currentHistoryKey] || []
       const rawData = zoomRange?.start && zoomRange?.end
         ? baseHistory
         : trimChartPointsToRange(baseHistory, effectiveRangeValue, now)
@@ -1161,15 +1247,23 @@ const Metrics = () => {
       const xDomain: [number, number] = zoomRange?.start && zoomRange?.end
         ? [zoomRange.start, zoomRange.end]
         : [rangeStart, now]
-      const gapValue = null
-      const data = insertCollectionGaps(zoomedData, series, gapThresholdMs, gapValue)
+      const data = resampleChartData(zoomedData, series, xDomain, effectiveInterval, gapThresholdMs, selectedMonitorGroup.unit)
       const pointCount = data.filter((point) => hasSeriesValue(point, series)).length
       const dotStride = getChartDotStride(effectiveRangeValue, pointCount)
       const values = series.flatMap((serie) =>
         data.map((item) => item[serie.key]).filter((value): value is number => typeof value === 'number')
       )
       const max = values.length ? Math.max(...values) : null
+      const speedValues = data
+        .map((item) => item.speed_bps)
+        .filter((value): value is number => typeof value === 'number' && value > 0)
+      const speedCap = selectedMonitorGroup.unit === 'bps'
+        ? (speedValues.length ? Math.max(...speedValues) : target.interface.speed_bps)
+        : null
+      const yAxis = getLinearYAxisTicks(values, 5, speedCap)
       const latestPoint = [...data].reverse().find((point) => hasSeriesValue(point, series))
+      const xTicks = getLinearXAxisTicks(xDomain, effectiveRangeValue)
+      const axisMax = yAxis.domain[1]
 
       return {
         target,
@@ -1177,12 +1271,14 @@ const Metrics = () => {
         series,
         max,
         latestPoint,
-        domain: getChartDomain(values),
-        scale: getDisplayScale(selectedMonitorGroup.unit, max),
+        domain: yAxis.domain,
+        yTicks: yAxis.ticks,
+        scale: getDisplayScale(selectedMonitorGroup.unit, axisMax),
         zoomRange,
         effectiveRangeValue,
         effectiveInterval,
         xDomain,
+        xTicks,
         dragSelection: dragSelections[target.key],
         pointCount,
         dotStride,
@@ -1378,7 +1474,7 @@ const Metrics = () => {
             alignItems: 'start',
           }}
         >
-          {chartCards.map(({ target, data, series, max, latestPoint, domain, scale, zoomRange, effectiveRangeValue, effectiveInterval, xDomain, dragSelection, dotStride }) => (
+          {chartCards.map(({ target, data, series, max, latestPoint, domain, yTicks, scale, zoomRange, effectiveRangeValue, effectiveInterval, xDomain, xTicks, dragSelection, dotStride }) => (
             <Card
               key={target.key}
               onDragOver={(event) => {
@@ -1477,8 +1573,8 @@ const Metrics = () => {
                         type="number"
                         scale="time"
                         domain={xDomain}
-                        tickCount={getXAxisTickCount(effectiveRangeValue)}
-                        interval="preserveStartEnd"
+                        ticks={xTicks}
+                        interval={0}
                         minTickGap={getXAxisMinTickGap(effectiveRangeValue)}
                         tickFormatter={(value) => formatXAxisTick(Number(value), effectiveRangeValue)}
                         tick={{ fill: chartAxis, fontSize: 12 }}
@@ -1490,6 +1586,7 @@ const Metrics = () => {
                         tick={{ fill: chartAxis, fontSize: 12 }}
                         tickMargin={8}
                         domain={domain as [number, number]}
+                        ticks={yTicks}
                         tickFormatter={(value) =>
                           formatAxisTick(Number(value), selectedMonitorGroup.unit, scale, max)
                         }
@@ -1515,7 +1612,7 @@ const Metrics = () => {
                           dot={dotStride ? renderSampledDot(dotStride) : false}
                           activeDot={{ r: 4 }}
                           name={serie.label}
-                          connectNulls={false}
+                          connectNulls={selectedMonitorGroup.unit === 'bps'}
                         />
                       ))}
                       {dragSelection?.start && dragSelection?.end ? (

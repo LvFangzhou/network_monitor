@@ -46,6 +46,8 @@ router = APIRouter()
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 RULE_STATUS_CACHE_PREFIX = "alerts:rule_status"
 RULE_STATUS_CACHE_TTL_SECONDS = 900
+SILENCE_MATCH_CACHE_PREFIX = "alerts:silence_matches"
+SILENCE_MATCH_CACHE_TTL_SECONDS = 60
 
 SEVERITY_NORMALIZATION = {
     "critical": "P0",
@@ -54,6 +56,7 @@ SEVERITY_NORMALIZATION = {
     "P0": "P0",
     "P1": "P1",
     "P2": "P2",
+    "P3": "P3",
 }
 
 
@@ -67,6 +70,7 @@ def _severity_filter_values(value: Optional[str]) -> List[str]:
         "P0": ["P0", "critical"],
         "P1": ["P1", "warning"],
         "P2": ["P2", "info"],
+        "P3": ["P3"],
     }
     return reverse_map.get(normalized, [normalized])
 
@@ -123,10 +127,6 @@ def _build_silence_candidate_query(
         alerts_query = alerts_query.filter(AlertHistory.rule_id == silence.rule_id)
     if silence.device_id:
         alerts_query = alerts_query.filter(AlertHistory.device_id == silence.device_id)
-    if silence.starts_at:
-        alerts_query = alerts_query.filter(AlertHistory.started_at >= silence.starts_at)
-    if silence.expires_at:
-        alerts_query = alerts_query.filter(AlertHistory.started_at <= silence.expires_at)
 
     for condition in silence.conditions or []:
         field_name = str((condition or {}).get("field") or "").strip()
@@ -155,6 +155,35 @@ def _build_silence_candidate_query(
 
 def _count_silence_matches(db: Session, silence: AlertSilence) -> int:
     return len(_get_silence_matched_alerts(db, silence))
+
+
+def _silence_match_count_cache_key(silence: AlertSilence, active_only: bool) -> str:
+    updated_marker = silence.updated_at or silence.created_at
+    marker_text = updated_marker.isoformat() if updated_marker else "none"
+    raw = f"{silence.id}:{int(bool(active_only))}:{int(silence.enabled or 0)}:{marker_text}"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return f"{SILENCE_MATCH_CACHE_PREFIX}:{digest}"
+
+
+def _count_silence_matches_cached(db: Session, silence: AlertSilence, *, active_only: bool = True) -> int:
+    cache_key = _silence_match_count_cache_key(silence, active_only)
+    cached = redis_client.get(cache_key)
+    if cached is not None:
+        try:
+            return int(cached)
+        except (TypeError, ValueError):
+            pass
+    count = len(_get_silence_matched_alerts(db, silence, active_only=active_only))
+    redis_client.setex(cache_key, SILENCE_MATCH_CACHE_TTL_SECONDS, str(count))
+    return count
+
+
+def _clear_silence_match_cache() -> None:
+    try:
+        for key in redis_client.scan_iter(f"{SILENCE_MATCH_CACHE_PREFIX}:*"):
+            redis_client.delete(key)
+    except Exception as exc:
+        logger.warning("清理告警屏蔽命中缓存失败", error=str(exc))
 
 
 def _resolve_active_alerts_for_disabled_rule(db: Session, rule_id: int) -> int:
@@ -888,8 +917,8 @@ async def list_alert_silences(
     response_items = []
     for item in items:
         data = item.to_dict()
-        data["matched_active_alerts"] = _count_silence_matches(db, item)
-        data["matched_total_alerts"] = len(_get_silence_matched_alerts(db, item, active_only=False))
+        data["matched_active_alerts"] = _count_silence_matches_cached(db, item, active_only=True)
+        data["matched_total_alerts"] = _count_silence_matches_cached(db, item, active_only=False)
         response_items.append(data)
     return {"total": total, "items": response_items}
 

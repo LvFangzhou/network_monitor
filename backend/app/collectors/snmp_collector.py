@@ -18,6 +18,7 @@ from app.core import LoggerMixin
 
 class SNMPCollector(LoggerMixin):
     """SNMP采集器"""
+    INTERFACE_RATE_CAP_MULTIPLIER = 1.03
     
     # 预定义OID模板
     OID_TEMPLATES = {
@@ -70,6 +71,13 @@ class SNMPCollector(LoggerMixin):
     }
 
     HILLSTONE_PRIVATE_OIDS = {
+        "cpu_usage_table_oids": [
+            "1.3.6.1.4.1.28557.2.25.1.2.1.15",
+            "1.3.6.1.4.1.28557.2.25.1.2.1.8",
+            "1.3.6.1.4.1.28557.2.25.1.2.1.7",
+            "1.3.6.1.4.1.28557.2.25.1.2.1.13",
+        ],
+        "cpu_usage_aggregate": "max",
         "cpu_usage_oid": "1.3.6.1.4.1.28557.2.2.1.3.0",
         "memory_usage_oid": "1.3.6.1.4.1.28557.2.2.1.17.0",
         "temperature_oid": "1.3.6.1.4.1.28557.2.28.1.2.1.3",
@@ -101,6 +109,27 @@ class SNMPCollector(LoggerMixin):
         "slb_vs_connections_oid": "1.3.6.1.4.1.28557.2.31.1.2.1.4",
     }
 
+    def _sanitize_interface_rates(
+        self,
+        in_bps: Optional[float],
+        out_bps: Optional[float],
+        speed_bps: Optional[float],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if not speed_bps or speed_bps <= 0:
+            return in_bps, out_bps
+        speed_value = float(speed_bps)
+        if in_bps is not None:
+            if in_bps < 0:
+                in_bps = None
+            elif in_bps > speed_value:
+                in_bps = speed_value
+        if out_bps is not None:
+            if out_bps < 0:
+                out_bps = None
+            elif out_bps > speed_value:
+                out_bps = speed_value
+        return in_bps, out_bps
+
     H3C_PRIVATE_OIDS = {
         "cpu_usage_table_oids": [
             "1.3.6.1.4.1.25506.2.6.1.1.1.1.33",
@@ -123,6 +152,20 @@ class SNMPCollector(LoggerMixin):
             "1.3.6.1.4.1.25506.2.202.1.1.2.1.4",
         ],
     }
+
+    DENSIVELO_PRIVATE_OIDS = {
+        # S9867/DensiveloOS exposes a Yillion private tree under 1.3.6.1.4.1.64812.
+        # The currently available H3C 9867 documents only cover standard MIBs
+        # (IF-MIB/BGP4-MIB/ENTITY-MIB, etc.), so do not reuse legacy H3C 25506
+        # CPU/memory/environment OIDs here. Device-specific 64812 resource OIDs
+        # can be added through custom_fields.snmp_private_oids when the private
+        # MIB object names are available.
+        "bgp_state_oids": [
+            "1.3.6.1.2.1.15.3.1.2",
+        ],
+        "entity_class_oid": "1.3.6.1.2.1.47.1.1.1.1.5",
+        "entity_name_oid": "1.3.6.1.2.1.47.1.1.1.1.7",
+    }
     
     def __init__(self):
         self.timeout = settings.SNMP_DEFAULT_TIMEOUT
@@ -137,9 +180,11 @@ class SNMPCollector(LoggerMixin):
         ]).lower()
         if any(marker in identity for marker in ["hillstone", "sg-6000", "山石"]):
             defaults = self.HILLSTONE_PRIVATE_OIDS.copy()
+        elif any(marker in identity for marker in ["densivelo", "yillion", "deepcompute", "s9867"]):
+            defaults = self.DENSIVELO_PRIVATE_OIDS.copy()
         elif (
             any(marker in identity for marker in ["h3c", "comware", "华三", "新华三"])
-            or re.search(r"\bs(?:51|55|58|65|68)\d{2}", identity)
+            or re.search(r"\bs(?:51|55|58|65|68|98)\d{2}", identity)
         ):
             defaults = self.H3C_PRIVATE_OIDS.copy()
         else:
@@ -658,6 +703,7 @@ class SNMPCollector(LoggerMixin):
                 out_bps = round((delta_out * 8) / elapsed, 2)
 
         speed_bps = second_snapshot.get("speed_bps")
+        in_bps, out_bps = self._sanitize_interface_rates(in_bps, out_bps, speed_bps)
         in_utilization = round((in_bps / speed_bps) * 100, 2) if in_bps is not None and speed_bps else None
         out_utilization = round((out_bps / speed_bps) * 100, 2) if out_bps is not None and speed_bps else None
 
@@ -959,6 +1005,7 @@ class SNMPCollector(LoggerMixin):
                 sample_seconds = None
             else:
                 sample_seconds = round(elapsed, 2)
+                in_bps, out_bps = self._sanitize_interface_rates(in_bps, out_bps, speed_bps)
             in_utilization = round((in_bps / speed_bps) * 100, 2) if in_bps is not None and speed_bps else None
             out_utilization = round((out_bps / speed_bps) * 100, 2) if out_bps is not None and speed_bps else None
             admin_status_text = status_map.get(walk_results["admin_status_map"].get(index), "unknown")

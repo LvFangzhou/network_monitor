@@ -102,15 +102,19 @@ const AlertSilences = () => {
   const navigate = useNavigate()
   const canModify = !currentUser?.read_only
 
-  const fetchData = async () => {
-    setLoading(true)
+  const fetchData = async (options?: { silent?: boolean }) => {
+    if (!options?.silent) {
+      setLoading(true)
+    }
     try {
       const result = await getAlertSilences()
       setItems(result.items)
     } catch {
       message.error('获取告警屏蔽失败')
     } finally {
-      setLoading(false)
+      if (!options?.silent) {
+        setLoading(false)
+      }
     }
   }
 
@@ -162,15 +166,31 @@ const AlertSilences = () => {
         expires_at: values.expires_at ? values.expires_at.toISOString() : null,
         actor_username: currentUser?.username || null,
       }
+      let savedItem: AlertSilence
       if (editingItem) {
-        await updateAlertSilence(editingItem.id, payload)
+        savedItem = await updateAlertSilence(editingItem.id, payload)
+        setItems((prev) => prev.map((item) => (
+          item.id === savedItem.id
+            ? {
+                ...savedItem,
+                matched_active_alerts: item.matched_active_alerts,
+                matched_total_alerts: item.matched_total_alerts,
+              }
+            : item
+        )))
         message.success('告警屏蔽已更新')
       } else {
-        await createAlertSilence(payload)
+        savedItem = await createAlertSilence(payload)
+        setItems((prev) => [
+          { ...savedItem, matched_active_alerts: 0, matched_total_alerts: 0 },
+          ...prev,
+        ])
         message.success('告警屏蔽已创建')
       }
       setModalOpen(false)
-      fetchData()
+      window.setTimeout(() => {
+        void fetchData({ silent: true })
+      }, 300)
     } catch (error: any) {
       if (!error?.errorFields) {
         message.error(error?.response?.data?.detail || '保存失败')
@@ -287,7 +307,7 @@ const AlertSilences = () => {
                     <Tooltip title="编辑">
                       <Button type="text" icon={<EditOutlined />} onClick={() => openEdit(record)} />
                     </Tooltip>
-                    <Popconfirm title="确认删除这条屏蔽吗？" onConfirm={() => deleteAlertSilence(record.id).then(fetchData)}>
+                    <Popconfirm title="确认删除这条屏蔽吗？" onConfirm={() => deleteAlertSilence(record.id).then(() => fetchData())}>
                       <Tooltip title="删除">
                         <Button type="text" danger icon={<DeleteOutlined />} />
                       </Tooltip>

@@ -14,7 +14,7 @@ export interface AlertRule {
   condition: '>' | '>=' | '<' | '<=' | '==' | '!='
   threshold: number
   duration: number
-  severity: 'P0' | 'P1' | 'P2' | 'critical' | 'warning' | 'info'
+  severity: 'P0' | 'P1' | 'P2' | 'P3' | 'critical' | 'warning' | 'info'
   suppress_duration?: number
   enabled: boolean
   device_group_id?: number | null
@@ -39,7 +39,7 @@ export interface AlertHistory {
   alert_target_key?: string | null
   alert_target_name?: string | null
   status: 'firing' | 'resolved' | 'acknowledged' | 'ignored' | 'snoozed'
-  severity?: 'P0' | 'P1' | 'P2' | 'critical' | 'warning' | 'info' | null
+  severity?: 'P0' | 'P1' | 'P2' | 'P3' | 'critical' | 'warning' | 'info' | null
   acknowledged_by?: string | null
   acknowledged_at?: string | null
   ignored_by?: string | null
@@ -110,7 +110,7 @@ export interface AlertRulePayload {
   condition: '>' | '>=' | '<' | '<=' | '==' | '!='
   threshold: number
   duration: number
-  severity: 'P0' | 'P1' | 'P2'
+  severity: 'P0' | 'P1' | 'P2' | 'P3'
   enabled: boolean
   device_group_id?: number | null
   device_ids: number[]

@@ -137,6 +137,9 @@ services:
       - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
       - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
+      - SNMP_TRAP_ENABLED=true
+      - SNMP_TRAP_LISTEN_HOST=0.0.0.0
+      - SNMP_TRAP_LISTEN_PORT=1162
       - FLOW_ENABLED=true
       - FLOW_LISTEN_HOST=0.0.0.0
       - FLOW_NETFLOW_PORT=2055
@@ -158,11 +161,12 @@ services:
       - LOG_FORMAT=json
     volumes:
       - ./backend/app:/app/app
-      - ${DATA_ROOT:-./data}/tacacs:/app/data/tacacs
+      - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8000:8000"
       - "5514:5514/udp"
+      - "162:1162/udp"
       - "2055:2055/udp"
       - "6343:6343/udp"
     depends_on:
@@ -215,7 +219,7 @@ services:
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
-      - ${DATA_ROOT:-./data}/tacacs:/app/data/tacacs
+      - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
     depends_on:
       - postgres
       - redis
@@ -262,7 +266,7 @@ services:
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
-      - ${DATA_ROOT:-./data}/tacacs:/app/data/tacacs
+      - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
       - ${DATA_ROOT:-./data}/influxdb:/host-data/influxdb:ro
     depends_on:
       - postgres
@@ -315,7 +319,7 @@ services:
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
-      - ${DATA_ROOT:-./data}/tacacs:/app/data/tacacs
+      - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
       - ${DATA_ROOT:-./data}/influxdb:/host-data/influxdb:ro
     depends_on:
       - postgres
@@ -365,7 +369,7 @@ services:
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
-      - ${DATA_ROOT:-./data}/tacacs:/app/data/tacacs
+      - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
       - ${DATA_ROOT:-./data}/influxdb:/host-data/influxdb:ro
     depends_on:
       - postgres
@@ -415,7 +419,7 @@ services:
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
-      - ${DATA_ROOT:-./data}/tacacs:/app/data/tacacs
+      - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
       - ${DATA_ROOT:-./data}/influxdb:/host-data/influxdb:ro
     depends_on:
       - postgres
@@ -452,8 +456,8 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ${DATA_ROOT:-./data}/tacacs/tac_plus.cfg:/etc/tacacs+/tac_plus.cfg:ro
-      - ${DATA_ROOT:-./data}/tacacs/logs:/var/log/tacacs+
+      - ${TACACS_DATA_ROOT:-./data/tacacs}/tac_plus.cfg:/etc/tacacs+/tac_plus.cfg:ro
+      - ${TACACS_DATA_ROOT:-./data/tacacs}/logs:/var/log/tacacs+
     environment:
       - TZ=UTC
     command: ["/usr/local/sbin/tac_plus", "-C", "/etc/tacacs+/tac_plus.cfg", "-G", "-d", "2", "-l", "/var/log/tacacs+/tacacs.log"]

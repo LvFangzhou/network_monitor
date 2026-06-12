@@ -120,6 +120,11 @@ class Settings(BaseSettings):
     SYSLOG_LISTEN_HOST: str = "0.0.0.0"
     SYSLOG_LISTEN_PORT: int = 5514
 
+    # SNMP Trap 配置。容器内监听 1162，compose 默认映射宿主机 UDP/162。
+    SNMP_TRAP_ENABLED: bool = True
+    SNMP_TRAP_LISTEN_HOST: str = "0.0.0.0"
+    SNMP_TRAP_LISTEN_PORT: int = 1162
+
     # Flow 配置（用于按客户公网 IP 统计流量）
     FLOW_ENABLED: bool = True
     FLOW_LISTEN_HOST: str = "0.0.0.0"
