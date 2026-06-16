@@ -33,7 +33,7 @@ services:
       DOCKER_INFLUXDB_INIT_BUCKET: network_metrics
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: network-monitor-token
     volumes:
-      - ${DATA_ROOT:-./data}/influxdb:/var/lib/influxdb2
+      - ${INFLUXDB_DATA_ROOT:-./data/influxdb}:/var/lib/influxdb2
     ports:
       - "8086:8086"
     healthcheck:
@@ -152,10 +152,11 @@ services:
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
       - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=100
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
       - ASTERNOS_MAX_DEVICES_PER_TICK=50
       - LOG_LEVEL=INFO
       - LOG_FORMAT=json
@@ -211,10 +212,11 @@ services:
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
       - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=100
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
       - ASTERNOS_MAX_DEVICES_PER_TICK=50
       - LOG_LEVEL=INFO
     volumes:
@@ -258,16 +260,17 @@ services:
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
       - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=100
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
       - ASTERNOS_MAX_DEVICES_PER_TICK=50
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
       - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
-      - ${DATA_ROOT:-./data}/influxdb:/host-data/influxdb:ro
+      - ${INFLUXDB_DATA_ROOT:-./data/influxdb}:/host-data/influxdb:ro
     depends_on:
       - postgres
       - redis
@@ -286,7 +289,7 @@ services:
   celery-worker-asternos:
     build: ./backend
     container_name: nm-celery-worker-asternos
-    command: celery -A app.tasks worker -l info -Q asternos,asternos_realtime -n worker-asternos@%h --pool=threads -c 12 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q asternos -n worker-asternos@%h --pool=threads -c 4 --prefetch-multiplier=1 -Ofair
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -311,16 +314,71 @@ services:
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
       - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=100
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
       - ASTERNOS_MAX_DEVICES_PER_TICK=50
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
       - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
-      - ${DATA_ROOT:-./data}/influxdb:/host-data/influxdb:ro
+      - ${INFLUXDB_DATA_ROOT:-./data/influxdb}:/host-data/influxdb:ro
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+      - influxdb
+    networks:
+      - network-monitor
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+
+  # Celery Worker Asteros 高频实时采集，与全量 Exporter 采集分离，减少互相抢占
+  celery-worker-asternos-realtime:
+    build: ./backend
+    container_name: nm-celery-worker-asternos-realtime
+    command: celery -A app.tasks worker -l info -Q asternos_realtime -n worker-asternos-realtime@%h --pool=threads -c 10 --prefetch-multiplier=1 -Ofair
+    environment:
+      - DEBUG=false
+      - SECRET_KEY=your-secret-key-change-in-production
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=network_monitor
+      - POSTGRES_PASSWORD=network_monitor
+      - POSTGRES_DB=network_monitor
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_ORG=network-monitor
+      - INFLUXDB_BUCKET=network_metrics
+      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_DATA_PATH=/host-data/influxdb
+      - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
+      - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
+      - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASSWORD=guest
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=100
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
+      - ASTERNOS_MAX_DEVICES_PER_TICK=50
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./backend/app:/app/app
+      - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
+      - ${INFLUXDB_DATA_ROOT:-./data/influxdb}:/host-data/influxdb:ro
     depends_on:
       - postgres
       - redis
@@ -364,13 +422,13 @@ services:
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
       - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
       - SNMP_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
       - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
-      - ${DATA_ROOT:-./data}/influxdb:/host-data/influxdb:ro
+      - ${INFLUXDB_DATA_ROOT:-./data/influxdb}:/host-data/influxdb:ro
     depends_on:
       - postgres
       - redis
@@ -389,7 +447,7 @@ services:
   celery-worker-snmp-circuit:
     build: ./backend
     container_name: nm-celery-worker-snmp-circuit
-    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime -n worker-snmp-circuit@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -414,13 +472,14 @@ services:
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
       - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
       - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
-      - ${DATA_ROOT:-./data}/influxdb:/host-data/influxdb:ro
+      - ${INFLUXDB_DATA_ROOT:-./data/influxdb}:/host-data/influxdb:ro
     depends_on:
       - postgres
       - redis

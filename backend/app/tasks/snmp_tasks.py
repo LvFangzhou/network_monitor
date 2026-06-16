@@ -29,9 +29,17 @@ SNMP_FULL_COLLECTION_INTERVAL_SECONDS = max(
     SNMP_SCHEDULER_INTERVAL_SECONDS,
     int(settings.SNMP_FULL_COLLECTION_INTERVAL_SECONDS),
 )
+SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS = max(
+    SNMP_SCHEDULER_INTERVAL_SECONDS,
+    int(settings.SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS),
+)
 SNMP_BATCH_COUNT = max(
     1,
     math.ceil(SNMP_FULL_COLLECTION_INTERVAL_SECONDS / SNMP_SCHEDULER_INTERVAL_SECONDS),
+)
+SNMP_INTERFACE_BATCH_COUNT = max(
+    1,
+    math.ceil(SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS / SNMP_SCHEDULER_INTERVAL_SECONDS),
 )
 SNMP_MAX_DEVICES_PER_TICK = max(1, int(settings.SNMP_MAX_DEVICES_PER_TICK))
 SNMP_TASK_LOCK_TTL_SECONDS = max(180, min(600, SNMP_FULL_COLLECTION_INTERVAL_SECONDS * 3))
@@ -52,11 +60,13 @@ SNMP_STATUS_UNREACHABLE = "unreachable"
 SNMP_STATUS_UNKNOWN = "unknown"
 ICMP_PING_PACKETS = 5
 ICMP_PING_TIMEOUT_SECONDS = 2
-MONITOR_CACHE_TTL_SECONDS = 180
+ICMP_PING_INTERVAL_MS = 200
+MONITOR_CACHE_TTL_SECONDS = max(180, min(3600, ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS * 2))
 ASTERNOS_TASK_LOCK_TTL_SECONDS = max(45, min(180, ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS * 2))
 INTERFACE_REALTIME_LOCK_TTL_SECONDS = 120
 INTERFACE_REALTIME_MAX_WORKERS = 4
 INTERFACE_RATE_CAP_MULTIPLIER = 1.03
+ICMP_REACHABILITY_LOCK_TTL_SECONDS = max(25, (ICMP_PING_PACKETS * ICMP_PING_TIMEOUT_SECONDS) + 15)
 ASTERNOS_COUNTER_METRICS = [
     {
         "field": "queue_egress_dropped_pkts_delta",
@@ -108,6 +118,10 @@ def _interface_realtime_lock_key(kind: str = "asternos") -> str:
     return f"interface_realtime_collect:{kind}:lock"
 
 
+def _icmp_reachability_lock_key() -> str:
+    return "device_reachability_collect:lock"
+
+
 def _try_lock_asternos_device(device_id: int) -> bool:
     return bool(redis_client.set(_asternos_lock_key(device_id), "1", ex=ASTERNOS_TASK_LOCK_TTL_SECONDS, nx=True))
 
@@ -137,10 +151,37 @@ def _release_interface_realtime_lock(kind: str = "asternos", token: Optional[str
     redis_client.delete(key)
 
 
+def _try_lock_icmp_reachability() -> Optional[str]:
+    token = uuid.uuid4().hex
+    locked = redis_client.set(
+        _icmp_reachability_lock_key(),
+        token,
+        ex=ICMP_REACHABILITY_LOCK_TTL_SECONDS,
+        nx=True,
+    )
+    return token if locked else None
+
+
+def _release_icmp_reachability_lock(token: Optional[str] = None) -> None:
+    key = _icmp_reachability_lock_key()
+    current = redis_client.get(key)
+    if isinstance(current, bytes):
+        current = current.decode("utf-8", errors="ignore")
+    if token and current != token:
+        return
+    redis_client.delete(key)
+
+
+def _monitor_cache_ttl_seconds(kind: str) -> int:
+    if kind in {"overview", "interfaces", "protocol_neighbors"}:
+        return MONITOR_CACHE_TTL_SECONDS
+    return 180
+
+
 def _set_monitor_cache(kind: str, device_id: int, payload: Any, suffix: str = "") -> None:
     redis_client.setex(
         _monitor_cache_key(kind, device_id, suffix),
-        MONITOR_CACHE_TTL_SECONDS,
+        _monitor_cache_ttl_seconds(kind),
         json.dumps(payload, ensure_ascii=False, default=str),
     )
 
@@ -726,6 +767,87 @@ def _collect_icmp_reachability(device: Device) -> Dict[str, Any]:
     }
 
 
+def _collect_icmp_reachability_batch(devices: List[Device]) -> Dict[int, Dict[str, Any]]:
+    targets = [device for device in devices if device.ip_address]
+    if not targets:
+        return {}
+
+    default_result = {
+        "reachable": 0.0,
+        "sent_packets": float(ICMP_PING_PACKETS),
+        "success_packets": 0.0,
+        "packet_loss_percent": 100.0,
+        "avg_latency_ms": None,
+    }
+    metrics_by_device: Dict[int, Dict[str, Any]] = {
+        device.id: default_result.copy() for device in targets
+    }
+    ip_to_device = {device.ip_address: device for device in targets}
+
+    command = [
+        "fping",
+        "-C",
+        str(ICMP_PING_PACKETS),
+        "-q",
+        "-p",
+        str(ICMP_PING_INTERVAL_MS),
+        "-t",
+        str(ICMP_PING_TIMEOUT_SECONDS * 1000),
+        *ip_to_device.keys(),
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(len(targets), 1) * ICMP_PING_TIMEOUT_SECONDS + 10,
+            check=False,
+        )
+    except FileNotFoundError:
+        logger.warning("fping不可用，回退到单设备ping探测")
+        return {device.id: _collect_icmp_reachability(device) for device in targets}
+    except Exception as exc:
+        logger.warning("批量ICMP探测执行失败，回退到单设备ping探测", error=str(exc))
+        return {device.id: _collect_icmp_reachability(device) for device in targets}
+
+    output = result.stderr or result.stdout or ""
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        ip_address, samples_text = line.split(":", 1)
+        ip_address = ip_address.strip()
+        device = ip_to_device.get(ip_address)
+        if not device:
+            continue
+
+        sample_tokens = [token for token in samples_text.strip().split() if token]
+        latencies: List[float] = []
+        for token in sample_tokens:
+            if token == "-":
+                continue
+            try:
+                latencies.append(float(token))
+            except ValueError:
+                continue
+
+        received = float(len(latencies))
+        transmitted = float(ICMP_PING_PACKETS)
+        loss_percent = 100.0 if transmitted <= 0 else round(((transmitted - received) / transmitted) * 100, 2)
+        avg_latency_ms = round(sum(latencies) / len(latencies), 3) if latencies else None
+
+        metrics_by_device[device.id] = {
+            "reachable": 1.0 if received > 0 and loss_percent < 100 else 0.0,
+            "sent_packets": transmitted,
+            "success_packets": received,
+            "packet_loss_percent": loss_percent,
+            "avg_latency_ms": avg_latency_ms,
+        }
+
+    return metrics_by_device
+
+
 @shared_task(bind=True)
 def collect_snmp_for_device(self, device_id: int):
     """
@@ -758,22 +880,13 @@ def collect_snmp_for_device(self, device_id: int):
         logger.debug("开始SNMP采集", device_id=device_id, ip=device.ip_address)
         
         result: Dict[str, Any] = {}
-        interface_history_result: Dict[str, Any] = {}
         protocol_status_result: Dict[str, Any] = {}
         optical_result: Dict[str, Any] = {}
 
         try:
             result = snmp_collector.collect_device(device)
         except Exception as exc:
-            logger.error("设备SNMP指标采集失败，继续采集接口历史", device_id=device_id, error=str(exc))
-
-        try:
-            interface_history_result = snmp_collector.collect_interface_monitoring(
-                device,
-                suppress_rate_interface_names=_circuit_port_names_for_device(db, device.id),
-            )
-        except Exception as exc:
-            logger.error("接口历史采集失败", device_id=device_id, error=str(exc))
+            logger.error("设备SNMP指标采集失败", device_id=device_id, error=str(exc))
 
         try:
             protocol_status_result = snmp_collector.collect_protocol_status(device)
@@ -789,14 +902,13 @@ def collect_snmp_for_device(self, device_id: int):
             "SNMP采集完成",
             device_id=device_id,
             points=result.get("points_written", 0),
-            interface_points=interface_history_result.get("points_written", 0),
+            interface_points=0,
             protocol_points=protocol_status_result.get("points_written", 0),
             optical_points=optical_result.get("points_written", 0),
         )
 
         total_points_written = (
             int(result.get("points_written") or 0)
-            + int(interface_history_result.get("points_written") or 0)
             + int(protocol_status_result.get("points_written") or 0)
             + int(optical_result.get("points_written") or 0)
         )
@@ -831,8 +943,8 @@ def collect_snmp_for_device(self, device_id: int):
             "memory": result.get("memory"),
             "interfaces": result.get("interfaces_count"),
             "points_written": result.get("points_written"),
-            "interface_points_written": interface_history_result.get("points_written", 0),
-            "interfaces_monitored": interface_history_result.get("interfaces_monitored", 0),
+            "interface_points_written": 0,
+            "interfaces_monitored": 0,
             "protocol_points_written": protocol_status_result.get("points_written", 0),
             "optical_points_written": optical_result.get("points_written", 0),
         }
@@ -917,6 +1029,103 @@ def collect_all_snmp():
         logger.error("批量SNMP采集失败", error=str(e))
         return {"error": str(e)}
     finally:
+        db.close()
+
+
+@shared_task
+def collect_all_snmp_interface_realtime():
+    """高频采集所有受监控 SNMP 设备的接口流量历史，避免端口图被慢速全量轮询拖慢。"""
+    lock_token = _try_lock_interface_realtime("snmp")
+    if not lock_token:
+        return {"skipped": True, "reason": "上一轮SNMP端口高频采集未完成"}
+
+    db = SessionLocal()
+    try:
+        devices = db.query(Device).filter(
+            Device.snmp_version.isnot(None),
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+            or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
+        ).order_by(Device.id.asc()).all()
+
+        current_bucket = int(time.time() // SNMP_SCHEDULER_INTERVAL_SECONDS) % SNMP_INTERFACE_BATCH_COUNT
+        devices_in_bucket = [
+            device for device in devices
+            if int(device.id or 0) % SNMP_INTERFACE_BATCH_COUNT == current_bucket
+        ]
+        if len(devices_in_bucket) > SNMP_MAX_DEVICES_PER_TICK:
+            devices_in_bucket = devices_in_bucket[:SNMP_MAX_DEVICES_PER_TICK]
+
+        collection_started = time.monotonic()
+        results: List[Dict[str, Any]] = []
+        skipped_unreachable = 0
+        workers = min(INTERFACE_REALTIME_MAX_WORKERS, max(1, len(devices_in_bucket)))
+
+        def collect_device_interfaces(device: Device) -> Dict[str, Any]:
+            if _get_device_status(device.id) == SNMP_STATUS_UNREACHABLE:
+                return {"device_id": device.id, "skipped": "unreachable"}
+            if not _try_lock_device(device.id):
+                return {"device_id": device.id, "skipped": "locked"}
+            try:
+                return snmp_collector.collect_interface_monitoring(
+                    device,
+                    suppress_rate_interface_names=_circuit_port_names_for_device(db, device.id),
+                )
+            finally:
+                _release_device_lock(device.id)
+
+        if devices_in_bucket:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(collect_device_interfaces, device): device for device in devices_in_bucket}
+                for future in as_completed(futures):
+                    device = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        logger.warning(
+                            "SNMP端口高频采集设备失败",
+                            device_id=device.id,
+                            ip_address=device.ip_address,
+                            error=str(exc),
+                        )
+                        continue
+                    if result.get("skipped") == "unreachable":
+                        skipped_unreachable += 1
+                    results.append(result)
+
+        points_written = sum(int(item.get("points_written") or 0) for item in results)
+        interfaces_monitored = sum(int(item.get("interfaces_monitored") or 0) for item in results)
+        logger.info(
+            "SNMP端口高频采集完成",
+            total_devices=len(devices),
+            bucket=current_bucket,
+            bucket_count=SNMP_INTERFACE_BATCH_COUNT,
+            devices_in_bucket=len(devices_in_bucket),
+            target_interval_seconds=SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS,
+            devices_collected=len(results),
+            interfaces_monitored=interfaces_monitored,
+            points_written=points_written,
+            skipped_unreachable=skipped_unreachable,
+            elapsed_seconds=round(time.monotonic() - collection_started, 3),
+            workers=workers,
+        )
+        return {
+            "total_devices": len(devices),
+            "bucket": current_bucket,
+            "bucket_count": SNMP_INTERFACE_BATCH_COUNT,
+            "devices_in_bucket": len(devices_in_bucket),
+            "target_interval_seconds": SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS,
+            "devices_collected": len(results),
+            "interfaces_monitored": interfaces_monitored,
+            "points_written": points_written,
+            "skipped_unreachable": skipped_unreachable,
+            "elapsed_seconds": round(time.monotonic() - collection_started, 3),
+        }
+    except Exception as exc:
+        logger.error("SNMP端口高频采集失败", error=str(exc))
+        return {"error": str(exc)}
+    finally:
+        _release_interface_realtime_lock("snmp", lock_token)
         db.close()
 
 
@@ -1250,6 +1459,10 @@ def collect_circuit_interface_realtime():
 @shared_task
 def collect_device_reachability():
     """每30秒对已上线设备执行 ICMP 探测并写入时序库。"""
+    lock_token = _try_lock_icmp_reachability()
+    if not lock_token:
+        logger.info("设备ICMP探测跳过：上一轮任务仍在执行")
+        return {"skipped": True, "reason": "previous_run_in_progress"}
     db = SessionLocal()
     try:
         devices = db.query(Device).filter(
@@ -1259,10 +1472,11 @@ def collect_device_reachability():
 
         points = []
         now = datetime.utcnow()
+        metrics_by_device = _collect_icmp_reachability_batch(devices)
         for device in devices:
             if not device.ip_address:
                 continue
-            metrics = _collect_icmp_reachability(device)
+            metrics = metrics_by_device.get(device.id) or _collect_icmp_reachability(device)
             points.append({
                 "measurement": "device_reachability",
                 "tags": {
@@ -1283,6 +1497,7 @@ def collect_device_reachability():
         logger.error("设备ICMP探测失败", error=str(exc))
         return {"error": str(exc)}
     finally:
+        _release_icmp_reachability_lock(lock_token)
         db.close()
 
 

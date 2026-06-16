@@ -22,6 +22,7 @@ from app.database import get_db
 from app.models import Device, AlertHistory, AlertRule, Circuit, Customer
 from sqlalchemy.orm import Session
 from app.core import get_logger
+from app.config import settings
 from app.collectors import snmp_collector
 from app.services.flow_listener import flow_listener
 
@@ -32,7 +33,10 @@ SNMP_FAILURE_KEY_PREFIX = "snmp_collect:failure:"
 SNMP_STATUS_REACHABLE = "reachable"
 SNMP_STATUS_UNREACHABLE = "unreachable"
 SNMP_VERIFY_OID = "1.3.6.1.2.1.1.3.0"
-MONITOR_CACHE_STALE_SECONDS = 180
+MONITOR_CACHE_STALE_SECONDS = max(
+    180,
+    min(3600, int(settings.ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS) * 2),
+)
 MAX_INTERFACE_HISTORY_SECONDS = 7 * 24 * 60 * 60
 RATE_FALLBACK_MAX_SECONDS = 5 * 60
 HISTORY_REQUEST_CACHE_SECONDS = 8
@@ -804,24 +808,49 @@ def _max_latest_grouped_value(device_id: int, measurement: str, field: str, grou
 
 
 def _hardware_summary(device_id: int) -> Dict[str, Any]:
-    rows = _latest_grouped_values(device_id, "snmp_hardware", "up", ["component_type", "component"])
+    up_rows = _latest_grouped_values(device_id, "snmp_hardware", "up", ["component_type", "component"])
+    present_rows = _latest_grouped_values(device_id, "snmp_hardware", "present", ["component_type", "component"])
+    status_rows = _latest_grouped_values(device_id, "snmp_hardware", "status_known", ["component_type", "component"])
+    up_map = {
+        (str(row.get("component_type") or ""), str(row.get("component") or "")): _safe_float(row.get("value"))
+        for row in up_rows
+    }
+    present_map = {
+        (str(row.get("component_type") or ""), str(row.get("component") or "")): _safe_float(row.get("value"))
+        for row in present_rows
+    }
+    status_map = {
+        (str(row.get("component_type") or ""), str(row.get("component") or "")): _safe_float(row.get("value"))
+        for row in status_rows
+    }
     summary = {
         "fan_total": 0,
         "fan_down": 0,
+        "fan_status_known": True,
         "power_total": 0,
         "power_down": 0,
+        "power_status_known": True,
     }
-    for row in rows:
-        component_type = str(row.get("component_type") or "")
-        value = _safe_float(row.get("value"))
+    keys = sorted(set(up_map) | set(present_map) | set(status_map))
+    for component_type, component in keys:
+        value = up_map.get((component_type, component))
+        present = present_map.get((component_type, component))
+        status_known = status_map.get((component_type, component))
+        is_present = present is None or present >= 1
         if component_type == "fan":
-            summary["fan_total"] += 1
+            if is_present:
+                summary["fan_total"] += 1
             if value == 0:
                 summary["fan_down"] += 1
+            if status_known == 0:
+                summary["fan_status_known"] = False
         elif component_type == "power":
-            summary["power_total"] += 1
+            if is_present:
+                summary["power_total"] += 1
             if value == 0:
                 summary["power_down"] += 1
+            if status_known == 0:
+                summary["power_status_known"] = False
     return summary
 
 
@@ -859,6 +888,24 @@ def _get_snmp_protocol_summary(device_id: int) -> Dict[str, Dict[str, int]]:
       |> last()
     '''
     return _summarize_protocol_rows(influx_client.query(flux))
+
+
+def _snmp_overview_has_recent_data(
+    device_id: int,
+    resources: Dict[str, Any],
+    hardware: Dict[str, Any],
+    protocols: Dict[str, Dict[str, int]],
+    sessions: Dict[str, Any],
+) -> bool:
+    if any(resources.get(field) is not None for field in ["cpu_percent", "memory_percent", "temperature", "storage_percent"]):
+        return True
+    if any(sessions.get(field) is not None for field in ["current", "total", "usage_percent"]):
+        return True
+    if (hardware.get("fan_total") or 0) > 0 or (hardware.get("power_total") or 0) > 0:
+        return True
+    if (protocols.get("bgp", {}).get("total") or 0) > 0 or (protocols.get("ospf", {}).get("total") or 0) > 0:
+        return True
+    return _has_recent_interface_history(device_id)
 
 
 def _label_text(row: Dict[str, Any], keys: List[str]) -> str:
@@ -1056,7 +1103,14 @@ async def _build_asternos_overview(device: Device) -> Dict[str, Any]:
             "storage_percent": None,
         },
         "sessions": {"current": None, "total": None, "usage_percent": None},
-        "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
+        "hardware": {
+            "fan_total": 0,
+            "fan_down": 0,
+            "fan_status_known": True,
+            "power_total": 0,
+            "power_down": 0,
+            "power_status_known": True,
+        },
         "protocols": {
             "bgp": _summarize_exporter_protocol(
                 asternos_exporter_client._rows(metrics, "bgp_status"),
@@ -1077,15 +1131,42 @@ def _build_snmp_overview(
     include_sessions: bool = False,
 ) -> Dict[str, Any]:
     snmp_status = redis_client.get(_snmp_status_key(device.id)) or "unknown"
+    resources = {
+        "cpu_percent": _latest_numeric(device.id, "snmp_metrics", ["usage"]),
+        "memory_percent": _latest_numeric(device.id, "snmp_metrics", ["usage_percent", "used_percent", "percent"]),
+        "temperature": _latest_numeric(device.id, "snmp_temperature", ["temperature", "value", "temp"]),
+        "storage_percent": _max_latest_grouped_value(device.id, "snmp_storage", "usage_percent", ["storage"]) if include_storage else None,
+    }
+    sessions = {
+        "current": _latest_numeric(device.id, "snmp_sessions", ["current"]) if include_sessions else None,
+        "total": _latest_numeric(device.id, "snmp_sessions", ["total"]) if include_sessions else None,
+        "usage_percent": _latest_numeric(device.id, "snmp_sessions", ["usage_percent"]) if include_sessions else None,
+    }
+    hardware = _hardware_summary(device.id) if include_hardware else {
+        "fan_total": 0,
+        "fan_down": 0,
+        "fan_status_known": True,
+        "power_total": 0,
+        "power_down": 0,
+        "power_status_known": True,
+    }
+    protocols = _get_snmp_protocol_summary(device.id)
+    has_recent_data = _snmp_overview_has_recent_data(device.id, resources, hardware, protocols, sessions)
+
     if not device.snmp_version:
         connectivity_status = "not_configured"
         message = "未配置SNMP参数"
     elif snmp_status == SNMP_STATUS_UNREACHABLE:
         connectivity_status = "unreachable"
         message = "SNMP最近采集不可达"
+        if has_recent_data:
+            message = "SNMP最近采集不可达，当前展示最近一次后台采集结果"
     elif snmp_status == SNMP_STATUS_REACHABLE:
         connectivity_status = "reachable"
         message = f"SNMP {device.snmp_version}"
+    elif has_recent_data:
+        connectivity_status = "reachable"
+        message = f"SNMP {device.snmp_version}（展示最近一次后台采集结果）"
     else:
         connectivity_status = "unknown"
         message = "等待SNMP采集结果"
@@ -1096,19 +1177,10 @@ def _build_snmp_overview(
             "status": connectivity_status,
             "message": message,
         },
-        "resources": {
-            "cpu_percent": _latest_numeric(device.id, "snmp_metrics", ["usage"]),
-            "memory_percent": _latest_numeric(device.id, "snmp_metrics", ["usage_percent", "used_percent", "percent"]),
-            "temperature": _latest_numeric(device.id, "snmp_temperature", ["temperature", "value", "temp"]),
-            "storage_percent": _max_latest_grouped_value(device.id, "snmp_storage", "usage_percent", ["storage"]) if include_storage else None,
-        },
-        "sessions": {
-            "current": _latest_numeric(device.id, "snmp_sessions", ["current"]) if include_sessions else None,
-            "total": _latest_numeric(device.id, "snmp_sessions", ["total"]) if include_sessions else None,
-            "usage_percent": _latest_numeric(device.id, "snmp_sessions", ["usage_percent"]) if include_sessions else None,
-        },
-        "hardware": _hardware_summary(device.id) if include_hardware else {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
-        "protocols": _get_snmp_protocol_summary(device.id),
+        "resources": resources,
+        "sessions": sessions,
+        "hardware": hardware,
+        "protocols": protocols,
     }
 
 
@@ -1128,7 +1200,14 @@ def _device_base_overview(device: Device) -> Dict[str, Any]:
             "storage_percent": None,
         },
         "sessions": {"current": None, "total": None, "usage_percent": None},
-        "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
+        "hardware": {
+            "fan_total": 0,
+            "fan_down": 0,
+            "fan_status_known": True,
+            "power_total": 0,
+            "power_down": 0,
+            "power_status_known": True,
+        },
         "protocols": _empty_protocol_summary(),
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }

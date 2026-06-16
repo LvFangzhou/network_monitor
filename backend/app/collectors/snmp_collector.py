@@ -856,6 +856,9 @@ class SNMPCollector(LoggerMixin):
     def _interface_snapshot_cache_key(self, device_id: int, interface_index: int) -> str:
         return f"interface_monitoring:last:{device_id}:{interface_index}"
 
+    def _interface_initialized_cache_key(self, device_id: int, interface_index: int) -> str:
+        return f"interface_monitoring:initialized:{device_id}:{interface_index}"
+
     def collect_interface_monitoring(
         self,
         device: Any,
@@ -927,6 +930,7 @@ class SNMPCollector(LoggerMixin):
                 speed_bps = None
 
             cache_key = self._interface_snapshot_cache_key(device.id, int(index))
+            initialized_key = self._interface_initialized_cache_key(device.id, int(index))
             previous_raw = redis_client.get(cache_key)
             redis_client.setex(
                 cache_key,
@@ -945,6 +949,50 @@ class SNMPCollector(LoggerMixin):
             )
 
             if not previous_raw:
+                first_seen = bool(redis_client.set(initialized_key, "1", ex=2592000, nx=True))
+                if not first_seen:
+                    continue
+
+                admin_status = status_map.get(walk_results["admin_status_map"].get(index), "unknown")
+                oper_status = status_map.get(walk_results["oper_status_map"].get(index), "unknown")
+                in_bps = None if name in suppress_rate_interface_names else 0.0
+                out_bps = None if name in suppress_rate_interface_names else 0.0
+                monitored_count += 1
+                points.append({
+                    "measurement": "interface_monitoring",
+                    "tags": {
+                        "device_id": str(device.id),
+                        "device_name": device.name,
+                        "interface_index": str(index),
+                        "interface_name": name,
+                        "vendor": device.vendor or "",
+                    },
+                    "fields": {
+                        "in_octets": int(current_in) if current_in is not None else 0,
+                        "out_octets": int(current_out) if current_out is not None else 0,
+                        "in_bps": in_bps,
+                        "out_bps": out_bps,
+                        "speed_bps": float(speed_bps) if speed_bps is not None else None,
+                        "in_utilization_percent": round((in_bps / speed_bps) * 100, 2) if speed_bps and in_bps is not None else None,
+                        "out_utilization_percent": round((out_bps / speed_bps) * 100, 2) if speed_bps and out_bps is not None else None,
+                        "admin_status_code": float(walk_results["admin_status_map"].get(index) or 0),
+                        "oper_status_code": float(walk_results["oper_status_map"].get(index) or 0),
+                        "admin_up": 1.0 if admin_status == "up" else 0.0,
+                        "oper_up": 1.0 if oper_status == "up" else 0.0,
+                        "interface_admin_up_oper_down": 1.0 if admin_status == "up" and oper_status != "up" else 0.0,
+                        "in_discards": float(walk_results["in_discards_map"].get(index) or 0),
+                        "out_discards": float(walk_results["out_discards_map"].get(index) or 0),
+                        "in_errors": float(walk_results["in_errors_map"].get(index) or 0),
+                        "out_errors": float(walk_results["out_errors_map"].get(index) or 0),
+                        "queue_length": float(walk_results["queue_length_map"].get(index) or 0),
+                        "sample_seconds": 0.0,
+                        "in_discards_delta": 0.0,
+                        "out_discards_delta": 0.0,
+                        "in_errors_delta": 0.0,
+                        "out_errors_delta": 0.0,
+                    },
+                    "timestamp": now,
+                })
                 continue
 
             try:
@@ -1373,26 +1421,46 @@ class SNMPCollector(LoggerMixin):
         entity_name_oid = private_oids.get("entity_name_oid")
         entity_oper_status_oid = private_oids.get("entity_oper_status_oid")
         entity_error_status_oid = private_oids.get("entity_error_status_oid")
-        if entity_class_oid and (entity_oper_status_oid or entity_error_status_oid):
+        if entity_class_oid:
             class_map = self._walk_indexed_map(device, str(entity_class_oid), int)
             name_map = self._walk_indexed_map(device, str(entity_name_oid), str) if entity_name_oid else {}
-            oper_map = self._walk_indexed_map(device, str(entity_oper_status_oid), int) if entity_oper_status_oid else {}
-            error_map = self._walk_indexed_map(device, str(entity_error_status_oid), int) if entity_error_status_oid else {}
-            ok_values = set(private_oids.get("hardware_ok_values") or [2, 3])
+            if entity_oper_status_oid or entity_error_status_oid:
+                oper_map = self._walk_indexed_map(device, str(entity_oper_status_oid), int) if entity_oper_status_oid else {}
+                error_map = self._walk_indexed_map(device, str(entity_error_status_oid), int) if entity_error_status_oid else {}
+                ok_values = set(private_oids.get("hardware_ok_values") or [2, 3])
+                for index, entity_class in class_map.items():
+                    if entity_class not in {6, 7}:
+                        continue
+                    state = error_map.get(index, oper_map.get(index))
+                    component_type = "power" if entity_class == 6 else "fan"
+                    rows.append({
+                        "component_type": component_type,
+                        "component": name_map.get(index) or str(index),
+                        "state": float(state) if state is not None else None,
+                        "up": 1.0 if state in ok_values else 0.0 if state is not None else None,
+                        "speed": None,
+                        "present": 1.0,
+                        "status_known": 1.0 if state is not None else 0.0,
+                    })
+                if rows:
+                    return rows
+
+            inventory_rows: List[Dict[str, Any]] = []
             for index, entity_class in class_map.items():
                 if entity_class not in {6, 7}:
                     continue
-                state = error_map.get(index, oper_map.get(index))
                 component_type = "power" if entity_class == 6 else "fan"
-                rows.append({
+                inventory_rows.append({
                     "component_type": component_type,
                     "component": name_map.get(index) or str(index),
-                    "state": float(state) if state is not None else None,
-                    "up": 1.0 if state in ok_values else 0.0 if state is not None else None,
+                    "state": None,
+                    "up": None,
                     "speed": None,
+                    "present": 1.0,
+                    "status_known": 0.0,
                 })
-            if rows:
-                return rows
+            if inventory_rows:
+                return inventory_rows
 
         fan_state_oid = private_oids.get("fan_state_oid")
         fan_speed_oid = private_oids.get("fan_speed_oid")
@@ -1407,6 +1475,8 @@ class SNMPCollector(LoggerMixin):
                     "state": float(state) if state is not None else None,
                     "up": 1.0 if state == 0 else 0.0 if state is not None else None,
                     "speed": self._normalize_numeric(speed_map.get(index)),
+                    "present": 1.0,
+                    "status_known": 1.0 if state is not None else 0.0,
                 })
         power_state_oid = private_oids.get("power_state_oid")
         if power_state_oid:
@@ -1416,6 +1486,8 @@ class SNMPCollector(LoggerMixin):
                     "component": str(index),
                     "state": float(state),
                     "up": 1.0 if state == 0 else 0.0,
+                    "present": 1.0,
+                    "status_known": 1.0,
                 })
         return rows
     
@@ -1643,6 +1715,8 @@ class SNMPCollector(LoggerMixin):
                     "state": item.get("state"),
                     "up": item.get("up"),
                     "speed": item.get("speed"),
+                    "present": item.get("present"),
+                    "status_known": item.get("status_known"),
                 },
                 "timestamp": timestamp
             })

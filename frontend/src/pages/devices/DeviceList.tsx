@@ -36,13 +36,13 @@ const { Search } = Input
 const { Text } = Typography
 const { Option } = Select
 const DEVICE_LIST_STORAGE_KEY = 'resource-network-device-list-state'
-const DEVICE_LIST_STORAGE_VERSION = 4
+const DEVICE_LIST_STORAGE_VERSION = 5
 const DEFAULT_VISIBLE_COLUMNS = [
   'name',
   'ip_address',
   'status',
+  'is_monitored',
   'datacenter',
-  'device_role',
   'model',
   'device_type',
   'serial_number',
@@ -51,6 +51,7 @@ const DEFAULT_VISIBLE_COLUMNS = [
 const DEFAULT_COLUMN_WIDTHS = {
   name: 180,
   status: 120,
+  is_monitored: 110,
   ip_address: 84,
   datacenter: 180,
   device_type: 140,
@@ -60,7 +61,7 @@ const DEFAULT_COLUMN_WIDTHS = {
   serial_number: 180,
   action: 150,
 }
-const COLUMN_ORDER = ['name', 'ip_address', 'status', 'datacenter', 'device_role', 'model', 'device_type', 'vendor', 'serial_number', 'action']
+const COLUMN_ORDER = ['name', 'ip_address', 'status', 'is_monitored', 'datacenter', 'device_role', 'model', 'device_type', 'vendor', 'serial_number', 'action']
 const TABLE_CELL_TEXT_STYLE: React.CSSProperties = {
   display: 'block',
   width: '100%',
@@ -152,6 +153,7 @@ const DeviceList = () => {
   const [statusFilter, setStatusFilter] = useState<string | undefined>(persistedState?.statusFilter)
   const [roleFilter, setRoleFilter] = useState<string | undefined>(persistedState?.roleFilter)
   const [vendorFilter, setVendorFilter] = useState<string | undefined>(persistedState?.vendorFilter)
+  const [monitoredFilter, setMonitoredFilter] = useState<string | undefined>(persistedState?.monitoredFilter)
   const [datacenterFilter, setDatacenterFilter] = useState<number | undefined>(persistedState?.datacenterFilter)
   const [deviceTypeFilter, setDeviceTypeFilter] = useState<number | undefined>(persistedState?.deviceTypeFilter)
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>({
@@ -196,6 +198,7 @@ const DeviceList = () => {
         device_type_id: deviceTypeFilter,
         device_role: roleFilter,
         vendor: vendorFilter,
+        is_monitored: monitoredFilter === undefined ? undefined : monitoredFilter === 'true',
         datacenter_id: datacenterFilter,
         ...params,
       })
@@ -257,13 +260,14 @@ const DeviceList = () => {
         statusFilter,
         roleFilter,
         vendorFilter,
+        monitoredFilter,
         datacenterFilter,
         deviceTypeFilter,
         columnWidths,
         visibleColumns,
       })
     )
-  }, [currentPage, pageSize, searchKeyword, statusFilter, roleFilter, vendorFilter, datacenterFilter, deviceTypeFilter, columnWidths, visibleColumns])
+  }, [currentPage, pageSize, searchKeyword, statusFilter, roleFilter, vendorFilter, monitoredFilter, datacenterFilter, deviceTypeFilter, columnWidths, visibleColumns])
 
   useEffect(() => {
     return () => {
@@ -366,6 +370,15 @@ const DeviceList = () => {
     fetchDevices({ vendor: value, skip: 0 })
   }
 
+  const handleMonitoredChange = (value: string | undefined) => {
+    setMonitoredFilter(value)
+    setCurrentPage(1)
+    fetchDevices({
+      is_monitored: value === undefined ? undefined : value === 'true',
+      skip: 0,
+    })
+  }
+
   const handleResetFilters = () => {
     if (searchTimerRef.current) {
       window.clearTimeout(searchTimerRef.current)
@@ -374,6 +387,7 @@ const DeviceList = () => {
     setStatusFilter(undefined)
     setRoleFilter(undefined)
     setVendorFilter(undefined)
+    setMonitoredFilter(undefined)
     setDatacenterFilter(undefined)
     setDeviceTypeFilter(undefined)
     setCurrentPage(1)
@@ -386,6 +400,7 @@ const DeviceList = () => {
       device_type_id: undefined,
       device_role: undefined,
       vendor: undefined,
+      is_monitored: undefined,
       datacenter_id: undefined,
     })
   }
@@ -654,6 +669,33 @@ const DeviceList = () => {
       },
     },
     {
+      title: '是否监控',
+      dataIndex: 'is_monitored',
+      key: 'is_monitored',
+      width: columnWidths.is_monitored,
+      render: (value: boolean) => (
+        <span
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            minWidth: 42,
+            padding: '2px 8px',
+            fontSize: 12,
+            lineHeight: 1.4,
+            fontWeight: 700,
+            borderRadius: 4,
+            background: value ? '#f6ffed' : '#fff7e6',
+            color: value ? '#389e0d' : '#d46b08',
+            border: `1px solid ${value ? '#b7eb8f' : '#ffd591'}`,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {value ? '监控中' : '未监控'}
+        </span>
+      ),
+    },
+    {
       title: '设备类型',
       dataIndex: 'device_type',
       key: 'device_type',
@@ -761,10 +803,11 @@ const DeviceList = () => {
   const columnToggleOptions = [
     { key: 'name', label: '设备名称' },
     { key: 'ip_address', label: '管理地址' },
+    { key: 'status', label: '运行状态' },
+    { key: 'is_monitored', label: '是否监控' },
     { key: 'datacenter', label: '机房' },
     { key: 'device_role', label: '设备角色' },
     { key: 'model', label: '型号' },
-    { key: 'status', label: '运行状态' },
     { key: 'device_type', label: '设备类型' },
     { key: 'vendor', label: '厂商' },
     { key: 'serial_number', label: '序列号' },
@@ -880,6 +923,15 @@ const DeviceList = () => {
               value: vendor,
               label: vendor,
             })),
+          })}
+          {renderFilterChips({
+            label: '监控状态',
+            value: monitoredFilter,
+            onChange: handleMonitoredChange,
+            options: [
+              { value: 'true', label: '已监控' },
+              { value: 'false', label: '未监控' },
+            ],
           })}
         </div>
         <div style={{ marginTop: 12 }}>

@@ -72,13 +72,16 @@ class Settings(BaseSettings):
         return self.REDIS_URL
     
     # SNMP配置
-    SNMP_DEFAULT_TIMEOUT: int = 5
+    SNMP_DEFAULT_TIMEOUT: int = 1
     SNMP_DEFAULT_RETRIES: int = 3
     SNMP_DEFAULT_PORT: int = 161
     # 全量 SNMP 端口采集按批次分摊：Beat 每 10 秒调度一批，每台设备约 60 秒完整采集一轮。
     # 300-500 台 128 口交换机时，避免所有设备在同一个 10 秒窗口内集中 walk。
     SNMP_SCHEDULER_INTERVAL_SECONDS: int = 10
     SNMP_FULL_COLLECTION_INTERVAL_SECONDS: int = 60
+    # 端口流量历史要持续可见，因此接口高频采集与全量资源采集拆分。
+    # 这里保持约 60 秒内完整轮一遍所有 SNMP 设备端口基础流量数据。
+    SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS: int = 60
     SNMP_MAX_DEVICES_PER_TICK: int = 100
     # Asteros Exporter 全量资源/协议/队列指标也按批次分摊，避免和 10 秒端口流量采集抢队列。
     ASTERNOS_SCHEDULER_INTERVAL_SECONDS: int = 10

@@ -38,6 +38,20 @@ const VENDOR_OPTIONS = [
   { value: 'Hillstone', label: 'Hillstone/山石' },
 ]
 
+const DATACENTER_ALL_VALUE = '__all__'
+const DATACENTER_BADGE_COLORS = [
+  { background: '#f6ffed', border: '#b7eb8f', color: '#389e0d' },
+  { background: '#e6f4ff', border: '#91caff', color: '#0958d9' },
+  { background: '#fff7e6', border: '#ffd591', color: '#d46b08' },
+  { background: '#f9f0ff', border: '#d3adf7', color: '#722ed1' },
+  { background: '#fff0f6', border: '#ffadd2', color: '#c41d7f' },
+  { background: '#fcffe6', border: '#eaff8f', color: '#7cb305' },
+  { background: '#e6fffb', border: '#87e8de', color: '#08979c' },
+  { background: '#fff1f0', border: '#ffa39e', color: '#cf1322' },
+  { background: '#f0f5ff', border: '#adc6ff', color: '#1d39c4' },
+  { background: '#fffbe6', border: '#ffe58f', color: '#ad6800' },
+]
+
 const CONNECTIVITY_OPTIONS = [
   { value: '', label: '全部连通性' },
   { value: 'reachable', label: '可达' },
@@ -59,6 +73,12 @@ const SORT_OPTIONS = [
   { value: 'model_asc', label: '型号 A-Z' },
 ]
 
+const REFRESH_OPTIONS = [
+  { value: 0, label: '手动刷新' },
+  { value: 30, label: '每30秒刷新' },
+  { value: 60, label: '每60秒刷新' },
+]
+
 const ipToNumber = (ip?: string) => {
   const parts = String(ip || '').split('.').map((item) => Number(item))
   if (parts.length !== 4 || parts.some((item) => Number.isNaN(item))) return 0
@@ -69,6 +89,41 @@ const normalizePercent = (value?: number | null) => {
   if (value === undefined || value === null) return null
   const numeric = Number(value)
   return numeric
+}
+
+const hashText = (value: string) => {
+  let hash = 0
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0
+  }
+  return hash
+}
+
+const DatacenterBadge = ({ name, code }: { name?: string | null; code?: string | null }) => {
+  const label = (name || '').trim()
+  if (!label) return <Text type="secondary">-</Text>
+  const tone = DATACENTER_BADGE_COLORS[hashText(label) % DATACENTER_BADGE_COLORS.length]
+  return (
+    <span
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        maxWidth: '100%',
+        padding: '2px 8px',
+        borderRadius: 4,
+        border: `1px solid ${tone.border}`,
+        background: tone.background,
+        color: tone.color,
+        fontSize: 12,
+        fontWeight: 600,
+        lineHeight: 1.4,
+      }}
+    >
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
+      {code ? <span style={{ opacity: 0.8, fontWeight: 500 }}>{code}</span> : null}
+    </span>
+  )
 }
 
 const formatPercent = (value?: number | null) => {
@@ -100,8 +155,19 @@ const ResourceCell = ({ value }: { value?: number | null }) => {
   )
 }
 
-const HardwareCell = ({ total = 0, down = 0, label }: { total?: number; down?: number; label: string }) => {
+const HardwareCell = ({
+  total = 0,
+  down = 0,
+  label,
+  statusKnown = true,
+}: {
+  total?: number
+  down?: number
+  label: string
+  statusKnown?: boolean
+}) => {
   if (!total) return <Text type="secondary">-</Text>
+  if (!statusKnown) return <Tag color="blue">已识别 {total}/{total}</Tag>
   return <Tag color={down > 0 ? 'red' : 'green'}>{label} {total - down}/{total}</Tag>
 }
 
@@ -118,10 +184,20 @@ const ProtocolCell = ({ data }: { data: DeviceProtocolSummary }) => {
 
 const ConnectivityTag = ({ item }: { item: DeviceOverviewItem }) => {
   const { status, message: detail } = item.connectivity
-  const typeLabel = item.monitor_source === 'asternos_exporter' ? 'Exporter' : 'SNMP'
+  const source = String(item.monitor_source || 'snmp')
+  const typeLabel =
+    source === 'asternos_exporter'
+      ? 'Exporter'
+      : source === 'telemetry'
+        ? 'Telemetry'
+        : 'SNMP'
   const color =
     status === 'reachable'
-      ? 'green'
+      ? source === 'asternos_exporter'
+        ? 'green'
+        : source === 'telemetry'
+          ? 'purple'
+        : 'blue'
       : status === 'unreachable'
         ? 'red'
         : status === 'not_configured' || status === 'not_monitored'
@@ -159,15 +235,24 @@ const formatDuration = (seconds?: number | null, fallback?: string | null) => {
   return `${minutes}分钟`
 }
 
+const OVERVIEW_CACHE_KEY = 'device-overview:last-success'
+
+type DeviceOverviewCachePayload = {
+  items: DeviceOverviewItem[]
+  savedAt: string
+}
+
 const DeviceOverview = () => {
   const [loading, setLoading] = useState(false)
   const [refreshingDeviceId, setRefreshingDeviceId] = useState<number | null>(null)
   const [items, setItems] = useState<DeviceOverviewItem[]>([])
   const [search, setSearch] = useState('')
   const [vendor, setVendor] = useState('')
+  const [datacenter, setDatacenter] = useState(DATACENTER_ALL_VALUE)
   const [model, setModel] = useState('')
   const [connectivity, setConnectivity] = useState('')
   const [sortKey, setSortKey] = useState('ip_asc')
+  const [refreshIntervalSeconds, setRefreshIntervalSeconds] = useState(30)
   const [tablePageSize, setTablePageSize] = useState(20)
   const [detailOpen, setDetailOpen] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -175,6 +260,7 @@ const DeviceOverview = () => {
   const [neighbors, setNeighbors] = useState<{ bgp: ProtocolNeighbor[]; ospf: ProtocolNeighbor[] }>({ bgp: [], ospf: [] })
   const filtersReadyRef = useRef(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<string[]>([
+    'datacenter',
     'vendor',
     'connectivity',
     'cpu',
@@ -186,6 +272,7 @@ const DeviceOverview = () => {
   ])
 
   const columnOptions = [
+    { label: '所属机房', value: 'datacenter' },
     { label: '厂商/型号', value: 'vendor' },
     { label: '连通性', value: 'connectivity' },
     { label: 'CPU', value: 'cpu' },
@@ -218,7 +305,15 @@ const DeviceOverview = () => {
         include_sessions: false,
         limit: 500,
       })
-      setItems(result.items || [])
+      const nextItems = result.items || []
+      setItems(nextItems)
+      if (!nextSearch.trim() && !nextVendor && !nextModel.trim() && !nextConnectivity) {
+        const payload: DeviceOverviewCachePayload = {
+          items: nextItems,
+          savedAt: new Date().toISOString(),
+        }
+        window.localStorage.setItem(OVERVIEW_CACHE_KEY, JSON.stringify(payload))
+      }
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取设备总览失败')
     } finally {
@@ -227,6 +322,17 @@ const DeviceOverview = () => {
   }
 
   useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(OVERVIEW_CACHE_KEY)
+      if (raw) {
+        const payload = JSON.parse(raw) as DeviceOverviewCachePayload
+        if (Array.isArray(payload.items) && payload.items.length > 0) {
+          setItems(payload.items)
+        }
+      }
+    } catch {
+      window.localStorage.removeItem(OVERVIEW_CACHE_KEY)
+    }
     loadData('', '', '', '')
   }, [])
 
@@ -241,9 +347,40 @@ const DeviceOverview = () => {
     return () => window.clearTimeout(timer)
   }, [search, vendor, model, connectivity, visibleColumnKeys])
 
+  useEffect(() => {
+    if (!refreshIntervalSeconds) return undefined
+    const timer = window.setInterval(() => {
+      loadData(search, vendor, model, connectivity)
+    }, refreshIntervalSeconds * 1000)
+    return () => window.clearInterval(timer)
+  }, [refreshIntervalSeconds, search, vendor, model, connectivity, visibleColumnKeys])
+
+  const datacenterOptions = useMemo(() => {
+    const unique = new Map<string, string>()
+    for (const item of items) {
+      const name = item.device.datacenter?.name?.trim()
+      if (name) {
+        unique.set(name, name)
+      }
+    }
+    return [
+      { value: DATACENTER_ALL_VALUE, label: '全部机房' },
+      ...Array.from(unique.values())
+        .sort((left, right) => left.localeCompare(right, 'zh-CN'))
+        .map((value) => ({ value, label: value })),
+    ]
+  }, [items])
+
+  const filteredItems = useMemo(() => {
+    if (datacenter === DATACENTER_ALL_VALUE) {
+      return items
+    }
+    return items.filter((item) => (item.device.datacenter?.name || '') === datacenter)
+  }, [datacenter, items])
+
   const sortedItems = useMemo(() => {
     const protocolDownCount = (item: DeviceOverviewItem) => item.protocols.bgp.down + item.protocols.ospf.down
-    const list = [...items]
+    const list = [...filteredItems]
     return list.sort((a, b) => {
       if (sortKey === 'ip_desc') return ipToNumber(b.device.ip_address) - ipToNumber(a.device.ip_address)
       if (sortKey === 'cpu_desc') return (normalizePercent(b.resources.cpu_percent) || -1) - (normalizePercent(a.resources.cpu_percent) || -1)
@@ -260,14 +397,14 @@ const DeviceOverview = () => {
       if (sortKey === 'model_asc') return String(a.device.model || '').localeCompare(String(b.device.model || ''))
       return ipToNumber(a.device.ip_address) - ipToNumber(b.device.ip_address)
     })
-  }, [items, sortKey])
+  }, [filteredItems, sortKey])
 
   const stats = useMemo(() => {
-    const reachable = items.filter((item) => item.connectivity.status === 'reachable').length
-    const bgpDown = items.reduce((sum, item) => sum + item.protocols.bgp.down, 0)
-    const ospfDown = items.reduce((sum, item) => sum + item.protocols.ospf.down, 0)
-    return { total: items.length, reachable, bgpDown, ospfDown }
-  }, [items])
+    const reachable = filteredItems.filter((item) => item.connectivity.status === 'reachable').length
+    const bgpDown = filteredItems.reduce((sum, item) => sum + item.protocols.bgp.down, 0)
+    const ospfDown = filteredItems.reduce((sum, item) => sum + item.protocols.ospf.down, 0)
+    return { total: filteredItems.length, reachable, bgpDown, ospfDown }
+  }, [filteredItems])
 
   const openDetail = async (item: DeviceOverviewItem) => {
     setDetailDevice(item)
@@ -363,6 +500,19 @@ const DeviceOverview = () => {
       ),
     },
     {
+      title: '所属机房',
+      key: 'datacenter',
+      width: 180,
+      sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
+        String(a.device.datacenter?.name || '').localeCompare(String(b.device.datacenter?.name || ''), 'zh-CN'),
+      render: (_: any, record: DeviceOverviewItem) => (
+        <DatacenterBadge
+          name={record.device.datacenter?.name}
+          code={record.device.datacenter?.code}
+        />
+      ),
+    },
+    {
       title: '连通性',
       key: 'connectivity',
       width: 140,
@@ -406,7 +556,12 @@ const DeviceOverview = () => {
       key: 'fan',
       width: 110,
       render: (_: any, record: DeviceOverviewItem) => (
-        <HardwareCell label="正常" total={record.hardware?.fan_total} down={record.hardware?.fan_down} />
+        <HardwareCell
+          label="正常"
+          total={record.hardware?.fan_total}
+          down={record.hardware?.fan_down}
+          statusKnown={record.hardware?.fan_status_known}
+        />
       ),
     },
     {
@@ -414,7 +569,12 @@ const DeviceOverview = () => {
       key: 'power',
       width: 110,
       render: (_: any, record: DeviceOverviewItem) => (
-        <HardwareCell label="正常" total={record.hardware?.power_total} down={record.hardware?.power_down} />
+        <HardwareCell
+          label="正常"
+          total={record.hardware?.power_total}
+          down={record.hardware?.power_down}
+          statusKnown={record.hardware?.power_status_known}
+        />
       ),
     },
     {
@@ -474,10 +634,17 @@ const DeviceOverview = () => {
             style={{ flex: '1 1 300px', minWidth: 260, maxWidth: 460 }}
           />
           <Select style={{ width: 180 }} options={VENDOR_OPTIONS} value={vendor} onChange={setVendor} />
+          <Select style={{ width: 180 }} options={datacenterOptions} value={datacenter} onChange={setDatacenter} />
           <Input allowClear placeholder="筛选型号" value={model} onChange={(event) => setModel(event.target.value)} style={{ width: 220 }} />
           <Select style={{ width: 180 }} options={CONNECTIVITY_OPTIONS} value={connectivity} onChange={setConnectivity} />
           <Select style={{ width: 190 }} options={SORT_OPTIONS} value={sortKey} onChange={setSortKey} />
+          <Select style={{ width: 150 }} options={REFRESH_OPTIONS} value={refreshIntervalSeconds} onChange={setRefreshIntervalSeconds} />
           <Space size={10} wrap style={{ marginLeft: 'auto' }}>
+            {loading ? (
+              <Space size={4} style={{ color: '#1677ff', fontSize: 12 }}>
+                <ReloadOutlined spin />
+              </Space>
+            ) : null}
             <Dropdown
               trigger={['click']}
               dropdownRender={() => (

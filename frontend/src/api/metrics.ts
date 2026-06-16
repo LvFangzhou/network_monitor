@@ -306,8 +306,10 @@ export interface DeviceOverviewItem {
   hardware?: {
     fan_total?: number
     fan_down?: number
+    fan_status_known?: boolean
     power_total?: number
     power_down?: number
+    power_status_known?: boolean
   }
   protocols: {
     bgp: DeviceProtocolSummary

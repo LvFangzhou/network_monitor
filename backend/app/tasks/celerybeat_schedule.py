@@ -13,6 +13,14 @@ beat_schedule = {
             'expires': 8.0,
         }
     },
+    # SNMP接口高频采集 - 端口出入流量独立高频轮询，不受15分钟全量资源采集影响
+    'collect-snmp-interface-realtime-every-10s': {
+        'task': 'app.tasks.snmp_tasks.collect_all_snmp_interface_realtime',
+        'schedule': 10.0,
+        'options': {
+            'expires': 8.0,
+        }
+    },
     # 线路绑定端口轻量采集 - 重点公网/专线端口保持10秒级曲线
     'collect-circuit-interface-realtime-every-10s': {
         'task': 'app.tasks.snmp_tasks.collect_circuit_interface_realtime',
