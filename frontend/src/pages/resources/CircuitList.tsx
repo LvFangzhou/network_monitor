@@ -206,6 +206,15 @@ type CircuitListProps = {
   fixedLineType?: 'internet' | 'private_line'
 }
 
+type AggregationOption = {
+  value: string
+  label: string
+  interfaceName: string
+  monitorDeviceId: number | null
+  presentOnPrimary: boolean
+  presentOnSecondary: boolean
+}
+
 const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps) => {
   const canModify = !useAuthStore((state) => state.user?.read_only)
   const isPrivateLine = fixedLineType === 'private_line'
@@ -302,6 +311,64 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
     }
   }
 
+  const buildAggregationOptions = (): AggregationOption[] => {
+    const primaryInterfaces = primaryDeviceId ? deviceInterfacesMap[primaryDeviceId] || [] : []
+    const secondaryInterfaces = secondaryDeviceId ? deviceInterfacesMap[secondaryDeviceId] || [] : []
+    const aggregationMap = new Map<string, AggregationOption>()
+
+    const appendInterfaces = (
+      interfaces: MonitorInterface[],
+      deviceId: number | undefined,
+      side: 'primary' | 'secondary'
+    ) => {
+      interfaces
+        .filter((item) => /^(Bridge-Aggregation|Route-Aggregation)/i.test(item.name))
+        .forEach((item) => {
+          const existing = aggregationMap.get(item.name)
+          if (existing) {
+            if (side === 'primary') {
+              existing.presentOnPrimary = true
+              existing.monitorDeviceId = deviceId ?? existing.monitorDeviceId
+            } else {
+              existing.presentOnSecondary = true
+              if (!existing.monitorDeviceId) {
+                existing.monitorDeviceId = deviceId ?? null
+              }
+            }
+            return
+          }
+          aggregationMap.set(item.name, {
+            value: item.name,
+            label: item.name,
+            interfaceName: item.name,
+            monitorDeviceId: deviceId ?? null,
+            presentOnPrimary: side === 'primary',
+            presentOnSecondary: side === 'secondary',
+          })
+        })
+    }
+
+    appendInterfaces(primaryInterfaces, primaryDeviceId, 'primary')
+    appendInterfaces(secondaryInterfaces, secondaryDeviceId, 'secondary')
+
+    return Array.from(aggregationMap.values())
+      .map((item) => {
+        let placementLabel = '单端识别'
+        if (item.presentOnPrimary && item.presentOnSecondary) {
+          placementLabel = '双端同步（M-LAG）'
+        } else if (item.presentOnPrimary) {
+          placementLabel = '仅主端识别'
+        } else if (item.presentOnSecondary) {
+          placementLabel = '仅备端识别'
+        }
+        return {
+          ...item,
+          label: `${item.interfaceName}（${placementLabel}）`,
+        }
+      })
+      .sort((left, right) => left.interfaceName.localeCompare(right.interfaceName, 'zh-CN', { numeric: true }))
+  }
+
   useEffect(() => {
     fetchOptions()
     fetchCircuits('')
@@ -329,21 +396,6 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       void loadDeviceInterfaces(secondaryDeviceId)
     }
   }, [secondaryDeviceId])
-
-  useEffect(() => {
-    if (!isDualLacpMode) {
-      form.setFieldValue('aggregation_selection', undefined)
-      return
-    }
-    const currentValue = form.getFieldValue('aggregation_selection') as string | undefined
-    if (!currentValue) {
-      return
-    }
-    const validOptions = new Set(getAggregationOptions().map((item) => item.value))
-    if (!validOptions.has(currentValue)) {
-      form.setFieldValue('aggregation_selection', undefined)
-    }
-  }, [isDualLacpMode, primaryDeviceId, secondaryDeviceId, deviceInterfacesMap])
 
   const handleCreate = () => {
     setEditingCircuit(null)
@@ -396,10 +448,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
     setEditingCircuit(record)
     form.setFieldsValue({
       ...record,
-      aggregation_selection:
-        record.aggregation_monitor_device_id && record.aggregation_interface_name
-          ? `${record.aggregation_monitor_device_id}::${record.aggregation_interface_name}`
-          : undefined,
+      aggregation_selection: record.aggregation_interface_name || undefined,
       bfd_mode: record.bfd_mode || (record.bfd_enabled ? 'bfd' : 'none'),
       primary_local_interconnect_ip: record.primary_local_interconnect_ip || record.primary_interconnect_ip || record.local_interconnect_address,
       primary_remote_interconnect_ip: record.primary_remote_interconnect_ip || record.remote_interconnect_address,
@@ -803,17 +852,18 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
   )
 
   const renderAggregationDetailLine = (
-    deviceName?: string,
-    deviceIp?: string,
-    interfaceName?: string
+    interfaceName?: string,
+    placementLabel?: string
   ) => (
     <div style={{ color: '#666', fontWeight: 600, lineHeight: 1.7 }}>
       <span style={{ color: '#333', fontWeight: 700 }}>逻辑聚合接口：</span>
-      设备名称：
-      <span style={{ color: '#333', fontWeight: 700 }}>{deviceName || '未绑定'}</span>
-      <span style={{ color: '#1677ff', fontWeight: 800 }}>【{deviceIp || '未填写'}】</span>
-      {' '} / 聚合接口：
       <span style={{ color: '#262626', fontWeight: 800 }}>【{interfaceName || '未填写'}】</span>
+      {placementLabel ? (
+        <>
+          {' '} / 部署方式：
+          <span style={{ color: '#1677ff', fontWeight: 800 }}>【{placementLabel}】</span>
+        </>
+      ) : null}
     </div>
   )
 
@@ -945,38 +995,51 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       value: item.name,
       label: item.name,
     }))
-  const getAggregationOptions = () => {
-    const deviceIds = [primaryDeviceId, secondaryDeviceId].filter(Boolean) as number[]
-    const seen = new Set<string>()
-    return deviceIds.flatMap((deviceId) => {
-      const device = devices.find((item) => item.id === deviceId)
-      return (deviceInterfacesMap[deviceId] || [])
-        .filter((item) => /^(Bridge-Aggregation|Route-Aggregation)/i.test(item.name))
-        .map((item) => {
-          const value = `${deviceId}::${item.name}`
-          if (seen.has(value)) {
-            return null
-          }
-          seen.add(value)
-          return {
-            value,
-            label: `${device?.ip_address || device?.name || deviceId} / ${item.name}`,
-          }
-        })
-        .filter(Boolean) as Array<{ value: string; label: string }>
-    })
+  const aggregationOptions = useMemo<AggregationOption[]>(() => buildAggregationOptions(), [deviceInterfacesMap, primaryDeviceId, secondaryDeviceId])
+
+  const getAggregationOptionByInterfaceName = (interfaceName?: string) =>
+    aggregationOptions.find((item) => item.interfaceName === interfaceName)
+
+  const getAggregationPlacementLabel = (interfaceName?: string) => {
+    const matched = getAggregationOptionByInterfaceName(interfaceName)
+    if (matched?.presentOnPrimary && matched?.presentOnSecondary) {
+      return '双端同步（M-LAG）'
+    }
+    if (matched?.presentOnPrimary) {
+      return '仅主端识别'
+    }
+    if (matched?.presentOnSecondary) {
+      return '仅备端识别'
+    }
+    return undefined
   }
+
   const decodeAggregationSelection = (value?: string) => {
-    if (!value || !value.includes('::')) {
+    const matched = getAggregationOptionByInterfaceName(value)
+    if (!matched) {
       return { deviceId: null, interfaceName: null }
     }
-    const [deviceIdText, interfaceName] = value.split('::')
-    const deviceId = Number(deviceIdText)
-    if (!Number.isFinite(deviceId) || !interfaceName) {
-      return { deviceId: null, interfaceName: null }
+    return {
+      deviceId: matched.monitorDeviceId,
+      interfaceName: matched.interfaceName,
     }
-    return { deviceId, interfaceName }
   }
+
+  useEffect(() => {
+    if (!isDualLacpMode) {
+      form.setFieldValue('aggregation_selection', undefined)
+      return
+    }
+    const currentValue = form.getFieldValue('aggregation_selection') as string | undefined
+    if (!currentValue) {
+      return
+    }
+    const validOptions = new Set(aggregationOptions.map((item) => item.value))
+    if (!validOptions.has(currentValue)) {
+      form.setFieldValue('aggregation_selection', undefined)
+    }
+  }, [aggregationOptions, form, isDualLacpMode])
+
   const isDualLacpCircuit = (record: Circuit) =>
     isPrivateLine && record.access_mode === 'dual' && record.dual_link_mode === 'lacp'
 
@@ -1172,15 +1235,24 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
             {record.access_mode === 'dual'
               ? renderTerminationLine('备接入', record.secondary_device_ip || record.secondary_device_name, record.secondary_port_name, record.secondary_port_rate, true)
               : null}
-            {dualLacpCircuit
-              ? renderTerminationLine(
-                  '逻辑聚合',
-                  record.aggregation_monitor_device_ip || record.aggregation_monitor_device_name,
-                  record.aggregation_interface_name,
-                  record.primary_port_rate || record.secondary_port_rate,
-                  true
-                )
-              : null}
+            {dualLacpCircuit ? (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', lineHeight: 1.4, minWidth: 0 }}>
+                <Tag style={{ marginInlineEnd: 0, fontSize: 12 }}>逻辑聚合</Tag>
+                <span
+                  title={`${record.aggregation_interface_name || '-'} / ${getAggregationPlacementLabel(record.aggregation_interface_name) || '逻辑单线'} / ${record.primary_port_rate || record.secondary_port_rate || '-'}`}
+                  style={{
+                    minWidth: 0,
+                    flex: 1,
+                    fontSize: 12,
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {`${record.aggregation_interface_name || '-'} / ${getAggregationPlacementLabel(record.aggregation_interface_name) || '逻辑单线'} / ${record.primary_port_rate || record.secondary_port_rate || '-'}`}
+                </span>
+              </div>
+            ) : null}
           </div>
         )
       },
@@ -1652,9 +1724,8 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                         {renderTerminationDetailLine('备接入', record.secondary_device_name, record.secondary_device_ip, record.secondary_port_name, record.secondary_port_rate)}
                         {dualLacpCircuit
                           ? renderAggregationDetailLine(
-                              record.aggregation_monitor_device_name,
-                              record.aggregation_monitor_device_ip,
-                              record.aggregation_interface_name
+                              record.aggregation_interface_name,
+                              getAggregationPlacementLabel(record.aggregation_interface_name)
                             )
                           : null}
                         <div style={{ color: '#666', fontWeight: 600, marginTop: 2 }}>
@@ -1916,7 +1987,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                         showSearch
                         optionFilterProp="label"
                         placeholder="请选择 Bridge-Aggregation / Route-Aggregation 接口"
-                        options={getAggregationOptions()}
+                        options={aggregationOptions}
                       />
                     </Form.Item>
                   </Col>
