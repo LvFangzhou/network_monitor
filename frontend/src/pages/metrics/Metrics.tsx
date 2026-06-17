@@ -351,8 +351,18 @@ const toChartPoint = (item: MonitorHistoryPoint | { _time?: string } & Record<st
   }
 }
 
-const formatXAxisTick = (timestamp: number, rangeValue: string) => {
+const formatXAxisTick = (timestamp: number, rangeValue: string, domain?: [number, number]) => {
   const time = dayjs(timestamp)
+  const spanMs =
+    domain && Number.isFinite(domain[0]) && Number.isFinite(domain[1]) && domain[1] > domain[0]
+      ? domain[1] - domain[0]
+      : getRangeWindowMs(rangeValue)
+  const shouldIncludeDate = spanMs > 24 * 60 * 60 * 1000
+
+  if (shouldIncludeDate) {
+    if (spanMs >= 3 * 24 * 60 * 60 * 1000) return time.format('MM-DD HH:mm')
+    return time.format('MM-DD HH:mm')
+  }
   if (rangeValue === '-10m') return time.format('HH:mm:ss')
   if (rangeValue === '-30m' || rangeValue === '-1h') return time.format('HH:mm')
   if (rangeValue === '-6h' || rangeValue === '-12h' || rangeValue === '-24h') return time.format('HH:mm')
@@ -1576,7 +1586,7 @@ const Metrics = () => {
                         ticks={xTicks}
                         interval={0}
                         minTickGap={getXAxisMinTickGap(effectiveRangeValue)}
-                        tickFormatter={(value) => formatXAxisTick(Number(value), effectiveRangeValue)}
+                        tickFormatter={(value) => formatXAxisTick(Number(value), effectiveRangeValue, xDomain as [number, number])}
                         tick={{ fill: chartAxis, fontSize: 12 }}
                         axisLine={{ stroke: panelBorder }}
                         tickLine={{ stroke: panelBorder }}

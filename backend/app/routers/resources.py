@@ -315,6 +315,9 @@ def circuit_matches_search(circuit: Circuit, search: str, search_ip) -> bool:
         circuit.secondary_device_ref.name if circuit.secondary_device_ref else None,
         circuit.secondary_device_ref.ip_address if circuit.secondary_device_ref else None,
         circuit.secondary_port_name,
+        circuit.aggregation_monitor_device_ref.name if circuit.aggregation_monitor_device_ref else None,
+        circuit.aggregation_monitor_device_ref.ip_address if circuit.aggregation_monitor_device_ref else None,
+        circuit.aggregation_interface_name,
         circuit.primary_interconnect_ip,
         circuit.secondary_interconnect_ip,
         circuit.local_interconnect_address,
@@ -329,6 +332,7 @@ def circuit_matches_search(circuit: Circuit, search: str, search_ip) -> bool:
         circuit.ip_address,
         circuit.primary_device_ref.ip_address if circuit.primary_device_ref else None,
         circuit.secondary_device_ref.ip_address if circuit.secondary_device_ref else None,
+        circuit.aggregation_monitor_device_ref.ip_address if circuit.aggregation_monitor_device_ref else None,
         circuit.primary_interconnect_ip,
         circuit.secondary_interconnect_ip,
         circuit.local_interconnect_address,
@@ -514,6 +518,8 @@ AUDITED_CIRCUIT_FIELDS = [
     "customer_id",
     "primary_device_id",
     "primary_port_name",
+    "aggregation_monitor_device_id",
+    "aggregation_interface_name",
     "primary_local_interconnect_ip",
     "primary_remote_interconnect_ip",
     "primary_interconnect_type",
@@ -568,6 +574,8 @@ def snapshot_circuit(circuit: Circuit) -> dict:
         "customer_id": circuit.customer_id,
         "primary_device_id": circuit.primary_device_id,
         "primary_port_name": circuit.primary_port_name,
+        "aggregation_monitor_device_id": circuit.aggregation_monitor_device_id,
+        "aggregation_interface_name": circuit.aggregation_interface_name,
         "primary_local_interconnect_ip": circuit.primary_local_interconnect_ip,
         "primary_remote_interconnect_ip": circuit.primary_remote_interconnect_ip,
         "primary_interconnect_type": circuit.primary_interconnect_type or circuit.interconnect_type,
@@ -991,21 +999,33 @@ async def create_circuit(
             raise HTTPException(status_code=400, detail="双线接入时请选择备端口物理速率")
         if not circuit.dual_link_mode:
             raise HTTPException(status_code=400, detail="双线接入时请选择接入策略")
+    if circuit.aggregation_monitor_device_id:
+        aggregation_device = db.query(Device).filter(Device.id == circuit.aggregation_monitor_device_id).first()
+        if not aggregation_device:
+            raise HTTPException(status_code=400, detail="逻辑聚合接口设备不存在")
+    is_dual_lacp_private_line = (
+        circuit.line_type == "private_line"
+        and circuit.access_mode == "dual"
+        and circuit.dual_link_mode == "lacp"
+    )
     if circuit.line_type == "private_line":
         primary_interconnect_type = circuit.primary_interconnect_type or circuit.interconnect_type
-        secondary_interconnect_type = circuit.secondary_interconnect_type or circuit.interconnect_type
         if not circuit.primary_local_interconnect_ip:
             raise HTTPException(status_code=400, detail="请填写主本端地址")
         if not circuit.primary_remote_interconnect_ip:
             raise HTTPException(status_code=400, detail="请填写主对端地址")
-        if circuit.access_mode == "dual" and not circuit.secondary_local_interconnect_ip:
+        if is_dual_lacp_private_line:
+            if not circuit.aggregation_monitor_device_id or not circuit.aggregation_interface_name:
+                raise HTTPException(status_code=400, detail="LACP 双线专线时请选择逻辑聚合接口")
+        if circuit.access_mode == "dual" and not is_dual_lacp_private_line and not circuit.secondary_local_interconnect_ip:
             raise HTTPException(status_code=400, detail="双线接入时请填写备本端地址")
-        if circuit.access_mode == "dual" and not circuit.secondary_remote_interconnect_ip:
+        if circuit.access_mode == "dual" and not is_dual_lacp_private_line and not circuit.secondary_remote_interconnect_ip:
             raise HTTPException(status_code=400, detail="双线接入时请填写备对端地址")
         if primary_interconnect_type == "l2":
             if not circuit.primary_vlan_id:
                 raise HTTPException(status_code=400, detail="二层互联时请填写主接入VLAN ID")
-        if circuit.access_mode == "dual" and secondary_interconnect_type == "l2":
+        secondary_interconnect_type = circuit.secondary_interconnect_type or circuit.interconnect_type
+        if circuit.access_mode == "dual" and not is_dual_lacp_private_line and secondary_interconnect_type == "l2":
             if not circuit.secondary_vlan_id:
                 raise HTTPException(status_code=400, detail="双线接入二层互联时请填写备接入VLAN ID")
     payload = circuit.model_dump()
@@ -1013,28 +1033,45 @@ async def create_circuit(
         payload["operator_name"] = "专线"
     if payload.get("line_type") == "private_line":
         payload["primary_interconnect_type"] = payload.get("primary_interconnect_type") or payload.get("interconnect_type")
-        payload["secondary_interconnect_type"] = payload.get("secondary_interconnect_type") or payload.get("interconnect_type")
         payload["interconnect_type"] = payload.get("primary_interconnect_type")
+        is_dual_lacp_private_line = (
+            payload.get("access_mode") == "dual"
+            and payload.get("dual_link_mode") == "lacp"
+        )
+        if is_dual_lacp_private_line:
+            payload["secondary_interconnect_type"] = None
+            payload["secondary_local_interconnect_ip"] = None
+            payload["secondary_remote_interconnect_ip"] = None
+            payload["secondary_routing_mode"] = None
+            payload["secondary_bfd_mode"] = "none"
+            payload["secondary_interconnect_ip"] = None
+            payload["secondary_vlan_id"] = None
+        else:
+            payload["aggregation_monitor_device_id"] = None
+            payload["aggregation_interface_name"] = None
+            payload["secondary_interconnect_type"] = payload.get("secondary_interconnect_type") or payload.get("interconnect_type")
         if payload.get("primary_interconnect_type") != "l2":
             payload["primary_vlan_id"] = None
         if payload.get("secondary_interconnect_type") != "l2":
             payload["secondary_vlan_id"] = None
         payload["primary_routing_mode"] = payload.get("primary_routing_mode") or payload.get("routing_mode")
-        payload["secondary_routing_mode"] = payload.get("secondary_routing_mode") or payload.get("routing_mode")
+        payload["secondary_routing_mode"] = None if is_dual_lacp_private_line else (payload.get("secondary_routing_mode") or payload.get("routing_mode"))
         payload["primary_bfd_mode"] = payload.get("primary_bfd_mode") or payload.get("bfd_mode") or ("bfd" if payload.get("bfd_enabled") else "none")
-        payload["secondary_bfd_mode"] = payload.get("secondary_bfd_mode") or payload.get("bfd_mode") or ("bfd" if payload.get("bfd_enabled") else "none")
+        payload["secondary_bfd_mode"] = "none" if is_dual_lacp_private_line else (payload.get("secondary_bfd_mode") or payload.get("bfd_mode") or ("bfd" if payload.get("bfd_enabled") else "none"))
         payload["routing_mode"] = payload.get("primary_routing_mode")
         payload["bfd_mode"] = payload.get("primary_bfd_mode") or "none"
         payload["bfd_enabled"] = payload["bfd_mode"] == "bfd"
         payload["primary_interconnect_ip"] = payload.get("primary_local_interconnect_ip")
-        payload["secondary_interconnect_ip"] = payload.get("secondary_local_interconnect_ip")
+        payload["secondary_interconnect_ip"] = None if is_dual_lacp_private_line else payload.get("secondary_local_interconnect_ip")
         payload["local_interconnect_address"] = payload.get("primary_local_interconnect_ip")
         payload["remote_interconnect_address"] = payload.get("primary_remote_interconnect_ip")
+        payload["interconnect_address"] = [payload.get("primary_local_interconnect_ip"), payload.get("primary_remote_interconnect_ip")]
+        payload["interconnect_address"] = " - ".join([item for item in payload["interconnect_address"] if item])
     db_circuit = Circuit(**payload)
     db.add(db_circuit)
     db.commit()
     db.refresh(db_circuit)
-    db.refresh(db_circuit, attribute_names=["datacenter_ref", "vendor_ref", "customer_ref", "primary_device_ref", "secondary_device_ref"])
+    db.refresh(db_circuit, attribute_names=["datacenter_ref", "vendor_ref", "customer_ref", "primary_device_ref", "secondary_device_ref", "aggregation_monitor_device_ref"])
     create_circuit_audit(
         db,
         circuit_id=db_circuit.id,
@@ -1086,6 +1123,11 @@ async def update_circuit(
         secondary_device = db.query(Device).filter(Device.id == data["secondary_device_id"]).first()
         if not secondary_device:
             raise HTTPException(status_code=400, detail="备接入交换机不存在")
+    next_aggregation_monitor_device_id = data.get("aggregation_monitor_device_id", db_circuit.aggregation_monitor_device_id)
+    if next_aggregation_monitor_device_id:
+        aggregation_device = db.query(Device).filter(Device.id == next_aggregation_monitor_device_id).first()
+        if not aggregation_device:
+            raise HTTPException(status_code=400, detail="逻辑聚合接口设备不存在")
     next_access_mode = data.get("access_mode", db_circuit.access_mode)
     next_secondary_device_id = data.get("secondary_device_id", db_circuit.secondary_device_id)
     next_secondary_port_name = data.get("secondary_port_name", db_circuit.secondary_port_name)
@@ -1114,27 +1156,47 @@ async def update_circuit(
     next_secondary_remote_interconnect_ip = data.get("secondary_remote_interconnect_ip", db_circuit.secondary_remote_interconnect_ip)
     next_primary_vlan_id = data.get("primary_vlan_id", db_circuit.primary_vlan_id)
     next_secondary_vlan_id = data.get("secondary_vlan_id", db_circuit.secondary_vlan_id)
+    next_aggregation_interface_name = data.get("aggregation_interface_name", db_circuit.aggregation_interface_name)
+    is_dual_lacp_private_line = (
+        next_line_type == "private_line"
+        and next_access_mode == "dual"
+        and next_dual_link_mode == "lacp"
+    )
     if next_line_type == "private_line":
         if not next_primary_local_interconnect_ip:
             raise HTTPException(status_code=400, detail="请填写主本端地址")
         if not next_primary_remote_interconnect_ip:
             raise HTTPException(status_code=400, detail="请填写主对端地址")
-        if next_access_mode == "dual" and not next_secondary_local_interconnect_ip:
+        if is_dual_lacp_private_line:
+            if not next_aggregation_monitor_device_id or not next_aggregation_interface_name:
+                raise HTTPException(status_code=400, detail="LACP 双线专线时请选择逻辑聚合接口")
+        if next_access_mode == "dual" and not is_dual_lacp_private_line and not next_secondary_local_interconnect_ip:
             raise HTTPException(status_code=400, detail="双线接入时请填写备本端地址")
-        if next_access_mode == "dual" and not next_secondary_remote_interconnect_ip:
+        if next_access_mode == "dual" and not is_dual_lacp_private_line and not next_secondary_remote_interconnect_ip:
             raise HTTPException(status_code=400, detail="双线接入时请填写备对端地址")
         if next_primary_interconnect_type == "l2":
             if not next_primary_vlan_id:
                 raise HTTPException(status_code=400, detail="二层互联时请填写主接入VLAN ID")
-        if next_access_mode == "dual" and next_secondary_interconnect_type == "l2":
+        if next_access_mode == "dual" and not is_dual_lacp_private_line and next_secondary_interconnect_type == "l2":
             if not next_secondary_vlan_id:
                 raise HTTPException(status_code=400, detail="双线接入二层互联时请填写备接入VLAN ID")
     if data.get("line_type", db_circuit.line_type) == "private_line" and not data.get("operator_name", db_circuit.operator_name):
         data["operator_name"] = "专线"
     if data.get("line_type", db_circuit.line_type) == "private_line":
         data["primary_interconnect_type"] = data.get("primary_interconnect_type", db_circuit.primary_interconnect_type or next_interconnect_type)
-        data["secondary_interconnect_type"] = data.get("secondary_interconnect_type", db_circuit.secondary_interconnect_type or next_interconnect_type)
         data["interconnect_type"] = data.get("primary_interconnect_type")
+        if is_dual_lacp_private_line:
+            data["secondary_interconnect_type"] = None
+            data["secondary_local_interconnect_ip"] = None
+            data["secondary_remote_interconnect_ip"] = None
+            data["secondary_routing_mode"] = None
+            data["secondary_bfd_mode"] = "none"
+            data["secondary_interconnect_ip"] = None
+            data["secondary_vlan_id"] = None
+        else:
+            data["aggregation_monitor_device_id"] = None
+            data["aggregation_interface_name"] = None
+            data["secondary_interconnect_type"] = data.get("secondary_interconnect_type", db_circuit.secondary_interconnect_type or next_interconnect_type)
         if data.get("primary_interconnect_type") != "l2":
             data["primary_vlan_id"] = None
         if data.get("secondary_interconnect_type") != "l2":
@@ -1142,22 +1204,32 @@ async def update_circuit(
         fallback_routing_mode = data.get("routing_mode", db_circuit.routing_mode)
         fallback_bfd_mode = data.get("bfd_mode", db_circuit.effective_bfd_mode())
         data["primary_routing_mode"] = data.get("primary_routing_mode", db_circuit.primary_routing_mode or fallback_routing_mode)
-        data["secondary_routing_mode"] = data.get("secondary_routing_mode", db_circuit.secondary_routing_mode or fallback_routing_mode)
+        data["secondary_routing_mode"] = None if is_dual_lacp_private_line else data.get("secondary_routing_mode", db_circuit.secondary_routing_mode or fallback_routing_mode)
         data["primary_bfd_mode"] = data.get("primary_bfd_mode", db_circuit.effective_primary_bfd_mode() or fallback_bfd_mode or "none")
-        data["secondary_bfd_mode"] = data.get("secondary_bfd_mode", db_circuit.effective_secondary_bfd_mode() or fallback_bfd_mode or "none")
+        data["secondary_bfd_mode"] = "none" if is_dual_lacp_private_line else data.get("secondary_bfd_mode", db_circuit.effective_secondary_bfd_mode() or fallback_bfd_mode or "none")
         data["routing_mode"] = data.get("primary_routing_mode")
         data["bfd_mode"] = data.get("primary_bfd_mode") or "none"
         data["bfd_enabled"] = data["bfd_mode"] == "bfd"
         data["primary_interconnect_ip"] = data.get("primary_local_interconnect_ip", db_circuit.primary_local_interconnect_ip or db_circuit.primary_interconnect_ip)
-        data["secondary_interconnect_ip"] = data.get("secondary_local_interconnect_ip", db_circuit.secondary_local_interconnect_ip or db_circuit.secondary_interconnect_ip)
+        data["secondary_interconnect_ip"] = None if is_dual_lacp_private_line else data.get("secondary_local_interconnect_ip", db_circuit.secondary_local_interconnect_ip or db_circuit.secondary_interconnect_ip)
         data["local_interconnect_address"] = data.get("primary_local_interconnect_ip", db_circuit.primary_local_interconnect_ip or db_circuit.primary_interconnect_ip)
         data["remote_interconnect_address"] = data.get("primary_remote_interconnect_ip", db_circuit.primary_remote_interconnect_ip or db_circuit.remote_interconnect_address)
+        data["interconnect_address"] = " - ".join(
+            [
+                item
+                for item in [
+                    data.get("primary_local_interconnect_ip", db_circuit.primary_local_interconnect_ip or db_circuit.primary_interconnect_ip),
+                    data.get("primary_remote_interconnect_ip", db_circuit.primary_remote_interconnect_ip or db_circuit.remote_interconnect_address),
+                ]
+                if item
+            ]
+        )
     for key, value in data.items():
         setattr(db_circuit, key, value)
     db_circuit.updated_at = datetime.now()
     db.commit()
     db.refresh(db_circuit)
-    db.refresh(db_circuit, attribute_names=["datacenter_ref", "vendor_ref", "customer_ref", "primary_device_ref", "secondary_device_ref"])
+    db.refresh(db_circuit, attribute_names=["datacenter_ref", "vendor_ref", "customer_ref", "primary_device_ref", "secondary_device_ref", "aggregation_monitor_device_ref"])
     create_circuit_audit(
         db,
         circuit_id=db_circuit.id,

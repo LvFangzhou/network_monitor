@@ -50,7 +50,7 @@ const physicalPortRateOptions = [
   { value: '100G', label: '100G' },
 ]
 const dualLinkModeOptions = [
-  { value: 'lacp', label: 'LACP' },
+  { value: 'lacp', label: 'LACP（逻辑单线）' },
   { value: 'cold_standby', label: '冷备' },
   { value: 'hot_standby', label: '热备' },
 ]
@@ -96,6 +96,8 @@ const auditFieldLabelMap: Record<string, string> = {
   customer_id: '客户',
   primary_device_id: '主接入交换机',
   primary_port_name: '主接入端口',
+  aggregation_monitor_device_id: '逻辑聚合接口设备',
+  aggregation_interface_name: '逻辑聚合接口',
   primary_local_interconnect_ip: '主本端地址',
   primary_remote_interconnect_ip: '主对端地址',
   primary_interconnect_type: '主互联方式',
@@ -243,10 +245,12 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
   const [accessModeFilter, setAccessModeFilter] = useState<string | undefined>()
   const [search, setSearch] = useState('')
   const accessMode = Form.useWatch('access_mode', form)
+  const dualLinkMode = Form.useWatch('dual_link_mode', form)
   const primaryInterconnectType = Form.useWatch('primary_interconnect_type', form)
   const secondaryInterconnectType = Form.useWatch('secondary_interconnect_type', form)
   const primaryDeviceId = Form.useWatch('primary_device_id', form)
   const secondaryDeviceId = Form.useWatch('secondary_device_id', form)
+  const isDualLacpMode = isPrivateLine && accessMode === 'dual' && dualLinkMode === 'lacp'
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -326,6 +330,21 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
     }
   }, [secondaryDeviceId])
 
+  useEffect(() => {
+    if (!isDualLacpMode) {
+      form.setFieldValue('aggregation_selection', undefined)
+      return
+    }
+    const currentValue = form.getFieldValue('aggregation_selection') as string | undefined
+    if (!currentValue) {
+      return
+    }
+    const validOptions = new Set(getAggregationOptions().map((item) => item.value))
+    if (!validOptions.has(currentValue)) {
+      form.setFieldValue('aggregation_selection', undefined)
+    }
+  }, [isDualLacpMode, primaryDeviceId, secondaryDeviceId, deviceInterfacesMap])
+
   const handleCreate = () => {
     setEditingCircuit(null)
     form.resetFields()
@@ -339,6 +358,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       primary_port_rate: '10G',
       secondary_port_rate: undefined,
       dual_link_mode: undefined,
+      aggregation_selection: undefined,
       bfd_mode: 'none',
       bfd_enabled: false,
       routing_mode: undefined,
@@ -376,6 +396,10 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
     setEditingCircuit(record)
     form.setFieldsValue({
       ...record,
+      aggregation_selection:
+        record.aggregation_monitor_device_id && record.aggregation_interface_name
+          ? `${record.aggregation_monitor_device_id}::${record.aggregation_interface_name}`
+          : undefined,
       bfd_mode: record.bfd_mode || (record.bfd_enabled ? 'bfd' : 'none'),
       primary_local_interconnect_ip: record.primary_local_interconnect_ip || record.primary_interconnect_ip || record.local_interconnect_address,
       primary_remote_interconnect_ip: record.primary_remote_interconnect_ip || record.remote_interconnect_address,
@@ -414,6 +438,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
   const handleSubmit = async () => {
     try {
       const values = await form.validateFields()
+      const aggregationSelection = decodeAggregationSelection(values.aggregation_selection)
       const normalizedValues = {
         ...values,
         line_type: fixedLineType || values.line_type,
@@ -422,6 +447,8 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
         secondary_port_name: values.access_mode === 'dual' ? values.secondary_port_name : null,
         secondary_port_rate: values.access_mode === 'dual' ? values.secondary_port_rate : null,
         dual_link_mode: values.access_mode === 'dual' ? values.dual_link_mode : null,
+        aggregation_monitor_device_id: isDualLacpMode ? aggregationSelection.deviceId : null,
+        aggregation_interface_name: isDualLacpMode ? aggregationSelection.interfaceName : null,
         physical_port_rate_gbps: 0,
         interconnect_type: isPrivateLine ? values.primary_interconnect_type : values.interconnect_type,
         routing_mode: isPrivateLine ? values.primary_routing_mode : values.routing_mode,
@@ -429,20 +456,20 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
         bfd_enabled: isPrivateLine && values.primary_bfd_mode === 'bfd',
         primary_interconnect_ip: isPrivateLine ? values.primary_local_interconnect_ip : values.primary_interconnect_ip,
         primary_interconnect_type: isPrivateLine ? values.primary_interconnect_type : null,
-        secondary_interconnect_ip: isPrivateLine && values.access_mode === 'dual' ? values.secondary_local_interconnect_ip : null,
-        secondary_local_interconnect_ip: isPrivateLine && values.access_mode === 'dual' ? values.secondary_local_interconnect_ip : null,
-        secondary_remote_interconnect_ip: isPrivateLine && values.access_mode === 'dual' ? values.secondary_remote_interconnect_ip : null,
-        secondary_interconnect_type: isPrivateLine && values.access_mode === 'dual' ? values.secondary_interconnect_type : null,
-        secondary_routing_mode: isPrivateLine && values.access_mode === 'dual' ? values.secondary_routing_mode : null,
-        secondary_bfd_mode: isPrivateLine && values.access_mode === 'dual' ? values.secondary_bfd_mode : 'none',
+        secondary_interconnect_ip: isPrivateLine && values.access_mode === 'dual' && !isDualLacpMode ? values.secondary_local_interconnect_ip : null,
+        secondary_local_interconnect_ip: isPrivateLine && values.access_mode === 'dual' && !isDualLacpMode ? values.secondary_local_interconnect_ip : null,
+        secondary_remote_interconnect_ip: isPrivateLine && values.access_mode === 'dual' && !isDualLacpMode ? values.secondary_remote_interconnect_ip : null,
+        secondary_interconnect_type: isPrivateLine && values.access_mode === 'dual' && !isDualLacpMode ? values.secondary_interconnect_type : null,
+        secondary_routing_mode: isPrivateLine && values.access_mode === 'dual' && !isDualLacpMode ? values.secondary_routing_mode : null,
+        secondary_bfd_mode: isPrivateLine && values.access_mode === 'dual' && !isDualLacpMode ? values.secondary_bfd_mode : 'none',
         primary_vlan_id: isPrivateLine && values.primary_interconnect_type === 'l2' ? values.primary_vlan_id : null,
-        secondary_vlan_id: isPrivateLine && values.access_mode === 'dual' && values.secondary_interconnect_type === 'l2' ? values.secondary_vlan_id : null,
+        secondary_vlan_id: isPrivateLine && values.access_mode === 'dual' && !isDualLacpMode && values.secondary_interconnect_type === 'l2' ? values.secondary_vlan_id : null,
         local_interconnect_address: isPrivateLine ? values.primary_local_interconnect_ip : values.local_interconnect_address,
         remote_interconnect_address: isPrivateLine ? values.primary_remote_interconnect_ip : values.remote_interconnect_address,
         interconnect_address: isPrivateLine
           ? [
               [values.primary_local_interconnect_ip, values.primary_remote_interconnect_ip].filter(Boolean).join(' - '),
-              values.access_mode === 'dual'
+              values.access_mode === 'dual' && !isDualLacpMode
                 ? [values.secondary_local_interconnect_ip, values.secondary_remote_interconnect_ip].filter(Boolean).join(' - ')
                 : undefined,
             ].filter(Boolean).join(' / ')
@@ -775,6 +802,21 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
     </div>
   )
 
+  const renderAggregationDetailLine = (
+    deviceName?: string,
+    deviceIp?: string,
+    interfaceName?: string
+  ) => (
+    <div style={{ color: '#666', fontWeight: 600, lineHeight: 1.7 }}>
+      <span style={{ color: '#333', fontWeight: 700 }}>逻辑聚合接口：</span>
+      设备名称：
+      <span style={{ color: '#333', fontWeight: 700 }}>{deviceName || '未绑定'}</span>
+      <span style={{ color: '#1677ff', fontWeight: 800 }}>【{deviceIp || '未填写'}】</span>
+      {' '} / 聚合接口：
+      <span style={{ color: '#262626', fontWeight: 800 }}>【{interfaceName || '未填写'}】</span>
+    </div>
+  )
+
   const renderPrivateLineInterconnectLine = (
     label: string,
     localAddress?: string,
@@ -903,6 +945,40 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       value: item.name,
       label: item.name,
     }))
+  const getAggregationOptions = () => {
+    const deviceIds = [primaryDeviceId, secondaryDeviceId].filter(Boolean) as number[]
+    const seen = new Set<string>()
+    return deviceIds.flatMap((deviceId) => {
+      const device = devices.find((item) => item.id === deviceId)
+      return (deviceInterfacesMap[deviceId] || [])
+        .filter((item) => /^(Bridge-Aggregation|Route-Aggregation)/i.test(item.name))
+        .map((item) => {
+          const value = `${deviceId}::${item.name}`
+          if (seen.has(value)) {
+            return null
+          }
+          seen.add(value)
+          return {
+            value,
+            label: `${device?.ip_address || device?.name || deviceId} / ${item.name}`,
+          }
+        })
+        .filter(Boolean) as Array<{ value: string; label: string }>
+    })
+  }
+  const decodeAggregationSelection = (value?: string) => {
+    if (!value || !value.includes('::')) {
+      return { deviceId: null, interfaceName: null }
+    }
+    const [deviceIdText, interfaceName] = value.split('::')
+    const deviceId = Number(deviceIdText)
+    if (!Number.isFinite(deviceId) || !interfaceName) {
+      return { deviceId: null, interfaceName: null }
+    }
+    return { deviceId, interfaceName }
+  }
+  const isDualLacpCircuit = (record: Circuit) =>
+    isPrivateLine && record.access_mode === 'dual' && record.dual_link_mode === 'lacp'
 
   const renderFilterChips = <T extends string>(params: {
     label: string
@@ -1089,11 +1165,21 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       key: 'termination',
       width: 360,
       render: (_: unknown, record: Circuit) => {
+        const dualLacpCircuit = isDualLacpCircuit(record)
         return (
           <div style={{ display: 'grid', gap: 4 }}>
             {renderTerminationLine('主接入', record.primary_device_ip || record.primary_device_name, record.primary_port_name, record.primary_port_rate, true)}
             {record.access_mode === 'dual'
               ? renderTerminationLine('备接入', record.secondary_device_ip || record.secondary_device_name, record.secondary_port_name, record.secondary_port_rate, true)
+              : null}
+            {dualLacpCircuit
+              ? renderTerminationLine(
+                  '逻辑聚合',
+                  record.aggregation_monitor_device_ip || record.aggregation_monitor_device_name,
+                  record.aggregation_interface_name,
+                  record.primary_port_rate || record.secondary_port_rate,
+                  true
+                )
               : null}
           </div>
         )
@@ -1107,15 +1193,15 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       render: (_: unknown, record: Circuit) => (
         <span
           title={
-            record.access_mode === 'dual'
+            record.access_mode === 'dual' && !isDualLacpCircuit(record)
               ? `${record.primary_port_rate || '-'} / ${record.secondary_port_rate || '-'}`
-              : record.primary_port_rate || '-'
+              : (record.primary_port_rate || record.secondary_port_rate || '-')
           }
           style={TABLE_TEXT_STYLE}
         >
-          {record.access_mode === 'dual'
+          {record.access_mode === 'dual' && !isDualLacpCircuit(record)
             ? `${record.primary_port_rate || '-'} / ${record.secondary_port_rate || '-'}`
-            : record.primary_port_rate || '-'}
+            : (record.primary_port_rate || record.secondary_port_rate || '-')}
         </span>
       ),
     },
@@ -1134,7 +1220,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       width: 160,
       ellipsis: true,
       render: (_: string, record: Circuit) => {
-        const text = record.access_mode === 'dual'
+        const text = record.access_mode === 'dual' && !isDualLacpCircuit(record)
           ? `主 ${getPrimaryLocalAddress(record) || '-'} -> ${getPrimaryRemoteAddress(record) || '-'} / 备 ${getSecondaryLocalAddress(record) || '-'} -> ${getSecondaryRemoteAddress(record) || '-'}`
           : `${getPrimaryLocalAddress(record) || '-'} -> ${getPrimaryRemoteAddress(record) || '-'}`
         return <span title={text} style={TABLE_TEXT_STYLE}>{text}</span>
@@ -1146,7 +1232,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       key: 'local_interconnect_address',
       width: 160,
       render: (_: string, record: Circuit) => {
-        if (record.access_mode === 'dual') {
+        if (record.access_mode === 'dual' && !isDualLacpCircuit(record)) {
           return renderStackedText([
             ['主', getPrimaryLocalAddress(record)],
             ['备', getSecondaryLocalAddress(record)],
@@ -1162,7 +1248,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       key: 'remote_interconnect_address',
       width: 160,
       render: (_: string, record: Circuit) => {
-        if (record.access_mode === 'dual') {
+        if (record.access_mode === 'dual' && !isDualLacpCircuit(record)) {
           return renderStackedText([
             ['主', getPrimaryRemoteAddress(record)],
             ['备', getSecondaryRemoteAddress(record)],
@@ -1194,7 +1280,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       key: 'interconnect_type',
       width: 130,
       render: (v: string, record: Circuit) => {
-        if (record.access_mode === 'dual') {
+        if (record.access_mode === 'dual' && !isDualLacpCircuit(record)) {
           return renderStackedText([
             ['主', getInterconnectTypeLabel(getPrimaryInterconnectType(record))],
             ['备', getInterconnectTypeLabel(getSecondaryInterconnectType(record))],
@@ -1211,8 +1297,8 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       width: 150,
       render: (_: string, record: Circuit) => {
         const primary = getPrimaryRoutingMode(record)
-        const secondary = record.access_mode === 'dual' ? getSecondaryRoutingMode(record) : undefined
-        if (record.access_mode === 'dual') {
+        const secondary = record.access_mode === 'dual' && !isDualLacpCircuit(record) ? getSecondaryRoutingMode(record) : undefined
+        if (record.access_mode === 'dual' && !isDualLacpCircuit(record)) {
           return renderStackedText([
             ['主', getRoutingModeLabel(primary)],
             ['备', getRoutingModeLabel(secondary)],
@@ -1228,14 +1314,14 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       key: 'bfd_enabled',
       width: 132,
       render: (_: string, record: Circuit) => {
-        const modes = record.access_mode === 'dual'
+        const modes = record.access_mode === 'dual' && !isDualLacpCircuit(record)
           ? [
               ['主', getPrimaryBfdMode(record)],
               ['备', getSecondaryBfdMode(record)],
             ]
           : [['', getPrimaryBfdMode(record)]]
         return (
-          <Space size={4} direction={record.access_mode === 'dual' ? 'vertical' : 'horizontal'}>
+          <Space size={4} direction={record.access_mode === 'dual' && !isDualLacpCircuit(record) ? 'vertical' : 'horizontal'}>
             {modes.map(([label, mode]) => (
               <Tag key={`${label}-${mode}`} style={{ fontWeight: 700, marginInlineEnd: 0 }} color={mode === 'bfd' ? 'success' : mode === 'track' ? 'processing' : 'default'}>
                 {label ? `${label}${bfdModeLabelMap[mode] || mode}` : bfdModeLabelMap[mode] || mode}
@@ -1552,6 +1638,10 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
           },
           expandedRowRender: (record) => (
             <div style={{ display: 'grid', gap: 12 }}>
+              {(() => {
+                const dualLacpCircuit = isDualLacpCircuit(record)
+                return (
+                  <>
               <div>
                 <strong>接入信息：</strong>
                 <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
@@ -1560,6 +1650,13 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                     ? (
                       <>
                         {renderTerminationDetailLine('备接入', record.secondary_device_name, record.secondary_device_ip, record.secondary_port_name, record.secondary_port_rate)}
+                        {dualLacpCircuit
+                          ? renderAggregationDetailLine(
+                              record.aggregation_monitor_device_name,
+                              record.aggregation_monitor_device_ip,
+                              record.aggregation_interface_name
+                            )
+                          : null}
                         <div style={{ color: '#666', fontWeight: 600, marginTop: 2 }}>
                           双线接入策略：{record.dual_link_mode ? (dualLinkModeLabelMap[record.dual_link_mode] || record.dual_link_mode) : '未填写'}
                         </div>
@@ -1572,15 +1669,15 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                 <div style={{ display: 'grid', gap: 8, color: '#666', fontWeight: 600 }}>
                   <div><strong style={{ color: '#333' }}>客户：</strong>{record.customer_name || '未绑定客户'}</div>
                   {renderPrivateLineInterconnectLine(
-                    record.access_mode === 'dual' ? '主' : '',
+                    dualLacpCircuit ? '逻辑' : (record.access_mode === 'dual' ? '主' : ''),
                     getPrimaryLocalAddress(record),
                     getPrimaryRemoteAddress(record),
                     record.primary_vlan_id,
                     getPrimaryInterconnectType(record),
                   )}
-                  <div><strong style={{ color: '#333' }}>主互联方式：</strong>{getInterconnectTypeLabel(getPrimaryInterconnectType(record))}</div>
-                  <div><strong style={{ color: '#333' }}>主链路路由/探测：</strong>{getPrimaryRoutingMode(record) ? (routingModeOptions.find((item) => item.value === getPrimaryRoutingMode(record))?.label || getPrimaryRoutingMode(record)) : '未填写'} / {bfdModeLabelMap[getPrimaryBfdMode(record)] || getPrimaryBfdMode(record)}</div>
-                  {record.access_mode === 'dual'
+                  <div><strong style={{ color: '#333' }}>{dualLacpCircuit ? '逻辑互联方式：' : '主互联方式：'}</strong>{getInterconnectTypeLabel(getPrimaryInterconnectType(record))}</div>
+                  <div><strong style={{ color: '#333' }}>{dualLacpCircuit ? '逻辑链路路由/探测：' : '主链路路由/探测：'}</strong>{getPrimaryRoutingMode(record) ? (routingModeOptions.find((item) => item.value === getPrimaryRoutingMode(record))?.label || getPrimaryRoutingMode(record)) : '未填写'} / {bfdModeLabelMap[getPrimaryBfdMode(record)] || getPrimaryBfdMode(record)}</div>
+                  {record.access_mode === 'dual' && !dualLacpCircuit
                     ? (
                       <>
                         {renderPrivateLineInterconnectLine(
@@ -1614,6 +1711,9 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                 <strong>线路备注：</strong>
                 <div style={{ marginTop: 8, color: '#666' }}>{record.description || '未填写备注'}</div>
               </div>
+                  </>
+                )
+              })()}
             </div>
           ),
         }}
@@ -1725,21 +1825,24 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                 <Input placeholder="例如：与另一条联通线路互为备份" />
               </Form.Item>
             </Col>
-            <Col span={8}>
-              <Form.Item
-                name="primary_device_id"
-                label="主接入交换机"
+                <Col span={8}>
+                  <Form.Item
+                    name="primary_device_id"
+                    label="主接入交换机"
                 rules={[{ required: true, message: '请选择主接入交换机' }]}
-              >
-                <Select
-                  allowClear
-                  showSearch
-                  optionFilterProp="label"
-                  options={deviceOptions}
-                  onChange={() => form.setFieldValue('primary_port_name', undefined)}
-                />
-              </Form.Item>
-            </Col>
+                  >
+                    <Select
+                      allowClear
+                      showSearch
+                      optionFilterProp="label"
+                      options={deviceOptions}
+                      onChange={() => {
+                        form.setFieldValue('primary_port_name', undefined)
+                        form.setFieldValue('aggregation_selection', undefined)
+                      }}
+                    />
+                  </Form.Item>
+                </Col>
             <Col span={8}>
               <Form.Item
                 name="primary_port_name"
@@ -1773,7 +1876,10 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                       showSearch
                       optionFilterProp="label"
                       options={deviceOptions}
-                      onChange={() => form.setFieldValue('secondary_port_name', undefined)}
+                      onChange={() => {
+                        form.setFieldValue('secondary_port_name', undefined)
+                        form.setFieldValue('aggregation_selection', undefined)
+                      }}
                     />
                   </Form.Item>
                 </Col>
@@ -1798,6 +1904,23 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                     <Select options={dualLinkModeOptions} placeholder="请选择 LACP / 冷备 / 热备" />
                   </Form.Item>
                 </Col>
+                {isDualLacpMode ? (
+                  <Col span={24}>
+                    <Form.Item
+                      name="aggregation_selection"
+                      label="逻辑聚合接口（Bridge-Aggregation / Route-Aggregation）"
+                      rules={[{ required: true, message: '请选择逻辑聚合接口' }]}
+                    >
+                      <Select
+                        allowClear
+                        showSearch
+                        optionFilterProp="label"
+                        placeholder="请选择 Bridge-Aggregation / Route-Aggregation 接口"
+                        options={getAggregationOptions()}
+                      />
+                    </Form.Item>
+                  </Col>
+                ) : null}
               </>
             ) : null}
             <Col span={24}>
@@ -1819,7 +1942,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                       <span>探测方式</span>
                     </div>
                     <div className="private-interconnect-grid-row">
-                      <div className="private-interconnect-row-label">主链路</div>
+                      <div className="private-interconnect-row-label">{isDualLacpMode ? '逻辑链路' : '主链路'}</div>
                       <Form.Item name="primary_interconnect_type" rules={[{ required: true, message: '请选择主互联方式' }]}>
                         <Select options={interconnectTypeOptions} placeholder="互联方式" />
                       </Form.Item>
@@ -1839,7 +1962,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                         <Select options={bfdModeOptions} placeholder="探测方式" />
                       </Form.Item>
                     </div>
-                    {accessMode === 'dual' ? (
+                    {accessMode === 'dual' && !isDualLacpMode ? (
                       <div className="private-interconnect-grid-row">
                         <div className="private-interconnect-row-label">备链路</div>
                         <Form.Item name="secondary_interconnect_type" rules={[{ required: true, message: '请选择备互联方式' }]}>

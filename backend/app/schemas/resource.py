@@ -112,6 +112,8 @@ class CircuitBase(BaseModel):
     primary_port_name: Optional[str] = Field(None, max_length=100)
     secondary_device_id: Optional[int] = None
     secondary_port_name: Optional[str] = Field(None, max_length=100)
+    aggregation_monitor_device_id: Optional[int] = None
+    aggregation_interface_name: Optional[str] = Field(None, max_length=100)
     primary_local_interconnect_ip: Optional[str] = Field(None, max_length=100)
     primary_remote_interconnect_ip: Optional[str] = Field(None, max_length=100)
     secondary_local_interconnect_ip: Optional[str] = Field(None, max_length=100)
@@ -168,6 +170,8 @@ class CircuitUpdate(BaseModel):
     primary_port_name: Optional[str] = None
     secondary_device_id: Optional[int] = None
     secondary_port_name: Optional[str] = None
+    aggregation_monitor_device_id: Optional[int] = None
+    aggregation_interface_name: Optional[str] = None
     primary_local_interconnect_ip: Optional[str] = None
     primary_remote_interconnect_ip: Optional[str] = None
     secondary_local_interconnect_ip: Optional[str] = None

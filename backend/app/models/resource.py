@@ -115,6 +115,8 @@ class Circuit(Base):
     primary_port_name = Column(String(100))
     secondary_device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
     secondary_port_name = Column(String(100))
+    aggregation_monitor_device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
+    aggregation_interface_name = Column(String(100))
     primary_local_interconnect_ip = Column(String(100))
     primary_remote_interconnect_ip = Column(String(100))
     secondary_local_interconnect_ip = Column(String(100))
@@ -152,6 +154,7 @@ class Circuit(Base):
     customer_ref = relationship("Customer")
     primary_device_ref = relationship("Device", foreign_keys=[primary_device_id])
     secondary_device_ref = relationship("Device", foreign_keys=[secondary_device_id])
+    aggregation_monitor_device_ref = relationship("Device", foreign_keys=[aggregation_monitor_device_id])
     ip_addresses = relationship("IPAddressRecord", back_populates="circuit_ref")
     audits = relationship("CircuitAudit", back_populates="circuit_ref")
 
@@ -197,6 +200,10 @@ class Circuit(Base):
             "secondary_device_name": self.secondary_device_ref.name if self.secondary_device_ref else None,
             "secondary_device_ip": self.secondary_device_ref.ip_address if self.secondary_device_ref else None,
             "secondary_port_name": self.secondary_port_name,
+            "aggregation_monitor_device_id": self.aggregation_monitor_device_id,
+            "aggregation_monitor_device_name": self.aggregation_monitor_device_ref.name if self.aggregation_monitor_device_ref else None,
+            "aggregation_monitor_device_ip": self.aggregation_monitor_device_ref.ip_address if self.aggregation_monitor_device_ref else None,
+            "aggregation_interface_name": self.aggregation_interface_name,
             "primary_local_interconnect_ip": self.primary_local_interconnect_ip,
             "primary_remote_interconnect_ip": self.primary_remote_interconnect_ip,
             "secondary_local_interconnect_ip": self.secondary_local_interconnect_ip,

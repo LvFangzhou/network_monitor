@@ -133,6 +133,10 @@ export interface Circuit {
   primary_device_name?: string
   primary_device_ip?: string
   primary_port_name?: string
+  aggregation_monitor_device_id?: number
+  aggregation_monitor_device_name?: string
+  aggregation_monitor_device_ip?: string
+  aggregation_interface_name?: string
   primary_local_interconnect_ip?: string
   primary_remote_interconnect_ip?: string
   primary_interconnect_type?: string
