@@ -878,7 +878,6 @@ def _silence_matches(silence: AlertSilence, rule: AlertRule, device: Device, tar
         field_map = {
             "ip": device_ip,
             "device_ip": device_ip,
-            "interface": interface_text,
             "message": searchable_message_text,
             "content": searchable_message_text,
             "alarm_id": str(target.get("alarm_id") or ""),
@@ -889,7 +888,29 @@ def _silence_matches(silence: AlertSilence, rule: AlertRule, device: Device, tar
             value = str((condition or {}).get("value") or "").strip()
             if not field_name or not value:
                 continue
-            if not _evaluate_condition(field_name, field_map.get(field_name, ""), operator, value):
+            if field_name == "interface":
+                interface_values = [
+                    str(target.get("target_name") or ""),
+                    str(target.get("target_key") or ""),
+                ]
+                if operator in {"not_contains", "not_equals", "not_regex"}:
+                    condition_matches = all(
+                        _evaluate_condition(field_name, item, operator, value)
+                        for item in interface_values
+                    )
+                else:
+                    condition_matches = any(
+                        _evaluate_condition(field_name, item, operator, value)
+                        for item in interface_values
+                    )
+            else:
+                condition_matches = _evaluate_condition(
+                    field_name,
+                    field_map.get(field_name, ""),
+                    operator,
+                    value,
+                )
+            if not condition_matches:
                 return False
     return True
 

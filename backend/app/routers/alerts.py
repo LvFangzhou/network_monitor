@@ -144,19 +144,25 @@ def _build_silence_candidate_query(
             if all(is_exact_ip_address(value) for value in values):
                 alerts_query = alerts_query.filter(or_(*[Device.ip_address == value for value in values]))
         elif field_name in {"interface"}:
-            alerts_query = alerts_query.filter(
-                or_(
-                    *[
-                        or_(
-                            AlertHistory.alert_target_name.ilike(f"%{value}%"),
-                            AlertHistory.alert_target_key.ilike(f"%{value}%"),
-                        )
-                        for value in values
-                    ]
+            if operator in {"contains", "equals"}:
+                alerts_query = alerts_query.filter(
+                    or_(
+                        *[
+                            or_(
+                                AlertHistory.alert_target_name.ilike(f"%{value}%"),
+                                AlertHistory.alert_target_key.ilike(f"%{value}%"),
+                            )
+                            for value in values
+                        ]
+                    )
                 )
-            )
         elif field_name == "alarm_id":
-            alerts_query = alerts_query.filter(or_(*[AlertHistory.alarm_id == value for value in values]))
+            if operator == "equals":
+                alerts_query = alerts_query.filter(or_(*[AlertHistory.alarm_id == value for value in values]))
+            elif operator == "contains":
+                alerts_query = alerts_query.filter(
+                    or_(*[AlertHistory.alarm_id.ilike(f"%{value}%") for value in values])
+                )
     return alerts_query
 
 
