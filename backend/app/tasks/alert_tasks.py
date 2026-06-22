@@ -780,6 +780,8 @@ def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
 
 
 def _silence_matches(silence: AlertSilence, rule: AlertRule, device: Device, target: Dict[str, Any]) -> bool:
+    from app.utils.ip_match import ip_value_matches
+
     now = _utc_now()
 
     def _matches_pattern(source: str, pattern: Optional[str]) -> bool:
@@ -796,19 +798,7 @@ def _silence_matches(silence: AlertSilence, rule: AlertRule, device: Device, tar
             return candidate in source_text
 
     def _matches_ip_value(source: str, candidate: str) -> bool:
-        source_text = (source or "").strip()
-        candidate_text = (candidate or "").strip()
-        if not source_text or not candidate_text:
-            return False
-        if source_text == candidate_text:
-            return True
-        if "/" not in candidate_text:
-            return False
-        try:
-            import ipaddress
-            return ipaddress.ip_address(source_text) in ipaddress.ip_network(candidate_text, strict=False)
-        except ValueError:
-            return False
+        return ip_value_matches(source, candidate)
 
     def _evaluate_condition(field_name: str, field_value: str, operator: str, raw_value: str) -> bool:
         source_text = field_value or ""

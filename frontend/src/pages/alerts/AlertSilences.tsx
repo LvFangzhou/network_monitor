@@ -434,7 +434,10 @@ const AlertSilences = () => {
                             rules={[{ required: true, message: '请输入匹配值' }]}
                             style={{ marginBottom: 0 }}
                           >
-                            <Input.TextArea rows={3} placeholder="多个值可用逗号、分号或换行分隔" />
+                            <Input.TextArea
+                              rows={3}
+                              placeholder="IP 支持单个、CIDR 或范围（如 10.239.0.1-10.239.0.254）；多个值可用逗号、分号或换行分隔"
+                            />
                           </Form.Item>
                         </div>
                       </Card>
