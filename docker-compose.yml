@@ -12,7 +12,7 @@ services:
     volumes:
       - ${DATA_ROOT:-./data}/postgres:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U network_monitor"]
       interval: 10s
@@ -20,6 +20,7 @@ services:
       retries: 5
     networks:
       - network-monitor
+    restart: unless-stopped
 
   # InfluxDB2 时序数据库
   influxdb:
@@ -35,7 +36,7 @@ services:
     volumes:
       - ${INFLUXDB_DATA_ROOT:-./data/influxdb}:/var/lib/influxdb2
     ports:
-      - "8086:8086"
+      - "127.0.0.1:8086:8086"
     healthcheck:
       test: ["CMD", "influx", "ping"]
       interval: 10s
@@ -43,6 +44,7 @@ services:
       retries: 5
     networks:
       - network-monitor
+    restart: unless-stopped
 
   # InfluxDB 每日备份，避免时序数据目录误删后完全不可恢复
   influxdb-backup:
@@ -62,6 +64,12 @@ services:
         set -eu
         mkdir -p /backups
         while true; do
+          recent=$$(find /backups -maxdepth 1 -type d -name 'influxdb-*' -mmin -1200 -print -quit)
+          if [ -n "$${recent}" ]; then
+            echo "Recent InfluxDB backup exists: $${recent}; checking again in one hour"
+            sleep 3600
+            continue
+          fi
           ts=$$(date +%Y%m%d%H%M%S)
           target="/backups/influxdb-$${ts}"
           echo "Starting InfluxDB backup to $${target}"
@@ -87,7 +95,7 @@ services:
     volumes:
       - ${DATA_ROOT:-./data}/redis:/data
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -95,6 +103,7 @@ services:
       retries: 5
     networks:
       - network-monitor
+    restart: unless-stopped
 
   # RabbitMQ 消息队列
   rabbitmq:
@@ -106,8 +115,8 @@ services:
     volumes:
       - ${DATA_ROOT:-./data}/rabbitmq:/var/lib/rabbitmq
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
@@ -115,6 +124,7 @@ services:
       retries: 5
     networks:
       - network-monitor
+    restart: unless-stopped
 
   # FastAPI 后端服务
   api:
@@ -134,7 +144,7 @@ services:
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
-      - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
+      - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
       - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
       - SNMP_TRAP_ENABLED=true
@@ -151,13 +161,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=100
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - ASTERNOS_MAX_DEVICES_PER_TICK=50
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
+      - SNMP_MAX_DEVICES_PER_TICK=200
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - ASTERNOS_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
       - LOG_FORMAT=json
     volumes:
@@ -165,7 +175,7 @@ services:
       - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
       - "5514:5514/udp"
       - "162:1162/udp"
       - "2055:2055/udp"
@@ -202,7 +212,7 @@ services:
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
-      - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
+      - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
       - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
       - REDIS_HOST=redis
@@ -211,13 +221,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=100
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - ASTERNOS_MAX_DEVICES_PER_TICK=50
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
+      - SNMP_MAX_DEVICES_PER_TICK=200
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - ASTERNOS_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -232,10 +242,11 @@ services:
     restart: unless-stopped
 
   # Celery Worker 任务执行
-  celery-worker:
+  celery-worker: &celery-worker-base
     build: ./backend
+    image: network_monitor-celery-worker
     container_name: nm-celery-worker
-    command: celery -A app.tasks worker -l info -Q celery,default,alerts,tacacs,resource,system -n worker-background@%h --pool=prefork -c 4 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=450000
+    command: celery -A app.tasks worker -l info -Q celery,default,alerts,tacacs,resource,system -n worker-background@%h --pool=prefork -c 6 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=450000
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -250,7 +261,7 @@ services:
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
-      - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
+      - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
       - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
       - REDIS_HOST=redis
@@ -259,13 +270,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=100
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - ASTERNOS_MAX_DEVICES_PER_TICK=50
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
+      - SNMP_MAX_DEVICES_PER_TICK=200
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - ASTERNOS_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -285,11 +296,22 @@ services:
           cpus: '2'
           memory: 2G
 
+  # 机器人通知独立队列，通知积压不再影响采集、告警计算和页面缓存任务
+  celery-worker-notification:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-notification
+    command: celery -A app.tasks worker -l info -Q notification -n worker-notification@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
   # Celery Worker Asteros Exporter 独立采集，避免与告警/Tacacs/资源任务互相挤占
   celery-worker-asternos:
     build: ./backend
     container_name: nm-celery-worker-asternos
-    command: celery -A app.tasks worker -l info -Q asternos -n worker-asternos@%h --pool=threads -c 4 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q asternos -n worker-asternos@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -304,7 +326,7 @@ services:
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
-      - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
+      - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
       - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
       - REDIS_HOST=redis
@@ -313,13 +335,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=100
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - ASTERNOS_MAX_DEVICES_PER_TICK=50
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
+      - SNMP_MAX_DEVICES_PER_TICK=200
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - ASTERNOS_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -343,7 +365,7 @@ services:
   celery-worker-asternos-realtime:
     build: ./backend
     container_name: nm-celery-worker-asternos-realtime
-    command: celery -A app.tasks worker -l info -Q asternos_realtime -n worker-asternos-realtime@%h --pool=threads -c 10 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q asternos_realtime -n worker-asternos-realtime@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -358,7 +380,7 @@ services:
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
-      - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
+      - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
       - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
       - REDIS_HOST=redis
@@ -367,13 +389,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=100
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=10
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - ASTERNOS_MAX_DEVICES_PER_TICK=50
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
+      - SNMP_MAX_DEVICES_PER_TICK=200
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
+      - ASTERNOS_MAX_DEVICES_PER_TICK=100
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -397,7 +419,7 @@ services:
   celery-worker-snmp:
     build: ./backend
     container_name: nm-celery-worker-snmp
-    command: celery -A app.tasks worker -l info -Q snmp_realtime -n worker-snmp@%h --pool=threads -c 24 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q snmp_realtime -n worker-snmp@%h --pool=threads -c 32 --prefetch-multiplier=1 -Ofair
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -412,7 +434,7 @@ services:
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
-      - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
+      - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
       - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
       - REDIS_HOST=redis
@@ -421,9 +443,9 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - SNMP_MAX_DEVICES_PER_TICK=100
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_MAX_DEVICES_PER_TICK=200
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -447,7 +469,7 @@ services:
   celery-worker-snmp-circuit:
     build: ./backend
     container_name: nm-celery-worker-snmp-circuit
-    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -462,7 +484,7 @@ services:
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
-      - FRONTEND_PUBLIC_URL=http://172.18.16.92:8080
+      - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
       - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
       - REDIS_HOST=redis
@@ -471,10 +493,10 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=10
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=900
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=100
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
+      - SNMP_MAX_DEVICES_PER_TICK=200
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -499,8 +521,8 @@ services:
     build: ./frontend
     container_name: nm-frontend
     ports:
-      - "8080:80"
-      - "8443:443"
+      - "10086:80"
+      - "40086:443"
     depends_on:
       - api
     networks:
@@ -519,7 +541,7 @@ services:
       - ${TACACS_DATA_ROOT:-./data/tacacs}/logs:/var/log/tacacs+
     environment:
       - TZ=UTC
-    command: ["/usr/local/sbin/tac_plus", "-C", "/etc/tacacs+/tac_plus.cfg", "-G", "-d", "2", "-l", "/var/log/tacacs+/tacacs.log"]
+    command: ["/usr/local/sbin/tac_plus", "-C", "/etc/tacacs+/tac_plus.cfg", "-G", "-l", "/var/log/tacacs+/tacacs.log"]
 
   # Nginx 反向代理（可选，用于高级配置）
   # nginx:
@@ -538,3 +560,6 @@ services:
 networks:
   network-monitor:
     driver: bridge
+    driver_opts:
+      # 云主机物理网卡 MTU 为 1442，业务还需穿过 OpenVPN；预留隧道封装空间，避免 TLS/大响应分片黑洞。
+      com.docker.network.driver.mtu: "1200"

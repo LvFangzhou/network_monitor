@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app.database import get_db
+from app.config import settings
 from app.models import AlertRule, AlertHistory, AlertSilence, Device, SyslogEvent, User
 from app.routers.auth import get_current_active_user
 from app.tasks.alert_tasks import (
@@ -700,7 +701,7 @@ async def test_notification(
                 {"label": "发生时间", "value": _format_local_time()},
                 {"label": "当前处理人", "value": "测试人员"},
             ],
-            "detail_url": "https://localhost:8443/alerts/history",
+            "detail_url": f"{settings.FRONTEND_PUBLIC_URL.rstrip('/')}/alerts/history",
         },
     )
 
@@ -895,8 +896,8 @@ async def ignore_alert(
 
     db.commit()
     db.refresh(alert)
-    from app.tasks.alert_tasks import _send_alert_event_notification
-    _send_alert_event_notification.delay(alert.id, "ignored", username)
+    from app.tasks.alert_tasks import enqueue_alert_notification
+    enqueue_alert_notification(alert.id, "ignored", username)
 
     logger.info("告警已忽略", alert_id=alert_id, user=username)
     return alert.to_dict()

@@ -41,6 +41,48 @@ EXPORTER_DELTA_CACHE_TTL_SECONDS = 86400
 RULE_STATUS_PREWARM_URL = "http://api:8000/api/v1/alerts/rules/{rule_id}/status?limit=500"
 RULE_STATUS_PREWARM_LOCK_KEY = "alerts:rule_status_prewarm:lock"
 RULE_STATUS_PREWARM_CURSOR_KEY = "alerts:rule_status_prewarm:cursor"
+NOTIFICATION_QUEUE = "notification"
+NOTIFICATION_DEDUP_SECONDS = {
+    "firing": 300,
+    "auto_resolved": 600,
+    "ignored": 600,
+}
+NOTIFICATION_EXPIRES_SECONDS = {
+    "firing": 180,
+    "auto_resolved": 600,
+    "ignored": 600,
+}
+
+
+def _notification_key(prefix: str, alert_id: int, event_type: str) -> str:
+    return f"alerts:notification:{prefix}:{int(alert_id)}:{event_type}"
+
+
+def enqueue_alert_notification(
+    alert_id: int,
+    event_type: str = "firing",
+    actor: Optional[str] = None,
+) -> bool:
+    """幂等提交告警通知；相同告警事件在窗口内只允许存在一个任务。"""
+    event_type = str(event_type or "firing")
+    dedup_seconds = NOTIFICATION_DEDUP_SECONDS.get(event_type, 300)
+    expires_seconds = NOTIFICATION_EXPIRES_SECONDS.get(event_type, 300)
+    queued_key = _notification_key("queued", alert_id, event_type)
+    token = uuid.uuid4().hex
+    if not redis_client.set(queued_key, token, ex=dedup_seconds, nx=True):
+        logger.info("跳过重复通知入队", alert_id=alert_id, event_type=event_type)
+        return False
+    try:
+        _send_alert_event_notification.apply_async(
+            args=[int(alert_id), event_type, actor],
+            queue=NOTIFICATION_QUEUE,
+            expires=expires_seconds,
+        )
+        return True
+    except Exception:
+        if redis_client.get(queued_key) == token:
+            redis_client.delete(queued_key)
+        raise
 
 
 def _is_asternos_vendor(vendor: Optional[str]) -> bool:
@@ -245,6 +287,21 @@ def _is_operation_notification(rule: Optional[AlertRule]) -> bool:
     return _normalize_severity_label(rule.severity if rule else None) == "P3"
 
 
+def _operation_notification_name(rule: Optional[AlertRule]) -> str:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            getattr(rule, "name", None),
+            getattr(rule, "metric_type", None),
+        )
+    ).lower()
+    if any(marker in text for marker in ("登录失败", "ssh", "login")):
+        return "SSH登录失败记录"
+    if any(marker in text for marker in ("配置变更", "config")):
+        return "配置变更记录"
+    return "操作记录"
+
+
 def _build_short_alarm_id(alert: AlertHistory) -> str:
     base_time = alert.started_at or _utc_now()
     return f"A{base_time.strftime('%m%d')}-{alert.id % 100000:05d}"
@@ -341,9 +398,10 @@ def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[
     mentions = _get_mention_users(rule)
     mention_suffix = f"@{'、'.join(mentions)}" if mentions else ""
     if _is_operation_notification(rule):
+        operation_name = _operation_notification_name(rule)
         if event_type == "ignored":
-            return f"{actor or '有人'}忽略了1条配置变更记录"
-        return f"{severity}-配置变更记录{mention_suffix}"
+            return f"{actor or '有人'}忽略了1条{operation_name}"
+        return f"{severity}-{operation_name}{mention_suffix}"
     if event_type == "ignored":
         return f"{actor or '有人'}忽略了1条故障"
     if event_type == "auto_resolved":
@@ -1288,7 +1346,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                         existing.resolution_note = None
                     db.commit()
                     if was_ignored or was_snoozed_expired:
-                        _send_alert_notification.delay(existing.id)
+                        enqueue_alert_notification(existing.id)
                         logger.info(
                             "暂停/屏蔽解除后告警重新触发",
                             rule_id=rule.id,
@@ -1298,7 +1356,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                             value=value,
                         )
                     elif _should_repeat_notify(existing, rule):
-                        _send_alert_notification.delay(existing.id)
+                        enqueue_alert_notification(existing.id)
                         logger.info(
                             "持续告警重复通知",
                             rule_id=rule.id,
@@ -1328,7 +1386,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                     db.commit()
                     db.refresh(alert)
                     _ensure_alarm_id(db, alert)
-                    _send_alert_notification.delay(alert.id)
+                    enqueue_alert_notification(alert.id)
 
                     logger.info(
                         "告警触发",
@@ -1356,7 +1414,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                     existing.resolved_by = "system"
                     db.commit()
                     if not was_silenced_ignored:
-                        _send_alert_event_notification.delay(existing.id, "auto_resolved", "system")
+                        enqueue_alert_notification(existing.id, "auto_resolved", "system")
                     logger.info(
                         "告警恢复",
                         rule_id=rule.id,
@@ -1393,7 +1451,7 @@ def _resolve_disappeared_target_alerts(
         alert.resolved_by = "system"
         alert.resolution_note = "协议邻居已不在当前采集结果中，自动恢复"
         db.commit()
-        _send_alert_event_notification.delay(alert.id, "auto_resolved", "system")
+        enqueue_alert_notification(alert.id, "auto_resolved", "system")
         logger.info(
             "协议目标消失，自动恢复告警",
             rule_id=rule.id,
@@ -2665,7 +2723,14 @@ def _send_alert_notification(alert_id: int):
 def _send_alert_event_notification(alert_id: int, event_type: str = "firing", actor: Optional[str] = None):
     """发送告警通知"""
     import asyncio
-    
+
+    event_type = str(event_type or "firing")
+    dedup_seconds = NOTIFICATION_DEDUP_SECONDS.get(event_type, 300)
+    processing_key = _notification_key("processed", alert_id, event_type)
+    if not redis_client.set(processing_key, uuid.uuid4().hex, ex=dedup_seconds, nx=True):
+        logger.info("跳过重复通知执行", alert_id=alert_id, event_type=event_type)
+        return {"skipped": "duplicate"}
+
     db = SessionLocal()
     try:
         alert = db.query(AlertHistory).filter(AlertHistory.id == alert_id).first()
@@ -2691,6 +2756,18 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
         rule = alert.rule
         if not rule or not rule.notification_channels:
             return
+        recent_success = False
+        now = _utc_now()
+        for sent in reversed(alert.notifications_sent or []):
+            if sent.get("event_type") != event_type or not sent.get("success"):
+                continue
+            sent_at = _parse_notification_timestamp(sent.get("sent_at"))
+            if sent_at and (now - sent_at).total_seconds() < dedup_seconds:
+                recent_success = True
+            break
+        if recent_success:
+            logger.info("跳过近期已成功发送的通知", alert_id=alert_id, event_type=event_type)
+            return {"skipped": "recently_sent"}
         if event_type == "auto_resolved" and _is_operation_notification(rule):
             logger.info("跳过P3配置变更记录的恢复通知", alert_id=alert_id, alarm_id=alert.alarm_id)
             return

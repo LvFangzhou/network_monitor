@@ -121,13 +121,15 @@ class SNMPCollector(LoggerMixin):
         if in_bps is not None:
             if in_bps < 0:
                 in_bps = None
-            elif in_bps > speed_value:
-                in_bps = speed_value
+            elif in_bps > speed_value * self.INTERFACE_RATE_CAP_MULTIPLIER:
+                # A rate above the physical interface speed is a bad sample
+                # (usually a stale/crossed counter baseline), not real traffic.
+                in_bps = None
         if out_bps is not None:
             if out_bps < 0:
                 out_bps = None
-            elif out_bps > speed_value:
-                out_bps = speed_value
+            elif out_bps > speed_value * self.INTERFACE_RATE_CAP_MULTIPLIER:
+                out_bps = None
         return in_bps, out_bps
 
     H3C_PRIVATE_OIDS = {
@@ -807,9 +809,21 @@ class SNMPCollector(LoggerMixin):
                     "timestamp": now,
                 })
 
+        protocol_summary = {
+            "bgp": {"total": 0, "up": 0, "down": 0},
+            "ospf": {"total": 0, "up": 0, "down": 0},
+        }
+        for point in points:
+            protocol = str(point.get("tags", {}).get("protocol") or "").lower()
+            if protocol not in protocol_summary:
+                continue
+            is_up = float(point.get("fields", {}).get("state_up") or 0) >= 1
+            protocol_summary[protocol]["total"] += 1
+            protocol_summary[protocol]["up" if is_up else "down"] += 1
+
         if points:
             influx_client.write_points(points, sync=False)
-        return {"points_written": len(points)}
+        return {"points_written": len(points), "protocols": protocol_summary}
 
     def collect_optical_monitoring(self, device: Any) -> Dict[str, Any]:
         """采集光模块 RX/TX 功率，需提供私有 OID"""
@@ -1769,7 +1783,23 @@ class SNMPCollector(LoggerMixin):
             "timestamp": timestamp,
             "cpu": cpu,
             "memory": memory,
+            "temperature": max(
+                (float(item["temperature"]) for item in temperatures if item.get("temperature") is not None),
+                default=None,
+            ),
+            "storage_percent": max(
+                (float(item["usage_percent"]) for item in storage_rows if item.get("usage_percent") is not None),
+                default=None,
+            ),
             "sessions": sessions,
+            "hardware": {
+                "fan_total": sum(1 for item in hardware_rows if item.get("component_type") == "fan" and item.get("present", 1) != 0),
+                "fan_down": sum(1 for item in hardware_rows if item.get("component_type") == "fan" and item.get("up") == 0),
+                "fan_status_known": all(item.get("status_known", 1) != 0 for item in hardware_rows if item.get("component_type") == "fan"),
+                "power_total": sum(1 for item in hardware_rows if item.get("component_type") == "power" and item.get("present", 1) != 0),
+                "power_down": sum(1 for item in hardware_rows if item.get("component_type") == "power" and item.get("up") == 0),
+                "power_status_known": all(item.get("status_known", 1) != 0 for item in hardware_rows if item.get("component_type") == "power"),
+            },
             "storage_count": len(storage_rows),
             "pak_buffer_count": len(pak_buffer_rows),
             "ipsec_tunnel_count": len(ipsec_rows),

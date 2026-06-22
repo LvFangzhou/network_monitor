@@ -49,6 +49,31 @@ const physicalPortRateOptions = [
   { value: '25G', label: '25G' },
   { value: '100G', label: '100G' },
 ]
+
+const parsePortRateMbps = (rate?: string) => {
+  const match = String(rate || '').trim().match(/^([\d.]+)\s*([GMK]?)(?:BPS|B)?$/i)
+  if (!match) return null
+  const value = Number(match[1])
+  if (!Number.isFinite(value)) return null
+  const unit = match[2].toUpperCase()
+  if (unit === 'G') return value * 1000
+  if (unit === 'K') return value / 1000
+  return value
+}
+
+const getAggregatedPortRate = (primaryRate?: string, secondaryRate?: string) => {
+  const primaryMbps = parsePortRateMbps(primaryRate)
+  const secondaryMbps = parsePortRateMbps(secondaryRate)
+  if (primaryMbps === null || secondaryMbps === null) {
+    return primaryRate || secondaryRate || '-'
+  }
+  const totalMbps = primaryMbps + secondaryMbps
+  if (totalMbps >= 1000) {
+    const totalGbps = totalMbps / 1000
+    return `${Number.isInteger(totalGbps) ? totalGbps.toFixed(0) : totalGbps.toFixed(1)}G`
+  }
+  return `${Number.isInteger(totalMbps) ? totalMbps.toFixed(0) : totalMbps.toFixed(1)}M`
+}
 const dualLinkModeOptions = [
   { value: 'lacp', label: 'LACP（逻辑单线）' },
   { value: 'cold_standby', label: '冷备' },
@@ -613,6 +638,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       state: {
         circuitMonitorTargets: targets,
         sourceCircuitName: record.name,
+        sourceCircuitType: record.line_type === 'private_line' ? '专线' : '公网',
       },
     })
   }
@@ -853,7 +879,8 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
 
   const renderAggregationDetailLine = (
     interfaceName?: string,
-    placementLabel?: string
+    placementLabel?: string,
+    aggregatedRate?: string
   ) => (
     <div style={{ color: '#666', fontWeight: 600, lineHeight: 1.7 }}>
       <span style={{ color: '#333', fontWeight: 700 }}>逻辑聚合接口：</span>
@@ -862,6 +889,12 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
         <>
           {' '} / 部署方式：
           <span style={{ color: '#1677ff', fontWeight: 800 }}>【{placementLabel}】</span>
+        </>
+      ) : null}
+      {aggregatedRate ? (
+        <>
+          {' '} / 聚合速率：
+          <span style={{ color: '#262626', fontWeight: 800 }}>【{aggregatedRate}】</span>
         </>
       ) : null}
     </div>
@@ -1239,7 +1272,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
               <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', lineHeight: 1.4, minWidth: 0 }}>
                 <Tag style={{ marginInlineEnd: 0, fontSize: 12 }}>逻辑聚合</Tag>
                 <span
-                  title={`${record.aggregation_interface_name || '-'} / ${getAggregationPlacementLabel(record.aggregation_interface_name) || '逻辑单线'} / ${record.primary_port_rate || record.secondary_port_rate || '-'}`}
+                  title={`${record.aggregation_interface_name || '-'} / ${getAggregationPlacementLabel(record.aggregation_interface_name) || '逻辑单线'} / ${getAggregatedPortRate(record.primary_port_rate, record.secondary_port_rate)}`}
                   style={{
                     minWidth: 0,
                     flex: 1,
@@ -1249,7 +1282,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                     textOverflow: 'ellipsis',
                   }}
                 >
-                  {`${record.aggregation_interface_name || '-'} / ${getAggregationPlacementLabel(record.aggregation_interface_name) || '逻辑单线'} / ${record.primary_port_rate || record.secondary_port_rate || '-'}`}
+                  {`${record.aggregation_interface_name || '-'} / ${getAggregationPlacementLabel(record.aggregation_interface_name) || '逻辑单线'} / ${getAggregatedPortRate(record.primary_port_rate, record.secondary_port_rate)}`}
                 </span>
               </div>
             ) : null}
@@ -1725,7 +1758,8 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
                         {dualLacpCircuit
                           ? renderAggregationDetailLine(
                               record.aggregation_interface_name,
-                              getAggregationPlacementLabel(record.aggregation_interface_name)
+                              getAggregationPlacementLabel(record.aggregation_interface_name),
+                              getAggregatedPortRate(record.primary_port_rate, record.secondary_port_rate)
                             )
                           : null}
                         <div style={{ color: '#666', fontWeight: 600, marginTop: 2 }}>

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import asyncio
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
@@ -33,10 +34,7 @@ SNMP_FAILURE_KEY_PREFIX = "snmp_collect:failure:"
 SNMP_STATUS_REACHABLE = "reachable"
 SNMP_STATUS_UNREACHABLE = "unreachable"
 SNMP_VERIFY_OID = "1.3.6.1.2.1.1.3.0"
-MONITOR_CACHE_STALE_SECONDS = max(
-    180,
-    min(3600, int(settings.ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS) * 2),
-)
+MONITOR_CACHE_STALE_SECONDS = 7 * 24 * 60 * 60
 MAX_INTERFACE_HISTORY_SECONDS = 7 * 24 * 60 * 60
 RATE_FALLBACK_MAX_SECONDS = 5 * 60
 HISTORY_REQUEST_CACHE_SECONDS = 8
@@ -769,8 +767,16 @@ def _sanitize_impossible_interface_rates(row: Dict[str, Any]) -> None:
         if value < 0:
             row[bps_key] = None
             row[utilization_key] = None
-        elif value > speed_bps:
-            row[bps_key] = speed_bps
+        elif (
+            value > speed_bps * INTERFACE_RATE_CAP_MULTIPLIER
+            or math.isclose(value, speed_bps, rel_tol=0.0, abs_tol=0.5)
+        ):
+            # Older collectors clipped impossible deltas to exactly the
+            # physical port speed. Treat those legacy line-rate points, and
+            # any new over-speed sample, as missing instead of displaying a
+            # fabricated 10G/100G peak.
+            row[bps_key] = None
+            row[utilization_key] = None
 
 
 def _latest_numeric(device_id: int, measurement: str, fields: List[str]) -> Optional[float]:
@@ -1966,50 +1972,49 @@ async def get_monitor_devices_overview(
             if isinstance(cached_overview, dict):
                 item.update(cached_overview)
             else:
-                exporter_status = redis_client.get(f"asternos_collect:status:{device.id}")
-                interfaces_cache = _load_monitor_cache("interfaces", device.id)
-                if exporter_status == "reachable" or isinstance(interfaces_cache, dict) or _has_recent_interface_history(device.id):
+                # 缓存缺失时同步补齐完整总览，避免首次进入只显示连通性、资源列短暂为“-”。
+                try:
+                    overview = await _build_asternos_overview(device)
+                    overview["collected_at"] = datetime.now(timezone.utc).isoformat()
+                    redis_client.setex(
+                        _monitor_cache_key("overview", device.id),
+                        MONITOR_CACHE_STALE_SECONDS,
+                        json.dumps(overview),
+                    )
+                    redis_client.set(f"asternos_collect:status:{device.id}", "reachable")
+                    item.update(overview)
+                except Exception as exc:
                     item["connectivity"] = {
                         "type": "exporter",
-                        "status": "reachable",
-                        "message": f"http://{device.ip_address}:8101/metrics",
+                        "status": "unreachable",
+                        "message": str(exc),
                     }
-                    item["collected_at"] = _cache_collected_at(interfaces_cache) or item.get("collected_at")
-                    try:
-                        from app.tasks.snmp_tasks import collect_asternos_for_device
-
-                        refresh_lock = f"monitor:overview_refresh:asternos:{device.id}"
-                        if redis_client.set(refresh_lock, "1", ex=30, nx=True):
-                            collect_asternos_for_device.delay(device.id)
-                    except Exception as exc:
-                        logger.warning("AsterNOS总览补采任务提交失败", device_id=device.id, error=str(exc))
-                else:
-                    try:
-                        overview = await _build_asternos_overview(device)
-                        overview["collected_at"] = datetime.now(timezone.utc).isoformat()
-                        redis_client.setex(
-                            _monitor_cache_key("overview", device.id),
-                            MONITOR_CACHE_STALE_SECONDS,
-                            json.dumps(overview),
-                        )
-                        redis_client.set(f"asternos_collect:status:{device.id}", "reachable")
-                        item.update(overview)
-                    except Exception as exc:
-                        item["connectivity"] = {
-                            "type": "exporter",
-                            "status": "unreachable",
-                            "message": str(exc),
-                        }
-                        redis_client.set(f"asternos_collect:status:{device.id}", "unreachable")
+                    redis_client.set(f"asternos_collect:status:{device.id}", "unreachable")
         else:
-            item.update(
-                _build_snmp_overview(
+            cached_overview = _load_monitor_cache("overview", device.id)
+            if isinstance(cached_overview, dict):
+                item.update(cached_overview)
+                snmp_status = redis_client.get(_snmp_status_key(device.id)) or "unknown"
+                if snmp_status == SNMP_STATUS_UNREACHABLE:
+                    item["connectivity"] = {
+                        "type": "snmp",
+                        "status": "unreachable",
+                        "message": "SNMP最近采集不可达，当前展示最近一次后台采集结果",
+                    }
+            else:
+                overview = _build_snmp_overview(
                     device,
                     include_storage=include_storage,
                     include_hardware=include_hardware,
                     include_sessions=include_sessions,
                 )
-            )
+                overview["collected_at"] = datetime.now(timezone.utc).isoformat()
+                redis_client.setex(
+                    _monitor_cache_key("overview", device.id),
+                    MONITOR_CACHE_STALE_SECONDS,
+                    json.dumps(overview),
+                )
+                item.update(overview)
         item["collected_at"] = item.get("collected_at") or datetime.now(timezone.utc).isoformat()
         if not connectivity or item["connectivity"]["status"] == connectivity:
             items.append(item)

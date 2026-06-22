@@ -65,7 +65,11 @@ def send_test_notification(channel_type: str, config: Dict[str, Any]):
     title = "网络监控系统测试通知"
     content = f"这是一条测试通知，用于验证{channel_type}渠道配置是否正确。"
     
-    return send_notification.delay(channel_type, config, title, content)
+    return send_notification.apply_async(
+        args=[channel_type, config, title, content],
+        queue="notification",
+        expires=300,
+    )
 
 
 @shared_task
@@ -81,11 +85,15 @@ def batch_send_notifications(
     results = []
     
     for notif in notifications:
-        result = send_notification.delay(
-            notif.get("channel_type"),
-            notif.get("config", {}),
-            notif.get("title", ""),
-            notif.get("content", "")
+        result = send_notification.apply_async(
+            args=[
+                notif.get("channel_type"),
+                notif.get("config", {}),
+                notif.get("title", ""),
+                notif.get("content", ""),
+            ],
+            queue="notification",
+            expires=300,
         )
         results.append(result.id)
     

@@ -20,8 +20,7 @@ from app.tasks.system_tasks import _detect_webhook_provider
 from app.tasks.alert_tasks import (
     _ensure_alarm_id,
     _is_silenced,
-    _send_alert_event_notification,
-    _send_alert_notification,
+    enqueue_alert_notification,
 )
 
 logger = get_logger(__name__)
@@ -355,7 +354,7 @@ def _handle_trap_datagram(source_ip: str, data: bytes) -> None:
                 existing.resolution_note = definition.name
                 existing.updated_at = datetime.now(timezone.utc)
                 db.commit()
-                _send_alert_event_notification.delay(existing.id, "auto_resolved", "snmp_trap")
+                enqueue_alert_notification(existing.id, "auto_resolved", "snmp_trap")
             logger.info("山石恢复Trap已处理", source_ip=source_ip, trap_oid=trap_oid, matched=bool(existing))
             return
 
@@ -422,7 +421,7 @@ def _handle_trap_datagram(source_ip: str, data: bytes) -> None:
         db.commit()
         db.refresh(alert)
         _ensure_alarm_id(db, alert)
-        _send_alert_notification.delay(alert.id)
+        enqueue_alert_notification(alert.id)
         logger.info("山石Trap已转换为告警", source_ip=source_ip, trap_oid=trap_oid, alert_id=alert.id)
     except Exception as exc:
         db.rollback()

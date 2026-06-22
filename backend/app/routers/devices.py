@@ -2,7 +2,7 @@
 设备管理路由
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from datetime import datetime
@@ -191,7 +191,20 @@ async def list_devices(
     business_type: Optional[str] = None,
     is_monitored: Optional[bool] = None,
     search: Optional[str] = None,
-    search_mode: str = Query("fuzzy", pattern="^(fuzzy|regex)$")
+    search_mode: str = Query("fuzzy", pattern="^(fuzzy|regex)$"),
+    name_text: Optional[str] = None,
+    ip_address_text: Optional[str] = None,
+    status_text: Optional[str] = None,
+    monitored_text: Optional[str] = None,
+    datacenter_text: Optional[str] = None,
+    model_text: Optional[str] = None,
+    device_type_text: Optional[str] = None,
+    serial_number_text: Optional[str] = None,
+    sort_by: Optional[str] = Query(
+        None,
+        pattern="^(name|ip_address|status|is_monitored|datacenter|model|device_type|serial_number)$",
+    ),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$"),
 ):
     """获取设备列表"""
     query = db.query(Device).options(
@@ -227,6 +240,57 @@ async def list_devices(
         query = query.filter(Device.business_type.ilike(f"%{business_type}%"))
     if is_monitored is not None:
         query = query.filter(Device.is_monitored == is_monitored)
+    if name_text:
+        query = query.filter(Device.name.ilike(f"%{name_text.strip()}%"))
+    if ip_address_text:
+        query = query.filter(Device.ip_address.ilike(f"%{ip_address_text.strip()}%"))
+    if model_text:
+        query = query.filter(Device.model.ilike(f"%{model_text.strip()}%"))
+    if serial_number_text:
+        query = query.filter(Device.serial_number.ilike(f"%{serial_number_text.strip()}%"))
+    if datacenter_text:
+        value = datacenter_text.strip()
+        query = query.filter(Device.datacenter_ref.has(
+            Datacenter.name.ilike(f"%{value}%") |
+            Datacenter.code.ilike(f"%{value}%") |
+            Datacenter.location.ilike(f"%{value}%")
+        ))
+    if device_type_text:
+        value = device_type_text.strip()
+        query = query.filter(
+            Device.device_type.ilike(f"%{value}%") |
+            Device.device_type_ref.has(
+                DeviceType.name.ilike(f"%{value}%") |
+                DeviceType.display_name.ilike(f"%{value}%")
+            )
+        )
+    if status_text:
+        value = status_text.strip()
+        status_aliases = {
+            "active": "上线",
+            "online": "上线",
+            "inactive": "离线",
+            "offline": "离线",
+            "in_stock": "库存",
+            "deployed": "上架",
+        }
+        matched_statuses = [key for key, label in status_aliases.items() if value.lower() in key.lower() or value in label]
+        status_conditions = [Device.status.ilike(f"%{value}%")]
+        if matched_statuses:
+            status_conditions.append(Device.status.in_(matched_statuses))
+        query = query.filter(or_(*status_conditions))
+    if monitored_text:
+        value = monitored_text.strip().lower()
+        true_labels = ["监控", "监控中", "已监控", "是", "true", "yes", "1"]
+        false_labels = ["未监控", "否", "false", "no", "0"]
+        matches_true = any(value in label.lower() for label in true_labels)
+        matches_false = any(value in label.lower() for label in false_labels)
+        if matches_true and not matches_false:
+            query = query.filter(Device.is_monitored.is_(True))
+        elif matches_false and not matches_true:
+            query = query.filter(Device.is_monitored.is_(False))
+        elif value:
+            query = query.filter(Device.id == -1)
     if search:
         if search_mode == "regex":
             try:
@@ -269,6 +333,26 @@ async def list_devices(
                 )
             )
     
+    if sort_by:
+        sort_columns = {
+            "name": Device.name,
+            "ip_address": Device.ip_address,
+            "status": Device.status,
+            "is_monitored": Device.is_monitored,
+            "model": Device.model,
+            "device_type": Device.device_type,
+            "serial_number": Device.serial_number,
+        }
+        if sort_by == "datacenter":
+            query = query.outerjoin(Datacenter, Device.datacenter_id == Datacenter.id)
+            sort_column = Datacenter.name
+        else:
+            sort_column = sort_columns[sort_by]
+        ordering = sort_column.desc().nullslast() if sort_order == "desc" else sort_column.asc().nullslast()
+        query = query.order_by(ordering, Device.id.asc())
+    else:
+        query = query.order_by(Device.id.asc())
+
     total = query.count()
     devices = query.offset(skip).limit(limit).all()
     
@@ -942,6 +1026,7 @@ async def batch_update_devices(payload: DeviceBatchUpdateRequest, db: Session = 
 
     supported_fields = {
         "status",
+        "is_monitored",
         "datacenter_id",
         "device_type",
         "device_role",
@@ -961,6 +1046,11 @@ async def batch_update_devices(payload: DeviceBatchUpdateRequest, db: Session = 
     update_kwargs: dict[str, object] = {}
     if payload.field == "status":
         update_kwargs["status"] = normalize_inventory_status(payload.value)
+    elif payload.field == "is_monitored":
+        normalized_value = (payload.value or "").strip().lower()
+        if normalized_value not in {"true", "false"}:
+            raise HTTPException(status_code=400, detail="请选择是否加入监控")
+        update_kwargs["is_monitored"] = normalized_value == "true"
     elif payload.field == "datacenter_id":
         if payload.value_id is None:
             raise HTTPException(status_code=400, detail="请选择机房")

@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   Empty,
+  InputNumber,
   Radio,
   Select,
   Space,
@@ -14,7 +15,7 @@ import {
   message,
   theme,
 } from 'antd'
-import { HolderOutlined, LineChartOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons'
+import { HolderOutlined, LineChartOutlined, LinkOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
@@ -94,6 +95,11 @@ type SelectedTarget = {
   key: string
   device: MonitorDevice
   interface: MonitorInterface
+}
+
+type SourceCircuitContext = {
+  name: string
+  type: '公网' | '专线'
 }
 
 type ZoomRange = {
@@ -313,7 +319,8 @@ const getNiceAxisMax = (value: number) => {
   const exponent = Math.floor(Math.log10(target))
   const base = 10 ** exponent
   const normalized = target / base
-  const niceNormalized = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10
+  const niceSteps = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]
+  const niceNormalized = niceSteps.find((step) => normalized <= step) || 10
   return niceNormalized * base
 }
 
@@ -739,6 +746,20 @@ const Metrics = () => {
   const [monitorSearchKeyword, setMonitorSearchKeyword] = useState(persistedState?.monitorSearchKeyword || '')
   const [rangeValue, setRangeValue] = useState(isValidRangeValue(persistedState?.rangeValue) ? persistedState.rangeValue : '-10m')
   const [refreshValue, setRefreshValue] = useState(persistedState?.refreshValue || 10)
+  const [chartsPerRow, setChartsPerRow] = useState(() => {
+    const value = Number(persistedState?.chartsPerRow || 2)
+    return Number.isInteger(value) && value >= 1 && value <= 8 ? value : 2
+  })
+  const [sourceCircuitContext, setSourceCircuitContext] = useState<SourceCircuitContext | null>(() => {
+    const routeName = String(location.state?.sourceCircuitName || '').trim()
+    if (routeName) {
+      return {
+        name: routeName,
+        type: location.state?.sourceCircuitType === '专线' ? '专线' : '公网',
+      }
+    }
+    return persistedState?.sourceCircuitContext || null
+  })
   const [historyMap, setHistoryMap] = useState<Record<string, ChartPoint[]>>(() => loadCachedHistoryMap())
   const [queueSeriesMap, setQueueSeriesMap] = useState<Record<string, MonitorDynamicSeries[]>>({})
   const [zoomRanges, setZoomRanges] = useState<Record<string, ZoomRange>>({})
@@ -887,6 +908,13 @@ const Metrics = () => {
   useEffect(() => {
     const routeTargets = location.state?.circuitMonitorTargets
     if (Array.isArray(routeTargets) && routeTargets.length) {
+      const routeName = String(location.state?.sourceCircuitName || '').trim()
+      if (routeName) {
+        setSourceCircuitContext({
+          name: routeName,
+          type: location.state?.sourceCircuitType === '专线' ? '专线' : '公网',
+        })
+      }
       void preloadTargetsFromRoute(routeTargets)
     }
   }, [location.state])
@@ -1033,6 +1061,7 @@ const Metrics = () => {
     const nextTargets = selectedTargets.some((item) => item.key === key)
       ? selectedTargets
       : [...selectedTargets, nextTarget]
+    setSourceCircuitContext(null)
     setSelectedTargets(nextTargets)
     await loadHistoryForTargets(nextTargets)
   }
@@ -1214,6 +1243,8 @@ const Metrics = () => {
         monitorSearchKeyword,
         rangeValue,
         refreshValue,
+        chartsPerRow,
+        sourceCircuitContext,
       })
     )
   }, [
@@ -1227,6 +1258,8 @@ const Metrics = () => {
     monitorSearchKeyword,
     rangeValue,
     refreshValue,
+    chartsPerRow,
+    sourceCircuitContext,
   ])
 
   const chartCards = useMemo(() => {
@@ -1299,6 +1332,33 @@ const Metrics = () => {
   return (
     <Space direction="vertical" size="middle" style={{ width: '100%' }}>
       <div style={{ color: '#8c8c8c', fontSize: 13 }}>监控中心 / 端口联合查询</div>
+
+      {sourceCircuitContext ? (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            minHeight: 58,
+            padding: '10px 16px',
+            border: `1px solid ${selectedPortBorder}`,
+            borderLeft: `5px solid ${selectedPortBorder}`,
+            borderRadius: 6,
+            background: selectedPortBg,
+          }}
+        >
+          <LinkOutlined style={{ color: selectedPortBorder, fontSize: 20 }} />
+          <div style={{ display: 'grid', gap: 2, minWidth: 0 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>当前查看线路</Text>
+            <Text strong style={{ fontSize: 18, lineHeight: 1.3, overflowWrap: 'anywhere' }}>
+              {sourceCircuitContext.name}
+            </Text>
+          </div>
+          <Tag color={sourceCircuitContext.type === '专线' ? 'blue' : 'green'} style={{ marginInlineStart: 'auto', marginInlineEnd: 0, fontSize: 13 }}>
+            {sourceCircuitContext.type}
+          </Tag>
+        </div>
+      ) : null}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         <Card title="选择交换机端口" bodyStyle={{ padding: 12 }}>
@@ -1468,6 +1528,15 @@ const Metrics = () => {
               }
             }}
           />
+          <Text type="secondary">每行图表</Text>
+          <InputNumber
+            min={1}
+            max={8}
+            precision={0}
+            value={chartsPerRow}
+            onChange={(value) => setChartsPerRow(Math.min(8, Math.max(1, Number(value) || 1)))}
+            style={{ width: 72 }}
+          />
         </Space>
       </Card>
 
@@ -1479,7 +1548,7 @@ const Metrics = () => {
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: chartCards.length === 1 ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))',
+            gridTemplateColumns: `repeat(${Math.min(chartsPerRow, chartCards.length)}, minmax(0, 1fr))`,
             gap: 16,
             alignItems: 'start',
           }}

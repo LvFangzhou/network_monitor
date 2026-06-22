@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     API_PREFIX: str = "/api/v1"
     DOCS_URL: str = "/docs"
     REDOC_URL: str = "/redoc"
-    FRONTEND_PUBLIC_URL: str = "http://172.18.16.92:8080"
+    FRONTEND_PUBLIC_URL: str = "http://172.18.17.250:8080"
     TACACS_WEBHOOK_URL: str = ""
     
     # PostgreSQL配置

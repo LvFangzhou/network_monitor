@@ -20,6 +20,10 @@ router = APIRouter()
 
 
 REQUIRED_IMPORT_HEADERS = {'name', 'ip_address'}
+DEVICE_CSV_HEADERS = [
+    'name', 'status', 'ip_address', 'device_role', 'device_type', 'vendor', 'model', 'serial_number',
+    'datacenter_name', 'datacenter_code', 'is_monitored'
+]
 
 
 def decode_csv_content(content: bytes) -> str:
@@ -59,6 +63,15 @@ def normalize_inventory_status(raw_status: Optional[str]) -> str:
         'offline': 'inactive',
     }
     return status_aliases.get(value, 'in_stock')
+
+
+def normalize_is_monitored(raw_value: Optional[str]) -> bool:
+    value = (raw_value or '').strip().lower()
+    if value in {'1', 'true', 'yes', 'y', '是', '加入', '已监控'}:
+        return True
+    if value in {'', '0', 'false', 'no', 'n', '否', '不加入', '未监控'}:
+        return False
+    raise ValueError("is_monitored 仅支持 是/否、true/false 或 1/0")
 
 
 def find_or_create_datacenter(
@@ -256,6 +269,7 @@ async def import_devices(
                     status=normalize_inventory_status(row.get('status')),
                     datacenter_id=datacenter_id,
                     group_id=group_id or row.get('group_id') or None,
+                    is_monitored=normalize_is_monitored(row.get('is_monitored')),
                 )
 
                 # 处理标签
@@ -301,34 +315,10 @@ async def import_devices(
     }
 
 
-@router.get("/devices/export")
-async def export_devices(
-    db: Session = Depends(get_db),
-    group_id: Optional[int] = None,
-    device_type: Optional[str] = None
-):
-    """导出设备（CSV格式）"""
-    query = db.query(Device)
-    
-    if group_id:
-        query = query.filter(Device.group_id == group_id)
-    if device_type:
-        query = query.filter(Device.device_type == device_type)
-    
-    devices = query.all()
-    
-    # 创建CSV
+def build_device_csv(devices: list[Device]) -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
-    
-    # 写入表头
-    headers = [
-        'name', 'status', 'ip_address', 'device_role', 'device_type', 'vendor', 'model', 'serial_number',
-        'datacenter_name', 'datacenter_code'
-    ]
-    writer.writerow(headers)
-    
-    # 写入数据
+    writer.writerow(DEVICE_CSV_HEADERS)
     for device in devices:
         writer.writerow([
             device.name,
@@ -341,16 +331,46 @@ async def export_devices(
             device.serial_number,
             device.datacenter_ref.name if device.datacenter_ref else None,
             device.datacenter_ref.code if device.datacenter_ref else None,
+            '是' if device.is_monitored else '否',
         ])
+    return output.getvalue().encode('utf-8-sig')
+
+
+@router.get("/devices/template")
+async def export_device_template():
+    """下载设备导入模板；SNMP 团体字由系统后台默认配置，不出现在模板中。"""
+    from fastapi.responses import StreamingResponse
+    content = io.StringIO()
+    writer = csv.writer(content)
+    writer.writerow(DEVICE_CSV_HEADERS)
+    writer.writerow(['示例交换机', 'in_stock', '192.0.2.10', '接入交换机', 'switch', 'H3C', '', '', '', '', '是'])
+    return StreamingResponse(
+        io.BytesIO(content.getvalue().encode('utf-8-sig')),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=device_import_template.csv"},
+    )
+
+
+@router.get("/devices/export")
+async def export_devices(
+    db: Session = Depends(get_db),
+    group_id: Optional[int] = None,
+    device_type: Optional[str] = None
+):
+    """导出设备（CSV格式）"""
+    query = db.query(Device)
+
+    if group_id:
+        query = query.filter(Device.group_id == group_id)
+    if device_type:
+        query = query.filter(Device.device_type == device_type)
     
-    output.seek(0)
-    content = output.getvalue()
-    output.close()
+    devices = query.all()
     
     from fastapi.responses import StreamingResponse
     return StreamingResponse(
-        io.BytesIO(content.encode('utf-8')),
-        media_type="text/csv",
+        io.BytesIO(build_device_csv(devices)),
+        media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=devices.csv"}
     )
 

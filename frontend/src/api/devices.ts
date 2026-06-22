@@ -177,6 +177,16 @@ export const getDevices = async (params?: {
   is_monitored?: boolean
   search?: string
   search_mode?: 'fuzzy' | 'regex'
+  name_text?: string
+  ip_address_text?: string
+  status_text?: string
+  monitored_text?: string
+  datacenter_text?: string
+  model_text?: string
+  device_type_text?: string
+  serial_number_text?: string
+  sort_by?: 'name' | 'ip_address' | 'status' | 'is_monitored' | 'datacenter' | 'model' | 'device_type' | 'serial_number'
+  sort_order?: 'asc' | 'desc'
 }): Promise<DeviceListResponse> => {
   return await request.get('/devices', { params }) as DeviceListResponse
 }
@@ -310,6 +320,12 @@ export const importDevices = async (file: File): Promise<{ imported: number; fai
 
 export const exportDevices = async (): Promise<Blob> => {
   return await request.get('/cmdb/devices/export', {
+    responseType: 'blob',
+  }) as Blob
+}
+
+export const exportDeviceTemplate = async (): Promise<Blob> => {
+  return await request.get('/cmdb/devices/template', {
     responseType: 'blob',
   }) as Blob
 }

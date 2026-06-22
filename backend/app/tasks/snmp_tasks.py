@@ -61,7 +61,7 @@ SNMP_STATUS_UNKNOWN = "unknown"
 ICMP_PING_PACKETS = 5
 ICMP_PING_TIMEOUT_SECONDS = 2
 ICMP_PING_INTERVAL_MS = 200
-MONITOR_CACHE_TTL_SECONDS = max(180, min(3600, ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS * 2))
+MONITOR_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 ASTERNOS_TASK_LOCK_TTL_SECONDS = max(45, min(180, ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS * 2))
 INTERFACE_REALTIME_LOCK_TTL_SECONDS = 120
 INTERFACE_REALTIME_MAX_WORKERS = 4
@@ -337,8 +337,11 @@ def _sanitize_interface_rates(stats: Dict[str, Any]) -> None:
         if numeric < 0:
             stats[bps_key] = None
             stats[utilization_key] = None
-        elif numeric > speed_value:
-            stats[bps_key] = speed_value
+        elif numeric > speed_value * INTERFACE_RATE_CAP_MULTIPLIER:
+            # Never turn an invalid counter delta into a believable line-rate
+            # spike. Missing data is safer than a fabricated 10G/100G point.
+            stats[bps_key] = None
+            stats[utilization_key] = None
 
 
 def _build_counter_target_key(labels: Dict[str, Any], target_labels: List[str]) -> str:
@@ -478,6 +481,20 @@ def _octet_rate_cache_key(device_id: int, interface_index: int) -> str:
     return f"monitor:interface_octets:{device_id}:{interface_index}"
 
 
+def _octet_rate_lock_key(device_id: int, interface_index: int) -> str:
+    return f"{_octet_rate_cache_key(device_id, interface_index)}:lock"
+
+
+def _release_octet_rate_lock(lock_key: str, token: str) -> None:
+    redis_client.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end",
+        1,
+        lock_key,
+        token,
+    )
+
+
 def _apply_octet_rates(device_id: int, stats: Dict[str, Any], timestamp: datetime) -> None:
     interface_index = stats.get("index")
     if interface_index is None:
@@ -488,61 +505,78 @@ def _apply_octet_rates(device_id: int, stats: Dict[str, Any], timestamp: datetim
     if current_in is None and current_out is None:
         return
 
-    cache_key = _octet_rate_cache_key(device_id, int(interface_index))
-    previous_raw = redis_client.get(cache_key)
-    previous = None
-    if previous_raw:
-        try:
-            previous = json.loads(previous_raw)
-        except Exception:
-            previous = None
+    interface_index = int(interface_index)
+    cache_key = _octet_rate_cache_key(device_id, interface_index)
+    lock_key = _octet_rate_lock_key(device_id, interface_index)
+    lock_token = uuid.uuid4().hex
+    if not redis_client.set(lock_key, lock_token, ex=10, nx=True):
+        # Another collector owns this baseline. Do not calculate from a value
+        # that may be replaced underneath us.
+        return
 
-    next_cache = {
-        "in_octets": current_in,
-        "out_octets": current_out,
-        "time": timestamp.replace(tzinfo=timezone.utc).isoformat(),
-    }
-
-    if previous:
-        try:
-            previous_time = datetime.fromisoformat(str(previous.get("time")))
-        except Exception:
-            previous_time = None
-
-        for octet_key, bps_key, time_key in [("in_octets", "in_bps", "in_time"), ("out_octets", "out_bps", "out_time")]:
-            current_value = stats.get(octet_key)
-            previous_value = previous.get(octet_key)
-            if current_value is None or previous_value is None:
-                continue
+    try:
+        sample_time = timestamp.replace(tzinfo=timezone.utc)
+        sample_time_text = sample_time.isoformat()
+        previous_raw = redis_client.get(cache_key)
+        previous = None
+        if previous_raw:
             try:
-                field_previous_time = datetime.fromisoformat(str(previous.get(time_key) or previous.get("time")))
+                previous = json.loads(previous_raw)
             except Exception:
-                field_previous_time = previous_time
-            elapsed = max((timestamp.replace(tzinfo=timezone.utc) - field_previous_time).total_seconds(), 0.0) if field_previous_time else 0.0
-            delta = float(current_value) - float(previous_value)
-            if 0.5 <= elapsed <= 300:
-                if delta > 0:
-                    stats[bps_key] = round((delta * 8) / elapsed, 2)
-                    stats.setdefault("_octet_rate_fields", []).append(bps_key)
-                    next_cache[time_key] = timestamp.replace(tzinfo=timezone.utc).isoformat()
-                elif delta == 0:
-                    stats[bps_key] = 0.0
-                    stats.setdefault("_octet_rate_fields", []).append(bps_key)
-                    next_cache[time_key] = timestamp.replace(tzinfo=timezone.utc).isoformat()
-                else:
-                    next_cache[time_key] = timestamp.replace(tzinfo=timezone.utc).isoformat()
-                stats["sample_seconds"] = round(elapsed, 2)
+                previous = None
 
-    if "in_time" not in next_cache:
-        next_cache["in_time"] = timestamp.replace(tzinfo=timezone.utc).isoformat()
-    if "out_time" not in next_cache:
-        next_cache["out_time"] = timestamp.replace(tzinfo=timezone.utc).isoformat()
+        next_cache = {
+            "in_octets": current_in,
+            "out_octets": current_out,
+            "time": sample_time_text,
+        }
 
-    redis_client.setex(
-        cache_key,
-        86400,
-        json.dumps(next_cache),
-    )
+        if previous:
+            try:
+                previous_time = datetime.fromisoformat(str(previous.get("time")))
+            except Exception:
+                previous_time = None
+
+            # A slower concurrent collector may finish after a newer sample.
+            # Never let that older result replace the current baseline.
+            if previous_time and sample_time <= previous_time:
+                return
+
+            for octet_key, bps_key, time_key in [
+                ("in_octets", "in_bps", "in_time"),
+                ("out_octets", "out_bps", "out_time"),
+            ]:
+                current_value = stats.get(octet_key)
+                previous_value = previous.get(octet_key)
+                if current_value is None or previous_value is None:
+                    continue
+                try:
+                    field_previous_time = datetime.fromisoformat(str(previous.get(time_key) or previous.get("time")))
+                except Exception:
+                    field_previous_time = previous_time
+                elapsed = (sample_time - field_previous_time).total_seconds() if field_previous_time else 0.0
+                delta = float(current_value) - float(previous_value)
+                if 0.5 <= elapsed <= 300:
+                    if delta > 0:
+                        stats[bps_key] = round((delta * 8) / elapsed, 2)
+                        stats.setdefault("_octet_rate_fields", []).append(bps_key)
+                        next_cache[time_key] = sample_time_text
+                    elif delta == 0:
+                        stats[bps_key] = 0.0
+                        stats.setdefault("_octet_rate_fields", []).append(bps_key)
+                        next_cache[time_key] = sample_time_text
+                    else:
+                        next_cache[time_key] = sample_time_text
+                    stats["sample_seconds"] = round(elapsed, 2)
+
+        if "in_time" not in next_cache:
+            next_cache["in_time"] = sample_time_text
+        if "out_time" not in next_cache:
+            next_cache["out_time"] = sample_time_text
+
+        redis_client.setex(cache_key, 86400, json.dumps(next_cache))
+    finally:
+        _release_octet_rate_lock(lock_key, lock_token)
 
 
 def _interface_point(device: Device, stats: Dict[str, Any], timestamp: datetime) -> Optional[Dict[str, Any]]:
@@ -935,6 +969,41 @@ def collect_snmp_for_device(self, device_id: int):
             }
 
         _clear_device_failure_state(device_id)
+
+        memory = result.get("memory") or {}
+        sessions = result.get("sessions") or {}
+        overview = {
+            "connectivity": {
+                "type": "snmp",
+                "status": "reachable",
+                "message": f"SNMP {device.snmp_version}",
+            },
+            "resources": {
+                "cpu_percent": result.get("cpu"),
+                "memory_percent": memory.get("usage_percent") or memory.get("used_percent") or memory.get("percent"),
+                "temperature": result.get("temperature"),
+                "storage_percent": result.get("storage_percent"),
+            },
+            "sessions": {
+                "current": sessions.get("current"),
+                "total": sessions.get("total"),
+                "usage_percent": sessions.get("usage_percent"),
+            },
+            "hardware": result.get("hardware") or {
+                "fan_total": 0,
+                "fan_down": 0,
+                "fan_status_known": True,
+                "power_total": 0,
+                "power_down": 0,
+                "power_status_known": True,
+            },
+            "protocols": protocol_status_result.get("protocols") or {
+                "bgp": {"total": 0, "up": 0, "down": 0},
+                "ospf": {"total": 0, "up": 0, "down": 0},
+            },
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _set_monitor_cache("overview", device.id, overview)
         
         return {
             "device_id": device_id,
@@ -1201,14 +1270,30 @@ def collect_asternos_for_device(self, device_id: int):
     except Exception as exc:
         logger.error("AsterNOS Exporter采集失败", device_id=device_id, error=str(exc))
         redis_client.set(f"asternos_collect:status:{device_id}", "unreachable")
-        _set_monitor_cache("overview", device_id, {
-            "connectivity": {"type": "exporter", "status": "unreachable", "message": str(exc)},
-            "resources": {"cpu_percent": None, "memory_percent": None, "temperature": None, "storage_percent": None},
-            "sessions": {"current": None, "total": None, "usage_percent": None},
-            "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
-            "protocols": {"bgp": {"total": 0, "up": 0, "down": 0}, "ospf": {"total": 0, "up": 0, "down": 0}},
-            "collected_at": datetime.now(timezone.utc).isoformat(),
-        })
+        cache_key = _monitor_cache_key("overview", device_id)
+        cached_raw = redis_client.get(cache_key)
+        cached_overview = None
+        if cached_raw:
+            try:
+                cached_overview = json.loads(cached_raw)
+            except Exception:
+                cached_overview = None
+        if isinstance(cached_overview, dict):
+            cached_overview["connectivity"] = {
+                "type": "exporter",
+                "status": "unreachable",
+                "message": f"最近一次采集失败，当前展示上一次有效指标：{exc}",
+            }
+            _set_monitor_cache("overview", device_id, cached_overview)
+        else:
+            _set_monitor_cache("overview", device_id, {
+                "connectivity": {"type": "exporter", "status": "unreachable", "message": str(exc)},
+                "resources": {"cpu_percent": None, "memory_percent": None, "temperature": None, "storage_percent": None},
+                "sessions": {"current": None, "total": None, "usage_percent": None},
+                "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
+                "protocols": {"bgp": {"total": 0, "up": 0, "down": 0}, "ospf": {"total": 0, "up": 0, "down": 0}},
+                "collected_at": datetime.now(timezone.utc).isoformat(),
+            })
         return {"device_id": device_id, "success": False, "error": str(exc)}
     finally:
         _release_asternos_device_lock(device_id)

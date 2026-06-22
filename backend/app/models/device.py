@@ -185,7 +185,7 @@ class Device(Base):
     # SNMP配置
     snmp_version = Column(String(10), default="v2c")  # v1, v2c, v3
     snmp_port = Column(Integer, default=161)
-    snmp_community = Column(String(100))  # v1/v2c
+    snmp_community = Column(String(100), default="para@2026")  # v1/v2c，导入时使用后台默认值
     snmp_username = Column(String(100))   # v3
     snmp_auth_protocol = Column(String(20))  # MD5, SHA
     snmp_auth_password = Column(String(100))

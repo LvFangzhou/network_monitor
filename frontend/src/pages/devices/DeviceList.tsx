@@ -24,11 +24,12 @@ import {
   DeleteOutlined,
   EyeOutlined,
   ExportOutlined,
+  DownloadOutlined,
   ImportOutlined,
   SettingOutlined,
   ReloadOutlined,
 } from '@ant-design/icons'
-import { getDevices, deleteDevice, batchDeleteDevices, batchUpdateDevices, exportDevices, importDevices, getDeviceFilterOptions } from '../../api/devices'
+import { getDevices, deleteDevice, batchDeleteDevices, batchUpdateDevices, exportDevices, exportDeviceTemplate, importDevices, getDeviceFilterOptions } from '../../api/devices'
 import type { Device } from '../../api/devices'
 import { useAuthStore } from '../../store/auth'
 
@@ -36,7 +37,11 @@ const { Search } = Input
 const { Text } = Typography
 const { Option } = Select
 const DEVICE_LIST_STORAGE_KEY = 'resource-network-device-list-state'
-const DEVICE_LIST_STORAGE_VERSION = 5
+const DEVICE_LIST_STORAGE_VERSION = 6
+const COLUMN_FILTER_KEYS = ['name', 'ip_address', 'status', 'is_monitored', 'datacenter', 'model', 'device_type', 'serial_number'] as const
+type ColumnFilterKey = typeof COLUMN_FILTER_KEYS[number]
+type SortField = ColumnFilterKey
+type SortOrder = 'ascend' | 'descend' | undefined
 const DEFAULT_VISIBLE_COLUMNS = [
   'name',
   'ip_address',
@@ -156,6 +161,9 @@ const DeviceList = () => {
   const [monitoredFilter, setMonitoredFilter] = useState<string | undefined>(persistedState?.monitoredFilter)
   const [datacenterFilter, setDatacenterFilter] = useState<number | undefined>(persistedState?.datacenterFilter)
   const [deviceTypeFilter, setDeviceTypeFilter] = useState<number | undefined>(persistedState?.deviceTypeFilter)
+  const [columnFilters, setColumnFilters] = useState<Partial<Record<ColumnFilterKey, string>>>(persistedState?.columnFilters || {})
+  const [sortField, setSortField] = useState<SortField | undefined>(persistedState?.sortField)
+  const [sortOrder, setSortOrder] = useState<SortOrder>(persistedState?.sortOrder)
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>({
     ...DEFAULT_COLUMN_WIDTHS,
     ...(persistedState?.columnWidths || {}),
@@ -185,10 +193,23 @@ const DeviceList = () => {
   const searchTimerRef = useRef<number | null>(null)
   const resizeStateRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null)
 
+  const getColumnFilterParams = (filters: Partial<Record<ColumnFilterKey, string>>) => ({
+    name_text: filters.name || undefined,
+    ip_address_text: filters.ip_address || undefined,
+    status_text: filters.status || undefined,
+    monitored_text: filters.is_monitored || undefined,
+    datacenter_text: filters.datacenter || undefined,
+    model_text: filters.model || undefined,
+    device_type_text: filters.device_type || undefined,
+    serial_number_text: filters.serial_number || undefined,
+  })
+
   const fetchDevices = async (params?: any) => {
     setLoading(true)
     try {
       const effectiveSearch = (params?.search ?? searchKeyword) || undefined
+      const effectiveColumnFilters = params?.columnFilters ?? columnFilters
+      const { columnFilters: _columnFilters, ...requestOverrides } = params || {}
       const result = await getDevices({
         skip: (currentPage - 1) * pageSize,
         limit: pageSize,
@@ -200,7 +221,10 @@ const DeviceList = () => {
         vendor: vendorFilter,
         is_monitored: monitoredFilter === undefined ? undefined : monitoredFilter === 'true',
         datacenter_id: datacenterFilter,
-        ...params,
+        ...getColumnFilterParams(effectiveColumnFilters),
+        sort_by: sortField,
+        sort_order: sortOrder === 'descend' ? 'desc' : 'asc',
+        ...requestOverrides,
       })
       setDevices(result.items)
       setTotal(result.total)
@@ -231,6 +255,9 @@ const DeviceList = () => {
       setVendorFilter(undefined)
       setDatacenterFilter(undefined)
       setDeviceTypeFilter(undefined)
+      setColumnFilters({})
+      setSortField(undefined)
+      setSortOrder(undefined)
       setCurrentPage(1)
       setSelectedRowKeys([])
       fetchDevices({
@@ -241,6 +268,9 @@ const DeviceList = () => {
         device_role: undefined,
         vendor: undefined,
         datacenter_id: undefined,
+        columnFilters: {},
+        sort_by: undefined,
+        sort_order: undefined,
       })
       setSearchParams(statusFromRoute ? { status: statusFromRoute } : {}, { replace: true })
     } else {
@@ -263,11 +293,14 @@ const DeviceList = () => {
         monitoredFilter,
         datacenterFilter,
         deviceTypeFilter,
+        columnFilters,
+        sortField,
+        sortOrder,
         columnWidths,
         visibleColumns,
       })
     )
-  }, [currentPage, pageSize, searchKeyword, statusFilter, roleFilter, vendorFilter, monitoredFilter, datacenterFilter, deviceTypeFilter, columnWidths, visibleColumns])
+  }, [currentPage, pageSize, searchKeyword, statusFilter, roleFilter, vendorFilter, monitoredFilter, datacenterFilter, deviceTypeFilter, columnFilters, sortField, sortOrder, columnWidths, visibleColumns])
 
   useEffect(() => {
     return () => {
@@ -390,6 +423,9 @@ const DeviceList = () => {
     setMonitoredFilter(undefined)
     setDatacenterFilter(undefined)
     setDeviceTypeFilter(undefined)
+    setColumnFilters({})
+    setSortField(undefined)
+    setSortOrder(undefined)
     setCurrentPage(1)
     setSelectedRowKeys([])
     setSearchParams({}, { replace: true })
@@ -402,15 +438,33 @@ const DeviceList = () => {
       vendor: undefined,
       is_monitored: undefined,
       datacenter_id: undefined,
+      columnFilters: {},
+      sort_by: undefined,
+      sort_order: undefined,
     })
   }
 
-  const handleTableChange = (pagination: any) => {
+  const handleTableChange = (pagination: any, filters: any, sorter: any) => {
+    const nextColumnFilters = COLUMN_FILTER_KEYS.reduce<Partial<Record<ColumnFilterKey, string>>>((result, key) => {
+      const value = filters?.[key]?.[0]
+      if (value !== undefined && value !== null && String(value).trim()) {
+        result[key] = String(value).trim()
+      }
+      return result
+    }, {})
+    const nextSortField = sorter?.order ? sorter.columnKey as SortField : undefined
+    const nextSortOrder = sorter?.order as SortOrder
     setCurrentPage(pagination.current)
     setPageSize(pagination.pageSize)
+    setColumnFilters(nextColumnFilters)
+    setSortField(nextSortField)
+    setSortOrder(nextSortOrder)
     fetchDevices({
       skip: (pagination.current - 1) * pagination.pageSize,
       limit: pagination.pageSize,
+      columnFilters: nextColumnFilters,
+      sort_by: nextSortField,
+      sort_order: nextSortOrder === 'descend' ? 'desc' : 'asc',
     })
   }
 
@@ -511,6 +565,21 @@ const DeviceList = () => {
       message.success('导出成功')
     } catch (error) {
       message.error('导出失败')
+    }
+  }
+
+  const handleExportTemplate = async () => {
+    try {
+      const blob = await exportDeviceTemplate()
+      const url = window.URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = 'device_import_template.csv'
+      link.click()
+      window.URL.revokeObjectURL(url)
+      message.success('模板下载成功')
+    } catch (error) {
+      message.error('模板下载失败')
     }
   }
 
@@ -617,6 +686,45 @@ const DeviceList = () => {
     )
   }
 
+  const getColumnSearchProps = (key: ColumnFilterKey, placeholder: string) => ({
+    sorter: true,
+    sortOrder: sortField === key ? sortOrder : null,
+    filteredValue: columnFilters[key] ? [columnFilters[key] as string] : null,
+    filterIcon: (filtered: boolean) => (
+      <SearchOutlined style={{ color: filtered ? '#1677ff' : undefined }} />
+    ),
+    filterDropdown: ({ setSelectedKeys, selectedKeys, confirm, clearFilters, close }: any) => (
+      <div style={{ padding: 10, width: 240 }} onKeyDown={(event) => event.stopPropagation()}>
+        <Input
+          autoFocus
+          allowClear
+          placeholder={placeholder}
+          value={selectedKeys[0] || ''}
+          onChange={(event) => setSelectedKeys(event.target.value ? [event.target.value] : [])}
+          onPressEnter={() => confirm()}
+          style={{ marginBottom: 8 }}
+        />
+        <Space>
+          <Button type="primary" size="small" icon={<SearchOutlined />} onClick={() => confirm()}>
+            筛选
+          </Button>
+          <Button
+            size="small"
+            onClick={() => {
+              clearFilters?.()
+              confirm()
+            }}
+          >
+            重置
+          </Button>
+          <Button size="small" type="link" onClick={() => close()}>
+            关闭
+          </Button>
+        </Space>
+      </div>
+    ),
+  })
+
   const allColumns: any[] = [
     {
       title: '设备名称',
@@ -624,6 +732,7 @@ const DeviceList = () => {
       key: 'name',
       width: columnWidths.name,
       ellipsis: true,
+      ...getColumnSearchProps('name', '输入设备名称'),
       render: (text: string) => (
         <span title={text} style={{ ...TABLE_CELL_TEXT_STYLE, fontWeight: 500 }}>
           {text}
@@ -635,6 +744,7 @@ const DeviceList = () => {
       dataIndex: 'status',
       key: 'status',
       width: columnWidths.status,
+      ...getColumnSearchProps('status', '输入上线、离线、库存或上架'),
       render: (status: string) => getStatusBadge(status),
     },
     {
@@ -644,6 +754,7 @@ const DeviceList = () => {
       width: columnWidths.ip_address,
       ellipsis: true,
       className: 'network-device-ip-column',
+      ...getColumnSearchProps('ip_address', '输入管理地址'),
       render: (value: string) => (
         <span title={value || '-'} style={TABLE_CELL_TEXT_STYLE}>
           {value || '-'}
@@ -656,6 +767,7 @@ const DeviceList = () => {
       key: 'datacenter',
       width: columnWidths.datacenter,
       ellipsis: true,
+      ...getColumnSearchProps('datacenter', '输入机房名称、编号或位置'),
       render: (_: string, record: Device) => {
         if (!record.datacenter) {
           return <span style={TABLE_CELL_TEXT_STYLE}>-</span>
@@ -673,6 +785,7 @@ const DeviceList = () => {
       dataIndex: 'is_monitored',
       key: 'is_monitored',
       width: columnWidths.is_monitored,
+      ...getColumnSearchProps('is_monitored', '输入监控中或未监控'),
       render: (value: boolean) => (
         <span
           style={{
@@ -701,6 +814,7 @@ const DeviceList = () => {
       key: 'device_type',
       width: columnWidths.device_type,
       ellipsis: true,
+      ...getColumnSearchProps('device_type', '输入设备类型'),
       render: (type: string, record: Device) => {
         if (record.device_type) {
           const typeMap: Record<string, string> = {
@@ -749,6 +863,7 @@ const DeviceList = () => {
       key: 'model',
       width: columnWidths.model,
       ellipsis: true,
+      ...getColumnSearchProps('model', '输入型号'),
       render: (text: string) => (
         <span title={text || '-'} style={TABLE_CELL_TEXT_STYLE}>
           {text || '-'}
@@ -761,6 +876,7 @@ const DeviceList = () => {
       key: 'serial_number',
       width: columnWidths.serial_number,
       ellipsis: true,
+      ...getColumnSearchProps('serial_number', '输入序列号'),
       render: (text: string) => (
         <span title={text || '-'} style={TABLE_CELL_TEXT_STYLE}>
           {text || '-'}
@@ -936,7 +1052,7 @@ const DeviceList = () => {
         </div>
         <div style={{ marginTop: 12 }}>
           <Text type="secondary">
-            导入/导出字段：设备名称、运行状态、IP地址、设备角色、设备类型、厂商、型号、序列号、机房名称、机房编号
+            导入/导出字段：设备名称、运行状态、IP地址、设备角色、设备类型、厂商、型号、序列号、机房名称、机房编号、是否加入监控
           </Text>
         </div>
       </div>
@@ -989,6 +1105,11 @@ const DeviceList = () => {
               </Tooltip>
             </>
           ) : null}
+          <Tooltip title="下载导入模板">
+            <Button icon={<DownloadOutlined />} onClick={handleExportTemplate}>
+              导出模板
+            </Button>
+          </Tooltip>
           <Tooltip title="导出">
             <Button icon={<ExportOutlined />} onClick={handleExport}>
               导出
@@ -1087,6 +1208,7 @@ const DeviceList = () => {
           >
             <Select placeholder="选择字段" onChange={handleBatchFieldChange}>
               <Option value="status">运行状态</Option>
+              <Option value="is_monitored">是否监控</Option>
               <Option value="datacenter_id">所属机房</Option>
               <Option value="device_type">设备类型</Option>
               <Option value="device_role">设备角色</Option>
@@ -1103,6 +1225,15 @@ const DeviceList = () => {
                 <Option value="inactive">离线</Option>
                 <Option value="in_stock">库存</Option>
                 <Option value="deployed">上架</Option>
+              </Select>
+            </Form.Item>
+          ) : null}
+
+          {batchField === 'is_monitored' ? (
+            <Form.Item name="value" label="新值" rules={[{ required: true, message: '请选择是否监控' }]}>
+              <Select placeholder="选择是否监控">
+                <Option value="true">监控中</Option>
+                <Option value="false">未监控</Option>
               </Select>
             </Form.Item>
           ) : null}
