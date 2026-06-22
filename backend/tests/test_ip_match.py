@@ -1,4 +1,4 @@
-from app.utils.ip_match import ip_value_matches
+from app.utils.ip_match import ip_value_matches, is_exact_ip_address
 
 
 def test_matches_inclusive_ipv4_range():
@@ -24,3 +24,10 @@ def test_exact_ip_and_cidr_are_still_supported():
     assert ip_value_matches("10.239.0.20", "10.239.0.20")
     assert ip_value_matches("10.239.0.20", "10.239.0.0/24")
     assert not ip_value_matches("10.239.1.20", "10.239.0.0/24")
+
+
+def test_exact_ip_detection_excludes_ranges_and_cidr():
+    assert is_exact_ip_address("10.239.0.20")
+    assert is_exact_ip_address("2001:db8::20")
+    assert not is_exact_ip_address("10.239.0.1-10.239.0.254")
+    assert not is_exact_ip_address("10.239.0.0/24")

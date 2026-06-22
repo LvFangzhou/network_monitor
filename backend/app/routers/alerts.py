@@ -35,6 +35,7 @@ from app.tasks.alert_tasks import (
     _silence_matches,
 )
 from app.utils import notification_manager, redis_client
+from app.utils.ip_match import is_exact_ip_address
 from app.schemas import (
     AlertRuleCreate, AlertRuleUpdate, AlertRuleResponse,
     AlertHistoryResponse, AlertAcknowledge, AlertResolve, AlertIgnore, SyslogEventResponse,
@@ -136,7 +137,12 @@ def _build_silence_candidate_query(
         if not values or operator in {"not_contains", "not_equals", "not_regex", "regex"}:
             continue
         if field_name in {"ip", "device_ip"}:
-            alerts_query = alerts_query.filter(or_(*[Device.ip_address == value for value in values]))
+            # Range and CIDR values cannot be compared to the varchar IP column
+            # with equality. Keep those candidates and let _silence_matches apply
+            # the complete IP matcher; exact-only lists can still use the fast SQL
+            # prefilter.
+            if all(is_exact_ip_address(value) for value in values):
+                alerts_query = alerts_query.filter(or_(*[Device.ip_address == value for value in values]))
         elif field_name in {"interface"}:
             alerts_query = alerts_query.filter(
                 or_(

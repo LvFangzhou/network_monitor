@@ -1,6 +1,15 @@
 import ipaddress
 
 
+def is_exact_ip_address(value: str) -> bool:
+    """Return whether a silence value is one exact IP address."""
+    try:
+        ipaddress.ip_address((value or "").strip())
+        return True
+    except ValueError:
+        return False
+
+
 def ip_value_matches(source: str, candidate: str) -> bool:
     """Match an IP against an exact address, CIDR network, or inclusive range."""
     source_text = (source or "").strip()
