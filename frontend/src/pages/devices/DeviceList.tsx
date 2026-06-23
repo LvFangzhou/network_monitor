@@ -205,11 +205,16 @@ const DeviceList = () => {
   })
 
   const fetchDevices = async (params?: any) => {
-    setLoading(true)
+    const silent = Boolean(params?.silent)
+    if (!silent) {
+      setLoading(true)
+    }
     try {
       const effectiveSearch = (params?.search ?? searchKeyword) || undefined
       const effectiveColumnFilters = params?.columnFilters ?? columnFilters
-      const { columnFilters: _columnFilters, ...requestOverrides } = params || {}
+      const requestOverrides = { ...(params || {}) }
+      delete requestOverrides.columnFilters
+      delete requestOverrides.silent
       const result = await getDevices({
         skip: (currentPage - 1) * pageSize,
         limit: pageSize,
@@ -231,7 +236,9 @@ const DeviceList = () => {
     } catch (error) {
       console.error('获取设备列表失败:', error)
     } finally {
-      setLoading(false)
+      if (!silent) {
+        setLoading(false)
+      }
     }
   }
 
@@ -360,8 +367,9 @@ const DeviceList = () => {
         search: value || undefined,
         search_mode: value ? getSearchMode(value) : 'fuzzy',
         skip: 0,
+        silent: true,
       })
-    }, 300)
+    }, 120)
   }
 
   const handleResizeStart = (key: string) => (event: ReactMouseEvent<HTMLSpanElement>) => {
@@ -376,31 +384,31 @@ const DeviceList = () => {
   const handleStatusChange = (value: string | undefined) => {
     setStatusFilter(value)
     setCurrentPage(1)
-    fetchDevices({ status: value, skip: 0 })
+    fetchDevices({ status: value, skip: 0, silent: true })
   }
 
   const handleDatacenterChange = (value: number | undefined) => {
     setDatacenterFilter(value)
     setCurrentPage(1)
-    fetchDevices({ datacenter_id: value, skip: 0 })
+    fetchDevices({ datacenter_id: value, skip: 0, silent: true })
   }
 
   const handleRoleChange = (value: string | undefined) => {
     setRoleFilter(value)
     setCurrentPage(1)
-    fetchDevices({ device_role: value, skip: 0 })
+    fetchDevices({ device_role: value, skip: 0, silent: true })
   }
 
   const handleDeviceTypeChange = (value: number | undefined) => {
     setDeviceTypeFilter(value)
     setCurrentPage(1)
-    fetchDevices({ device_type_id: value, skip: 0 })
+    fetchDevices({ device_type_id: value, skip: 0, silent: true })
   }
 
   const handleVendorChange = (value: string | undefined) => {
     setVendorFilter(value)
     setCurrentPage(1)
-    fetchDevices({ vendor: value, skip: 0 })
+    fetchDevices({ vendor: value, skip: 0, silent: true })
   }
 
   const handleMonitoredChange = (value: string | undefined) => {
@@ -409,6 +417,7 @@ const DeviceList = () => {
     fetchDevices({
       is_monitored: value === undefined ? undefined : value === 'true',
       skip: 0,
+      silent: true,
     })
   }
 

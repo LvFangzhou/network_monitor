@@ -137,6 +137,15 @@ select,
   backdrop-filter: blur(18px);
 }
 
+@keyframes route-loading {
+  from {
+    transform: translateX(-25%);
+  }
+  to {
+    transform: translateX(155%);
+  }
+}
+
 html[data-theme='dark'] body {
   background:
     radial-gradient(circle at top left, rgba(59, 130, 246, 0.18), transparent 32vw),

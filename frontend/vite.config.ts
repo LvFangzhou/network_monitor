@@ -24,6 +24,27 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    sourcemap: true,
+    sourcemap: false,
+    chunkSizeWarningLimit: 900,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined
+          if (id.includes('/react/') || id.includes('/react-dom/') || id.includes('/react-router-dom/') || id.includes('/zustand/') || id.includes('/react-query/')) {
+            return 'vendor-react'
+          }
+          if (id.includes('/antd/') || id.includes('/@ant-design/') || id.includes('/rc-')) {
+            return 'vendor-antd'
+          }
+          if (id.includes('/recharts/') || id.includes('/d3-')) {
+            return 'vendor-charts'
+          }
+          if (id.includes('/axios/') || id.includes('/dayjs/')) {
+            return 'vendor-utils'
+          }
+          return 'vendor-misc'
+        },
+      },
+    },
   },
 })
