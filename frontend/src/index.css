@@ -146,16 +146,15 @@ select,
   justify-content: center;
   padding: 36px;
   background:
-    linear-gradient(90deg, rgba(2, 6, 23, 0.62), rgba(15, 23, 42, 0.28), rgba(2, 6, 23, 0.58)),
-    radial-gradient(circle at 50% 50%, rgba(47, 102, 216, 0.18), rgba(2, 6, 23, 0.34) 62%),
-    url('/login-network-bg.png') center / cover no-repeat,
-    #061226;
+    radial-gradient(circle at 15% 15%, rgba(96, 165, 250, 0.38), transparent 30vw),
+    radial-gradient(circle at 82% 18%, rgba(14, 165, 233, 0.34), transparent 26vw),
+    linear-gradient(135deg, #0b1f55 0%, #1f4fb8 44%, #2f66d8 100%);
 }
 
 .login-grid-overlay {
   position: absolute;
   inset: 0;
-  opacity: 0.18;
+  opacity: 0.32;
   background-image:
     linear-gradient(rgba(255, 255, 255, 0.16) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.16) 1px, transparent 1px);
@@ -168,8 +167,8 @@ select,
   position: absolute;
   inset: 0;
   background:
-    linear-gradient(115deg, transparent 0%, rgba(255, 255, 255, 0.10) 48%, transparent 60%),
-    repeating-linear-gradient(90deg, transparent 0 92px, rgba(125, 211, 252, 0.12) 93px, transparent 95px);
+    linear-gradient(115deg, transparent 0%, rgba(255, 255, 255, 0.13) 48%, transparent 60%),
+    repeating-linear-gradient(90deg, transparent 0 92px, rgba(125, 211, 252, 0.18) 93px, transparent 95px);
   animation: login-scan 8s linear infinite;
 }
 
@@ -179,7 +178,7 @@ select,
   height: 420px;
   border-radius: 999px;
   filter: blur(22px);
-  opacity: 0.30;
+  opacity: 0.44;
   pointer-events: none;
 }
 
@@ -202,11 +201,11 @@ select,
 }
 
 .login-card.ant-card {
-  border: 1px solid rgba(255, 255, 255, 0.42) !important;
+  border: 1px solid rgba(255, 255, 255, 0.56) !important;
   border-radius: 26px;
-  background: rgba(255, 255, 255, 0.88);
-  backdrop-filter: blur(24px);
-  box-shadow: 0 34px 90px rgba(2, 8, 23, 0.38);
+  background: rgba(255, 255, 255, 0.86);
+  backdrop-filter: blur(22px);
+  box-shadow: 0 30px 80px rgba(2, 8, 23, 0.26);
 }
 
 .login-card .ant-card-body {
