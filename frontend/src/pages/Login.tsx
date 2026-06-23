@@ -5,9 +5,6 @@ import {
   UserOutlined,
   LockOutlined,
   SafetyOutlined,
-  ClusterOutlined,
-  ThunderboltOutlined,
-  RadarChartOutlined,
 } from '@ant-design/icons'
 import type { AxiosError } from 'axios'
 import { useAuthStore } from '../store/auth'
@@ -59,42 +56,12 @@ const Login = () => {
       <div className="login-glow login-glow-b" />
 
       <div className="login-stage">
-        <section className="login-hero-panel">
-          <div className="login-brand-pill">
-            <SafetyOutlined />
-            Network Ops Console
-          </div>
-          <Title level={1} className="login-hero-title">
-            面向现代网络工程师的可视化运维平台
-          </Title>
-          <Text className="login-hero-subtitle">
-            汇聚网络设备、端口流量、告警审计与 Tacacs 操作记录，用更直观的方式掌控基础设施状态。
-          </Text>
-
+        <section className="login-hero-panel" aria-hidden="true">
           <div className="login-signal-card">
-            <div>
-              <Text className="login-signal-label">Backbone health</Text>
-              <div className="login-signal-value">99.98%</div>
-            </div>
             <div className="login-signal-bars">
               {Array.from({ length: 18 }).map((_, index) => (
                 <span key={index} style={{ height: 12 + ((index * 7) % 28) }} />
               ))}
-            </div>
-          </div>
-
-          <div className="login-feature-row">
-            <div className="login-feature">
-              <ClusterOutlined />
-              <span>拓扑感知</span>
-            </div>
-            <div className="login-feature">
-              <RadarChartOutlined />
-              <span>实时监控</span>
-            </div>
-            <div className="login-feature">
-              <ThunderboltOutlined />
-              <span>快速定位</span>
             </div>
           </div>
         </section>

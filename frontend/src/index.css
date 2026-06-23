@@ -241,36 +241,18 @@ select,
 }
 
 .login-signal-card {
-  width: min(560px, 100%);
-  margin-top: 34px;
-  padding: 18px 20px;
+  width: min(540px, 100%);
+  margin-top: 0;
+  padding: 22px 24px;
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 22px;
   background: rgba(7, 20, 55, 0.24);
   box-shadow: 0 24px 60px rgba(2, 8, 23, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.16);
   backdrop-filter: blur(18px);
-  display: grid;
-  grid-template-columns: 150px 1fr;
-  gap: 22px;
-  align-items: center;
-}
-
-.login-signal-label.ant-typography {
-  color: rgba(219, 234, 254, 0.72);
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-}
-
-.login-signal-value {
-  margin-top: 6px;
-  font-size: 34px;
-  font-weight: 800;
-  letter-spacing: -0.03em;
 }
 
 .login-signal-bars {
-  height: 72px;
+  height: 96px;
   display: flex;
   align-items: end;
   gap: 7px;
