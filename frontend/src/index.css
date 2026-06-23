@@ -323,6 +323,13 @@ select,
   box-shadow: 0 12px 24px rgba(30, 64, 175, 0.20);
 }
 
+.modern-sider .ant-menu-item-selected,
+.modern-sider .ant-menu-item-selected .ant-menu-title-content,
+.modern-sider .ant-menu-item-selected .anticon,
+.modern-sider .ant-menu-item-selected a {
+  color: #1d4ed8 !important;
+}
+
 .modern-sider .ant-menu-item-selected::after {
   display: none !important;
 }
@@ -396,6 +403,13 @@ html[data-theme='dark'] .modern-sider .ant-menu-item:hover,
 html[data-theme='dark'] .modern-sider .ant-menu-submenu-title:hover {
   color: #ffffff !important;
   background: rgba(255, 255, 255, 0.10) !important;
+}
+
+html[data-theme='dark'] .modern-sider .ant-menu-item-selected,
+html[data-theme='dark'] .modern-sider .ant-menu-item-selected .ant-menu-title-content,
+html[data-theme='dark'] .modern-sider .ant-menu-item-selected .anticon,
+html[data-theme='dark'] .modern-sider .ant-menu-item-selected a {
+  color: #ffffff !important;
 }
 
 html[data-theme='dark'] .modern-sider .ant-menu-submenu-selected > .ant-menu-submenu-title {
