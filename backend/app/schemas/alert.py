@@ -120,6 +120,7 @@ class AlertHistoryClear(BaseModel):
     """批量清除告警历史"""
     status: Optional[str] = None
     severity: Optional[str] = None
+    datacenter: Optional[str] = None
     search: Optional[str] = None
     alert_id: Optional[int] = None
     device_id: Optional[int] = None

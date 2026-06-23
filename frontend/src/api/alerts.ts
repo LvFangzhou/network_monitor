@@ -211,6 +211,7 @@ export const getAlertHistory = async (params?: {
   alert_id?: number
   alarm_id?: string
   severity?: string
+  datacenter?: string
   search?: string
 }): Promise<{ total: number; items: AlertHistory[] }> => {
   return await request.get('/alerts/history', { params }) as { total: number; items: AlertHistory[] }
@@ -223,6 +224,7 @@ export const getAlertHistorySummary = async (params?: {
   alert_id?: number
   alarm_id?: string
   severity?: string
+  datacenter?: string
   search?: string
   older_than_days?: number
   limit?: number
@@ -237,6 +239,7 @@ export const clearAlertHistory = async (data: {
   alert_id?: number
   alarm_id?: string
   severity?: string
+  datacenter?: string
   search?: string
   older_than_days?: number
   include_active?: boolean

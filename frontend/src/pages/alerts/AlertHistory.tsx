@@ -28,6 +28,7 @@ import {
   type AlertHistorySummary,
   type AlertStats,
 } from '../../api/alerts'
+import { getDatacenters, type Datacenter } from '../../api/devices'
 import { useAuthStore } from '../../store/auth'
 
 const statusColors: Record<string, string> = {
@@ -220,6 +221,8 @@ const AlertHistory = () => {
   const [clearing, setClearing] = useState(false)
   const [statusFilter, setStatusFilter] = useState<string>()
   const [severityFilter, setSeverityFilter] = useState<string>()
+  const [datacenterFilter, setDatacenterFilter] = useState<string>()
+  const [datacenters, setDatacenters] = useState<Datacenter[]>([])
   const [searchText, setSearchText] = useState<string>('')
   const [datacenterChartType, setDatacenterChartType] = useState<'pie' | 'bar'>('pie')
   const [total, setTotal] = useState(0)
@@ -259,6 +262,7 @@ const AlertHistory = () => {
   const buildFilterParams = () => ({
     status: statusFilter,
     severity: severityFilter,
+    datacenter: datacenterFilter,
     alert_id: initialAlertId ? Number(initialAlertId) : undefined,
     search: searchText || undefined,
   })
@@ -314,6 +318,7 @@ const AlertHistory = () => {
   useEffect(() => {
     fetchData()
     fetchSummary()
+    getDatacenters().then(setDatacenters).catch(() => undefined)
   }, [])
 
   useEffect(() => {
@@ -324,7 +329,7 @@ const AlertHistory = () => {
     }, 300)
     return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter, severityFilter, searchText])
+  }, [statusFilter, severityFilter, datacenterFilter, searchText])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -333,11 +338,12 @@ const AlertHistory = () => {
     }, 10000)
     return () => window.clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, pageSize, statusFilter, severityFilter, searchText])
+  }, [page, pageSize, statusFilter, severityFilter, datacenterFilter, searchText])
 
   const handleResetFilters = () => {
     setStatusFilter(undefined)
     setSeverityFilter(undefined)
+    setDatacenterFilter(undefined)
     setSearchText('')
     setPage(1)
   }
@@ -618,6 +624,22 @@ const AlertHistory = () => {
                 { value: 'P1', label: 'P1' },
                 { value: 'P2', label: 'P2' },
                 { value: 'P3', label: 'P3' },
+              ]}
+            />
+            <Select
+              allowClear
+              showSearch
+              placeholder="机房"
+              style={{ width: 160 }}
+              value={datacenterFilter}
+              onChange={setDatacenterFilter}
+              optionFilterProp="label"
+              options={[
+                ...datacenters.map((item) => ({
+                  value: item.name,
+                  label: item.name,
+                })),
+                { value: '__none__', label: '未设置机房' },
               ]}
             />
             <Input

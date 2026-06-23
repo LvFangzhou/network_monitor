@@ -122,10 +122,22 @@ def _build_alert_history_query(
     alert_id: Optional[int] = None,
     alarm_id: Optional[str] = None,
     severity: Optional[str] = None,
+    datacenter_name: Optional[str] = None,
     search: Optional[str] = None,
     older_than_days: Optional[int] = None,
 ):
-    query = db.query(AlertHistory).join(Device).outerjoin(AlertRule, AlertHistory.rule_id == AlertRule.id)
+    query = (
+        db.query(AlertHistory)
+        .join(Device)
+        .outerjoin(AlertRule, AlertHistory.rule_id == AlertRule.id)
+        .outerjoin(Datacenter, Device.datacenter_id == Datacenter.id)
+    )
+
+    if datacenter_name:
+        if datacenter_name == "__none__":
+            query = query.filter(Device.datacenter_id.is_(None))
+        else:
+            query = query.filter(Datacenter.name == datacenter_name)
 
     if status:
         query = query.filter(AlertHistory.status == status)
@@ -787,6 +799,7 @@ async def list_alert_history(
     alert_id: Optional[int] = None,
     alarm_id: Optional[str] = None,
     severity: Optional[str] = None,
+    datacenter: Optional[str] = None,
     search: Optional[str] = None,
 ):
     """获取告警历史列表"""
@@ -798,6 +811,7 @@ async def list_alert_history(
         alert_id=alert_id,
         alarm_id=alarm_id,
         severity=severity,
+        datacenter_name=datacenter,
         search=search,
     )
     
@@ -819,6 +833,7 @@ async def get_alert_history_summary(
     alert_id: Optional[int] = None,
     alarm_id: Optional[str] = None,
     severity: Optional[str] = None,
+    datacenter: Optional[str] = None,
     search: Optional[str] = None,
     older_than_days: Optional[int] = Query(None, ge=0),
     limit: int = Query(10, ge=1, le=50),
@@ -832,6 +847,7 @@ async def get_alert_history_summary(
         alert_id=alert_id,
         alarm_id=alarm_id,
         severity=severity,
+        datacenter_name=datacenter,
         search=search,
         older_than_days=older_than_days,
     )
@@ -842,7 +858,6 @@ async def get_alert_history_summary(
         {"name": name or "未设置机房", "count": int(count or 0)}
         for name, count in (
             base_query
-            .outerjoin(Datacenter, Device.datacenter_id == Datacenter.id)
             .with_entities(Datacenter.name, func.count(AlertHistory.id))
             .group_by(Datacenter.name)
             .order_by(func.count(AlertHistory.id).desc())
@@ -908,6 +923,7 @@ async def clear_alert_history(
         alert_id=payload.alert_id,
         alarm_id=payload.alarm_id,
         severity=payload.severity,
+        datacenter_name=payload.datacenter,
         search=payload.search,
         older_than_days=payload.older_than_days,
     )
@@ -929,6 +945,7 @@ async def clear_alert_history(
         user=(payload.actor_username or current_user.username or "admin"),
         status=payload.status,
         severity=payload.severity,
+        datacenter_name=payload.datacenter,
         search=payload.search,
         older_than_days=payload.older_than_days,
     )
