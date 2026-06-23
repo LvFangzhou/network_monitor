@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Row, Col, Card, Statistic, List, Spin, Progress, Space, Typography, Select, theme } from 'antd'
+import { Row, Col, Card, Statistic, Spin, Progress, Space, Typography, theme } from 'antd'
 import {
   DesktopOutlined,
   CheckCircleOutlined,
@@ -10,7 +10,7 @@ import {
   ApartmentOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
-import { DashboardAlert, getDashboardStats, getServerResources, ServerResourceStats } from '../api/metrics'
+import { getDashboardStats, getServerResources, ServerResourceStats } from '../api/metrics'
 import { getDatacenters } from '../api/devices'
 import {
   CartesianGrid,
@@ -31,29 +31,6 @@ import {
 
 const { Text } = Typography
 const CHART_COLORS = ['#2563eb', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4']
-
-const severityRank: Record<string, number> = {
-  P0: 0,
-  critical: 0,
-  P1: 1,
-  warning: 1,
-  P2: 2,
-  info: 2,
-  P3: 3,
-}
-
-const sortOptions = [
-  { label: '告警产生时间', value: 'started_at' },
-  { label: '严重级别', value: 'severity' },
-] as const
-
-const sortDirectionOptions = [
-  { label: '降序', value: 'desc' },
-  { label: '升序', value: 'asc' },
-] as const
-
-type RecentAlertSortField = (typeof sortOptions)[number]['value']
-type RecentAlertSortDirection = (typeof sortDirectionOptions)[number]['value']
 
 interface ResourceSample {
   timestamp: number
@@ -99,9 +76,6 @@ const Dashboard = () => {
     publicCircuits: 0,
     privateCircuits: 0,
   })
-  const [recentAlerts, setRecentAlerts] = useState<DashboardAlert[]>([])
-  const [recentAlertSortField, setRecentAlertSortField] = useState<RecentAlertSortField>('started_at')
-  const [recentAlertSortDirection, setRecentAlertSortDirection] = useState<RecentAlertSortDirection>('desc')
 
   useEffect(() => {
     fetchStats()
@@ -125,7 +99,6 @@ const Dashboard = () => {
         publicCircuits: result.public_circuits,
         privateCircuits: result.private_circuits,
       })
-      setRecentAlerts(result.recent_alerts)
     } catch (error) {
       console.error('获取统计失败:', error)
     } finally {
@@ -152,26 +125,6 @@ const Dashboard = () => {
       console.error('获取服务器资源失败:', error)
     }
   }
-
-  const sortedRecentAlerts = useMemo(() => {
-    const items = [...recentAlerts]
-    items.sort((left, right) => {
-      let compareValue = 0
-
-      if (recentAlertSortField === 'severity') {
-        const leftRank = severityRank[left.severity] ?? 99
-        const rightRank = severityRank[right.severity] ?? 99
-        compareValue = leftRank - rightRank
-      } else {
-        const leftTime = left.started_at ? new Date(left.started_at).getTime() : 0
-        const rightTime = right.started_at ? new Date(right.started_at).getTime() : 0
-        compareValue = leftTime - rightTime
-      }
-
-      return recentAlertSortDirection === 'asc' ? compareValue : -compareValue
-    })
-    return items
-  }, [recentAlerts, recentAlertSortDirection, recentAlertSortField])
 
   const deviceHealthData = useMemo(() => [
     { name: '在线', value: stats.online, color: '#10b981' },
@@ -200,14 +153,6 @@ const Dashboard = () => {
     borderRadius: 12,
     color: token.colorText,
     boxShadow: token.boxShadowSecondary,
-  }
-
-  if (loading) {
-    return (
-      <div style={{ textAlign: 'center', padding: 100 }}>
-        <Spin size="large" />
-      </div>
-    )
   }
 
   return (
@@ -310,8 +255,8 @@ const Dashboard = () => {
       </Row>
 
       <Row gutter={[16, 16]}>
-        <Col xs={24} lg={8}>
-          <Card title="设备健康分布">
+        <Col xs={24} lg={12}>
+          <Card title="设备健康分布" loading={loading}>
             <div style={{ height: 260 }}>
               <ResponsiveContainer>
                 <PieChart>
@@ -325,8 +270,8 @@ const Dashboard = () => {
             </div>
           </Card>
         </Col>
-        <Col xs={24} lg={8}>
-          <Card title="资源资产结构">
+        <Col xs={24} lg={12}>
+          <Card title="资源资产结构" loading={loading}>
             <div style={{ height: 260 }}>
               <ResponsiveContainer>
                 <BarChart data={resourceMixData} margin={{ top: 18, right: 12, left: 0, bottom: 0 }}>
@@ -340,45 +285,6 @@ const Dashboard = () => {
                 </BarChart>
               </ResponsiveContainer>
             </div>
-          </Card>
-        </Col>
-        <Col xs={24} lg={8}>
-          <Card
-            title="最近告警"
-            extra={
-              <Space size={8} wrap>
-                <Select
-                  size="small"
-                  value={recentAlertSortField}
-                  onChange={setRecentAlertSortField}
-                  options={sortOptions.map((item) => ({ label: item.label, value: item.value }))}
-                  style={{ width: 136 }}
-                />
-                <Select
-                  size="small"
-                  value={recentAlertSortDirection}
-                  onChange={setRecentAlertSortDirection}
-                  options={sortDirectionOptions.map((item) => ({ label: item.label, value: item.value }))}
-                  style={{ width: 92 }}
-                />
-              </Space>
-            }
-          >
-            <List
-              dataSource={sortedRecentAlerts}
-              renderItem={(item) => (
-                <List.Item
-                  style={{ cursor: 'pointer' }}
-                  onClick={() => navigate(`/alerts/history?alert_id=${item.id}`)}
-                >
-                  <List.Item.Meta
-                    title={`${item.device_name} (${item.device_ip})`}
-                    description={item.message}
-                  />
-                </List.Item>
-              )}
-              locale={{ emptyText: '暂无告警' }}
-            />
           </Card>
         </Col>
       </Row>

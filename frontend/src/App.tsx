@@ -5,7 +5,8 @@ import request from './api/request'
 import Layout from './components/Layout'
 
 const Login = lazy(() => import('./pages/Login'))
-const Dashboard = lazy(() => import('./pages/Dashboard'))
+const loadDashboard = () => import('./pages/Dashboard')
+const Dashboard = lazy(loadDashboard)
 const DeviceList = lazy(() => import('./pages/devices/DeviceList'))
 const DeviceDictionaryManager = lazy(() => import('./pages/devices/DeviceDictionaryManager'))
 const DeviceForm = lazy(() => import('./pages/devices/DeviceForm'))
@@ -138,6 +139,10 @@ function App() {
 
   useEffect(() => {
     initAuth()
+    const timer = window.setTimeout(() => {
+      void loadDashboard()
+    }, 300)
+    return () => window.clearTimeout(timer)
   }, [initAuth])
 
   return (
