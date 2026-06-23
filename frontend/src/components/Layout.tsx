@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { startTransition, useEffect, useState } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
   Layout as AntLayout,
@@ -160,15 +160,21 @@ const Layout = () => {
   ]
 
   const handleMenuClick = ({ key }: { key: string }) => {
+    const navigateSmoothly = (path: string) => {
+      startTransition(() => {
+        navigate(path)
+      })
+    }
+
     if (key === 'logout') {
       logout()
-      navigate('/login')
+      navigateSmoothly('/login')
     } else if (key === 'login') {
-      navigate('/login')
+      navigateSmoothly('/login')
     } else if (key === 'profile') {
-      navigate('/settings')
+      navigateSmoothly('/settings')
     } else if (key.startsWith('/')) {
-      navigate(key)
+      navigateSmoothly(key)
     }
   }
 

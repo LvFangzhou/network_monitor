@@ -5,27 +5,69 @@ import { useAuthStore } from './store/auth'
 import request from './api/request'
 import Layout from './components/Layout'
 
-const Login = lazy(() => import('./pages/Login'))
+const loadLogin = () => import('./pages/Login')
 const loadDashboard = () => import('./pages/Dashboard')
+const loadDeviceList = () => import('./pages/devices/DeviceList')
+const loadDeviceDictionaryManager = () => import('./pages/devices/DeviceDictionaryManager')
+const loadDeviceForm = () => import('./pages/devices/DeviceForm')
+const loadDeviceDetail = () => import('./pages/devices/DeviceDetail')
+const loadDatacenterList = () => import('./pages/datacenters/DatacenterList')
+const loadCustomerList = () => import('./pages/resources/CustomerList')
+const loadVendorList = () => import('./pages/resources/VendorList')
+const loadPublicCircuitList = () => import('./pages/resources/PublicCircuitList')
+const loadPrivateCircuitList = () => import('./pages/resources/PrivateCircuitList')
+const loadIPDBList = () => import('./pages/resources/IPDBList')
+const loadAlertRules = () => import('./pages/alerts/AlertRules')
+const loadAlertHistory = () => import('./pages/alerts/AlertHistory')
+const loadAlertSilences = () => import('./pages/alerts/AlertSilences')
+const loadMetrics = () => import('./pages/metrics/Metrics')
+const loadDeviceOverview = () => import('./pages/metrics/DeviceOverview')
+const loadIPFlowQuery = () => import('./pages/metrics/IPFlowQuery')
+const loadSettings = () => import('./pages/Settings')
+const loadTacacsManager = () => import('./pages/TacacsManager')
+
+const Login = lazy(loadLogin)
 const Dashboard = lazy(loadDashboard)
-const DeviceList = lazy(() => import('./pages/devices/DeviceList'))
-const DeviceDictionaryManager = lazy(() => import('./pages/devices/DeviceDictionaryManager'))
-const DeviceForm = lazy(() => import('./pages/devices/DeviceForm'))
-const DeviceDetail = lazy(() => import('./pages/devices/DeviceDetail'))
-const DatacenterList = lazy(() => import('./pages/datacenters/DatacenterList'))
-const CustomerList = lazy(() => import('./pages/resources/CustomerList'))
-const VendorList = lazy(() => import('./pages/resources/VendorList'))
-const PublicCircuitList = lazy(() => import('./pages/resources/PublicCircuitList'))
-const PrivateCircuitList = lazy(() => import('./pages/resources/PrivateCircuitList'))
-const IPDBList = lazy(() => import('./pages/resources/IPDBList'))
-const AlertRules = lazy(() => import('./pages/alerts/AlertRules'))
-const AlertHistory = lazy(() => import('./pages/alerts/AlertHistory'))
-const AlertSilences = lazy(() => import('./pages/alerts/AlertSilences'))
-const Metrics = lazy(() => import('./pages/metrics/Metrics'))
-const DeviceOverview = lazy(() => import('./pages/metrics/DeviceOverview'))
-const IPFlowQuery = lazy(() => import('./pages/metrics/IPFlowQuery'))
-const Settings = lazy(() => import('./pages/Settings'))
-const TacacsManager = lazy(() => import('./pages/TacacsManager'))
+const DeviceList = lazy(loadDeviceList)
+const DeviceDictionaryManager = lazy(loadDeviceDictionaryManager)
+const DeviceForm = lazy(loadDeviceForm)
+const DeviceDetail = lazy(loadDeviceDetail)
+const DatacenterList = lazy(loadDatacenterList)
+const CustomerList = lazy(loadCustomerList)
+const VendorList = lazy(loadVendorList)
+const PublicCircuitList = lazy(loadPublicCircuitList)
+const PrivateCircuitList = lazy(loadPrivateCircuitList)
+const IPDBList = lazy(loadIPDBList)
+const AlertRules = lazy(loadAlertRules)
+const AlertHistory = lazy(loadAlertHistory)
+const AlertSilences = lazy(loadAlertSilences)
+const Metrics = lazy(loadMetrics)
+const DeviceOverview = lazy(loadDeviceOverview)
+const IPFlowQuery = lazy(loadIPFlowQuery)
+const Settings = lazy(loadSettings)
+const TacacsManager = lazy(loadTacacsManager)
+
+const preloadRouteModules = () => {
+  void Promise.allSettled([
+    loadDashboard(),
+    loadDeviceList(),
+    loadDeviceDictionaryManager(),
+    loadDatacenterList(),
+    loadCustomerList(),
+    loadVendorList(),
+    loadPublicCircuitList(),
+    loadPrivateCircuitList(),
+    loadIPDBList(),
+    loadAlertRules(),
+    loadAlertHistory(),
+    loadAlertSilences(),
+    loadMetrics(),
+    loadDeviceOverview(),
+    loadIPFlowQuery(),
+    loadSettings(),
+    loadTacacsManager(),
+  ])
+}
 
 const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/device-overview', '/port-query', '/ip-flow-query']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/port-query']
@@ -125,7 +167,7 @@ function App() {
   useEffect(() => {
     initAuth()
     const timer = window.setTimeout(() => {
-      void loadDashboard()
+      preloadRouteModules()
     }, 300)
     return () => window.clearTimeout(timer)
   }, [initAuth])
