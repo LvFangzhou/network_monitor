@@ -16,6 +16,12 @@ export interface DashboardStats {
   total_alerts_firing: number
   public_circuits: number
   private_circuits: number
+  device_status_distribution?: Array<{ name: string; value: number }>
+  asset_by_datacenter?: {
+    devices: Array<{ name: string; value: number }>
+    public_circuits: Array<{ name: string; value: number }>
+    private_circuits: Array<{ name: string; value: number }>
+  }
   snmp_metrics_count: number
   gnmi_metrics_count: number
   recent_alerts: DashboardAlert[]

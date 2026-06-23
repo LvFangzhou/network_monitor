@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Row, Col, Card, Statistic, Spin, Progress, Space, Typography, theme } from 'antd'
+import { Row, Col, Card, Statistic, Spin, Progress, Space, Typography, theme, Segmented } from 'antd'
 import {
   DesktopOutlined,
   CheckCircleOutlined,
@@ -30,7 +30,7 @@ import {
 } from 'recharts'
 
 const { Text } = Typography
-const CHART_COLORS = ['#2563eb', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4']
+const CHART_COLORS = ['#2f66d8', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4']
 
 interface ResourceSample {
   timestamp: number
@@ -38,6 +38,14 @@ interface ResourceSample {
   cpu: number
   memory: number
   disk: number
+}
+
+type ChartMode = 'bar' | 'pie' | 'horizontal'
+type AssetMetricKey = 'devices' | 'public_circuits' | 'private_circuits'
+
+interface NamedCount {
+  name: string
+  value: number
 }
 
 const formatBytes = (bytes: number) => {
@@ -65,6 +73,8 @@ const Dashboard = () => {
   const navigate = useNavigate()
   const { token } = theme.useToken()
   const [loading, setLoading] = useState(true)
+  const [assetMetric, setAssetMetric] = useState<AssetMetricKey>('devices')
+  const [assetChartMode, setAssetChartMode] = useState<ChartMode>('horizontal')
   const [serverResources, setServerResources] = useState<ServerResourceStats | null>(null)
   const [resourceSamples, setResourceSamples] = useState<ResourceSample[]>([])
   const [stats, setStats] = useState({
@@ -75,6 +85,12 @@ const Dashboard = () => {
     warning: 0,
     publicCircuits: 0,
     privateCircuits: 0,
+    deviceStatusDistribution: [] as NamedCount[],
+    assetByDatacenter: {
+      devices: [] as NamedCount[],
+      public_circuits: [] as NamedCount[],
+      private_circuits: [] as NamedCount[],
+    },
   })
 
   useEffect(() => {
@@ -98,6 +114,12 @@ const Dashboard = () => {
         warning: result.total_alerts_firing,
         publicCircuits: result.public_circuits,
         privateCircuits: result.private_circuits,
+        deviceStatusDistribution: result.device_status_distribution || [],
+        assetByDatacenter: result.asset_by_datacenter || {
+          devices: [],
+          public_circuits: [],
+          private_circuits: [],
+        },
       })
     } catch (error) {
       console.error('获取统计失败:', error)
@@ -126,18 +148,36 @@ const Dashboard = () => {
     }
   }
 
-  const deviceHealthData = useMemo(() => [
-    { name: '在线', value: stats.online, color: '#10b981' },
-    { name: '离线', value: stats.offline, color: '#ef4444' },
-    { name: '告警', value: stats.warning, color: '#f59e0b' },
-  ].filter((item) => item.value > 0), [stats.offline, stats.online, stats.warning])
+  const deviceStatusData = useMemo(() => {
+    const fallback = [
+      { name: '上线', value: stats.online },
+      { name: '离线', value: stats.offline },
+    ].filter((item) => item.value > 0)
+    const source = stats.deviceStatusDistribution.length ? stats.deviceStatusDistribution : fallback
+    const colorMap: Record<string, string> = {
+      上线: '#10b981',
+      离线: '#ef4444',
+      库存: '#8b5cf6',
+      上架: '#2f66d8',
+      其他: '#94a3b8',
+    }
+    return source.map((item, index) => ({
+      ...item,
+      color: colorMap[item.name] || CHART_COLORS[index % CHART_COLORS.length],
+    }))
+  }, [stats.deviceStatusDistribution, stats.offline, stats.online])
 
-  const resourceMixData = useMemo(() => [
-    { name: '网络设备', value: stats.total },
-    { name: '公网链路', value: stats.publicCircuits },
-    { name: '专线链路', value: stats.privateCircuits },
-    { name: '机房', value: stats.datacenters },
-  ], [stats.datacenters, stats.privateCircuits, stats.publicCircuits, stats.total])
+  const assetMetricMeta = useMemo(() => ({
+    devices: { title: '网络设备', unit: '台', color: '#2f66d8' },
+    public_circuits: { title: '公网链路', unit: '条', color: '#06b6d4' },
+    private_circuits: { title: '专线链路', unit: '条', color: '#8b5cf6' },
+  }), [])
+
+  const assetByDatacenterData = useMemo(() => (
+    (stats.assetByDatacenter[assetMetric] || [])
+      .filter((item) => item.value > 0)
+      .slice(0, 12)
+  ), [assetMetric, stats.assetByDatacenter])
 
   const resourceLatestData = useMemo(() => serverResources ? [
     { name: 'CPU', value: serverResources.cpu.percent },
@@ -153,6 +193,75 @@ const Dashboard = () => {
     borderRadius: 12,
     color: token.colorText,
     boxShadow: token.boxShadowSecondary,
+  }
+
+  const renderAssetChart = () => {
+    const meta = assetMetricMeta[assetMetric]
+    if (!assetByDatacenterData.length) {
+      return (
+        <div style={{ height: 260, display: 'grid', placeItems: 'center' }}>
+          <Text type="secondary">暂无机房维度数据</Text>
+        </div>
+      )
+    }
+
+    if (assetChartMode === 'pie') {
+      return (
+        <ResponsiveContainer>
+          <PieChart>
+            <Pie
+              data={assetByDatacenterData}
+              dataKey="value"
+              nameKey="name"
+              innerRadius={54}
+              outerRadius={88}
+              paddingAngle={3}
+            >
+              {assetByDatacenterData.map((_, index) => (
+                <Cell key={index} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+              ))}
+            </Pie>
+            <Tooltip contentStyle={tooltipStyle} formatter={(value: number) => `${value}${meta.unit}`} />
+            <Legend />
+          </PieChart>
+        </ResponsiveContainer>
+      )
+    }
+
+    if (assetChartMode === 'horizontal') {
+      return (
+        <ResponsiveContainer>
+          <BarChart
+            data={assetByDatacenterData}
+            layout="vertical"
+            margin={{ top: 10, right: 24, left: 24, bottom: 0 }}
+          >
+            <CartesianGrid stroke={gridColor} horizontal={false} />
+            <XAxis type="number" tick={{ fill: axisColor, fontSize: 12 }} allowDecimals={false} />
+            <YAxis
+              type="category"
+              dataKey="name"
+              width={96}
+              tick={{ fill: axisColor, fontSize: 12 }}
+            />
+            <Tooltip contentStyle={tooltipStyle} formatter={(value: number) => `${value}${meta.unit}`} />
+            <Bar dataKey="value" name={meta.title} fill={meta.color} radius={[0, 10, 10, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      )
+    }
+
+    return (
+      <ResponsiveContainer>
+        <BarChart data={assetByDatacenterData} margin={{ top: 18, right: 12, left: 0, bottom: 0 }}>
+          <CartesianGrid stroke={gridColor} vertical={false} />
+          <XAxis dataKey="name" tick={{ fill: axisColor, fontSize: 12 }} interval={0} angle={-18} textAnchor="end" height={58} />
+          <YAxis tick={{ fill: axisColor, fontSize: 12 }} allowDecimals={false} />
+          <Tooltip contentStyle={tooltipStyle} formatter={(value: number) => `${value}${meta.unit}`} />
+          <Bar dataKey="value" name={meta.title} fill={meta.color} radius={[10, 10, 0, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
+    )
   }
 
   return (
@@ -256,12 +365,12 @@ const Dashboard = () => {
 
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={12}>
-          <Card title="设备健康分布" loading={loading}>
+          <Card title="设备运行状态分布" loading={loading}>
             <div style={{ height: 260 }}>
               <ResponsiveContainer>
                 <PieChart>
-                  <Pie data={deviceHealthData} dataKey="value" nameKey="name" innerRadius={58} outerRadius={92} paddingAngle={4}>
-                    {deviceHealthData.map((item) => <Cell key={item.name} fill={item.color} />)}
+                  <Pie data={deviceStatusData} dataKey="value" nameKey="name" innerRadius={58} outerRadius={92} paddingAngle={4}>
+                    {deviceStatusData.map((item) => <Cell key={item.name} fill={item.color} />)}
                   </Pie>
                   <Tooltip contentStyle={tooltipStyle} />
                   <Legend />
@@ -271,19 +380,36 @@ const Dashboard = () => {
           </Card>
         </Col>
         <Col xs={24} lg={12}>
-          <Card title="资源资产结构" loading={loading}>
+          <Card
+            title={`${assetMetricMeta[assetMetric].title}按机房统计`}
+            loading={loading}
+            extra={
+              <Space wrap>
+                <Segmented
+                  size="small"
+                  value={assetMetric}
+                  onChange={(value) => setAssetMetric(value as AssetMetricKey)}
+                  options={[
+                    { label: '网络设备', value: 'devices' },
+                    { label: '公网链路', value: 'public_circuits' },
+                    { label: '专线链路', value: 'private_circuits' },
+                  ]}
+                />
+                <Segmented
+                  size="small"
+                  value={assetChartMode}
+                  onChange={(value) => setAssetChartMode(value as ChartMode)}
+                  options={[
+                    { label: '横向柱状', value: 'horizontal' },
+                    { label: '柱状图', value: 'bar' },
+                    { label: '饼图', value: 'pie' },
+                  ]}
+                />
+              </Space>
+            }
+          >
             <div style={{ height: 260 }}>
-              <ResponsiveContainer>
-                <BarChart data={resourceMixData} margin={{ top: 18, right: 12, left: 0, bottom: 0 }}>
-                  <CartesianGrid stroke={gridColor} vertical={false} />
-                  <XAxis dataKey="name" tick={{ fill: axisColor, fontSize: 12 }} />
-                  <YAxis tick={{ fill: axisColor, fontSize: 12 }} />
-                  <Tooltip contentStyle={tooltipStyle} />
-                  <Bar dataKey="value" radius={[10, 10, 0, 0]}>
-                    {resourceMixData.map((_, index) => <Cell key={index} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
+              {renderAssetChart()}
             </div>
           </Card>
         </Col>

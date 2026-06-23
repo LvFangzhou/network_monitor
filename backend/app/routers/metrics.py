@@ -20,8 +20,9 @@ from app.utils.asternos_exporter_client import asternos_exporter_client
 from app.utils import redis_client
 from app.schemas import MetricQuery, MetricResponse, DashboardStats
 from app.database import get_db
-from app.models import Device, AlertHistory, AlertRule, Circuit, Customer
+from app.models import Device, AlertHistory, AlertRule, Circuit, Customer, Datacenter
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from app.core import get_logger
 from app.config import settings
 from app.collectors import snmp_collector
@@ -2225,6 +2226,25 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
         offline_devices = db.query(Device).filter(
             Device.status.in_(["inactive", "offline"])
         ).count()
+
+        status_labels = {
+            "active": "上线",
+            "online": "上线",
+            "inactive": "离线",
+            "offline": "离线",
+            "in_stock": "库存",
+            "deployed": "上架",
+        }
+        status_order = ["上线", "离线", "库存", "上架", "其他"]
+        status_counts = {label: 0 for label in status_order}
+        for status, count in db.query(Device.status, func.count(Device.id)).group_by(Device.status).all():
+            label = status_labels.get(status or "", "其他")
+            status_counts[label] = status_counts.get(label, 0) + int(count or 0)
+        device_status_distribution = [
+            {"name": label, "value": status_counts.get(label, 0)}
+            for label in status_order
+            if status_counts.get(label, 0) > 0
+        ]
         
         # 告警统计
         total_alerts_firing = db.query(AlertHistory).filter(
@@ -2234,6 +2254,36 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
         # 资源统计
         public_circuits = db.query(Circuit).filter(Circuit.line_type == "internet").count()
         private_circuits = db.query(Circuit).filter(Circuit.line_type == "private_line").count()
+
+        def rows_by_datacenter(query_rows):
+            rows = []
+            for name, count in query_rows:
+                rows.append({"name": name or "未分配机房", "value": int(count or 0)})
+            return sorted(rows, key=lambda item: item["value"], reverse=True)
+
+        device_by_datacenter = rows_by_datacenter(
+            db.query(Datacenter.name, func.count(Device.id))
+            .select_from(Device)
+            .outerjoin(Datacenter, Device.datacenter_id == Datacenter.id)
+            .group_by(Datacenter.name)
+            .all()
+        )
+        public_circuit_by_datacenter = rows_by_datacenter(
+            db.query(Datacenter.name, func.count(Circuit.id))
+            .select_from(Circuit)
+            .outerjoin(Datacenter, Circuit.datacenter_id == Datacenter.id)
+            .filter(Circuit.line_type == "internet")
+            .group_by(Datacenter.name)
+            .all()
+        )
+        private_circuit_by_datacenter = rows_by_datacenter(
+            db.query(Datacenter.name, func.count(Circuit.id))
+            .select_from(Circuit)
+            .outerjoin(Datacenter, Circuit.datacenter_id == Datacenter.id)
+            .filter(Circuit.line_type == "private_line")
+            .group_by(Datacenter.name)
+            .all()
+        )
         
         # 获取最近告警
         recent_alerts = db.query(AlertHistory).join(Device).filter(
@@ -2284,6 +2334,12 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
             "total_alerts_firing": total_alerts_firing,
             "public_circuits": public_circuits,
             "private_circuits": private_circuits,
+            "device_status_distribution": device_status_distribution,
+            "asset_by_datacenter": {
+                "devices": device_by_datacenter,
+                "public_circuits": public_circuit_by_datacenter,
+                "private_circuits": private_circuit_by_datacenter,
+            },
             "snmp_metrics_count": snmp_count,
             "gnmi_metrics_count": gnmi_count,
             "recent_alerts": recent_alerts_data
