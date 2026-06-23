@@ -11,7 +11,6 @@ import {
   PieChart,
   ResponsiveContainer,
   Tooltip as RechartsTooltip,
-  Treemap,
   XAxis,
   YAxis,
 } from 'recharts'
@@ -233,12 +232,8 @@ const AlertHistory = () => {
     () => Math.max(1, ...dayChartData.map((item) => item.value)),
     [dayChartData],
   )
-  const deviceTreemapData = useMemo(
-    () => (summary?.devices || []).map((item) => ({
-      name: item.device_name,
-      size: item.count,
-      ip: item.device_ip,
-    })),
+  const maxDeviceCount = useMemo(
+    () => Math.max(1, ...(summary?.devices || []).map((item) => item.count)),
     [summary?.devices],
   )
   const chartGrid = themeToken.colorBorderSecondary
@@ -481,16 +476,40 @@ const AlertHistory = () => {
         </Col>
         <Col span={8}>
           <Card title="按设备统计 Top 10" loading={summaryLoading} bodyStyle={summaryCardBodyStyle}>
-            <ResponsiveContainer width="100%" height="100%">
-              <Treemap
-                data={deviceTreemapData}
-                dataKey="size"
-                nameKey="name"
-                stroke={themeToken.colorBgContainer}
-                fill="#2563eb"
-                aspectRatio={4 / 3}
-              />
-            </ResponsiveContainer>
+            <Space direction="vertical" size={10} style={{ width: '100%' }}>
+              {(summary?.devices || []).map((record, index) => {
+                const percent = Math.max(4, Math.round((record.count / maxDeviceCount) * 100))
+                return (
+                  <Tooltip key={record.device_id} title={`${record.device_name}：${record.count} 条`}>
+                    <div
+                      style={{
+                        padding: '10px 12px',
+                        borderRadius: 12,
+                        background: index === 0 ? 'rgba(37, 99, 235, 0.10)' : themeToken.colorFillQuaternary,
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+                        <div style={{ minWidth: 0 }}>
+                          <Typography.Text style={compactTextStyle}>{record.device_name}</Typography.Text>
+                          <span style={{ color: themeToken.colorTextSecondary, fontSize: 12 }}>{record.device_ip || '-'}</span>
+                        </div>
+                        <Typography.Text strong style={{ color: chartColors[index % chartColors.length] }}>{record.count}</Typography.Text>
+                      </div>
+                      <div style={{ height: 5, borderRadius: 999, marginTop: 8, background: themeToken.colorFillSecondary, overflow: 'hidden' }}>
+                        <div
+                          style={{
+                            height: '100%',
+                            width: `${percent}%`,
+                            borderRadius: 999,
+                            background: `linear-gradient(90deg, ${chartColors[index % chartColors.length]}, rgba(37, 99, 235, 0.35))`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </Tooltip>
+                )
+              })}
+            </Space>
           </Card>
         </Col>
       </Row>
