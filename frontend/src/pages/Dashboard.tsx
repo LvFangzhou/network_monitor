@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Row, Col, Card, Statistic, List, Spin, Progress, Space, Typography, Select } from 'antd'
+import { Row, Col, Card, Statistic, List, Spin, Progress, Space, Typography, Select, theme } from 'antd'
 import {
   DesktopOutlined,
   CheckCircleOutlined,
@@ -14,9 +14,15 @@ import { DashboardAlert, getDashboardStats, getServerResources, ServerResourceSt
 import { getDatacenters } from '../api/devices'
 import {
   CartesianGrid,
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  Cell,
   Legend,
   Line,
-  LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -24,6 +30,7 @@ import {
 } from 'recharts'
 
 const { Text } = Typography
+const CHART_COLORS = ['#2563eb', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4']
 
 const severityRank: Record<string, number> = {
   P0: 0,
@@ -79,6 +86,7 @@ const formatUptime = (seconds: number) => {
 
 const Dashboard = () => {
   const navigate = useNavigate()
+  const { token } = theme.useToken()
   const [loading, setLoading] = useState(true)
   const [serverResources, setServerResources] = useState<ServerResourceStats | null>(null)
   const [resourceSamples, setResourceSamples] = useState<ResourceSample[]>([])
@@ -165,6 +173,35 @@ const Dashboard = () => {
     return items
   }, [recentAlerts, recentAlertSortDirection, recentAlertSortField])
 
+  const deviceHealthData = useMemo(() => [
+    { name: '在线', value: stats.online, color: '#10b981' },
+    { name: '离线', value: stats.offline, color: '#ef4444' },
+    { name: '告警', value: stats.warning, color: '#f59e0b' },
+  ].filter((item) => item.value > 0), [stats.offline, stats.online, stats.warning])
+
+  const resourceMixData = useMemo(() => [
+    { name: '网络设备', value: stats.total },
+    { name: '公网链路', value: stats.publicCircuits },
+    { name: '专线链路', value: stats.privateCircuits },
+    { name: '机房', value: stats.datacenters },
+  ], [stats.datacenters, stats.privateCircuits, stats.publicCircuits, stats.total])
+
+  const resourceLatestData = useMemo(() => serverResources ? [
+    { name: 'CPU', value: serverResources.cpu.percent },
+    { name: '内存', value: serverResources.memory.percent },
+    { name: '磁盘', value: serverResources.disk.percent },
+  ] : [], [serverResources])
+
+  const gridColor = token.colorBorderSecondary
+  const axisColor = token.colorTextSecondary
+  const tooltipStyle = {
+    background: token.colorBgElevated,
+    border: `1px solid ${token.colorBorderSecondary}`,
+    borderRadius: 12,
+    color: token.colorText,
+    boxShadow: token.boxShadowSecondary,
+  }
+
   if (loading) {
     return (
       <div style={{ textAlign: 'center', padding: 100 }}>
@@ -174,10 +211,36 @@ const Dashboard = () => {
   }
 
   return (
-    <div>
+    <div className="modern-page">
+      <div className="modern-hero">
+        <Row gutter={[20, 20]} align="middle">
+          <Col xs={24} lg={15}>
+            <Space direction="vertical" size={8}>
+              <Typography.Title level={2} style={{ margin: 0 }}>
+                网络运行态势
+              </Typography.Title>
+              <Text type="secondary">
+                以设备、链路、告警与服务器资源为核心，实时呈现当前运维健康度。
+              </Text>
+            </Space>
+          </Col>
+          <Col xs={24} lg={9}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+              {resourceLatestData.map((item, index) => (
+                <div key={item.name} style={{ padding: 14, borderRadius: 16, background: token.colorBgContainer }}>
+                  <Text type="secondary">{item.name}</Text>
+                  <div style={{ fontSize: 24, fontWeight: 800, color: CHART_COLORS[index] }}>{item.value.toFixed(1)}%</div>
+                  <Progress percent={Math.round(item.value)} showInfo={false} strokeColor={CHART_COLORS[index]} />
+                </div>
+              ))}
+            </div>
+          </Col>
+        </Row>
+      </div>
+
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} lg={6}>
-          <Card hoverable onClick={() => navigate('/devices?reset=1')}>
+          <Card className="metric-card" hoverable onClick={() => navigate('/devices?reset=1')}>
             <Statistic
               title="网络设备总数"
               value={stats.total}
@@ -186,7 +249,7 @@ const Dashboard = () => {
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
-          <Card hoverable onClick={() => navigate('/datacenters')}>
+          <Card className="metric-card" hoverable onClick={() => navigate('/datacenters')}>
             <Statistic
               title="机房总数"
               value={stats.datacenters}
@@ -195,7 +258,7 @@ const Dashboard = () => {
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
-          <Card hoverable onClick={() => navigate('/devices?reset=1&status=active')}>
+          <Card className="metric-card" hoverable onClick={() => navigate('/devices?reset=1&status=active')}>
             <Statistic
               title="在线设备"
               value={stats.online}
@@ -205,7 +268,7 @@ const Dashboard = () => {
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
-          <Card hoverable onClick={() => navigate('/devices?reset=1&status=inactive')}>
+          <Card className="metric-card" hoverable onClick={() => navigate('/devices?reset=1&status=inactive')}>
             <Statistic
               title="离线设备"
               value={stats.offline}
@@ -215,7 +278,7 @@ const Dashboard = () => {
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
-          <Card hoverable onClick={() => navigate('/alerts/history?status=firing')}>
+          <Card className="metric-card" hoverable onClick={() => navigate('/alerts/history?status=firing')}>
             <Statistic
               title="告警设备"
               value={stats.warning}
@@ -225,7 +288,7 @@ const Dashboard = () => {
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
-          <Card hoverable onClick={() => navigate('/public-circuits')}>
+          <Card className="metric-card" hoverable onClick={() => navigate('/public-circuits')}>
             <Statistic
               title="公网链路"
               value={stats.publicCircuits}
@@ -235,7 +298,7 @@ const Dashboard = () => {
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
-          <Card hoverable onClick={() => navigate('/private-circuits')}>
+          <Card className="metric-card" hoverable onClick={() => navigate('/private-circuits')}>
             <Statistic
               title="专线链路"
               value={stats.privateCircuits}
@@ -246,16 +309,40 @@ const Dashboard = () => {
         </Col>
       </Row>
 
-      <Row gutter={16} style={{ marginTop: 24 }}>
-        <Col span={12}>
-          <Card title="资源概览">
-            <p>系统运行正常</p>
-            <p>当前共维护 {stats.total} 台网络设备</p>
-            <p>当前共维护 {stats.datacenters} 个机房</p>
-            <p>公网链路 {stats.publicCircuits} 条，专线链路 {stats.privateCircuits} 条</p>
+      <Row gutter={[16, 16]}>
+        <Col xs={24} lg={8}>
+          <Card title="设备健康分布">
+            <div style={{ height: 260 }}>
+              <ResponsiveContainer>
+                <PieChart>
+                  <Pie data={deviceHealthData} dataKey="value" nameKey="name" innerRadius={58} outerRadius={92} paddingAngle={4}>
+                    {deviceHealthData.map((item) => <Cell key={item.name} fill={item.color} />)}
+                  </Pie>
+                  <Tooltip contentStyle={tooltipStyle} />
+                  <Legend />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
           </Card>
         </Col>
-        <Col span={12}>
+        <Col xs={24} lg={8}>
+          <Card title="资源资产结构">
+            <div style={{ height: 260 }}>
+              <ResponsiveContainer>
+                <BarChart data={resourceMixData} margin={{ top: 18, right: 12, left: 0, bottom: 0 }}>
+                  <CartesianGrid stroke={gridColor} vertical={false} />
+                  <XAxis dataKey="name" tick={{ fill: axisColor, fontSize: 12 }} />
+                  <YAxis tick={{ fill: axisColor, fontSize: 12 }} />
+                  <Tooltip contentStyle={tooltipStyle} />
+                  <Bar dataKey="value" radius={[10, 10, 0, 0]}>
+                    {resourceMixData.map((_, index) => <Cell key={index} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </Card>
+        </Col>
+        <Col xs={24} lg={8}>
           <Card
             title="最近告警"
             extra={
@@ -296,7 +383,7 @@ const Dashboard = () => {
         </Col>
       </Row>
 
-      <Row gutter={16} style={{ marginTop: 24 }}>
+      <Row gutter={[16, 16]}>
         <Col span={24}>
           <Card
             title="服务器资源使用率"
@@ -358,18 +445,28 @@ const Dashboard = () => {
                   </Col>
                 </Row>
 
-                <div style={{ width: '100%', height: 260 }}>
+                <div style={{ width: '100%', height: 300 }}>
                   <ResponsiveContainer>
-                    <LineChart data={resourceSamples} margin={{ top: 16, right: 24, left: 0, bottom: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                      <XAxis dataKey="time" minTickGap={24} />
-                      <YAxis domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
-                      <Tooltip formatter={(value: number) => `${Number(value).toFixed(2)}%`} />
+                    <AreaChart data={resourceSamples} margin={{ top: 16, right: 24, left: 0, bottom: 0 }}>
+                      <defs>
+                        <linearGradient id="cpuGradient" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#2563eb" stopOpacity={0.26} />
+                          <stop offset="95%" stopColor="#2563eb" stopOpacity={0.02} />
+                        </linearGradient>
+                        <linearGradient id="memoryGradient" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#10b981" stopOpacity={0.24} />
+                          <stop offset="95%" stopColor="#10b981" stopOpacity={0.02} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+                      <XAxis dataKey="time" minTickGap={24} tick={{ fill: axisColor, fontSize: 12 }} />
+                      <YAxis domain={[0, 100]} tickFormatter={(value) => `${value}%`} tick={{ fill: axisColor, fontSize: 12 }} />
+                      <Tooltip contentStyle={tooltipStyle} formatter={(value: number) => `${Number(value).toFixed(2)}%`} />
                       <Legend />
-                      <Line type="linear" dataKey="cpu" name="CPU" stroke="#1677ff" strokeWidth={2} dot={false} />
-                      <Line type="linear" dataKey="memory" name="内存" stroke="#52c41a" strokeWidth={2} dot={false} />
-                      <Line type="linear" dataKey="disk" name="磁盘" stroke="#fa8c16" strokeWidth={2} dot={false} />
-                    </LineChart>
+                      <Area type="monotone" dataKey="cpu" name="CPU" stroke="#2563eb" strokeWidth={2.4} fill="url(#cpuGradient)" dot={false} />
+                      <Area type="monotone" dataKey="memory" name="内存" stroke="#10b981" strokeWidth={2.4} fill="url(#memoryGradient)" dot={false} />
+                      <Line type="monotone" dataKey="disk" name="磁盘" stroke="#f59e0b" strokeWidth={2.4} dot={false} />
+                    </AreaChart>
                   </ResponsiveContainer>
                 </div>
               </Space>

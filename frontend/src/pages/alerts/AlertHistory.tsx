@@ -1,6 +1,20 @@
-import { useEffect, useState, type CSSProperties } from 'react'
-import { Button, Card, Col, Input, Modal, Row, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message } from 'antd'
+import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { Button, Card, Col, Input, Modal, Row, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
 import { CheckOutlined, DeleteOutlined, EyeInvisibleOutlined, ReloadOutlined } from '@ant-design/icons'
+import {
+  Area,
+  AreaChart,
+  Cell,
+  CartesianGrid,
+  Legend,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip as RechartsTooltip,
+  Treemap,
+  XAxis,
+  YAxis,
+} from 'recharts'
 import {
   acknowledgeAlert,
   clearAlertHistory,
@@ -50,6 +64,8 @@ const severityColors: Record<string, string> = {
   warning: 'gold',
   info: 'blue',
 }
+
+const chartColors = ['#2563eb', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#f97316', '#14b8a6', '#6366f1', '#84cc16']
 
 const compactTextStyle: CSSProperties = {
   display: 'block',
@@ -187,6 +203,7 @@ const displayTargetName = (record: AlertHistoryItem) => {
 const isOperationRecord = (record: AlertHistoryItem) => record.severity === 'P3'
 
 const AlertHistory = () => {
+  const { token: themeToken } = theme.useToken()
   const [items, setItems] = useState<AlertHistoryItem[]>([])
   const [stats, setStats] = useState<AlertStats | null>(null)
   const [summary, setSummary] = useState<AlertHistorySummary | null>(null)
@@ -203,6 +220,36 @@ const AlertHistory = () => {
   const currentUser = useAuthStore((state) => state.user)
   const canModify = Boolean(token && !currentUser?.read_only)
   const initialAlertId = new URLSearchParams(window.location.search).get('alert_id')
+
+  const datacenterChartData = useMemo(
+    () => (summary?.datacenters || []).map((item) => ({ ...item, value: item.count })),
+    [summary?.datacenters],
+  )
+  const dayChartData = useMemo(
+    () => (summary?.days || []).map((item) => ({ ...item, label: item.day.slice(5), value: item.count })),
+    [summary?.days],
+  )
+  const maxDayCount = useMemo(
+    () => Math.max(1, ...dayChartData.map((item) => item.value)),
+    [dayChartData],
+  )
+  const deviceTreemapData = useMemo(
+    () => (summary?.devices || []).map((item) => ({
+      name: item.device_name,
+      size: item.count,
+      ip: item.device_ip,
+    })),
+    [summary?.devices],
+  )
+  const chartGrid = themeToken.colorBorderSecondary
+  const chartAxis = themeToken.colorTextSecondary
+  const chartTooltipStyle = {
+    background: themeToken.colorBgElevated,
+    border: `1px solid ${themeToken.colorBorderSecondary}`,
+    borderRadius: 12,
+    color: themeToken.colorText,
+    boxShadow: themeToken.boxShadowSecondary,
+  }
 
   const buildFilterParams = () => ({
     status: statusFilter,
@@ -358,7 +405,7 @@ const AlertHistory = () => {
   }
 
   return (
-    <Space direction="vertical" size="large" style={{ width: '100%' }}>
+    <div className="modern-page">
       <Row gutter={[16, 16]}>
         <Col span={8}>
           <Card bodyStyle={metricCardBodyStyle}>
@@ -380,53 +427,70 @@ const AlertHistory = () => {
       <Row gutter={[16, 16]} align="top">
         <Col span={8}>
           <Card title="按机房统计" loading={summaryLoading} bodyStyle={summaryCardBodyStyle}>
-            <Table
-              size="small"
-              rowKey="name"
-              pagination={false}
-              dataSource={summary?.datacenters || []}
-              columns={[
-                { title: '机房', dataIndex: 'name', ellipsis: true },
-                { title: '告警数', dataIndex: 'count', width: 90, align: 'right' },
-              ]}
-            />
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={datacenterChartData} dataKey="value" nameKey="name" innerRadius={58} outerRadius={96} paddingAngle={3}>
+                  {datacenterChartData.map((item, index) => (
+                    <Cell key={item.name} fill={chartColors[index % chartColors.length]} />
+                  ))}
+                </Pie>
+                <RechartsTooltip contentStyle={chartTooltipStyle} />
+                <Legend />
+              </PieChart>
+            </ResponsiveContainer>
           </Card>
         </Col>
         <Col span={8}>
           <Card title="按日期统计" loading={summaryLoading} bodyStyle={summaryCardBodyStyle}>
-            <Table
-              size="small"
-              rowKey="day"
-              pagination={false}
-              dataSource={summary?.days || []}
-              columns={[
-                { title: '日期', dataIndex: 'day', width: 130 },
-                { title: '告警数', dataIndex: 'count', width: 90, align: 'right' },
-              ]}
-            />
+            <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ flex: 1, minHeight: 0 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={dayChartData} margin={{ top: 12, right: 18, left: -12, bottom: 4 }}>
+                    <defs>
+                      <linearGradient id="alertDayTrend" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#2563eb" stopOpacity={0.30} />
+                        <stop offset="95%" stopColor="#2563eb" stopOpacity={0.03} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid stroke={chartGrid} vertical={false} />
+                    <XAxis dataKey="label" minTickGap={18} tick={{ fill: chartAxis, fontSize: 11 }} />
+                    <YAxis tick={{ fill: chartAxis, fontSize: 11 }} />
+                    <RechartsTooltip contentStyle={chartTooltipStyle} labelFormatter={(_, payload) => payload?.[0]?.payload?.day || ''} />
+                    <Area type="monotone" dataKey="value" name="告警数" stroke="#2563eb" strokeWidth={2.4} fill="url(#alertDayTrend)" dot={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(dayChartData.length || 1, 18)}, minmax(8px, 1fr))`, gap: 4 }}>
+                {dayChartData.slice(-18).map((item) => {
+                  const opacity = 0.18 + (item.value / maxDayCount) * 0.72
+                  return (
+                    <Tooltip key={item.day} title={`${item.day}：${item.value} 条`}>
+                      <div
+                        style={{
+                          height: 18,
+                          borderRadius: 5,
+                          background: `rgba(37, 99, 235, ${opacity})`,
+                        }}
+                      />
+                    </Tooltip>
+                  )
+                })}
+              </div>
+            </div>
           </Card>
         </Col>
         <Col span={8}>
           <Card title="按设备统计 Top 10" loading={summaryLoading} bodyStyle={summaryCardBodyStyle}>
-            <Table
-              size="small"
-              rowKey="device_id"
-              pagination={false}
-              dataSource={summary?.devices || []}
-              columns={[
-                {
-                  title: '设备',
-                  ellipsis: true,
-                  render: (_: unknown, record: AlertHistorySummary['devices'][number]) => (
-                    <Space direction="vertical" size={0}>
-                      <Typography.Text style={compactTextStyle}>{record.device_name}</Typography.Text>
-                      <span style={{ color: '#999', fontSize: 12 }}>{record.device_ip || '-'}</span>
-                    </Space>
-                  ),
-                },
-                { title: '告警数', dataIndex: 'count', width: 90, align: 'right' },
-              ]}
-            />
+            <ResponsiveContainer width="100%" height="100%">
+              <Treemap
+                data={deviceTreemapData}
+                dataKey="size"
+                nameKey="name"
+                stroke={themeToken.colorBgContainer}
+                fill="#2563eb"
+                aspectRatio={4 / 3}
+              />
+            </ResponsiveContainer>
           </Card>
         </Col>
       </Row>
@@ -630,7 +694,7 @@ const AlertHistory = () => {
           ].filter(Boolean) as any}
         />
       </Card>
-    </Space>
+    </div>
   )
 }
 

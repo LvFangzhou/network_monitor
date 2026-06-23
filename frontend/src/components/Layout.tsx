@@ -38,7 +38,7 @@ const Layout = () => {
   const appTheme = useThemeStore((state) => state.mode)
   const toggleTheme = useThemeStore((state) => state.toggleMode)
   const {
-    token: { colorBgContainer, colorBgLayout, borderRadiusLG },
+    token: { colorBgLayout, colorText, colorTextSecondary },
   } = theme.useToken()
 
   const publicMenus = ['/alerts/history', '/port-query']
@@ -173,7 +173,7 @@ const Layout = () => {
   }
 
   return (
-    <AntLayout style={{ minHeight: '100vh', background: colorBgLayout }}>
+    <AntLayout data-theme={appTheme} style={{ minHeight: '100vh', background: colorBgLayout }}>
       <Sider
         trigger={null}
         collapsible
@@ -186,21 +186,30 @@ const Layout = () => {
           left: 0,
           top: 0,
           bottom: 0,
+          padding: '14px 10px',
+          background: appTheme === 'dark'
+            ? 'linear-gradient(180deg, #0f172a 0%, #111827 56%, #0b1020 100%)'
+            : 'linear-gradient(180deg, #0f172a 0%, #111827 58%, #172554 100%)',
+          boxShadow: '10px 0 30px rgba(15, 23, 42, 0.18)',
         }}
       >
         <div
           style={{
-            height: 64,
+            height: 56,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
             color: '#fff',
             fontSize: collapsed ? 14 : 18,
-            fontWeight: 'bold',
-            borderBottom: '1px solid rgba(255,255,255,0.1)',
+            fontWeight: 800,
+            letterSpacing: collapsed ? 0 : 1,
+            borderRadius: 16,
+            marginBottom: 14,
+            background: 'linear-gradient(135deg, rgba(59,130,246,0.24), rgba(16,185,129,0.14))',
+            border: '1px solid rgba(255,255,255,0.10)',
           }}
         >
-          {collapsed ? 'NM' : '网络监控'}
+          {collapsed ? 'NM' : 'Network Ops'}
         </div>
         <Menu
           theme="dark"
@@ -209,32 +218,39 @@ const Layout = () => {
           defaultOpenKeys={['resource-management', '/alerts', 'monitor-center', 'tacacs-management']}
           items={menuItems}
           onClick={handleMenuClick}
-          style={{ borderRight: 0 }}
+          style={{ borderRight: 0, background: 'transparent', fontWeight: 600 }}
         />
       </Sider>
 
       <AntLayout style={{ marginLeft: collapsed ? 80 : 200, transition: 'all 0.2s' }}>
         <Header
           style={{
-            height: 64,
-            lineHeight: '64px',
-            padding: '0 24px',
-            background: colorBgContainer,
+            height: 68,
+            lineHeight: '68px',
+            padding: '0 26px',
+            background: appTheme === 'dark' ? 'rgba(17, 24, 39, 0.78)' : 'rgba(255, 255, 255, 0.76)',
+            backdropFilter: 'blur(18px)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            boxShadow: '0 1px 4px rgba(0,0,0,0.1)',
+            boxShadow: appTheme === 'dark' ? '0 1px 0 rgba(148,163,184,0.10)' : '0 1px 0 rgba(15,23,42,0.06)',
             position: 'sticky',
             top: 0,
             zIndex: 30,
             flexShrink: 0,
           }}
         >
-          <Button
-            type="text"
-            icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-            onClick={() => setCollapsed(!collapsed)}
-          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <Button
+              type="text"
+              icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+              onClick={() => setCollapsed(!collapsed)}
+            />
+            <div style={{ lineHeight: 1.2 }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: colorText }}>网络监控平台</div>
+              <div style={{ fontSize: 12, color: colorTextSecondary }}>Visualization-driven operations console</div>
+            </div>
+          </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, height: '100%', flexShrink: 0, whiteSpace: 'nowrap' }}>
             <Tooltip title={appTheme === 'dark' ? '切换白天模式' : '切换黑暗模式'}>
@@ -249,7 +265,7 @@ const Layout = () => {
               placement="bottomRight"
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', maxWidth: 180 }}>
-                <Avatar icon={<UserOutlined />} />
+                <Avatar style={{ background: 'linear-gradient(135deg, #2563eb, #10b981)' }} icon={<UserOutlined />} />
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{token ? (user?.full_name || user?.username) : '未登录'}</span>
               </div>
             </Dropdown>
@@ -258,10 +274,9 @@ const Layout = () => {
 
         <Content
           style={{
-            margin: 24,
+            margin: 0,
             padding: 24,
-            background: colorBgContainer,
-            borderRadius: borderRadiusLG,
+            background: 'transparent',
             minHeight: 280,
           }}
         >
