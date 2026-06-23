@@ -1,12 +1,19 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Form, Input, Button, Card, message, Typography } from 'antd'
-import { UserOutlined, LockOutlined, SafetyOutlined } from '@ant-design/icons'
+import { Form, Input, Button, Card, message, Typography, Space } from 'antd'
+import {
+  UserOutlined,
+  LockOutlined,
+  SafetyOutlined,
+  ClusterOutlined,
+  ThunderboltOutlined,
+  RadarChartOutlined,
+} from '@ant-design/icons'
 import type { AxiosError } from 'axios'
 import { useAuthStore } from '../store/auth'
 import { initAuth } from '../api/auth'
 
-const { Title } = Typography
+const { Title, Text } = Typography
 
 const Login = () => {
   const [loading, setLoading] = useState(false)
@@ -46,79 +53,120 @@ const Login = () => {
   }
 
   return (
-    <div
-      style={{
-        height: '100vh',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-      }}
-    >
-      <Card
-        style={{
-          width: 400,
-          borderRadius: 8,
-          boxShadow: '0 4px 20px rgba(0,0,0,0.1)',
-        }}
-      >
-        <div style={{ textAlign: 'center', marginBottom: 32 }}>
-          <Title level={3} style={{ margin: 0 }}>
-            <SafetyOutlined style={{ marginRight: 8 }} />
-            网络设备监控系统
+    <div className="login-shell">
+      <div className="login-grid-overlay" />
+      <div className="login-glow login-glow-a" />
+      <div className="login-glow login-glow-b" />
+
+      <div className="login-stage">
+        <section className="login-hero-panel">
+          <div className="login-brand-pill">
+            <SafetyOutlined />
+            Network Ops Console
+          </div>
+          <Title level={1} className="login-hero-title">
+            面向现代网络工程师的可视化运维平台
           </Title>
-          <p style={{ color: '#666', marginTop: 8 }}>Network Monitor System</p>
-        </div>
+          <Text className="login-hero-subtitle">
+            汇聚网络设备、端口流量、告警审计与 Tacacs 操作记录，用更直观的方式掌控基础设施状态。
+          </Text>
 
-        <Form
-          name="login"
-          onFinish={handleSubmit}
-          autoComplete="off"
-          size="large"
-        >
-          <Form.Item
-            name="username"
-            rules={[{ required: true, message: '请输入用户名' }]}
+          <div className="login-signal-card">
+            <div>
+              <Text className="login-signal-label">Backbone health</Text>
+              <div className="login-signal-value">99.98%</div>
+            </div>
+            <div className="login-signal-bars">
+              {Array.from({ length: 18 }).map((_, index) => (
+                <span key={index} style={{ height: 12 + ((index * 7) % 28) }} />
+              ))}
+            </div>
+          </div>
+
+          <div className="login-feature-row">
+            <div className="login-feature">
+              <ClusterOutlined />
+              <span>拓扑感知</span>
+            </div>
+            <div className="login-feature">
+              <RadarChartOutlined />
+              <span>实时监控</span>
+            </div>
+            <div className="login-feature">
+              <ThunderboltOutlined />
+              <span>快速定位</span>
+            </div>
+          </div>
+        </section>
+
+        <Card className="login-card">
+          <div className="login-card-header">
+            <div className="login-card-icon">
+              <SafetyOutlined />
+            </div>
+            <Title level={3} style={{ margin: 0 }}>
+              网络监控平台
+            </Title>
+            <Text type="secondary">Visualization-driven operations console</Text>
+          </div>
+
+          <Form
+            name="login"
+            onFinish={handleSubmit}
+            autoComplete="off"
+            size="large"
+            layout="vertical"
           >
-            <Input
-              prefix={<UserOutlined />}
-              placeholder="用户名"
-            />
-          </Form.Item>
-
-          <Form.Item
-            name="password"
-            rules={[{ required: true, message: '请输入密码' }]}
-          >
-            <Input.Password
-              prefix={<LockOutlined />}
-              placeholder="密码"
-            />
-          </Form.Item>
-
-          <Form.Item>
-            <Button
-              type="primary"
-              htmlType="submit"
-              loading={loading}
-              block
+            <Form.Item
+              name="username"
+              rules={[{ required: true, message: '请输入用户名' }]}
             >
-              登录
-            </Button>
-          </Form.Item>
+              <Input
+                prefix={<UserOutlined />}
+                placeholder="用户名"
+              />
+            </Form.Item>
 
-          <Form.Item style={{ marginBottom: 0 }}>
-            <Button
-              type="link"
-              onClick={handleInit}
-              loading={initLoading}
-              block
+            <Form.Item
+              name="password"
+              rules={[{ required: true, message: '请输入密码' }]}
             >
-              初始化系统（首次使用）
-            </Button>
-          </Form.Item>
-        </Form>
-      </Card>
+              <Input.Password
+                prefix={<LockOutlined />}
+                placeholder="密码"
+              />
+            </Form.Item>
+
+            <Form.Item>
+              <Button
+                type="primary"
+                htmlType="submit"
+                loading={loading}
+                block
+                className="login-submit"
+              >
+                登录控制台
+              </Button>
+            </Form.Item>
+
+            <Form.Item style={{ marginBottom: 0 }}>
+              <Button
+                type="link"
+                onClick={handleInit}
+                loading={initLoading}
+                block
+              >
+                初始化系统（首次使用）
+              </Button>
+            </Form.Item>
+          </Form>
+
+          <Space className="login-card-footer" size={8}>
+            <span />
+            <Text type="secondary">Secure access · Audit ready</Text>
+          </Space>
+        </Card>
+      </div>
     </div>
   )
 }

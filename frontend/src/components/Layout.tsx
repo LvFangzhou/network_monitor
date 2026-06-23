@@ -190,13 +190,13 @@ const Layout = () => {
           padding: collapsed ? '14px 8px' : '14px 12px',
           background: appTheme === 'dark'
             ? 'linear-gradient(180deg, #102a43 0%, #12395c 50%, #0f4c75 100%)'
-            : 'linear-gradient(180deg, #e0f7ff 0%, #d4f1ff 42%, #edf9ff 100%)',
+            : 'linear-gradient(180deg, #2f66d8 0%, #3477e6 46%, #56b6f7 100%)',
           boxShadow: appTheme === 'dark'
             ? '14px 0 36px rgba(2, 8, 23, 0.24)'
-            : '14px 0 36px rgba(14, 165, 233, 0.12)',
+            : '14px 0 36px rgba(47, 102, 216, 0.22)',
           borderRight: appTheme === 'dark'
             ? '1px solid rgba(255,255,255,0.10)'
-            : '1px solid rgba(14, 165, 233, 0.16)',
+            : '1px solid rgba(255,255,255,0.22)',
         }}
       >
         <div
@@ -206,7 +206,7 @@ const Layout = () => {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            color: appTheme === 'dark' ? '#fff' : '#075985',
+            color: '#fff',
             fontSize: collapsed ? 14 : 18,
             fontWeight: 800,
             letterSpacing: collapsed ? 0 : 1,
@@ -214,13 +214,13 @@ const Layout = () => {
             marginBottom: 14,
             background: appTheme === 'dark'
               ? 'linear-gradient(135deg, rgba(255,255,255,0.18), rgba(125,211,252,0.14), rgba(16,185,129,0.12))'
-              : 'linear-gradient(135deg, rgba(255,255,255,0.94), rgba(186,230,253,0.72), rgba(224,242,254,0.92))',
+              : 'linear-gradient(135deg, rgba(255,255,255,0.22), rgba(255,255,255,0.12), rgba(125,211,252,0.18))',
             border: appTheme === 'dark'
               ? '1px solid rgba(255,255,255,0.16)'
-              : '1px solid rgba(14, 165, 233, 0.18)',
+              : '1px solid rgba(255,255,255,0.26)',
             boxShadow: appTheme === 'dark'
               ? 'inset 0 1px 0 rgba(255,255,255,0.18), 0 12px 28px rgba(2, 8, 23, 0.16)'
-              : 'inset 0 1px 0 rgba(255,255,255,0.86), 0 12px 28px rgba(14, 165, 233, 0.14)',
+              : 'inset 0 1px 0 rgba(255,255,255,0.28), 0 12px 28px rgba(30, 64, 175, 0.18)',
           }}
         >
           {collapsed ? 'NM' : 'Network Ops'}
@@ -279,7 +279,7 @@ const Layout = () => {
               placement="bottomRight"
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', maxWidth: 180 }}>
-                <Avatar style={{ background: 'linear-gradient(135deg, #2563eb, #10b981)' }} icon={<UserOutlined />} />
+                <Avatar style={{ background: 'linear-gradient(135deg, #2f66d8, #38bdf8)' }} icon={<UserOutlined />} />
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{token ? (user?.full_name || user?.username) : '未登录'}</span>
               </div>
             </Dropdown>
