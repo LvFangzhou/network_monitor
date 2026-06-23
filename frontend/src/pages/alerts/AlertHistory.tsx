@@ -99,6 +99,18 @@ const operationContentStyle: CSSProperties = {
   color: '#222',
 }
 
+const summaryCardBodyStyle: CSSProperties = {
+  height: 320,
+  overflowY: 'auto',
+  paddingTop: 12,
+  paddingBottom: 12,
+}
+
+const metricCardBodyStyle: CSSProperties = {
+  paddingTop: 18,
+  paddingBottom: 18,
+}
+
 const decodeHexText = (value: string) => {
   const text = value.trim()
   if (!/^0x[0-9a-fA-F]+$/.test(text) || text.length % 2 !== 0) return ''
@@ -347,27 +359,27 @@ const AlertHistory = () => {
 
   return (
     <Space direction="vertical" size="large" style={{ width: '100%' }}>
-      <Row gutter={16}>
+      <Row gutter={[16, 16]}>
         <Col span={8}>
-          <Card>
+          <Card bodyStyle={metricCardBodyStyle}>
             <Statistic title="正在触发" value={stats?.total_firing || 0} />
           </Card>
         </Col>
         <Col span={8}>
-          <Card>
+          <Card bodyStyle={metricCardBodyStyle}>
             <Statistic title="已解决" value={stats?.total_resolved || 0} />
           </Card>
         </Col>
         <Col span={8}>
-          <Card>
+          <Card bodyStyle={metricCardBodyStyle}>
             <Statistic title="历史记录数" value={total} />
           </Card>
         </Col>
       </Row>
 
-      <Row gutter={16}>
+      <Row gutter={[16, 16]} align="top">
         <Col span={8}>
-          <Card title="按机房统计" loading={summaryLoading}>
+          <Card title="按机房统计" loading={summaryLoading} bodyStyle={summaryCardBodyStyle}>
             <Table
               size="small"
               rowKey="name"
@@ -381,11 +393,11 @@ const AlertHistory = () => {
           </Card>
         </Col>
         <Col span={8}>
-          <Card title="按日期统计" loading={summaryLoading}>
+          <Card title="按日期统计" loading={summaryLoading} bodyStyle={summaryCardBodyStyle}>
             <Table
               size="small"
               rowKey="day"
-              pagination={{ pageSize: 5, size: 'small' }}
+              pagination={false}
               dataSource={summary?.days || []}
               columns={[
                 { title: '日期', dataIndex: 'day', width: 130 },
@@ -395,7 +407,7 @@ const AlertHistory = () => {
           </Card>
         </Col>
         <Col span={8}>
-          <Card title="按设备统计 Top 10" loading={summaryLoading}>
+          <Card title="按设备统计 Top 10" loading={summaryLoading} bodyStyle={summaryCardBodyStyle}>
             <Table
               size="small"
               rowKey="device_id"
