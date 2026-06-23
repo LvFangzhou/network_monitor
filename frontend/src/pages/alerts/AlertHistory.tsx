@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState, type CSSProperties } from 'react'
-import { Button, Card, Col, Input, Modal, Row, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
+import { Button, Card, Col, Input, Modal, Row, Segmented, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
 import { CheckOutlined, DeleteOutlined, EyeInvisibleOutlined, ReloadOutlined } from '@ant-design/icons'
 import {
   Area,
   AreaChart,
+  Bar,
+  BarChart,
   Cell,
   CartesianGrid,
   Legend,
@@ -212,6 +214,7 @@ const AlertHistory = () => {
   const [statusFilter, setStatusFilter] = useState<string>()
   const [severityFilter, setSeverityFilter] = useState<string>()
   const [searchText, setSearchText] = useState<string>('')
+  const [datacenterChartType, setDatacenterChartType] = useState<'pie' | 'bar'>('pie')
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
@@ -421,18 +424,59 @@ const AlertHistory = () => {
 
       <Row gutter={[16, 16]} align="top">
         <Col span={8}>
-          <Card title="按机房统计" loading={summaryLoading} bodyStyle={summaryCardBodyStyle}>
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={datacenterChartData} dataKey="value" nameKey="name" innerRadius={58} outerRadius={96} paddingAngle={3}>
-                  {datacenterChartData.map((item, index) => (
-                    <Cell key={item.name} fill={chartColors[index % chartColors.length]} />
-                  ))}
-                </Pie>
-                <RechartsTooltip contentStyle={chartTooltipStyle} />
-                <Legend />
-              </PieChart>
-            </ResponsiveContainer>
+          <Card
+            title="按机房统计"
+            loading={summaryLoading}
+            bodyStyle={summaryCardBodyStyle}
+            extra={
+              <Segmented
+                size="small"
+                value={datacenterChartType}
+                onChange={(value) => setDatacenterChartType(value as 'pie' | 'bar')}
+                options={[
+                  { label: '饼图', value: 'pie' },
+                  { label: '柱状图', value: 'bar' },
+                ]}
+              />
+            }
+          >
+            {datacenterChartType === 'pie' ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie data={datacenterChartData} dataKey="value" nameKey="name" innerRadius={58} outerRadius={96} paddingAngle={3}>
+                    {datacenterChartData.map((item, index) => (
+                      <Cell key={item.name} fill={chartColors[index % chartColors.length]} />
+                    ))}
+                  </Pie>
+                  <RechartsTooltip contentStyle={chartTooltipStyle} />
+                  <Legend />
+                </PieChart>
+              </ResponsiveContainer>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart
+                  data={datacenterChartData}
+                  layout="vertical"
+                  margin={{ top: 8, right: 22, left: 18, bottom: 8 }}
+                >
+                  <CartesianGrid stroke={chartGrid} horizontal={false} />
+                  <XAxis type="number" tick={{ fill: chartAxis, fontSize: 11 }} />
+                  <YAxis
+                    type="category"
+                    dataKey="name"
+                    width={76}
+                    tick={{ fill: chartAxis, fontSize: 11 }}
+                    tickFormatter={(value) => String(value).length > 5 ? `${String(value).slice(0, 5)}…` : String(value)}
+                  />
+                  <RechartsTooltip contentStyle={chartTooltipStyle} />
+                  <Bar dataKey="value" name="告警数" radius={[0, 8, 8, 0]}>
+                    {datacenterChartData.map((item, index) => (
+                      <Cell key={item.name} fill={chartColors[index % chartColors.length]} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </Card>
         </Col>
         <Col span={8}>
