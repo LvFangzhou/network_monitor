@@ -1,13 +1,16 @@
 import { useEffect, useState, type CSSProperties } from 'react'
-import { Button, Card, Col, Input, Row, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message } from 'antd'
-import { CheckOutlined, EyeInvisibleOutlined, ReloadOutlined } from '@ant-design/icons'
+import { Button, Card, Col, Input, Modal, Row, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message } from 'antd'
+import { CheckOutlined, DeleteOutlined, EyeInvisibleOutlined, ReloadOutlined } from '@ant-design/icons'
 import {
   acknowledgeAlert,
+  clearAlertHistory,
   getAlertHistory,
+  getAlertHistorySummary,
   getAlertStats,
   ignoreAlert,
   resolveAlert,
   type AlertHistory as AlertHistoryItem,
+  type AlertHistorySummary,
   type AlertStats,
 } from '../../api/alerts'
 import { useAuthStore } from '../../store/auth'
@@ -174,7 +177,10 @@ const isOperationRecord = (record: AlertHistoryItem) => record.severity === 'P3'
 const AlertHistory = () => {
   const [items, setItems] = useState<AlertHistoryItem[]>([])
   const [stats, setStats] = useState<AlertStats | null>(null)
+  const [summary, setSummary] = useState<AlertHistorySummary | null>(null)
   const [loading, setLoading] = useState(false)
+  const [summaryLoading, setSummaryLoading] = useState(false)
+  const [clearing, setClearing] = useState(false)
   const [statusFilter, setStatusFilter] = useState<string>()
   const [severityFilter, setSeverityFilter] = useState<string>()
   const [searchText, setSearchText] = useState<string>('')
@@ -186,6 +192,13 @@ const AlertHistory = () => {
   const canModify = Boolean(token && !currentUser?.read_only)
   const initialAlertId = new URLSearchParams(window.location.search).get('alert_id')
 
+  const buildFilterParams = () => ({
+    status: statusFilter,
+    severity: severityFilter,
+    alert_id: initialAlertId ? Number(initialAlertId) : undefined,
+    search: searchText || undefined,
+  })
+
   const fetchData = async (nextPage = page, nextPageSize = pageSize, silent = false) => {
     if (!silent) {
       setLoading(true)
@@ -195,10 +208,7 @@ const AlertHistory = () => {
         getAlertHistory({
           skip: (nextPage - 1) * nextPageSize,
           limit: nextPageSize,
-          status: statusFilter,
-          severity: severityFilter,
-          alert_id: initialAlertId ? Number(initialAlertId) : undefined,
-          search: searchText || undefined,
+          ...buildFilterParams(),
         }),
         getAlertStats(),
       ])
@@ -216,14 +226,37 @@ const AlertHistory = () => {
     }
   }
 
+  const fetchSummary = async (silent = false) => {
+    if (!silent) {
+      setSummaryLoading(true)
+    }
+    try {
+      const result = await getAlertHistorySummary({
+        ...buildFilterParams(),
+        limit: 10,
+      })
+      setSummary(result)
+    } catch {
+      if (!silent) {
+        message.error('获取告警统计失败')
+      }
+    } finally {
+      if (!silent) {
+        setSummaryLoading(false)
+      }
+    }
+  }
+
   useEffect(() => {
     fetchData()
+    fetchSummary()
   }, [])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setPage(1)
       fetchData(1, pageSize)
+      fetchSummary()
     }, 300)
     return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -232,6 +265,7 @@ const AlertHistory = () => {
   useEffect(() => {
     const timer = window.setInterval(() => {
       fetchData(page, pageSize, true)
+      fetchSummary(true)
     }, 10000)
     return () => window.clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -242,6 +276,43 @@ const AlertHistory = () => {
     setSeverityFilter(undefined)
     setSearchText('')
     setPage(1)
+  }
+
+  const handleClearHistory = () => {
+    Modal.confirm({
+      title: '确认清除当前筛选下的告警历史？',
+      content: (
+        <Space direction="vertical" size={8}>
+          <Typography.Text>
+            当前筛选共 {total} 条。系统默认跳过“触发中 / 已确认 / 暂停复查”的活动告警，只清除可安全清理的历史记录。
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            如果要缩小范围，请先设置状态、级别或搜索条件后再清除。
+          </Typography.Text>
+        </Space>
+      ),
+      okText: '确认清除',
+      cancelText: '取消',
+      okButtonProps: { danger: true, loading: clearing },
+      onOk: async () => {
+        setClearing(true)
+        try {
+          const result = await clearAlertHistory({
+            ...buildFilterParams(),
+            include_active: false,
+            confirm_text: 'CLEAR',
+            actor_username: currentUser?.username,
+          })
+          message.success(`已清除 ${result.deleted_count} 条${result.protected_skipped ? `，跳过活动告警 ${result.protected_skipped} 条` : ''}`)
+          setPage(1)
+          await Promise.all([fetchData(1, pageSize), fetchSummary()])
+        } catch (error: any) {
+          message.error(error?.response?.data?.detail || '清除失败')
+        } finally {
+          setClearing(false)
+        }
+      },
+    })
   }
 
   const handleAcknowledge = async (id: number) => {
@@ -294,6 +365,60 @@ const AlertHistory = () => {
         </Col>
       </Row>
 
+      <Row gutter={16}>
+        <Col span={8}>
+          <Card title="按机房统计" loading={summaryLoading}>
+            <Table
+              size="small"
+              rowKey="name"
+              pagination={false}
+              dataSource={summary?.datacenters || []}
+              columns={[
+                { title: '机房', dataIndex: 'name', ellipsis: true },
+                { title: '告警数', dataIndex: 'count', width: 90, align: 'right' },
+              ]}
+            />
+          </Card>
+        </Col>
+        <Col span={8}>
+          <Card title="按日期统计" loading={summaryLoading}>
+            <Table
+              size="small"
+              rowKey="day"
+              pagination={{ pageSize: 5, size: 'small' }}
+              dataSource={summary?.days || []}
+              columns={[
+                { title: '日期', dataIndex: 'day', width: 130 },
+                { title: '告警数', dataIndex: 'count', width: 90, align: 'right' },
+              ]}
+            />
+          </Card>
+        </Col>
+        <Col span={8}>
+          <Card title="按设备统计 Top 10" loading={summaryLoading}>
+            <Table
+              size="small"
+              rowKey="device_id"
+              pagination={false}
+              dataSource={summary?.devices || []}
+              columns={[
+                {
+                  title: '设备',
+                  ellipsis: true,
+                  render: (_: unknown, record: AlertHistorySummary['devices'][number]) => (
+                    <Space direction="vertical" size={0}>
+                      <Typography.Text style={compactTextStyle}>{record.device_name}</Typography.Text>
+                      <span style={{ color: '#999', fontSize: 12 }}>{record.device_ip || '-'}</span>
+                    </Space>
+                  ),
+                },
+                { title: '告警数', dataIndex: 'count', width: 90, align: 'right' },
+              ]}
+            />
+          </Card>
+        </Col>
+      </Row>
+
       <Card
         title="告警历史"
         extra={
@@ -336,6 +461,13 @@ const AlertHistory = () => {
                 重置
               </Button>
             </Tooltip>
+            {canModify ? (
+              <Tooltip title="按当前筛选条件清除历史告警，默认跳过活动告警">
+                <Button danger icon={<DeleteOutlined />} loading={clearing} onClick={handleClearHistory}>
+                  清除当前筛选
+                </Button>
+              </Tooltip>
+            ) : null}
           </Space>
         }
       >

@@ -58,6 +58,13 @@ export interface AlertStats {
   by_device: Record<string, number>
 }
 
+export interface AlertHistorySummary {
+  total: number
+  datacenters: Array<{ name: string; count: number }>
+  days: Array<{ day: string; count: number }>
+  devices: Array<{ device_id: number; device_name: string; device_ip?: string | null; count: number }>
+}
+
 export interface AlertSilence {
   id: number
   name: string
@@ -205,6 +212,34 @@ export const getAlertHistory = async (params?: {
   search?: string
 }): Promise<{ total: number; items: AlertHistory[] }> => {
   return await request.get('/alerts/history', { params }) as { total: number; items: AlertHistory[] }
+}
+
+export const getAlertHistorySummary = async (params?: {
+  status?: string
+  device_id?: number
+  rule_id?: number
+  alert_id?: number
+  alarm_id?: string
+  severity?: string
+  search?: string
+  limit?: number
+}): Promise<AlertHistorySummary> => {
+  return await request.get('/alerts/history/summary', { params }) as AlertHistorySummary
+}
+
+export const clearAlertHistory = async (data: {
+  status?: string
+  device_id?: number
+  rule_id?: number
+  alert_id?: number
+  alarm_id?: string
+  severity?: string
+  search?: string
+  include_active?: boolean
+  confirm_text: string
+  actor_username?: string
+}): Promise<{ deleted_count: number; protected_skipped: number }> => {
+  return await request.post('/alerts/history/clear', data) as { deleted_count: number; protected_skipped: number }
 }
 
 export const acknowledgeAlert = async (id: number, note?: string, actor_username?: string): Promise<AlertHistory> => {

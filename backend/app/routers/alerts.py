@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from app.database import get_db
 from app.config import settings
-from app.models import AlertRule, AlertHistory, AlertSilence, Device, SyslogEvent, User
+from app.models import AlertRule, AlertHistory, AlertSilence, Datacenter, Device, SyslogEvent, User
 from app.routers.auth import get_current_active_user
 from app.tasks.alert_tasks import (
     CIRCUIT_METRIC_TYPES,
@@ -38,7 +38,7 @@ from app.utils import notification_manager, redis_client
 from app.utils.ip_match import is_exact_ip_address
 from app.schemas import (
     AlertRuleCreate, AlertRuleUpdate, AlertRuleResponse,
-    AlertHistoryResponse, AlertAcknowledge, AlertResolve, AlertIgnore, SyslogEventResponse,
+    AlertHistoryResponse, AlertAcknowledge, AlertResolve, AlertIgnore, AlertHistoryClear, SyslogEventResponse,
     AlertSilenceCreate, AlertSilenceUpdate
 )
 from app.core import get_logger
@@ -78,6 +78,7 @@ def _severity_filter_values(value: Optional[str]) -> List[str]:
 
 
 SILENCE_ACTIVE_STATUSES = ["firing", "acknowledged", "ignored", "snoozed"]
+CLEAR_PROTECTED_STATUSES = ["firing", "acknowledged", "snoozed"]
 
 
 def _get_silence_matched_alerts(
@@ -110,6 +111,47 @@ def _alert_matches_silence(silence: AlertSilence, alert: AlertHistory) -> bool:
 
 def _split_silence_values(value: Optional[str]) -> List[str]:
     return [item.strip() for item in re.split(r"[,，;；\n\r]+", value or "") if item.strip()]
+
+
+def _build_alert_history_query(
+    db: Session,
+    *,
+    status: Optional[str] = None,
+    device_id: Optional[int] = None,
+    rule_id: Optional[int] = None,
+    alert_id: Optional[int] = None,
+    alarm_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    query = db.query(AlertHistory).join(Device).outerjoin(AlertRule, AlertHistory.rule_id == AlertRule.id)
+
+    if status:
+        query = query.filter(AlertHistory.status == status)
+    if device_id:
+        query = query.filter(AlertHistory.device_id == device_id)
+    if rule_id:
+        query = query.filter(AlertHistory.rule_id == rule_id)
+    if alert_id:
+        query = query.filter(AlertHistory.id == alert_id)
+    if alarm_id:
+        query = query.filter(AlertHistory.alarm_id.ilike(f"%{alarm_id}%"))
+    if severity:
+        query = query.filter(AlertRule.severity.in_(_severity_filter_values(severity)))
+    if search:
+        keyword = f"%{search}%"
+        query = query.filter(
+            or_(
+                AlertHistory.message.ilike(keyword),
+                AlertHistory.alarm_id.ilike(keyword),
+                AlertHistory.alert_target_name.ilike(keyword),
+                AlertHistory.alert_target_key.ilike(keyword),
+                Device.name.ilike(keyword),
+                Device.ip_address.ilike(keyword),
+                AlertRule.name.ilike(keyword),
+            )
+        )
+    return query
 
 
 def _build_silence_candidate_query(
@@ -744,33 +786,16 @@ async def list_alert_history(
     search: Optional[str] = None,
 ):
     """获取告警历史列表"""
-    query = db.query(AlertHistory).join(Device).outerjoin(AlertRule, AlertHistory.rule_id == AlertRule.id)
-    
-    if status:
-        query = query.filter(AlertHistory.status == status)
-    if device_id:
-        query = query.filter(AlertHistory.device_id == device_id)
-    if rule_id:
-        query = query.filter(AlertHistory.rule_id == rule_id)
-    if alert_id:
-        query = query.filter(AlertHistory.id == alert_id)
-    if alarm_id:
-        query = query.filter(AlertHistory.alarm_id.ilike(f"%{alarm_id}%"))
-    if severity:
-        query = query.filter(AlertRule.severity.in_(_severity_filter_values(severity)))
-    if search:
-        keyword = f"%{search}%"
-        query = query.filter(
-            or_(
-                AlertHistory.message.ilike(keyword),
-                AlertHistory.alarm_id.ilike(keyword),
-                AlertHistory.alert_target_name.ilike(keyword),
-                AlertHistory.alert_target_key.ilike(keyword),
-                Device.name.ilike(keyword),
-                Device.ip_address.ilike(keyword),
-                AlertRule.name.ilike(keyword),
-            )
-        )
+    query = _build_alert_history_query(
+        db,
+        status=status,
+        device_id=device_id,
+        rule_id=rule_id,
+        alert_id=alert_id,
+        alarm_id=alarm_id,
+        severity=severity,
+        search=search,
+    )
     
     total = query.count()
     histories = query.order_by(AlertHistory.started_at.desc()).offset(skip).limit(limit).all()
@@ -778,6 +803,127 @@ async def list_alert_history(
     return {
         "total": total,
         "items": [h.to_dict() for h in histories]
+    }
+
+
+@router.get("/history/summary", response_model=dict)
+async def get_alert_history_summary(
+    db: Session = Depends(get_db),
+    status: Optional[str] = None,
+    device_id: Optional[int] = None,
+    rule_id: Optional[int] = None,
+    alert_id: Optional[int] = None,
+    alarm_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+):
+    """按当前筛选条件聚合告警历史。"""
+    base_query = _build_alert_history_query(
+        db,
+        status=status,
+        device_id=device_id,
+        rule_id=rule_id,
+        alert_id=alert_id,
+        alarm_id=alarm_id,
+        severity=severity,
+        search=search,
+    )
+
+    total = base_query.count()
+    datacenters = [
+        {"name": name or "未设置机房", "count": int(count or 0)}
+        for name, count in (
+            base_query
+            .outerjoin(Datacenter, Device.datacenter_id == Datacenter.id)
+            .with_entities(Datacenter.name, func.count(AlertHistory.id))
+            .group_by(Datacenter.name)
+            .order_by(func.count(AlertHistory.id).desc())
+            .limit(limit)
+            .all()
+        )
+    ]
+    devices = [
+        {
+            "device_id": device_id_value,
+            "device_name": device_name or f"设备 {device_id_value}",
+            "device_ip": device_ip,
+            "count": int(count or 0),
+        }
+        for device_id_value, device_name, device_ip, count in (
+            base_query
+            .with_entities(Device.id, Device.name, Device.ip_address, func.count(AlertHistory.id))
+            .group_by(Device.id, Device.name, Device.ip_address)
+            .order_by(func.count(AlertHistory.id).desc())
+            .limit(limit)
+            .all()
+        )
+    ]
+    days = [
+        {"day": str(day), "count": int(count or 0)}
+        for day, count in (
+            base_query
+            .with_entities(
+                func.date(func.timezone("Asia/Shanghai", AlertHistory.started_at)).label("day"),
+                func.count(AlertHistory.id),
+            )
+            .group_by("day")
+            .order_by("day")
+            .all()
+        )
+    ]
+
+    return {
+        "total": total,
+        "datacenters": datacenters,
+        "days": days,
+        "devices": devices,
+    }
+
+
+@router.post("/history/clear", response_model=dict)
+async def clear_alert_history(
+    payload: AlertHistoryClear,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """按筛选条件人工清除告警历史。"""
+    if (payload.confirm_text or "").strip().upper() != "CLEAR":
+        raise HTTPException(status_code=400, detail="确认码不正确，请输入 CLEAR")
+
+    query = _build_alert_history_query(
+        db,
+        status=payload.status,
+        device_id=payload.device_id,
+        rule_id=payload.rule_id,
+        alert_id=payload.alert_id,
+        alarm_id=payload.alarm_id,
+        severity=payload.severity,
+        search=payload.search,
+    )
+    protected_count = query.filter(AlertHistory.status.in_(CLEAR_PROTECTED_STATUSES)).count()
+    if protected_count and not payload.include_active:
+        query = query.filter(~AlertHistory.status.in_(CLEAR_PROTECTED_STATUSES))
+
+    target_ids = query.with_entities(AlertHistory.id).subquery()
+    deleted_count = (
+        db.query(AlertHistory)
+        .filter(AlertHistory.id.in_(target_ids))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    logger.warning(
+        "人工清除告警历史",
+        deleted_count=deleted_count,
+        protected_skipped=protected_count if not payload.include_active else 0,
+        user=(payload.actor_username or current_user.username or "admin"),
+        status=payload.status,
+        severity=payload.severity,
+        search=payload.search,
+    )
+    return {
+        "deleted_count": int(deleted_count or 0),
+        "protected_skipped": int(protected_count or 0) if not payload.include_active else 0,
     }
 
 

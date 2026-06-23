@@ -116,6 +116,20 @@ class AlertIgnore(BaseModel):
     actor_username: Optional[str] = None
 
 
+class AlertHistoryClear(BaseModel):
+    """批量清除告警历史"""
+    status: Optional[str] = None
+    severity: Optional[str] = None
+    search: Optional[str] = None
+    alert_id: Optional[int] = None
+    device_id: Optional[int] = None
+    rule_id: Optional[int] = None
+    alarm_id: Optional[str] = None
+    include_active: bool = False
+    confirm_text: str
+    actor_username: Optional[str] = None
+
+
 class AlertStats(BaseModel):
     """告警统计"""
     total_firing: int
