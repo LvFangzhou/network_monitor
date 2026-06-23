@@ -6,7 +6,7 @@ import json
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
@@ -921,6 +921,8 @@ async def list_alert_silences(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=200),
     enabled: Optional[bool] = None,
+    include_match_counts: bool = Query(True, description="是否同步计算命中告警数量"),
+    include_total_match_counts: bool = Query(True, description="是否同步计算历史命中告警数量"),
 ):
     query = db.query(AlertSilence)
     if enabled is not None:
@@ -930,8 +932,15 @@ async def list_alert_silences(
     response_items = []
     for item in items:
         data = item.to_dict()
-        data["matched_active_alerts"] = _count_silence_matches_cached(db, item, active_only=True)
-        data["matched_total_alerts"] = _count_silence_matches_cached(db, item, active_only=False)
+        if include_match_counts:
+            data["matched_active_alerts"] = _count_silence_matches_cached(db, item, active_only=True)
+            if include_total_match_counts:
+                data["matched_total_alerts"] = _count_silence_matches_cached(db, item, active_only=False)
+            else:
+                data["matched_total_alerts"] = None
+        else:
+            data["matched_active_alerts"] = None
+            data["matched_total_alerts"] = None
         response_items.append(data)
     return {"total": total, "items": response_items}
 
@@ -1022,28 +1031,38 @@ async def delete_alert_silence(
 @router.get("/stats")
 async def get_alert_stats(db: Session = Depends(get_db)):
     """获取告警统计"""
-    total_firing = db.query(AlertHistory).filter(AlertHistory.status == "firing").count()
-    total_resolved = db.query(AlertHistory).filter(AlertHistory.status == "resolved").count()
-    
-    # 按严重级别统计
+    status_counts = dict(
+        db.query(AlertHistory.status, func.count(AlertHistory.id))
+        .filter(AlertHistory.status.in_(["firing", "resolved"]))
+        .group_by(AlertHistory.status)
+        .all()
+    )
+    total_firing = int(status_counts.get("firing") or 0)
+    total_resolved = int(status_counts.get("resolved") or 0)
+
     by_severity = {}
-    severity_counts = db.query(AlertRule.severity, AlertHistory.id).join(
-        AlertHistory, AlertRule.id == AlertHistory.rule_id
-    ).filter(AlertHistory.status == "firing").all()
-    
-    for severity, _ in severity_counts:
+    severity_counts = (
+        db.query(AlertRule.severity, func.count(AlertHistory.id))
+        .join(AlertHistory, AlertRule.id == AlertHistory.rule_id)
+        .filter(AlertHistory.status == "firing")
+        .group_by(AlertRule.severity)
+        .all()
+    )
+    for severity, count in severity_counts:
         normalized = _normalize_severity(severity)
-        by_severity[normalized] = by_severity.get(normalized, 0) + 1
-    
-    # 按设备统计
-    by_device = {}
-    device_counts = db.query(Device.name, AlertHistory.id).join(
-        AlertHistory, Device.id == AlertHistory.device_id
-    ).filter(AlertHistory.status == "firing").all()
-    
-    for device_name, _ in device_counts:
-        by_device[device_name] = by_device.get(device_name, 0) + 1
-    
+        by_severity[normalized] = by_severity.get(normalized, 0) + int(count or 0)
+
+    by_device = {
+        device_name or "未知设备": int(count or 0)
+        for device_name, count in (
+            db.query(Device.name, func.count(AlertHistory.id))
+            .join(AlertHistory, Device.id == AlertHistory.device_id)
+            .filter(AlertHistory.status == "firing")
+            .group_by(Device.name)
+            .all()
+        )
+    }
+
     return {
         "total_firing": total_firing,
         "total_resolved": total_resolved,

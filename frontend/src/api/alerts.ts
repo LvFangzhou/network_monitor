@@ -77,8 +77,8 @@ export interface AlertSilence {
   created_by?: string | null
   enabled: boolean
   expires_at?: string | null
-  matched_active_alerts?: number
-  matched_total_alerts?: number
+  matched_active_alerts?: number | null
+  matched_total_alerts?: number | null
   created_at?: string | null
   updated_at?: string | null
 }
@@ -236,8 +236,14 @@ export const testAlertNotification = async (url: string): Promise<{ success: boo
   return await request.post('/alerts/test-notification', { url }) as { success: boolean; channel_type: string; message: string }
 }
 
-export const getAlertSilences = async (): Promise<{ total: number; items: AlertSilence[] }> => {
-  return await request.get('/alerts/silences') as { total: number; items: AlertSilence[] }
+export const getAlertSilences = async (params?: {
+  skip?: number
+  limit?: number
+  enabled?: boolean
+  include_match_counts?: boolean
+  include_total_match_counts?: boolean
+}): Promise<{ total: number; items: AlertSilence[] }> => {
+  return await request.get('/alerts/silences', { params }) as { total: number; items: AlertSilence[] }
 }
 
 export const getAlertSilenceMatches = async (

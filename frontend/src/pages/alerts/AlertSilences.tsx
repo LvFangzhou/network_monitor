@@ -107,7 +107,10 @@ const AlertSilences = () => {
       setLoading(true)
     }
     try {
-      const result = await getAlertSilences()
+      const result = await getAlertSilences({
+        include_match_counts: Boolean(options?.silent),
+        include_total_match_counts: false,
+      })
       setItems(result.items)
     } catch {
       message.error('获取告警屏蔽失败')
@@ -120,6 +123,10 @@ const AlertSilences = () => {
 
   useEffect(() => {
     fetchData()
+    const timer = window.setTimeout(() => {
+      void fetchData({ silent: true })
+    }, 100)
+    return () => window.clearTimeout(timer)
   }, [])
 
   const openCreate = () => {
@@ -275,8 +282,31 @@ const AlertSilences = () => {
           {
             title: '命中告警',
             render: (_: unknown, record: AlertSilence) => {
+              const countsLoading = record.matched_active_alerts === null || record.matched_total_alerts === null
               const activeCount = record.matched_active_alerts || 0
               const totalCount = record.matched_total_alerts || 0
+              if (countsLoading) {
+                return record.matched_active_alerts === null ? (
+                  <Tag color="processing">统计中</Tag>
+                ) : (
+                  <Space size={6}>
+                    <Tooltip title="当前仍处于触发、确认、忽略或暂缓状态的命中告警">
+                      <Tag color={activeCount > 0 ? 'red' : 'default'}>当前 {activeCount} 条</Tag>
+                    </Tooltip>
+                    <Tooltip title="历史命中数较重，点开后按需统计">
+                      <Tag color="default">历史 点击查看</Tag>
+                    </Tooltip>
+                    <Tooltip title="查看历史命中告警">
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<EyeOutlined />}
+                        onClick={() => openMatches(record)}
+                      />
+                    </Tooltip>
+                  </Space>
+                )
+              }
               return (
                 <Space size={6}>
                   <Tooltip title="当前仍处于触发、确认、忽略或暂缓状态的命中告警">

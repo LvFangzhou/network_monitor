@@ -240,3 +240,27 @@ def ensure_compatible_schema() -> None:
                 connection.execute(text("ALTER TABLE devices ADD COLUMN prometheus_job VARCHAR(100)"))
             if "prometheus_instance" not in device_columns:
                 connection.execute(text("ALTER TABLE devices ADD COLUMN prometheus_instance VARCHAR(255)"))
+
+        if "alert_histories" in table_names:
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_alert_histories_status_started "
+                "ON alert_histories (status, started_at DESC)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_alert_histories_status_rule "
+                "ON alert_histories (status, rule_id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_alert_histories_status_device "
+                "ON alert_histories (status, device_id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_alert_histories_rule_device_status "
+                "ON alert_histories (rule_id, device_id, status)"
+            ))
+
+        if "alert_silences" in table_names:
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_alert_silences_created_at "
+                "ON alert_silences (created_at DESC)"
+            ))
