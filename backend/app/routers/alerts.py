@@ -123,6 +123,7 @@ def _build_alert_history_query(
     alarm_id: Optional[str] = None,
     severity: Optional[str] = None,
     search: Optional[str] = None,
+    older_than_days: Optional[int] = None,
 ):
     query = db.query(AlertHistory).join(Device).outerjoin(AlertRule, AlertHistory.rule_id == AlertRule.id)
 
@@ -151,6 +152,9 @@ def _build_alert_history_query(
                 AlertRule.name.ilike(keyword),
             )
         )
+    if older_than_days is not None:
+        cutoff = _utc_now() - timedelta(days=max(0, int(older_than_days)))
+        query = query.filter(AlertHistory.started_at < cutoff)
     return query
 
 
@@ -816,6 +820,7 @@ async def get_alert_history_summary(
     alarm_id: Optional[str] = None,
     severity: Optional[str] = None,
     search: Optional[str] = None,
+    older_than_days: Optional[int] = Query(None, ge=0),
     limit: int = Query(10, ge=1, le=50),
 ):
     """按当前筛选条件聚合告警历史。"""
@@ -828,9 +833,11 @@ async def get_alert_history_summary(
         alarm_id=alarm_id,
         severity=severity,
         search=search,
+        older_than_days=older_than_days,
     )
 
     total = base_query.count()
+    protected_total = base_query.filter(AlertHistory.status.in_(CLEAR_PROTECTED_STATUSES)).count()
     datacenters = [
         {"name": name or "未设置机房", "count": int(count or 0)}
         for name, count in (
@@ -875,6 +882,8 @@ async def get_alert_history_summary(
 
     return {
         "total": total,
+        "protected_total": int(protected_total or 0),
+        "deletable_total": int((total or 0) - (protected_total or 0)),
         "datacenters": datacenters,
         "days": days,
         "devices": devices,
@@ -900,6 +909,7 @@ async def clear_alert_history(
         alarm_id=payload.alarm_id,
         severity=payload.severity,
         search=payload.search,
+        older_than_days=payload.older_than_days,
     )
     protected_count = query.filter(AlertHistory.status.in_(CLEAR_PROTECTED_STATUSES)).count()
     if protected_count and not payload.include_active:
@@ -920,6 +930,7 @@ async def clear_alert_history(
         status=payload.status,
         severity=payload.severity,
         search=payload.search,
+        older_than_days=payload.older_than_days,
     )
     return {
         "deleted_count": int(deleted_count or 0),

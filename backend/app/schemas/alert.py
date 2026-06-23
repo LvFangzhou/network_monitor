@@ -125,6 +125,7 @@ class AlertHistoryClear(BaseModel):
     device_id: Optional[int] = None
     rule_id: Optional[int] = None
     alarm_id: Optional[str] = None
+    older_than_days: Optional[int] = None
     include_active: bool = False
     confirm_text: str
     actor_username: Optional[str] = None

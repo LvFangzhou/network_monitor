@@ -67,6 +67,13 @@ const severityColors: Record<string, string> = {
 }
 
 const chartColors = ['#2563eb', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#f97316', '#14b8a6', '#6366f1', '#84cc16']
+const cleanupOptions = [
+  { label: '30天前', days: 30 },
+  { label: '15天前', days: 15 },
+  { label: '7天前', days: 7 },
+  { label: '3天前', days: 3 },
+  { label: '所有', days: undefined },
+]
 
 const compactTextStyle: CSSProperties = {
   display: 'block',
@@ -335,16 +342,39 @@ const AlertHistory = () => {
     setPage(1)
   }
 
-  const handleClearHistory = () => {
+  const handleClearHistory = async (olderThanDays?: number, label = '当前筛选') => {
+    setClearing(true)
+    let previewTotal = total
+    let previewProtected = 0
+    let previewDeletable = total
+    try {
+      const preview = await getAlertHistorySummary({
+        ...buildFilterParams(),
+        older_than_days: olderThanDays,
+        limit: 1,
+      })
+      previewTotal = preview.total || 0
+      previewProtected = preview.protected_total || 0
+      previewDeletable = preview.deletable_total ?? Math.max(0, previewTotal - previewProtected)
+    } catch (error: any) {
+      setClearing(false)
+      message.error(error?.response?.data?.detail || '获取清理数量失败')
+      return
+    }
+    setClearing(false)
+
     Modal.confirm({
-      title: '确认清除当前筛选下的告警历史？',
+      title: `确认清除${label}的告警历史？`,
       content: (
         <Space direction="vertical" size={8}>
           <Typography.Text>
-            当前筛选共 {total} 条。系统默认跳过“触发中 / 已确认 / 暂停复查”的活动告警，只清除可安全清理的历史记录。
+            当前选中共 {previewTotal} 条，预计清除 {previewDeletable} 条。
+          </Typography.Text>
+          <Typography.Text>
+            系统默认跳过“触发中 / 已确认 / 暂停复查”的活动告警{previewProtected ? `，本次将跳过 ${previewProtected} 条。` : '。'}
           </Typography.Text>
           <Typography.Text type="secondary">
-            如果要缩小范围，请先设置状态、级别或搜索条件后再清除。
+            如果要缩小范围，请先设置状态、级别或搜索条件后再清除；这些快捷按钮会跟随当前筛选条件。
           </Typography.Text>
         </Space>
       ),
@@ -356,6 +386,7 @@ const AlertHistory = () => {
         try {
           const result = await clearAlertHistory({
             ...buildFilterParams(),
+            older_than_days: olderThanDays,
             include_active: false,
             confirm_text: 'CLEAR',
             actor_username: currentUser?.username,
@@ -601,11 +632,23 @@ const AlertHistory = () => {
               </Button>
             </Tooltip>
             {canModify ? (
-              <Tooltip title="按当前筛选条件清除历史告警，默认跳过活动告警">
-                <Button danger icon={<DeleteOutlined />} loading={clearing} onClick={handleClearHistory}>
-                  清除当前筛选
-                </Button>
-              </Tooltip>
+              <Space.Compact>
+                {cleanupOptions.map((option) => (
+                  <Tooltip
+                    key={option.label}
+                    title={`清除当前筛选下${option.days ? `${option.days}天前` : '所有'}的历史告警，默认跳过活动告警`}
+                  >
+                    <Button
+                      danger
+                      icon={option.days === 30 ? <DeleteOutlined /> : undefined}
+                      loading={clearing}
+                      onClick={() => handleClearHistory(option.days, option.days ? `${option.label}` : '所有')}
+                    >
+                      清{option.label}
+                    </Button>
+                  </Tooltip>
+                ))}
+              </Space.Compact>
             ) : null}
           </Space>
         }

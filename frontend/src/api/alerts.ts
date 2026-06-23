@@ -60,6 +60,8 @@ export interface AlertStats {
 
 export interface AlertHistorySummary {
   total: number
+  protected_total?: number
+  deletable_total?: number
   datacenters: Array<{ name: string; count: number }>
   days: Array<{ day: string; count: number }>
   devices: Array<{ device_id: number; device_name: string; device_ip?: string | null; count: number }>
@@ -222,6 +224,7 @@ export const getAlertHistorySummary = async (params?: {
   alarm_id?: string
   severity?: string
   search?: string
+  older_than_days?: number
   limit?: number
 }): Promise<AlertHistorySummary> => {
   return await request.get('/alerts/history/summary', { params }) as AlertHistorySummary
@@ -235,6 +238,7 @@ export const clearAlertHistory = async (data: {
   alarm_id?: string
   severity?: string
   search?: string
+  older_than_days?: number
   include_active?: boolean
   confirm_text: string
   actor_username?: string
