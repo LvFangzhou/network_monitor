@@ -240,30 +240,24 @@ select,
   line-height: 1.9;
 }
 
-.login-signal-card {
-  width: min(540px, 100%);
-  margin-top: 0;
-  padding: 22px 24px;
+.login-meme-card {
+  width: min(500px, 100%);
+  margin: 0 auto;
+  padding: 14px;
   border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 22px;
-  background: rgba(7, 20, 55, 0.24);
-  box-shadow: 0 24px 60px rgba(2, 8, 23, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  border-radius: 28px;
+  background: rgba(255, 255, 255, 0.16);
+  box-shadow: 0 28px 70px rgba(2, 8, 23, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.18);
   backdrop-filter: blur(18px);
 }
 
-.login-signal-bars {
-  height: 96px;
-  display: flex;
-  align-items: end;
-  gap: 7px;
-}
-
-.login-signal-bars span {
-  flex: 1;
-  min-width: 5px;
-  border-radius: 999px 999px 4px 4px;
-  background: linear-gradient(180deg, #dbeafe, rgba(125, 211, 252, 0.42));
-  box-shadow: 0 0 18px rgba(147, 197, 253, 0.48);
+.login-meme-card img {
+  display: block;
+  width: 100%;
+  max-height: min(68vh, 540px);
+  object-fit: contain;
+  border-radius: 20px;
+  background: #ffffff;
 }
 
 .login-feature-row {

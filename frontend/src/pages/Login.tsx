@@ -57,12 +57,8 @@ const Login = () => {
 
       <div className="login-stage">
         <section className="login-hero-panel" aria-hidden="true">
-          <div className="login-signal-card">
-            <div className="login-signal-bars">
-              {Array.from({ length: 18 }).map((_, index) => (
-                <span key={index} style={{ height: 12 + ((index * 7) % 28) }} />
-              ))}
-            </div>
+          <div className="login-meme-card">
+            <img src="/login-ops-meme.jpg" alt="" />
           </div>
         </section>
 
