@@ -10,7 +10,7 @@ import bcrypt
 from typing import Optional
 
 from app.database import get_db
-from app.models import AuditLog, User, Role, Permission, DEFAULT_PERMISSIONS, DEFAULT_MENU_PERMISSIONS
+from app.models import AuditLog, CustomerAudit, CircuitAudit, User, Role, Permission, DEFAULT_PERMISSIONS, DEFAULT_MENU_PERMISSIONS
 from app.schemas import (
     UserCreate, UserUpdate, UserResponse, Token,
 )
@@ -513,6 +513,18 @@ async def delete_user(
     db_user = db.query(User).filter(User.id == user_id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="用户不存在")
+    db.query(AuditLog).filter(AuditLog.user_id == user_id).update(
+        {AuditLog.user_id: None},
+        synchronize_session=False,
+    )
+    db.query(CustomerAudit).filter(CustomerAudit.actor_user_id == user_id).update(
+        {CustomerAudit.actor_user_id: None},
+        synchronize_session=False,
+    )
+    db.query(CircuitAudit).filter(CircuitAudit.actor_user_id == user_id).update(
+        {CircuitAudit.actor_user_id: None},
+        synchronize_session=False,
+    )
     db.delete(db_user)
     db.commit()
     return {"message": "用户已删除"}
