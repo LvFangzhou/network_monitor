@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import React, { Suspense, lazy, useEffect } from 'react'
+import { Spin } from 'antd'
 import { useAuthStore } from './store/auth'
 import request from './api/request'
 import Layout from './components/Layout'
@@ -111,25 +112,9 @@ const RouteAuditTracker = () => {
 }
 
 const RouteFallback = () => (
-  <div style={{ padding: 24 }}>
-    <div
-      style={{
-        height: 3,
-        width: 180,
-        borderRadius: 999,
-        overflow: 'hidden',
-        background: 'rgba(37, 99, 235, 0.12)',
-      }}
-    >
-      <div
-        style={{
-          width: '45%',
-          height: '100%',
-          borderRadius: 999,
-          background: 'linear-gradient(90deg, #2563eb, #10b981)',
-          animation: 'route-loading 0.9s ease-in-out infinite alternate',
-        }}
-      />
+  <div className="route-spin-fallback">
+    <div className="route-spin-card">
+      <Spin size="large" />
     </div>
   </div>
 )
