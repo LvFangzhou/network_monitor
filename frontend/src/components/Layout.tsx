@@ -189,10 +189,14 @@ const Layout = () => {
           bottom: 0,
           padding: collapsed ? '14px 8px' : '14px 12px',
           background: appTheme === 'dark'
-            ? 'linear-gradient(180deg, #111c33 0%, #10203a 48%, #0f2748 100%)'
-            : 'linear-gradient(180deg, #18345f 0%, #16416d 48%, #155e75 100%)',
-          boxShadow: '14px 0 36px rgba(15, 23, 42, 0.14)',
-          borderRight: '1px solid rgba(255,255,255,0.10)',
+            ? 'linear-gradient(180deg, #102a43 0%, #12395c 50%, #0f4c75 100%)'
+            : 'linear-gradient(180deg, #e0f7ff 0%, #d4f1ff 42%, #edf9ff 100%)',
+          boxShadow: appTheme === 'dark'
+            ? '14px 0 36px rgba(2, 8, 23, 0.24)'
+            : '14px 0 36px rgba(14, 165, 233, 0.12)',
+          borderRight: appTheme === 'dark'
+            ? '1px solid rgba(255,255,255,0.10)'
+            : '1px solid rgba(14, 165, 233, 0.16)',
         }}
       >
         <div
@@ -202,15 +206,21 @@ const Layout = () => {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            color: '#fff',
+            color: appTheme === 'dark' ? '#fff' : '#075985',
             fontSize: collapsed ? 14 : 18,
             fontWeight: 800,
             letterSpacing: collapsed ? 0 : 1,
             borderRadius: collapsed ? 18 : 20,
             marginBottom: 14,
-            background: 'linear-gradient(135deg, rgba(255,255,255,0.18), rgba(125,211,252,0.14), rgba(16,185,129,0.12))',
-            border: '1px solid rgba(255,255,255,0.16)',
-            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.18), 0 12px 28px rgba(2, 8, 23, 0.16)',
+            background: appTheme === 'dark'
+              ? 'linear-gradient(135deg, rgba(255,255,255,0.18), rgba(125,211,252,0.14), rgba(16,185,129,0.12))'
+              : 'linear-gradient(135deg, rgba(255,255,255,0.94), rgba(186,230,253,0.72), rgba(224,242,254,0.92))',
+            border: appTheme === 'dark'
+              ? '1px solid rgba(255,255,255,0.16)'
+              : '1px solid rgba(14, 165, 233, 0.18)',
+            boxShadow: appTheme === 'dark'
+              ? 'inset 0 1px 0 rgba(255,255,255,0.18), 0 12px 28px rgba(2, 8, 23, 0.16)'
+              : 'inset 0 1px 0 rgba(255,255,255,0.86), 0 12px 28px rgba(14, 165, 233, 0.14)',
           }}
         >
           {collapsed ? 'NM' : 'Network Ops'}

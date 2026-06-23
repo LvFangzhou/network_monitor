@@ -139,7 +139,7 @@ select,
 
 .modern-sider {
   scrollbar-width: thin;
-  scrollbar-color: rgba(186, 230, 253, 0.38) transparent;
+  scrollbar-color: rgba(14, 165, 233, 0.32) transparent;
 }
 
 .modern-sider::before {
@@ -148,9 +148,9 @@ select,
   inset: 0;
   pointer-events: none;
   background:
-    radial-gradient(circle at 18% 8%, rgba(125, 211, 252, 0.22), transparent 30%),
-    radial-gradient(circle at 86% 34%, rgba(16, 185, 129, 0.14), transparent 28%),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.08), transparent 38%);
+    radial-gradient(circle at 18% 8%, rgba(14, 165, 233, 0.22), transparent 30%),
+    radial-gradient(circle at 82% 38%, rgba(56, 189, 248, 0.20), transparent 28%),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.60), transparent 46%);
 }
 
 .modern-sider .ant-layout-sider-children {
@@ -174,7 +174,7 @@ select,
 
 .modern-sider .ant-menu {
   padding: 4px 0;
-  color: rgba(226, 232, 240, 0.86);
+  color: rgba(12, 74, 110, 0.82);
 }
 
 .modern-sider .ant-menu-item,
@@ -184,22 +184,22 @@ select,
   margin: 4px 0 !important;
   width: 100% !important;
   border-radius: 14px !important;
-  color: rgba(226, 232, 240, 0.82) !important;
+  color: rgba(12, 74, 110, 0.78) !important;
   transition: background 0.18s ease, color 0.18s ease, transform 0.18s ease;
 }
 
 .modern-sider .ant-menu-item:hover,
 .modern-sider .ant-menu-submenu-title:hover {
-  color: #ffffff !important;
-  background: rgba(255, 255, 255, 0.10) !important;
+  color: #0369a1 !important;
+  background: rgba(255, 255, 255, 0.70) !important;
   transform: translateX(2px);
 }
 
 .modern-sider .ant-menu-item-selected {
   color: #ffffff !important;
   background:
-    linear-gradient(135deg, rgba(59, 130, 246, 0.72), rgba(14, 165, 233, 0.56)) !important;
-  box-shadow: 0 12px 24px rgba(37, 99, 235, 0.24);
+    linear-gradient(135deg, rgba(14, 165, 233, 0.92), rgba(37, 99, 235, 0.78)) !important;
+  box-shadow: 0 12px 24px rgba(14, 165, 233, 0.26);
 }
 
 .modern-sider .ant-menu-item-selected::after {
@@ -207,14 +207,15 @@ select,
 }
 
 .modern-sider .ant-menu-submenu-selected > .ant-menu-submenu-title {
-  color: #ffffff !important;
+  color: #0369a1 !important;
 }
 
 .modern-sider .ant-menu-sub.ant-menu-inline {
-  background: rgba(2, 8, 23, 0.10) !important;
+  background: rgba(255, 255, 255, 0.36) !important;
   border-radius: 16px;
   padding: 4px 6px;
   margin: 2px 0 8px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.48);
 }
 
 .modern-sider .ant-menu-sub.ant-menu-inline .ant-menu-item {
@@ -222,7 +223,7 @@ select,
   line-height: 36px !important;
   margin: 3px 0 !important;
   border-radius: 12px !important;
-  color: rgba(226, 232, 240, 0.74) !important;
+  color: rgba(12, 74, 110, 0.70) !important;
 }
 
 .modern-sider .ant-menu-inline-collapsed .ant-menu-item,
@@ -246,8 +247,51 @@ select,
 }
 
 .modern-sider::-webkit-scrollbar-thumb {
-  background: rgba(186, 230, 253, 0.34);
+  background: rgba(14, 165, 233, 0.28);
   border-radius: 999px;
+}
+
+html[data-theme='dark'] .modern-sider {
+  scrollbar-color: rgba(186, 230, 253, 0.38) transparent;
+}
+
+html[data-theme='dark'] .modern-sider::before {
+  background:
+    radial-gradient(circle at 18% 8%, rgba(125, 211, 252, 0.22), transparent 30%),
+    radial-gradient(circle at 86% 34%, rgba(16, 185, 129, 0.14), transparent 28%),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.08), transparent 38%);
+}
+
+html[data-theme='dark'] .modern-sider .ant-menu {
+  color: rgba(226, 232, 240, 0.86);
+}
+
+html[data-theme='dark'] .modern-sider .ant-menu-item,
+html[data-theme='dark'] .modern-sider .ant-menu-submenu-title {
+  color: rgba(226, 232, 240, 0.82) !important;
+}
+
+html[data-theme='dark'] .modern-sider .ant-menu-item:hover,
+html[data-theme='dark'] .modern-sider .ant-menu-submenu-title:hover {
+  color: #ffffff !important;
+  background: rgba(255, 255, 255, 0.10) !important;
+}
+
+html[data-theme='dark'] .modern-sider .ant-menu-submenu-selected > .ant-menu-submenu-title {
+  color: #ffffff !important;
+}
+
+html[data-theme='dark'] .modern-sider .ant-menu-sub.ant-menu-inline {
+  background: rgba(2, 8, 23, 0.10) !important;
+  box-shadow: none;
+}
+
+html[data-theme='dark'] .modern-sider .ant-menu-sub.ant-menu-inline .ant-menu-item {
+  color: rgba(226, 232, 240, 0.74) !important;
+}
+
+html[data-theme='dark'] .modern-sider::-webkit-scrollbar-thumb {
+  background: rgba(186, 230, 253, 0.34);
 }
 
 @keyframes brand-sheen {
