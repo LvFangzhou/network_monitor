@@ -56,12 +56,6 @@ const Login = () => {
       <div className="login-glow login-glow-b" />
 
       <div className="login-stage">
-        <section className="login-hero-panel" aria-hidden="true">
-          <div className="login-meme-card">
-            <img src="/login-ops-meme.jpg" alt="" />
-          </div>
-        </section>
-
         <Card className="login-card">
           <div className="login-card-header">
             <div className="login-card-icon">

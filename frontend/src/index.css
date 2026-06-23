@@ -197,86 +197,7 @@ select,
 .login-stage {
   position: relative;
   z-index: 1;
-  width: min(1120px, 100%);
-  display: grid;
-  grid-template-columns: minmax(0, 1.16fr) 430px;
-  gap: 36px;
-  align-items: center;
-}
-
-.login-hero-panel {
-  color: #fff;
-  padding: 18px 8px;
-}
-
-.login-brand-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 9px 14px;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.12);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.20);
-  backdrop-filter: blur(16px);
-  font-weight: 700;
-  letter-spacing: 0.02em;
-}
-
-.login-hero-title.ant-typography {
-  max-width: 680px;
-  margin: 24px 0 16px;
-  color: #fff;
-  font-size: clamp(36px, 5vw, 58px);
-  line-height: 1.05;
-  letter-spacing: -0.04em;
-}
-
-.login-hero-subtitle.ant-typography {
-  display: block;
-  max-width: 620px;
-  color: rgba(239, 246, 255, 0.82);
-  font-size: 16px;
-  line-height: 1.9;
-}
-
-.login-meme-card {
-  width: min(500px, 100%);
-  margin: 0 auto;
-  padding: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 28px;
-  background: rgba(255, 255, 255, 0.16);
-  box-shadow: 0 28px 70px rgba(2, 8, 23, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.18);
-  backdrop-filter: blur(18px);
-}
-
-.login-meme-card img {
-  display: block;
-  width: 100%;
-  max-height: min(68vh, 540px);
-  object-fit: contain;
-  border-radius: 20px;
-  background: #ffffff;
-}
-
-.login-feature-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin-top: 18px;
-}
-
-.login-feature {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
-  border-radius: 14px;
-  color: rgba(239, 246, 255, 0.88);
-  background: rgba(255, 255, 255, 0.11);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  backdrop-filter: blur(14px);
+  width: min(430px, 100%);
 }
 
 .login-card.ant-card {
@@ -513,17 +434,8 @@ html[data-theme='dark'] .modern-sider::-webkit-scrollbar-thumb {
 }
 
 @media (max-width: 920px) {
-  .login-stage {
-    grid-template-columns: 1fr;
-  }
-
-  .login-hero-panel {
-    display: none;
-  }
-
   .login-card {
     width: min(430px, 100%);
-    justify-self: center;
   }
 }
 
