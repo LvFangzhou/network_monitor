@@ -137,6 +137,128 @@ select,
   backdrop-filter: blur(18px);
 }
 
+.modern-sider {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(186, 230, 253, 0.38) transparent;
+}
+
+.modern-sider::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 8%, rgba(125, 211, 252, 0.22), transparent 30%),
+    radial-gradient(circle at 86% 34%, rgba(16, 185, 129, 0.14), transparent 28%),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.08), transparent 38%);
+}
+
+.modern-sider .ant-layout-sider-children {
+  position: relative;
+  z-index: 1;
+}
+
+.modern-sider-brand {
+  position: relative;
+  overflow: hidden;
+}
+
+.modern-sider-brand::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, transparent 0%, rgba(255, 255, 255, 0.18) 46%, transparent 68%);
+  transform: translateX(-110%);
+  animation: brand-sheen 5s ease-in-out infinite;
+}
+
+.modern-sider .ant-menu {
+  padding: 4px 0;
+  color: rgba(226, 232, 240, 0.86);
+}
+
+.modern-sider .ant-menu-item,
+.modern-sider .ant-menu-submenu-title {
+  height: 42px !important;
+  line-height: 42px !important;
+  margin: 4px 0 !important;
+  width: 100% !important;
+  border-radius: 14px !important;
+  color: rgba(226, 232, 240, 0.82) !important;
+  transition: background 0.18s ease, color 0.18s ease, transform 0.18s ease;
+}
+
+.modern-sider .ant-menu-item:hover,
+.modern-sider .ant-menu-submenu-title:hover {
+  color: #ffffff !important;
+  background: rgba(255, 255, 255, 0.10) !important;
+  transform: translateX(2px);
+}
+
+.modern-sider .ant-menu-item-selected {
+  color: #ffffff !important;
+  background:
+    linear-gradient(135deg, rgba(59, 130, 246, 0.72), rgba(14, 165, 233, 0.56)) !important;
+  box-shadow: 0 12px 24px rgba(37, 99, 235, 0.24);
+}
+
+.modern-sider .ant-menu-item-selected::after {
+  display: none !important;
+}
+
+.modern-sider .ant-menu-submenu-selected > .ant-menu-submenu-title {
+  color: #ffffff !important;
+}
+
+.modern-sider .ant-menu-sub.ant-menu-inline {
+  background: rgba(2, 8, 23, 0.10) !important;
+  border-radius: 16px;
+  padding: 4px 6px;
+  margin: 2px 0 8px;
+}
+
+.modern-sider .ant-menu-sub.ant-menu-inline .ant-menu-item {
+  height: 36px !important;
+  line-height: 36px !important;
+  margin: 3px 0 !important;
+  border-radius: 12px !important;
+  color: rgba(226, 232, 240, 0.74) !important;
+}
+
+.modern-sider .ant-menu-inline-collapsed .ant-menu-item,
+.modern-sider .ant-menu-inline-collapsed .ant-menu-submenu-title {
+  padding-inline: 0 !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modern-sider .ant-menu-inline-collapsed .anticon {
+  font-size: 18px;
+}
+
+.modern-sider::-webkit-scrollbar {
+  width: 4px;
+}
+
+.modern-sider::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.modern-sider::-webkit-scrollbar-thumb {
+  background: rgba(186, 230, 253, 0.34);
+  border-radius: 999px;
+}
+
+@keyframes brand-sheen {
+  0%, 60% {
+    transform: translateX(-110%);
+  }
+  82%, 100% {
+    transform: translateX(110%);
+  }
+}
+
 @keyframes route-loading {
   from {
     transform: translateX(-25%);

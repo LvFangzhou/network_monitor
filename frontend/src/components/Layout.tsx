@@ -175,6 +175,7 @@ const Layout = () => {
   return (
     <AntLayout data-theme={appTheme} style={{ minHeight: '100vh', background: colorBgLayout }}>
       <Sider
+        className="modern-sider"
         trigger={null}
         collapsible
         collapsed={collapsed}
@@ -186,14 +187,16 @@ const Layout = () => {
           left: 0,
           top: 0,
           bottom: 0,
-          padding: '14px 10px',
+          padding: collapsed ? '14px 8px' : '14px 12px',
           background: appTheme === 'dark'
-            ? 'linear-gradient(180deg, #0f172a 0%, #111827 56%, #0b1020 100%)'
-            : 'linear-gradient(180deg, #0f172a 0%, #111827 58%, #172554 100%)',
-          boxShadow: '10px 0 30px rgba(15, 23, 42, 0.18)',
+            ? 'linear-gradient(180deg, #111c33 0%, #10203a 48%, #0f2748 100%)'
+            : 'linear-gradient(180deg, #18345f 0%, #16416d 48%, #155e75 100%)',
+          boxShadow: '14px 0 36px rgba(15, 23, 42, 0.14)',
+          borderRight: '1px solid rgba(255,255,255,0.10)',
         }}
       >
         <div
+          className="modern-sider-brand"
           style={{
             height: 56,
             display: 'flex',
@@ -203,10 +206,11 @@ const Layout = () => {
             fontSize: collapsed ? 14 : 18,
             fontWeight: 800,
             letterSpacing: collapsed ? 0 : 1,
-            borderRadius: 16,
+            borderRadius: collapsed ? 18 : 20,
             marginBottom: 14,
-            background: 'linear-gradient(135deg, rgba(59,130,246,0.24), rgba(16,185,129,0.14))',
-            border: '1px solid rgba(255,255,255,0.10)',
+            background: 'linear-gradient(135deg, rgba(255,255,255,0.18), rgba(125,211,252,0.14), rgba(16,185,129,0.12))',
+            border: '1px solid rgba(255,255,255,0.16)',
+            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.18), 0 12px 28px rgba(2, 8, 23, 0.16)',
           }}
         >
           {collapsed ? 'NM' : 'Network Ops'}
