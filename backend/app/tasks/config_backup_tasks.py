@@ -4,7 +4,7 @@ import hashlib
 import io
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import defaultdict
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -20,6 +20,7 @@ from app.utils.config_backup_settings import config_backup_notification_channels
 
 logger = get_logger(__name__)
 CONFIG_BACKUP_CONCURRENCY = max(1, int(os.getenv("CONFIG_BACKUP_CONCURRENCY", "16")))
+CONFIG_BACKUP_WAIT_TIMEOUT_SECONDS = max(1, int(os.getenv("CONFIG_BACKUP_WAIT_TIMEOUT_SECONDS", "2")))
 
 
 def _utc_now() -> datetime:
@@ -344,6 +345,14 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
             db.commit()
             db.refresh(job)
         else:
+            if job.status == "cancelled":
+                return {
+                    "job_id": job.id,
+                    "status": job.status,
+                    "total_devices": job.total_devices,
+                    "success_count": job.success_count,
+                    "failed_count": job.failed_count,
+                }
             job.status = "running"
             job.started_at = _utc_now()
             job.error_message = None
@@ -380,44 +389,99 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
         db.commit()
 
         max_workers = min(CONFIG_BACKUP_CONCURRENCY, max(1, len(payloads)))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             future_map = {executor.submit(_backup_device_payload, payload): payload for payload in payloads}
-            for future in as_completed(future_map):
-                backup_result = future.result()
-                result_id = result_ids.get(backup_result["id"])
-                if not result_id:
+            pending_futures = set(future_map.keys())
+            while pending_futures:
+                db.refresh(job)
+                if job.status == "cancelled":
+                    for future in pending_futures:
+                        future.cancel()
+                    for future in pending_futures:
+                        payload = future_map[future]
+                        result_id = result_ids.get(payload["id"])
+                        if not result_id:
+                            continue
+                        result = db.query(ConfigBackupResult).filter(ConfigBackupResult.id == result_id).first()
+                        if result and result.status in {"pending", "running"}:
+                            result.status = "failed"
+                            result.error_message = "任务已手动取消"
+                            result.finished_at = _utc_now()
+                    job.error_message = "任务已手动取消"
+                    job.finished_at = _utc_now()
+                    db.commit()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return {
+                        "job_id": job.id,
+                        "status": job.status,
+                        "total_devices": job.total_devices,
+                        "success_count": job.success_count,
+                        "failed_count": job.failed_count,
+                    }
+
+                done, pending_futures = wait(
+                    pending_futures,
+                    timeout=CONFIG_BACKUP_WAIT_TIMEOUT_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
                     continue
 
-                result = db.query(ConfigBackupResult).filter(ConfigBackupResult.id == result_id).first()
-                if not result:
-                    continue
+                for future in done:
+                    if future.cancelled():
+                        continue
+                    try:
+                        backup_result = future.result()
+                    except Exception as exc:
+                        payload = future_map.get(future, {})
+                        backup_result = {
+                            **payload,
+                            "status": "failed",
+                            "command": None,
+                            "config_content": None,
+                            "config_hash": None,
+                            "line_count": 0,
+                            "error_message": str(exc)[:2000],
+                            "started_at": _utc_now(),
+                            "finished_at": _utc_now(),
+                        }
+                    result_id = result_ids.get(backup_result["id"])
+                    if not result_id:
+                        continue
 
-                result.status = backup_result["status"]
-                result.command = backup_result.get("command")
-                result.config_content = backup_result.get("config_content")
-                result.config_hash = backup_result.get("config_hash")
-                result.line_count = backup_result.get("line_count") or 0
-                result.error_message = backup_result.get("error_message")
-                result.started_at = backup_result.get("started_at")
-                result.finished_at = backup_result.get("finished_at")
+                    result = db.query(ConfigBackupResult).filter(ConfigBackupResult.id == result_id).first()
+                    if not result:
+                        continue
 
-                datacenter = backup_result.get("datacenter_name") or "未设置机房"
-                if result.status == "success":
-                    job.success_count += 1
-                    datacenter_stats[datacenter]["success"] += 1
-                else:
-                    job.failed_count += 1
-                    datacenter_stats[datacenter]["failed"] += 1
-                db.commit()
+                    result.status = backup_result["status"]
+                    result.command = backup_result.get("command")
+                    result.config_content = backup_result.get("config_content")
+                    result.config_hash = backup_result.get("config_hash")
+                    result.line_count = backup_result.get("line_count") or 0
+                    result.error_message = backup_result.get("error_message")
+                    result.started_at = backup_result.get("started_at")
+                    result.finished_at = backup_result.get("finished_at")
 
-                if (job.success_count + job.failed_count) % 10 == 0:
-                    logger.info(
-                        "配置备份进度",
-                        job_id=job.id,
-                        success=job.success_count,
-                        failed=job.failed_count,
-                        total=job.total_devices,
-                    )
+                    datacenter = backup_result.get("datacenter_name") or "未设置机房"
+                    if result.status == "success":
+                        job.success_count += 1
+                        datacenter_stats[datacenter]["success"] += 1
+                    else:
+                        job.failed_count += 1
+                        datacenter_stats[datacenter]["failed"] += 1
+                    db.commit()
+
+                    if (job.success_count + job.failed_count) % 10 == 0:
+                        logger.info(
+                            "配置备份进度",
+                            job_id=job.id,
+                            success=job.success_count,
+                            failed=job.failed_count,
+                            total=job.total_devices,
+                        )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         job.status = "success" if job.failed_count == 0 else ("partial_failed" if job.success_count else "failed")
         job.finished_at = _utc_now()

@@ -30,7 +30,7 @@ import { useThemeStore } from '../store/theme'
 const { Header, Sider, Content } = AntLayout
 
 const Layout = () => {
-  const [collapsed, setCollapsed] = useState(() => localStorage.getItem('layoutCollapsed') === 'true')
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem('layoutCollapsed') !== 'false')
   const navigate = useNavigate()
   const location = useLocation()
   const { user, logout } = useAuthStore()
@@ -139,7 +139,18 @@ const Layout = () => {
     },
   ]
 
-  const menuItems = filterMenuItems(baseMenuItems)
+  const addMenuTooltips = (items: ItemType[]): ItemType[] => items.map((item) => {
+    if (!item || !('key' in item)) return item
+    const label = 'label' in item ? item.label : undefined
+    const children = 'children' in item && item.children ? addMenuTooltips(item.children as ItemType[]) : undefined
+    return {
+      ...item,
+      title: typeof label === 'string' ? label : undefined,
+      ...(children ? { children } : {}),
+    }
+  })
+
+  const menuItems = addMenuTooltips(filterMenuItems(baseMenuItems))
 
   const userMenuItems = token ? [
     {
@@ -187,6 +198,8 @@ const Layout = () => {
         trigger={null}
         collapsible
         collapsed={collapsed}
+        width={200}
+        collapsedWidth={72}
         theme="dark"
         style={{
           overflow: 'auto',
@@ -195,7 +208,7 @@ const Layout = () => {
           left: 0,
           top: 0,
           bottom: 0,
-          padding: collapsed ? '14px 8px' : '14px 12px',
+          padding: collapsed ? '14px 6px' : '14px 12px',
           background: appTheme === 'dark'
             ? 'linear-gradient(180deg, #102a43 0%, #12395c 50%, #0f4c75 100%)'
             : 'linear-gradient(180deg, #2f66d8 0%, #3477e6 46%, #56b6f7 100%)',
@@ -236,6 +249,7 @@ const Layout = () => {
         <Menu
           theme="dark"
           mode="inline"
+          inlineCollapsed={collapsed}
           selectedKeys={[selectedMenuKey]}
           defaultOpenKeys={['resource-management', '/alerts', 'monitor-center', 'tacacs-management']}
           items={menuItems}
@@ -244,7 +258,7 @@ const Layout = () => {
         />
       </Sider>
 
-      <AntLayout style={{ marginLeft: collapsed ? 80 : 200, transition: 'all 0.2s' }}>
+      <AntLayout style={{ marginLeft: collapsed ? 72 : 200, transition: 'all 0.2s' }}>
         <Header
           style={{
             height: 68,

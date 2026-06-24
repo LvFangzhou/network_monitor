@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
-import { Button, Card, Col, Drawer, Form, Input, Row, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
+import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react'
+import { Button, Card, Col, Drawer, Form, Input, Row, Select, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
 import { CloudDownloadOutlined, EyeOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import {
+  cancelConfigBackupJob,
   getConfigBackupFilters,
   getConfigBackupJob,
   getConfigBackupJobs,
@@ -34,6 +35,7 @@ const statusColor: Record<string, string> = {
   success: 'green',
   partial_failed: 'orange',
   failed: 'red',
+  cancelled: 'default',
 }
 
 const statusLabel: Record<string, string> = {
@@ -42,6 +44,7 @@ const statusLabel: Record<string, string> = {
   success: '成功',
   partial_failed: '部分失败',
   failed: '失败',
+  cancelled: '已取消',
 }
 
 const formatTime = (value?: string | null) => value ? new Date(value).toLocaleString() : '-'
@@ -66,6 +69,8 @@ const highlightText = (text: string, keyword: string) => {
   )
 }
 
+type WidthMap = Record<string, number>
+
 const ConfigBackups = () => {
   const {
     token: { colorBgContainer, colorFillQuaternary },
@@ -85,8 +90,10 @@ const ConfigBackups = () => {
   const [searchItems, setSearchItems] = useState<ConfigSearchMatch[]>([])
   const [searchJob, setSearchJob] = useState<ConfigBackupJob | null>(null)
   const [resultDrawerOpen, setResultDrawerOpen] = useState(false)
+  const [resultLoading, setResultLoading] = useState(false)
   const [resultDetail, setResultDetail] = useState<ConfigBackupResult | null>(null)
   const [jobResultsOpen, setJobResultsOpen] = useState(false)
+  const [jobResultsLoading, setJobResultsLoading] = useState(false)
   const [jobResults, setJobResults] = useState<ConfigBackupResult[]>([])
   const [latestResults, setLatestResults] = useState<ConfigBackupResult[]>([])
   const [resultFilterText, setResultFilterText] = useState('')
@@ -94,10 +101,64 @@ const ConfigBackups = () => {
   const [resultVendorFilter, setResultVendorFilter] = useState<string>()
   const [resultDeviceTypeFilter, setResultDeviceTypeFilter] = useState<string>()
   const [notificationWebhook, setNotificationWebhook] = useState('')
+  const [savedNotificationWebhook, setSavedNotificationWebhook] = useState('')
   const [webhookEditing, setWebhookEditing] = useState(false)
   const [webhookLabel, setWebhookLabel] = useState('未填写')
   const [savingWebhook, setSavingWebhook] = useState(false)
   const [testingWebhook, setTestingWebhook] = useState(false)
+  const [latestColumnWidths, setLatestColumnWidths] = useState<WidthMap>({
+    device: 230,
+    datacenter: 130,
+    status: 90,
+    finishedAt: 160,
+    action: 100,
+  })
+  const [searchColumnWidths, setSearchColumnWidths] = useState<WidthMap>({
+    device: 220,
+    datacenter: 120,
+    lineNumber: 70,
+    line: 360,
+    action: 82,
+  })
+
+  const resizableTitle = (
+    title: string,
+    key: string,
+    widths: WidthMap,
+    setWidths: Dispatch<SetStateAction<WidthMap>>,
+    minWidth = 70
+  ) => (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+      <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{title}</span>
+      <span
+        title="拖动调整列宽"
+        onMouseDown={(event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          const startX = event.clientX
+          const startWidth = widths[key] || minWidth
+          const handleMouseMove = (moveEvent: MouseEvent) => {
+            const nextWidth = Math.max(minWidth, startWidth + moveEvent.clientX - startX)
+            setWidths((previous) => ({ ...previous, [key]: nextWidth }))
+          }
+          const handleMouseUp = () => {
+            window.removeEventListener('mousemove', handleMouseMove)
+            window.removeEventListener('mouseup', handleMouseUp)
+          }
+          window.addEventListener('mousemove', handleMouseMove)
+          window.addEventListener('mouseup', handleMouseUp)
+        }}
+        style={{
+          width: 8,
+          height: 18,
+          cursor: 'col-resize',
+          borderRight: '2px solid rgba(148,163,184,0.55)',
+          opacity: 0.75,
+          flexShrink: 0,
+        }}
+      />
+    </div>
+  )
 
   const refreshJobProgress = async (page = jobsPage, pageSize = jobsPageSize) => {
     const [latest, result] = await Promise.all([
@@ -133,6 +194,7 @@ const ConfigBackups = () => {
       const channel = settings.settings?.notification_channels?.[0]
       const webhook = channel?.webhook || channel?.url || ''
       setNotificationWebhook(webhook)
+      setSavedNotificationWebhook(webhook)
       setWebhookLabel(detectWebhookLabel(webhook))
       setWebhookEditing(!webhook)
       if (latest.job?.id) {
@@ -175,6 +237,17 @@ const ConfigBackups = () => {
     }
   }
 
+  const handleCancelJob = async (jobId?: number) => {
+    if (!jobId) return
+    try {
+      const result = await cancelConfigBackupJob(jobId)
+      message.success(result.message || '已发送取消指令')
+      await refreshJobProgress(jobsPage, jobsPageSize)
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '取消任务失败')
+    }
+  }
+
   const handleSearch = async (silent = false) => {
     const text = keyword.trim()
     if (!text) {
@@ -207,22 +280,32 @@ const ConfigBackups = () => {
   }
 
   const openResult = async (resultId: number) => {
+    setResultDetail(null)
+    setResultDrawerOpen(true)
+    setResultLoading(true)
     try {
       const detail = await getConfigBackupResult(resultId)
       setResultDetail(detail)
-      setResultDrawerOpen(true)
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取配置详情失败')
+      setResultDrawerOpen(false)
+    } finally {
+      setResultLoading(false)
     }
   }
 
   const openJobResults = async (jobId: number) => {
+    setJobResults([])
+    setJobResultsOpen(true)
+    setJobResultsLoading(true)
     try {
       const detail = await getConfigBackupJob(jobId)
       setJobResults(detail.results || [])
-      setJobResultsOpen(true)
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取任务明细失败')
+      setJobResultsOpen(false)
+    } finally {
+      setJobResultsLoading(false)
     }
   }
 
@@ -237,6 +320,7 @@ const ConfigBackups = () => {
       const channel = result.settings.notification_channels?.[0]
       const webhook = channel?.webhook || channel?.url || ''
       setNotificationWebhook(webhook)
+      setSavedNotificationWebhook(webhook)
       setWebhookLabel(detectWebhookLabel(webhook))
       setWebhookEditing(!webhook)
       message.success(result.message || '机器人通知已保存')
@@ -248,7 +332,7 @@ const ConfigBackups = () => {
   }
 
   const handleTestWebhook = async () => {
-    const url = notificationWebhook.trim()
+    const url = (notificationWebhook.trim() || savedNotificationWebhook.trim())
     if (!url) {
       message.warning('请先填写机器人 Webhook 地址')
       return
@@ -268,6 +352,7 @@ const ConfigBackups = () => {
     if (!latestJob?.total_devices) return 0
     return Math.round((latestJob.success_count / latestJob.total_devices) * 100)
   }, [latestJob])
+  const hasRunningJob = Boolean(latestJob && ['pending', 'running'].includes(latestJob.status))
 
   const filteredLatestResults = useMemo(() => {
     const text = resultFilterText.trim().toLowerCase()
@@ -344,9 +429,15 @@ const ConfigBackups = () => {
           >
             <Space direction="vertical" size={12} style={{ width: '100%' }}>
               <Text type="secondary">每天 00:00 自动备份所有上线设备；手动触发后异步执行，完成后推送机器人。</Text>
-              <Button block type="primary" icon={<CloudDownloadOutlined />} onClick={handleTrigger} loading={triggering}>
-                手动触发备份
-              </Button>
+              {hasRunningJob ? (
+                <Button block danger onClick={() => handleCancelJob(latestJob?.id)}>
+                  停止当前备份任务
+                </Button>
+              ) : (
+                <Button block type="primary" icon={<CloudDownloadOutlined />} onClick={handleTrigger} loading={triggering}>
+                  手动触发备份
+                </Button>
+              )}
               {latestJob?.summary ? (
                 <Paragraph
                   ellipsis={{ rows: 5, expandable: true, symbol: '展开' }}
@@ -383,7 +474,16 @@ const ConfigBackups = () => {
                 { title: '状态', dataIndex: 'status', width: 92, render: (value: string) => <Tag color={statusColor[value] || 'default'}>{statusLabel[value] || value}</Tag> },
                 { title: '成功/失败', width: 92, render: (_: unknown, record: ConfigBackupJob) => `${record.success_count}/${record.failed_count}` },
                 { title: '完成时间', dataIndex: 'finished_at', render: formatTime },
-                { title: '操作', width: 84, render: (_: unknown, record: ConfigBackupJob) => <Button size="small" onClick={() => openJobResults(record.id)}>明细</Button> },
+                {
+                  title: '操作',
+                  width: 112,
+                  render: (_: unknown, record: ConfigBackupJob) => (
+                    <Space size={4}>
+                      <Button size="small" onClick={() => openJobResults(record.id)}>明细</Button>
+                      {['pending', 'running'].includes(record.status) ? <Button size="small" danger onClick={() => handleCancelJob(record.id)}>停止</Button> : null}
+                    </Space>
+                  ),
+                },
               ]}
             />
           </Card>
@@ -400,7 +500,10 @@ const ConfigBackups = () => {
                 </div>
                 <Space>
                   <Button onClick={handleTestWebhook} loading={testingWebhook}>测试</Button>
-                  <Button onClick={() => setWebhookEditing(true)}>修改</Button>
+                  <Button onClick={() => {
+                    setNotificationWebhook('')
+                    setWebhookEditing(true)
+                  }}>修改</Button>
                 </Space>
               </Space>
             ) : (
@@ -423,7 +526,11 @@ const ConfigBackups = () => {
                 <Space>
                   <Button onClick={handleTestWebhook} loading={testingWebhook}>测试</Button>
                   <Button type="primary" onClick={handleSaveWebhook} loading={savingWebhook}>保存</Button>
-                  {notificationWebhook ? <Button onClick={() => setWebhookEditing(false)}>取消</Button> : null}
+                  {savedNotificationWebhook ? <Button onClick={() => {
+                    setNotificationWebhook(savedNotificationWebhook)
+                    setWebhookLabel(detectWebhookLabel(savedNotificationWebhook))
+                    setWebhookEditing(false)
+                  }}>取消</Button> : null}
                 </Space>
               </Form>
             )}
@@ -449,13 +556,13 @@ const ConfigBackups = () => {
               rowKey="id"
               dataSource={filteredLatestResults}
               pagination={false}
-              scroll={{ y: 470 }}
+              scroll={{ x: 720, y: 470 }}
               columns={[
-                { title: '设备', width: 230, render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text strong>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
-                { title: '机房', dataIndex: 'datacenter_name', width: 130, render: (value?: string) => value || '-' },
-                { title: '状态', dataIndex: 'status', width: 90, render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : 'blue'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value}</Tag> },
-                { title: '完成时间', dataIndex: 'finished_at', width: 160, render: formatTime },
-                { title: '操作', width: 100, render: (_: unknown, record: ConfigBackupResult) => <Button size="small" icon={<EyeOutlined />} disabled={record.status !== 'success'} onClick={() => openResult(record.id)}>查看</Button> },
+                { title: resizableTitle('设备', 'device', latestColumnWidths, setLatestColumnWidths, 160), width: latestColumnWidths.device, render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text strong>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
+                { title: resizableTitle('机房', 'datacenter', latestColumnWidths, setLatestColumnWidths, 90), dataIndex: 'datacenter_name', width: latestColumnWidths.datacenter, render: (value?: string) => value || '-' },
+                { title: resizableTitle('状态', 'status', latestColumnWidths, setLatestColumnWidths, 80), dataIndex: 'status', width: latestColumnWidths.status, render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : value === 'pending' ? 'blue' : 'default'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value === 'pending' ? '等待' : value}</Tag> },
+                { title: resizableTitle('完成时间', 'finishedAt', latestColumnWidths, setLatestColumnWidths, 130), dataIndex: 'finished_at', width: latestColumnWidths.finishedAt, render: formatTime },
+                { title: resizableTitle('操作', 'action', latestColumnWidths, setLatestColumnWidths, 80), width: latestColumnWidths.action, render: (_: unknown, record: ConfigBackupResult) => <Button size="small" icon={<EyeOutlined />} disabled={record.status !== 'success'} onClick={() => openResult(record.id)}>查看</Button> },
               ]}
             />
           </Card>
@@ -475,11 +582,11 @@ const ConfigBackups = () => {
               loading={searchLoading}
               dataSource={searchItems}
               pagination={false}
-              scroll={{ y: 470 }}
+              scroll={{ x: 860, y: 470 }}
               columns={[
                 {
-                  title: '设备',
-                  width: 220,
+                  title: resizableTitle('设备', 'device', searchColumnWidths, setSearchColumnWidths, 160),
+                  width: searchColumnWidths.device,
                   render: (_: unknown, record: ConfigSearchMatch) => (
                     <Space direction="vertical" size={0}>
                       <Text strong>{record.device_name}</Text>
@@ -487,10 +594,10 @@ const ConfigBackups = () => {
                     </Space>
                   ),
                 },
-                { title: '机房', dataIndex: 'datacenter_name', width: 120, render: (value?: string) => value || '-' },
-                { title: '行号', dataIndex: 'line_number', width: 70 },
-                { title: '匹配内容', dataIndex: 'line', render: (value: string) => <code style={{ whiteSpace: 'pre-wrap' }}>{highlightText(value, keyword.trim())}</code> },
-                { title: '操作', width: 82, render: (_: unknown, record: ConfigSearchMatch) => <Button size="small" icon={<EyeOutlined />} onClick={() => openResult(record.result_id)}>查看</Button> },
+                { title: resizableTitle('机房', 'datacenter', searchColumnWidths, setSearchColumnWidths, 90), dataIndex: 'datacenter_name', width: searchColumnWidths.datacenter, render: (value?: string) => value || '-' },
+                { title: resizableTitle('行号', 'lineNumber', searchColumnWidths, setSearchColumnWidths, 62), dataIndex: 'line_number', width: searchColumnWidths.lineNumber },
+                { title: resizableTitle('匹配内容', 'line', searchColumnWidths, setSearchColumnWidths, 220), dataIndex: 'line', width: searchColumnWidths.line, render: (value: string) => <code style={{ whiteSpace: 'pre-wrap' }}>{highlightText(value, keyword.trim())}</code> },
+                { title: resizableTitle('操作', 'action', searchColumnWidths, setSearchColumnWidths, 70), width: searchColumnWidths.action, render: (_: unknown, record: ConfigSearchMatch) => <Button size="small" icon={<EyeOutlined />} onClick={() => openResult(record.result_id)}>查看</Button> },
               ]}
               expandable={{
                 expandedRowRender: (record) => (
@@ -513,24 +620,28 @@ const ConfigBackups = () => {
         title={resultDetail ? `${resultDetail.device_name} (${resultDetail.device_ip}) 配置` : '配置详情'}
         open={resultDrawerOpen}
         onClose={() => setResultDrawerOpen(false)}
-        width="80%"
+        width="96vw"
       >
-        <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: colorFillQuaternary, borderRadius: 12, padding: 16 }}>
-          {resultDetail?.config_content || '暂无配置内容'}
-        </pre>
+        <Spin spinning={resultLoading}>
+          <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: colorFillQuaternary, borderRadius: 12, padding: 16, minHeight: '72vh', maxHeight: '78vh', overflow: 'auto' }}>
+            {resultDetail?.config_content || (resultLoading ? '正在加载配置内容...' : '暂无配置内容')}
+          </pre>
+        </Spin>
       </Drawer>
 
-      <Drawer title="任务设备明细" open={jobResultsOpen} onClose={() => setJobResultsOpen(false)} width="78%">
+      <Drawer title="任务设备明细" open={jobResultsOpen} onClose={() => setJobResultsOpen(false)} width="96vw">
         <Table
           rowKey="id"
+          loading={jobResultsLoading}
           dataSource={jobResults}
           pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total) => `共 ${total} 台` }}
+          scroll={{ y: '70vh' }}
           columns={[
             { title: '设备', width: 260, render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
             { title: '机房', dataIndex: 'datacenter_name', width: 150, render: (value?: string) => value || '-' },
             { title: '命令', dataIndex: 'command', width: 180, render: (value?: string) => value || '-' },
             { title: '行数', dataIndex: 'line_count', width: 90, render: (value?: number) => value || '-' },
-            { title: '状态', dataIndex: 'status', width: 100, render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : 'blue'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value}</Tag> },
+            { title: '状态', dataIndex: 'status', width: 100, render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : value === 'pending' ? 'blue' : 'default'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value === 'pending' ? '等待' : value}</Tag> },
             { title: '错误信息', dataIndex: 'error_message', ellipsis: true, render: (value?: string) => value ? <Tooltip title={value}>{value}</Tooltip> : <Text type="secondary">-</Text> },
             { title: '完成时间', dataIndex: 'finished_at', width: 180, render: formatTime },
             {

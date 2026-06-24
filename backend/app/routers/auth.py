@@ -438,6 +438,7 @@ async def list_users(
 ):
     if not current_user.is_superuser:
         check_permission(current_user, "user:view")
+    _touch_online_user(current_user)
     users = db.query(User).order_by(User.id.asc()).all()
     return {
         "total": len(users),

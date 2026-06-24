@@ -78,9 +78,27 @@ const Settings = () => {
     }
   }
 
+  const refreshUsersOnlineState = async () => {
+    if (!isAdmin) return
+    try {
+      const usersResult = await getUsers()
+      setUsers(usersResult.items)
+    } catch {
+      // 在线状态轮询失败时静默处理，避免反复弹错。
+    }
+  }
+
   useEffect(() => {
     fetchUsers()
   }, [isAdmin, currentUser?.id])
+
+  useEffect(() => {
+    if (!isAdmin) return
+    const timer = window.setInterval(() => {
+      refreshUsersOnlineState()
+    }, 10000)
+    return () => window.clearInterval(timer)
+  }, [isAdmin])
 
   const fetchAuditLogs = async (
     nextPage = auditPage,
@@ -205,9 +223,14 @@ const Settings = () => {
               <Card
                 title="用户管理"
                 extra={
-                  <Button type="primary" icon={<PlusOutlined />} onClick={handleCreateUser}>
-                    新增账号
-                  </Button>
+                  <Space>
+                    <Button icon={<ReloadOutlined />} onClick={fetchUsers} loading={loading}>
+                      刷新
+                    </Button>
+                    <Button type="primary" icon={<PlusOutlined />} onClick={handleCreateUser}>
+                      新增账号
+                    </Button>
+                  </Space>
                 }
               >
                 <Table

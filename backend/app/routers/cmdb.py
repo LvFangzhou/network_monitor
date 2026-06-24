@@ -379,8 +379,8 @@ def build_device_csv(devices: list[Device]) -> bytes:
             '是' if device.is_monitored else '否',
             device.ssh_port or 22,
             device.ssh_username,
-            device.ssh_password,
-            device.ssh_key,
+            '',
+            '',
         ])
     return output.getvalue().encode('utf-8-sig')
 

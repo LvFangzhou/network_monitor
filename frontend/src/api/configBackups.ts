@@ -2,7 +2,7 @@ import request from './request'
 
 export interface ConfigBackupJob {
   id: number
-  status: 'pending' | 'running' | 'success' | 'partial_failed' | 'failed'
+  status: 'pending' | 'running' | 'success' | 'partial_failed' | 'failed' | 'cancelled'
   trigger_type: 'manual' | 'scheduled'
   total_devices: number
   success_count: number
@@ -58,6 +58,14 @@ export interface ConfigBackupNotificationChannel {
 
 export const triggerConfigBackup = async (): Promise<{ message: string; task_id?: string; job: ConfigBackupJob }> => {
   return await request.post('/config-backups/run') as { message: string; task_id?: string; job: ConfigBackupJob }
+}
+
+export const cancelConfigBackupJob = async (id: number): Promise<{ message: string; job: ConfigBackupJob | null }> => {
+  return await request.post(`/config-backups/jobs/${id}/cancel`) as { message: string; job: ConfigBackupJob | null }
+}
+
+export const cancelRunningConfigBackupJob = async (): Promise<{ message: string; job: ConfigBackupJob | null }> => {
+  return await request.post('/config-backups/jobs/cancel-running') as { message: string; job: ConfigBackupJob | null }
 }
 
 export const getConfigBackupJobs = async (params?: { skip?: number; limit?: number }): Promise<{ total: number; items: ConfigBackupJob[] }> => {

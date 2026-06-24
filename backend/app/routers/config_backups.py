@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -96,6 +97,59 @@ async def trigger_config_backup(
         "task_id": task.id,
         "job": _job_to_dict(job),
     }
+
+
+@router.post("/jobs/{job_id}/cancel", response_model=dict)
+async def cancel_config_backup_job(
+    job_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """取消正在执行/等待的配置备份任务。"""
+    job = db.query(ConfigBackupJob).filter(ConfigBackupJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="配置备份任务不存在")
+    if job.status not in {"pending", "running"}:
+        return {"message": "任务已结束，无需取消", "job": _job_to_dict(job)}
+
+    job.status = "cancelled"
+    job.error_message = f"由 {current_user.username} 手动取消"
+    job.finished_at = job.finished_at or datetime.now(timezone.utc)
+    (
+        db.query(ConfigBackupResult)
+        .filter(
+            ConfigBackupResult.job_id == job.id,
+            ConfigBackupResult.status.in_(["pending", "running"]),
+        )
+        .update(
+            {
+                ConfigBackupResult.status: "failed",
+                ConfigBackupResult.error_message: "任务已手动取消",
+                ConfigBackupResult.finished_at: job.finished_at,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    db.refresh(job)
+    return {"message": "已发送取消指令", "job": _job_to_dict(job)}
+
+
+@router.post("/jobs/cancel-running", response_model=dict)
+async def cancel_running_config_backup_job(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """取消最新的运行中/等待中配置备份任务。"""
+    job = (
+        db.query(ConfigBackupJob)
+        .filter(ConfigBackupJob.status.in_(["pending", "running"]))
+        .order_by(ConfigBackupJob.started_at.desc(), ConfigBackupJob.id.desc())
+        .first()
+    )
+    if not job:
+        return {"message": "当前没有运行中的配置备份任务", "job": None}
+    return await cancel_config_backup_job(job.id, current_user=current_user, db=db)
 
 
 @router.get("/jobs", response_model=dict)
