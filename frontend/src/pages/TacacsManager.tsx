@@ -193,6 +193,15 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
     fetchLogs()
   }, [])
 
+  useEffect(() => {
+    if (activeTab !== 'logs') return
+    const timer = window.setTimeout(() => {
+      fetchLogs(1, logPageSize)
+    }, 450)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, search, logDevice, logUser, logCommand, logTimeRange])
+
   const handleSave = async () => {
     const values = await configForm.validateFields()
     setSaving(true)
@@ -459,11 +468,6 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
               <Card
                 style={compactCardStyle}
                 title="Tacacs 命令操作日志"
-                extra={
-                  <Tooltip title="查询日志">
-                    <Button icon={<ReloadOutlined />} onClick={() => fetchLogs(1, logPageSize)}>查询</Button>
-                  </Tooltip>
-                }
               >
                 <Space direction="vertical" size={8} style={{ width: '100%', marginBottom: 12 }}>
                   <Space wrap>
@@ -478,6 +482,9 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
                     <Input allowClear placeholder="账号" value={logUser} onChange={(event) => setLogUser(event.target.value)} onPressEnter={() => fetchLogs(1, logPageSize)} style={{ width: 140 }} />
                     <Input allowClear placeholder="命令" value={logCommand} onChange={(event) => setLogCommand(event.target.value)} onPressEnter={() => fetchLogs(1, logPageSize)} style={{ width: 220 }} />
                     <Input allowClear placeholder="全文搜索" value={search} onChange={(event) => setSearch(event.target.value)} onPressEnter={() => fetchLogs(1, logPageSize)} style={{ width: 220 }} />
+                    <Tooltip title="按当前条件刷新日志">
+                      <Button icon={<ReloadOutlined />} loading={logLoading} onClick={() => fetchLogs(1, logPageSize)}>刷新</Button>
+                    </Tooltip>
                   </Space>
                   <div style={{ color: '#8c8c8c' }}>{logPath || '日志路径加载中'}，共 {logTotal} 条匹配记录</div>
                 </Space>

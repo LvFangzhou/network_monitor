@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react'
-import { Button, Card, Col, Drawer, Form, Input, Row, Select, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
+import { Button, Card, Col, Drawer, Form, Input, Progress, Row, Select, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
 import { CloudDownloadOutlined, EyeOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import {
   cancelConfigBackupJob,
@@ -70,6 +70,14 @@ const highlightText = (text: string, keyword: string) => {
 }
 
 type WidthMap = Record<string, number>
+const uniqueFilterOptions = (values: Array<string | null | undefined>) =>
+  Array.from(new Set(values.filter(Boolean) as string[])).sort().map((value) => ({ text: value, value }))
+
+const ipToNumber = (value?: string) => {
+  const parts = String(value || '').split('.').map((item) => Number(item))
+  if (parts.length !== 4 || parts.some((item) => Number.isNaN(item))) return Number.MAX_SAFE_INTEGER
+  return parts.reduce((total, item) => total * 256 + item, 0)
+}
 
 const ConfigBackups = () => {
   const {
@@ -92,6 +100,7 @@ const ConfigBackups = () => {
   const [resultDrawerOpen, setResultDrawerOpen] = useState(false)
   const [resultLoading, setResultLoading] = useState(false)
   const [resultDetail, setResultDetail] = useState<ConfigBackupResult | null>(null)
+  const [highlightLine, setHighlightLine] = useState<number | null>(null)
   const [jobResultsOpen, setJobResultsOpen] = useState(false)
   const [jobResultsLoading, setJobResultsLoading] = useState(false)
   const [jobResults, setJobResults] = useState<ConfigBackupResult[]>([])
@@ -279,13 +288,19 @@ const ConfigBackups = () => {
     }
   }
 
-  const openResult = async (resultId: number) => {
+  const openResult = async (resultId: number, lineNumber?: number) => {
     setResultDetail(null)
+    setHighlightLine(lineNumber || null)
     setResultDrawerOpen(true)
     setResultLoading(true)
     try {
       const detail = await getConfigBackupResult(resultId)
       setResultDetail(detail)
+      if (lineNumber) {
+        window.setTimeout(() => {
+          document.getElementById(`config-line-${lineNumber}`)?.scrollIntoView({ block: 'center' })
+        }, 120)
+      }
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取配置详情失败')
       setResultDrawerOpen(false)
@@ -348,9 +363,9 @@ const ConfigBackups = () => {
     }
   }
 
-  const successRate = useMemo(() => {
+  const progressPercent = useMemo(() => {
     if (!latestJob?.total_devices) return 0
-    return Math.round((latestJob.success_count / latestJob.total_devices) * 100)
+    return Math.round(((latestJob.success_count + latestJob.failed_count) / latestJob.total_devices) * 100)
   }, [latestJob])
   const hasRunningJob = Boolean(latestJob && ['pending', 'running'].includes(latestJob.status))
 
@@ -376,6 +391,45 @@ const ConfigBackups = () => {
     vendors: Array.from(new Set(latestResults.map((item) => item.vendor).filter(Boolean) as string[])).sort(),
     deviceTypes: Array.from(new Set(latestResults.map((item) => item.device_type).filter(Boolean) as string[])).sort(),
   }), [latestResults])
+
+  const jobResultOptions = useMemo(() => ({
+    datacenters: uniqueFilterOptions(jobResults.map((item) => item.datacenter_name)),
+    statuses: uniqueFilterOptions(jobResults.map((item) => item.status)),
+    vendors: uniqueFilterOptions(jobResults.map((item) => item.vendor)),
+  }), [jobResults])
+
+  const renderConfigContent = () => {
+    if (resultLoading) return '正在加载配置内容...'
+    const content = resultDetail?.config_content || ''
+    if (!content) return '暂无配置内容'
+    return (
+      <div style={{ fontFamily: 'Menlo, Consolas, monospace', fontSize: 13, lineHeight: 1.7 }}>
+        {content.split('\n').map((line, index) => {
+          const lineNumber = index + 1
+          const active = highlightLine === lineNumber
+          return (
+            <div
+              key={lineNumber}
+              id={`config-line-${lineNumber}`}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '72px 1fr',
+                gap: 12,
+                padding: '1px 8px',
+                borderRadius: 8,
+                background: active ? 'rgba(250, 204, 21, 0.34)' : 'transparent',
+                color: active ? '#7c2d12' : undefined,
+                fontWeight: active ? 800 : 500,
+              }}
+            >
+              <Text type="secondary" style={{ userSelect: 'none', textAlign: 'right' }}>{lineNumber}</Text>
+              <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{highlightText(line, keyword.trim())}</span>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
 
   useEffect(() => {
     const text = keyword.trim()
@@ -407,15 +461,15 @@ const ConfigBackups = () => {
         <Col span={6}>
           <Card style={{ borderColor: latestJob && ['pending', 'running'].includes(latestJob.status) ? '#1677ff' : undefined, boxShadow: latestJob && ['pending', 'running'].includes(latestJob.status) ? '0 0 0 3px rgba(22,119,255,0.10)' : undefined }}>
             <Statistic
-              title={latestJob && ['pending', 'running'].includes(latestJob.status) ? '成功 / 失败（实时）' : '成功 / 失败'}
-              value={`${latestJob?.success_count || 0} / ${latestJob?.failed_count || 0}`}
+              title={latestJob && ['pending', 'running'].includes(latestJob.status) ? '成功 / 总数（实时）' : '成功 / 总数'}
+              value={`${latestJob?.success_count || 0} / ${latestJob?.total_devices || 0}`}
               valueStyle={{ color: latestJob?.failed_count ? '#f5222d' : '#16a34a', fontWeight: 800 }}
             />
           </Card>
         </Col>
         <Col span={6}>
           <Card>
-            <Statistic title="成功率" value={successRate} suffix="%" />
+            <Statistic title="总进度" value={progressPercent} suffix="%" />
           </Card>
         </Col>
       </Row>
@@ -438,6 +492,17 @@ const ConfigBackups = () => {
                   手动触发备份
                 </Button>
               )}
+              {latestJob ? (
+                <div>
+                  <Progress
+                    percent={progressPercent}
+                    status={latestJob.status === 'failed' ? 'exception' : latestJob.status === 'success' ? 'success' : 'active'}
+                  />
+                  <Text type="secondary">
+                    已完成 {(latestJob.success_count || 0) + (latestJob.failed_count || 0)} / {latestJob.total_devices || 0}，成功 {latestJob.success_count || 0}，失败 {latestJob.failed_count || 0}
+                  </Text>
+                </div>
+              ) : null}
               {latestJob?.summary ? (
                 <Paragraph
                   ellipsis={{ rows: 5, expandable: true, symbol: '展开' }}
@@ -558,10 +623,10 @@ const ConfigBackups = () => {
               pagination={false}
               scroll={{ x: 720, y: 470 }}
               columns={[
-                { title: resizableTitle('设备', 'device', latestColumnWidths, setLatestColumnWidths, 160), width: latestColumnWidths.device, render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text strong>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
-                { title: resizableTitle('机房', 'datacenter', latestColumnWidths, setLatestColumnWidths, 90), dataIndex: 'datacenter_name', width: latestColumnWidths.datacenter, render: (value?: string) => value || '-' },
-                { title: resizableTitle('状态', 'status', latestColumnWidths, setLatestColumnWidths, 80), dataIndex: 'status', width: latestColumnWidths.status, render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : value === 'pending' ? 'blue' : 'default'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value === 'pending' ? '等待' : value}</Tag> },
-                { title: resizableTitle('完成时间', 'finishedAt', latestColumnWidths, setLatestColumnWidths, 130), dataIndex: 'finished_at', width: latestColumnWidths.finishedAt, render: formatTime },
+                { title: resizableTitle('设备', 'device', latestColumnWidths, setLatestColumnWidths, 160), width: latestColumnWidths.device, sorter: (a, b) => ipToNumber(a.device_ip) - ipToNumber(b.device_ip), render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text strong>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
+                { title: resizableTitle('机房', 'datacenter', latestColumnWidths, setLatestColumnWidths, 90), dataIndex: 'datacenter_name', width: latestColumnWidths.datacenter, filters: latestResultOptions.datacenters.map((value) => ({ text: value, value })), onFilter: (value, record) => record.datacenter_name === value, sorter: (a, b) => String(a.datacenter_name || '').localeCompare(String(b.datacenter_name || '')), render: (value?: string) => value || '-' },
+                { title: resizableTitle('状态', 'status', latestColumnWidths, setLatestColumnWidths, 80), dataIndex: 'status', width: latestColumnWidths.status, filters: uniqueFilterOptions(latestResults.map((item) => item.status)), onFilter: (value, record) => record.status === value, sorter: (a, b) => String(a.status).localeCompare(String(b.status)), render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : value === 'pending' ? 'blue' : 'default'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value === 'pending' ? '等待' : value}</Tag> },
+                { title: resizableTitle('完成时间', 'finishedAt', latestColumnWidths, setLatestColumnWidths, 130), dataIndex: 'finished_at', width: latestColumnWidths.finishedAt, sorter: (a, b) => new Date(a.finished_at || 0).getTime() - new Date(b.finished_at || 0).getTime(), render: formatTime },
                 { title: resizableTitle('操作', 'action', latestColumnWidths, setLatestColumnWidths, 80), width: latestColumnWidths.action, render: (_: unknown, record: ConfigBackupResult) => <Button size="small" icon={<EyeOutlined />} disabled={record.status !== 'success'} onClick={() => openResult(record.id)}>查看</Button> },
               ]}
             />
@@ -594,10 +659,10 @@ const ConfigBackups = () => {
                     </Space>
                   ),
                 },
-                { title: resizableTitle('机房', 'datacenter', searchColumnWidths, setSearchColumnWidths, 90), dataIndex: 'datacenter_name', width: searchColumnWidths.datacenter, render: (value?: string) => value || '-' },
-                { title: resizableTitle('行号', 'lineNumber', searchColumnWidths, setSearchColumnWidths, 62), dataIndex: 'line_number', width: searchColumnWidths.lineNumber },
-                { title: resizableTitle('匹配内容', 'line', searchColumnWidths, setSearchColumnWidths, 220), dataIndex: 'line', width: searchColumnWidths.line, render: (value: string) => <code style={{ whiteSpace: 'pre-wrap' }}>{highlightText(value, keyword.trim())}</code> },
-                { title: resizableTitle('操作', 'action', searchColumnWidths, setSearchColumnWidths, 70), width: searchColumnWidths.action, render: (_: unknown, record: ConfigSearchMatch) => <Button size="small" icon={<EyeOutlined />} onClick={() => openResult(record.result_id)}>查看</Button> },
+                { title: resizableTitle('机房', 'datacenter', searchColumnWidths, setSearchColumnWidths, 90), dataIndex: 'datacenter_name', width: searchColumnWidths.datacenter, filters: uniqueFilterOptions(searchItems.map((item) => item.datacenter_name)), onFilter: (value, record) => record.datacenter_name === value, sorter: (a, b) => String(a.datacenter_name || '').localeCompare(String(b.datacenter_name || '')), render: (value?: string) => value || '-' },
+                { title: resizableTitle('行号', 'lineNumber', searchColumnWidths, setSearchColumnWidths, 62), dataIndex: 'line_number', width: searchColumnWidths.lineNumber, sorter: (a, b) => a.line_number - b.line_number },
+                { title: resizableTitle('匹配内容', 'line', searchColumnWidths, setSearchColumnWidths, 220), dataIndex: 'line', width: searchColumnWidths.line, sorter: (a, b) => String(a.line || '').localeCompare(String(b.line || '')), render: (value: string) => <code style={{ whiteSpace: 'pre-wrap' }}>{highlightText(value, keyword.trim())}</code> },
+                { title: resizableTitle('操作', 'action', searchColumnWidths, setSearchColumnWidths, 70), width: searchColumnWidths.action, render: (_: unknown, record: ConfigSearchMatch) => <Button size="small" icon={<EyeOutlined />} onClick={() => openResult(record.result_id, record.line_number)}>查看</Button> },
               ]}
               expandable={{
                 expandedRowRender: (record) => (
@@ -623,9 +688,9 @@ const ConfigBackups = () => {
         width="96vw"
       >
         <Spin spinning={resultLoading}>
-          <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: colorFillQuaternary, borderRadius: 12, padding: 16, minHeight: '72vh', maxHeight: '78vh', overflow: 'auto' }}>
-            {resultDetail?.config_content || (resultLoading ? '正在加载配置内容...' : '暂无配置内容')}
-          </pre>
+          <div style={{ background: colorFillQuaternary, borderRadius: 12, padding: 16, minHeight: '72vh', maxHeight: '78vh', overflow: 'auto' }}>
+            {renderConfigContent()}
+          </div>
         </Spin>
       </Drawer>
 
@@ -637,11 +702,11 @@ const ConfigBackups = () => {
           pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total) => `共 ${total} 台` }}
           scroll={{ y: '70vh' }}
           columns={[
-            { title: '设备', width: 260, render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
-            { title: '机房', dataIndex: 'datacenter_name', width: 150, render: (value?: string) => value || '-' },
-            { title: '命令', dataIndex: 'command', width: 180, render: (value?: string) => value || '-' },
-            { title: '行数', dataIndex: 'line_count', width: 90, render: (value?: number) => value || '-' },
-            { title: '状态', dataIndex: 'status', width: 100, render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : value === 'pending' ? 'blue' : 'default'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value === 'pending' ? '等待' : value}</Tag> },
+            { title: '设备', width: 260, sorter: (a, b) => ipToNumber(a.device_ip) - ipToNumber(b.device_ip), render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
+            { title: '机房', dataIndex: 'datacenter_name', width: 150, filters: jobResultOptions.datacenters, onFilter: (value, record) => record.datacenter_name === value, sorter: (a, b) => String(a.datacenter_name || '').localeCompare(String(b.datacenter_name || '')), render: (value?: string) => value || '-' },
+            { title: '命令', dataIndex: 'command', width: 180, filters: uniqueFilterOptions(jobResults.map((item) => item.command)), onFilter: (value, record) => record.command === value, render: (value?: string) => value || '-' },
+            { title: '行数', dataIndex: 'line_count', width: 90, sorter: (a, b) => (a.line_count || 0) - (b.line_count || 0), render: (value?: number) => value || '-' },
+            { title: '状态', dataIndex: 'status', width: 100, filters: jobResultOptions.statuses, onFilter: (value, record) => record.status === value, sorter: (a, b) => String(a.status).localeCompare(String(b.status)), render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : value === 'pending' ? 'blue' : 'default'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value === 'pending' ? '等待' : value}</Tag> },
             { title: '错误信息', dataIndex: 'error_message', ellipsis: true, render: (value?: string) => value ? <Tooltip title={value}>{value}</Tooltip> : <Text type="secondary">-</Text> },
             { title: '完成时间', dataIndex: 'finished_at', width: 180, render: formatTime },
             {

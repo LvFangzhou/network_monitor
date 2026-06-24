@@ -19,7 +19,7 @@ from app.utils import notification_manager
 from app.utils.config_backup_settings import config_backup_notification_channels
 
 logger = get_logger(__name__)
-CONFIG_BACKUP_CONCURRENCY = max(1, int(os.getenv("CONFIG_BACKUP_CONCURRENCY", "16")))
+CONFIG_BACKUP_CONCURRENCY = max(1, int(os.getenv("CONFIG_BACKUP_CONCURRENCY", "32")))
 CONFIG_BACKUP_WAIT_TIMEOUT_SECONDS = max(1, int(os.getenv("CONFIG_BACKUP_WAIT_TIMEOUT_SECONDS", "2")))
 
 
@@ -38,6 +38,51 @@ def _backup_command(device: Device) -> str:
     if any(marker in vendor for marker in ["cisco", "nexus", "ios", "nx-os"]):
         return "show running-config"
     return "display current-configuration"
+
+
+def _vendor_text(device: Device) -> str:
+    return f"{getattr(device, 'vendor', '') or ''} {getattr(device, 'model', '') or ''}".lower()
+
+
+def _is_asteros(device: Device) -> bool:
+    return any(marker in _vendor_text(device) for marker in ["asteros", "asternos", "asterfusion", "星融元"])
+
+
+def _looks_like_interactive_prompt(text: str) -> bool:
+    normalized = text.lower()
+    prompt_markers = [
+        "do you want to change the password",
+        "[y/n]",
+        "--more--",
+        "press any key",
+        "are you sure",
+        "continue?",
+    ]
+    return any(marker in normalized for marker in prompt_markers)
+
+
+def _validate_config_content(device: Device, command: str, config: str) -> None:
+    """确认备份结果不是登录提示/命令回显/交互提示，而是真实配置内容。"""
+    text = (config or "").strip()
+    if not text:
+        raise RuntimeError("备份命令未返回配置内容")
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    normalized = text.lower()
+    command_only = len(lines) <= 1 and command.lower() in normalized
+    if command_only:
+        raise RuntimeError(f"备份内容异常：仅获取到命令回显 {command}，未获取到配置正文")
+
+    if _looks_like_interactive_prompt(text):
+        raise RuntimeError("备份内容异常：设备仍停留在交互提示/分页提示，未完整输出配置")
+
+    # 大多数设备的配置不会只有几行。阈值保守一点，避免把真正的空配置误判成功。
+    min_lines = 5
+    if _is_asteros(device):
+        min_lines = 8
+    if len(lines) < min_lines:
+        preview = " / ".join(line.strip() for line in lines[:3])[:160]
+        raise RuntimeError(f"备份内容过短：仅 {len(lines)} 行，疑似未完整输出配置。预览：{preview}")
 
 
 def _screen_disable_commands(device: Device) -> List[str]:
@@ -110,6 +155,9 @@ def _collect_config_netmiko(device: Device) -> Tuple[str, str]:
 
     connection = ConnectHandler(**base_params)
     try:
+        if _is_asteros(device):
+            # Asteros 登录后 CLI 初始化较慢，立即下发命令容易只返回命令回显。
+            time.sleep(5)
         output = connection.send_command(
             command,
             expect_string=None,
@@ -118,8 +166,7 @@ def _collect_config_netmiko(device: Device) -> Tuple[str, str]:
             strip_command=True,
         )
         config = output.strip()
-        if not config:
-            raise RuntimeError("Netmiko 备份命令未返回配置内容")
+        _validate_config_content(device, command, config)
         return command, config
     finally:
         connection.disconnect()
@@ -165,6 +212,14 @@ def _clean_config_output(output: str, command: str) -> str:
     while cleaned and not cleaned[-1].strip():
         cleaned.pop()
     return "\n".join(cleaned).strip()
+
+
+def _handle_login_prompts(shell: Any, initial_output: str) -> str:
+    output = initial_output
+    if "do you want to change the password" in output.lower() or "[y/n]" in output.lower():
+        shell.send("n\n")
+        output += _read_shell_output(shell, idle_seconds=0.8, timeout_seconds=8)
+    return output
 
 
 def _collect_config(device: Device) -> Tuple[str, str]:
@@ -223,15 +278,17 @@ def _collect_config(device: Device) -> Tuple[str, str]:
     try:
         client.connect(**connect_kwargs)
         shell = client.invoke_shell(width=240, height=1000)
-        _read_shell_output(shell, idle_seconds=0.3, timeout_seconds=3)
+        initial_output = _read_shell_output(shell, idle_seconds=0.8, timeout_seconds=8)
+        _handle_login_prompts(shell, initial_output)
         for disable_command in _screen_disable_commands(device):
             shell.send(disable_command + "\n")
             _read_shell_output(shell, idle_seconds=0.3, timeout_seconds=3)
+        if _is_asteros(device):
+            time.sleep(5)
         shell.send(command + "\n")
         output = _read_shell_output(shell, idle_seconds=1.2, timeout_seconds=90)
         config = _clean_config_output(output, command)
-        if not config:
-            raise RuntimeError("备份命令未返回配置内容")
+        _validate_config_content(device, command, config)
         return command, config
     finally:
         client.close()
