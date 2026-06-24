@@ -47,7 +47,7 @@ const Layout = () => {
     allowedMenus.includes('*') ||
     allowedMenus.includes(path) ||
     (path.startsWith('/tacacs/') && allowedMenus.includes('/tacacs')) ||
-    ((path === '/port-query' || path === '/device-overview') && allowedMenus.includes('/metrics'))
+    ((path === '/port-query' || path === '/device-overview' || path === '/config-backups') && allowedMenus.includes('/metrics'))
 
   const selectedMenuKey = location.pathname === '/metrics' ? '/port-query' : location.pathname
 
@@ -120,6 +120,7 @@ const Layout = () => {
         { key: '/device-overview', label: '设备总览' },
         { key: '/port-query', label: '端口查询' },
         { key: '/ip-flow-query', label: 'IP流量查询' },
+        { key: '/config-backups', label: '配置备份' },
       ],
     },
     {

@@ -62,6 +62,7 @@ MENU_OPTIONS = [
     {"label": "端口查询", "value": "/port-query"},
     {"label": "IP流量查询", "value": "/ip-flow-query"},
     {"label": "设备总览", "value": "/device-overview"},
+    {"label": "配置备份", "value": "/config-backups"},
     {"label": "系统设置", "value": "/settings"},
     {"label": "Tacacs管理", "value": "/tacacs"},
 ]
@@ -86,6 +87,8 @@ def normalize_allowed_menus(allowed_menus: Optional[list[str]], is_superuser: bo
         normalized.append("/port-query")
     if "/metrics" in normalized and "/device-overview" not in normalized:
         normalized.append("/device-overview")
+    if "/metrics" in normalized and "/config-backups" not in normalized:
+        normalized.append("/config-backups")
     return [path for path in normalized if path != "/metrics"]
 
 

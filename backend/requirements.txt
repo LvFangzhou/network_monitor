@@ -19,6 +19,8 @@ pyasn1==0.4.8
 grpcio==1.59.3
 grpcio-tools==1.59.3
 ping3==4.0.4
+paramiko==3.4.0
+netmiko==4.3.0
 
 # gNMI相关
 pygnmi==0.8.14

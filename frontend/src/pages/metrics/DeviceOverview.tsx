@@ -82,8 +82,15 @@ const REFRESH_OPTIONS = [
 
 const ipToNumber = (ip?: string) => {
   const parts = String(ip || '').split('.').map((item) => Number(item))
-  if (parts.length !== 4 || parts.some((item) => Number.isNaN(item))) return 0
+  if (parts.length !== 4 || parts.some((item) => !Number.isInteger(item) || item < 0 || item > 255)) return 0
   return parts.reduce((sum, part) => (sum << 8) + part, 0)
+}
+
+const compareIpAddress = (left?: string, right?: string) => {
+  const leftValue = ipToNumber(left)
+  const rightValue = ipToNumber(right)
+  if (leftValue !== rightValue) return leftValue - rightValue
+  return String(left || '').localeCompare(String(right || ''), undefined, { numeric: true, sensitivity: 'base' })
 }
 
 const normalizePercent = (value?: number | null) => {
@@ -495,7 +502,7 @@ const DeviceOverview = () => {
     const protocolDownCount = (item: DeviceOverviewItem) => item.protocols.bgp.down + item.protocols.ospf.down
     const list = [...filteredItems]
     return list.sort((a, b) => {
-      if (sortKey === 'ip_desc') return ipToNumber(b.device.ip_address) - ipToNumber(a.device.ip_address)
+      if (sortKey === 'ip_desc') return compareIpAddress(b.device.ip_address, a.device.ip_address)
       if (sortKey === 'cpu_desc') return (normalizePercent(b.resources.cpu_percent) || -1) - (normalizePercent(a.resources.cpu_percent) || -1)
       if (sortKey === 'memory_desc') return (normalizePercent(b.resources.memory_percent) || -1) - (normalizePercent(a.resources.memory_percent) || -1)
       if (sortKey === 'temperature_desc') return (b.resources.temperature || -1) - (a.resources.temperature || -1)
@@ -508,7 +515,7 @@ const DeviceOverview = () => {
       if (sortKey === 'protocol_down_desc') return protocolDownCount(b) - protocolDownCount(a)
       if (sortKey === 'vendor_asc') return String(a.device.vendor || '').localeCompare(String(b.device.vendor || ''))
       if (sortKey === 'model_asc') return String(a.device.model || '').localeCompare(String(b.device.model || ''))
-      return ipToNumber(a.device.ip_address) - ipToNumber(b.device.ip_address)
+      return compareIpAddress(a.device.ip_address, b.device.ip_address)
     })
   }, [filteredItems, sortKey])
 
@@ -592,7 +599,7 @@ const DeviceOverview = () => {
       key: 'device',
       fixed: 'left',
       width: 260,
-      sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => ipToNumber(a.device.ip_address) - ipToNumber(b.device.ip_address),
+      sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => compareIpAddress(a.device.ip_address, b.device.ip_address),
       render: (_: any, record: DeviceOverviewItem) => {
         const enteredName = record.device.name || record.device.hostname || record.device.ip_address
         const sysName = record.system_info?.sys_name

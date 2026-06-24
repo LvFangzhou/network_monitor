@@ -64,6 +64,7 @@ AUDIT_MENU_PREFIXES = [
     ("/api/v1/alerts/silences", "告警屏蔽"),
     ("/api/v1/alerts/syslog", "Syslog"),
     ("/api/v1/metrics", "监控中心"),
+    ("/api/v1/config-backups", "配置备份"),
     ("/api/v1/tacacs", "Tacacs管理"),
     ("/api/v1/auth/users", "用户管理"),
     ("/api/v1/auth/login", "登录"),

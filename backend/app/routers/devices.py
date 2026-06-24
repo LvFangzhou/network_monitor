@@ -2,7 +2,8 @@
 设备管理路由
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
+from sqlalchemy import case, cast, func, or_
+from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from datetime import datetime
@@ -346,6 +347,14 @@ async def list_devices(
         if sort_by == "datacenter":
             query = query.outerjoin(Datacenter, Device.datacenter_id == Datacenter.id)
             sort_column = Datacenter.name
+        elif sort_by == "ip_address":
+            sort_column = case(
+                (
+                    Device.ip_address.op("~")(r"^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]+$"),
+                    cast(Device.ip_address, INET),
+                ),
+                else_=None,
+            )
         else:
             sort_column = sort_columns[sort_by]
         ordering = sort_column.desc().nullslast() if sort_order == "desc" else sort_column.asc().nullslast()

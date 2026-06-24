@@ -14,6 +14,7 @@ celery_app = Celery(
         "app.tasks.resource_tasks",
         "app.tasks.tacacs_tasks",
         "app.tasks.system_tasks",
+        "app.tasks.config_backup_tasks",
     ]
 )
 
@@ -46,6 +47,8 @@ celery_app.conf.update(
         "app.tasks.tacacs_tasks.process_tacacs_command_logs": {"queue": "tacacs"},
         "app.tasks.resource_tasks.collect_circuit_usage_hourly": {"queue": "resource"},
         "app.tasks.system_tasks.check_influxdb_storage_health": {"queue": "system"},
+        "app.tasks.config_backup_tasks.run_config_backup": {"queue": "resource"},
+        "app.tasks.config_backup_tasks.run_scheduled_config_backup": {"queue": "resource"},
     },
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=1000,

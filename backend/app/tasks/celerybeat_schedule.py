@@ -139,6 +139,14 @@ beat_schedule = {
         'task': 'app.tasks.resource_tasks.collect_circuit_usage_hourly',
         'schedule': crontab(minute=5, hour='*'),
     },
+    # 网络设备配置备份 - 每天凌晨 00:00 对所有上线设备执行一次
+    'run-config-backup-daily-midnight': {
+        'task': 'app.tasks.config_backup_tasks.run_scheduled_config_backup',
+        'schedule': crontab(minute=0, hour=0),
+        'options': {
+            'expires': 6 * 3600,
+        },
+    },
     'process-tacacs-command-logs-every-10s': {
         'task': 'app.tasks.tacacs_tasks.process_tacacs_command_logs',
         'schedule': 10.0,

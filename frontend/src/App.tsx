@@ -26,6 +26,7 @@ const loadDeviceOverview = () => import('./pages/metrics/DeviceOverview')
 const loadIPFlowQuery = () => import('./pages/metrics/IPFlowQuery')
 const loadSettings = () => import('./pages/Settings')
 const loadTacacsManager = () => import('./pages/TacacsManager')
+const loadConfigBackups = () => import('./pages/ConfigBackups')
 
 const Login = lazy(loadLogin)
 const Dashboard = lazy(loadDashboard)
@@ -48,6 +49,7 @@ const DeviceOverview = lazy(loadDeviceOverview)
 const IPFlowQuery = lazy(loadIPFlowQuery)
 const Settings = lazy(loadSettings)
 const TacacsManager = lazy(loadTacacsManager)
+const ConfigBackups = lazy(loadConfigBackups)
 
 const preloadRouteModules = () => {
   void Promise.allSettled([
@@ -69,10 +71,11 @@ const preloadRouteModules = () => {
     loadIPFlowQuery(),
     loadSettings(),
     loadTacacsManager(),
+    loadConfigBackups(),
   ])
 }
 
-const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/device-overview', '/port-query', '/ip-flow-query']
+const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/device-overview', '/port-query', '/ip-flow-query', '/config-backups']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/port-query']
 const ROUTE_ALIASES: Record<string, string[]> = {
   '/port-query': ['/metrics'],
@@ -210,6 +213,7 @@ function App() {
             <Route path="port-query" element={<MenuRoute menuPath="/port-query"><Metrics /></MenuRoute>} />
             <Route path="ip-flow-query" element={<MenuRoute menuPath="/ip-flow-query"><IPFlowQuery /></MenuRoute>} />
             <Route path="device-overview" element={<MenuRoute menuPath="/device-overview"><DeviceOverview /></MenuRoute>} />
+            <Route path="config-backups" element={<MenuRoute menuPath="/config-backups"><ConfigBackups /></MenuRoute>} />
             <Route path="metrics" element={<Navigate to="/port-query" replace />} />
             <Route path="settings" element={<MenuRoute menuPath="/settings"><Settings /></MenuRoute>} />
             <Route path="tacacs" element={<Navigate to="/tacacs/config" replace />} />
