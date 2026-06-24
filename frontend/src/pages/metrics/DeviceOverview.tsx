@@ -243,6 +243,18 @@ const isSnmpNameMismatch = (record: DeviceOverviewItem) => {
   return Boolean(sysName && enteredName && sysName !== enteredName)
 }
 
+const normalizeModelName = (value?: string | null) =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '')
+
+const isSnmpModelMismatch = (record: DeviceOverviewItem) => {
+  const snmpModel = normalizeModelName(record.system_info?.snmp_model)
+  const enteredModel = normalizeModelName(record.device.model)
+  return Boolean(snmpModel && enteredModel && snmpModel !== enteredModel)
+}
+
 const OVERVIEW_CACHE_KEY = 'device-overview:last-success'
 
 type DeviceOverviewCachePayload = {
@@ -269,8 +281,7 @@ const DeviceOverview = () => {
   const filtersReadyRef = useRef(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<string[]>([
     'datacenter',
-    'snmp_name',
-    'system_info',
+    'uptime',
     'vendor',
     'connectivity',
     'cpu',
@@ -283,8 +294,8 @@ const DeviceOverview = () => {
 
   const columnOptions = [
     { label: '所属机房', value: 'datacenter' },
-    { label: 'SNMP设备名', value: 'snmp_name' },
-    { label: '系统信息', value: 'system_info' },
+    { label: '运行时间', value: 'uptime' },
+    { label: '软件版本', value: 'software_version' },
     { label: '厂商/型号', value: 'vendor' },
     { label: '连通性', value: 'connectivity' },
     { label: 'CPU', value: 'cpu' },
@@ -490,26 +501,46 @@ const DeviceOverview = () => {
       title: '设备',
       key: 'device',
       fixed: 'left',
-      width: 220,
+      width: 260,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => ipToNumber(a.device.ip_address) - ipToNumber(b.device.ip_address),
-      render: (_: any, record: DeviceOverviewItem) => (
-        <Space direction="vertical" size={0}>
-          <Text strong>{record.device.name || record.device.hostname || record.device.ip_address}</Text>
-          <Text type="secondary">{record.device.ip_address}</Text>
-        </Space>
-      ),
+      render: (_: any, record: DeviceOverviewItem) => {
+        const enteredName = record.device.name || record.device.hostname || record.device.ip_address
+        const sysName = record.system_info?.sys_name
+        const mismatch = isSnmpNameMismatch(record)
+        return (
+          <Space direction="vertical" size={2}>
+            <Text strong type={mismatch ? 'danger' : undefined}>{enteredName}</Text>
+            <Text type="secondary">{record.device.ip_address}</Text>
+            {mismatch ? (
+              <Tooltip title={`录入：${enteredName}；SNMP：${sysName}`}>
+                <Tag color="red">SNMP名称：{sysName}</Tag>
+              </Tooltip>
+            ) : null}
+          </Space>
+        )
+      },
     },
     {
       title: '厂商/型号',
       key: 'vendor',
-      width: 180,
+      width: 220,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => String(a.device.model || '').localeCompare(String(b.device.model || '')),
-      render: (_: any, record: DeviceOverviewItem) => (
-        <Space direction="vertical" size={0}>
-          <Text>{record.device.vendor || '-'}</Text>
-          <Text type="secondary">{record.device.model || '-'}</Text>
-        </Space>
-      ),
+      render: (_: any, record: DeviceOverviewItem) => {
+        const snmpModel = record.system_info?.snmp_model
+        const enteredModel = record.device.model || '-'
+        const mismatch = isSnmpModelMismatch(record)
+        return (
+          <Space direction="vertical" size={2}>
+            <Text>{record.device.vendor || '-'}</Text>
+            <Text type={mismatch ? 'danger' : 'secondary'}>{enteredModel}</Text>
+            {mismatch ? (
+              <Tooltip title={`录入型号：${enteredModel}；SNMP型号：${snmpModel}`}>
+                <Tag color="red">SNMP型号：{snmpModel}</Tag>
+              </Tooltip>
+            ) : null}
+          </Space>
+        )
+      },
     },
     {
       title: '所属机房',
@@ -525,52 +556,26 @@ const DeviceOverview = () => {
       ),
     },
     {
-      title: 'SNMP设备名',
-      key: 'snmp_name',
-      width: 210,
-      sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
-        String(a.system_info?.sys_name || '').localeCompare(String(b.system_info?.sys_name || ''), 'zh-CN'),
-      render: (_: any, record: DeviceOverviewItem) => {
-        const sysName = record.system_info?.sys_name
-        if (!sysName) return <Text type="secondary">-</Text>
-        const mismatch = isSnmpNameMismatch(record)
-        return (
-          <Space direction="vertical" size={2}>
-            <Tooltip title={sysName}>
-              <Text
-                type={mismatch ? 'danger' : undefined}
-                style={{ maxWidth: 170 }}
-                ellipsis
-              >
-                {sysName}
-              </Text>
-            </Tooltip>
-            {mismatch ? (
-              <Tooltip title={`录入名称：${record.device.name || record.device.hostname || '-'}`}>
-                <Tag color="red">与录入不一致</Tag>
-              </Tooltip>
-            ) : null}
-          </Space>
-        )
-      },
-    },
-    {
-      title: '系统信息',
-      key: 'system_info',
-      width: 260,
+      title: '运行时间',
+      key: 'uptime',
+      width: 130,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
         (a.system_info?.uptime_seconds || -1) - (b.system_info?.uptime_seconds || -1),
+      render: (_: any, record: DeviceOverviewItem) => formatDuration(record.system_info?.uptime_seconds),
+    },
+    {
+      title: '软件版本',
+      key: 'software_version',
+      width: 210,
+      sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
+        String(a.system_info?.software_version || '').localeCompare(String(b.system_info?.software_version || '')),
       render: (_: any, record: DeviceOverviewItem) => {
-        const sysDescr = record.system_info?.sys_descr
-        const uptime = formatDuration(record.system_info?.uptime_seconds)
-        if (!sysDescr && uptime === '-') return <Text type="secondary">-</Text>
+        const version = record.system_info?.software_version
+        if (!version) return <Text type="secondary">-</Text>
         return (
-          <Space direction="vertical" size={0}>
-            <Tooltip title={sysDescr || '未采集到版本描述'}>
-              <Text style={{ maxWidth: 230 }} ellipsis>{sysDescr || '-'}</Text>
-            </Tooltip>
-            <Text type="secondary">运行时间：{uptime}</Text>
-          </Space>
+          <Tooltip title={record.system_info?.sys_descr || version}>
+            <Text style={{ maxWidth: 180 }} ellipsis>{version}</Text>
+          </Tooltip>
         )
       },
     },

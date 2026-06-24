@@ -385,6 +385,19 @@ class SNMPCollector(LoggerMixin):
             return ""
 
         return result.stdout
+
+    def _snmp_get_text_value(self, device: Any, oid: str) -> Optional[str]:
+        """使用 net-snmp 获取完整文本值，保留多行 sysDescr。"""
+        command = [part for part in self._build_snmp_command("snmpget", device, oid) if part != "-On"]
+        command.insert(1, "-Oqv")
+        output = self._run_snmp_command(command, device)
+        if output is None:
+            value = self.snmp_get(device, oid)
+            return str(value).strip() if value is not None else None
+        text = output.strip()
+        if text.startswith('"') and text.endswith('"'):
+            text = text[1:-1]
+        return text.strip() or None
     
     def _get_snmp_target(self, device: Any) -> Tuple[Any, CommunityData or UsmUserData]:
         """获取SNMP目标配置"""
@@ -1553,12 +1566,28 @@ class SNMPCollector(LoggerMixin):
 
     def collect_system_info(self, device: Any) -> Dict[str, Optional[str]]:
         """采集标准 SNMP system 信息"""
-        oids = self.OID_TEMPLATES["system_info"]["oids"]
-        sys_descr = self.snmp_get(device, "1.3.6.1.2.1.1.1.0")
-        sys_name = self.snmp_get(device, "1.3.6.1.2.1.1.5.0")
+        sys_descr_text = self._snmp_get_text_value(device, "1.3.6.1.2.1.1.1.0")
+        sys_name_text = self._snmp_get_text_value(device, "1.3.6.1.2.1.1.5.0")
+        software_version = None
+        snmp_model = None
+        if sys_descr_text:
+            version_match = re.search(
+                r"Software\s+Version\s+([^,\r\n]+)(?:,\s*(Release\s+[^\r\n,]+))?",
+                sys_descr_text,
+                re.IGNORECASE,
+            )
+            if version_match:
+                software_version = f"Version {version_match.group(1).strip()}"
+                if version_match.group(2):
+                    software_version = f"{software_version}, {version_match.group(2).strip()}"
+            model_match = re.search(r"^\s*Densivelo\s+([A-Za-z0-9._/-]+)", sys_descr_text, re.IGNORECASE | re.MULTILINE)
+            if model_match:
+                snmp_model = model_match.group(1).strip()
         return {
-            "sys_descr": str(sys_descr).strip() if sys_descr is not None else None,
-            "sys_name": str(sys_name).strip() if sys_name is not None else None,
+            "sys_descr": sys_descr_text,
+            "sys_name": sys_name_text,
+            "software_version": software_version,
+            "snmp_model": snmp_model,
         }
     
     def collect_device(self, device: Any) -> Dict[str, Any]:
@@ -1795,6 +1824,8 @@ class SNMPCollector(LoggerMixin):
                     "device_name": device.name,
                     "sys_name": system_info.get("sys_name"),
                     "sys_descr": system_info.get("sys_descr"),
+                    "software_version": system_info.get("software_version"),
+                    "snmp_model": system_info.get("snmp_model"),
                 },
                 "fields": {"uptime_seconds": float(uptime or 0)},
                 "timestamp": timestamp

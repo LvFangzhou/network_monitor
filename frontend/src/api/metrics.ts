@@ -324,6 +324,8 @@ export interface DeviceOverviewItem {
   system_info?: {
     sys_name?: string | null
     sys_descr?: string | null
+    software_version?: string | null
+    snmp_model?: string | null
     uptime_seconds?: number | null
   }
   collected_at: string
