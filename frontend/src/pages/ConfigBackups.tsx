@@ -83,6 +83,9 @@ const ConfigBackups = () => {
   const [jobResults, setJobResults] = useState<ConfigBackupResult[]>([])
   const [latestResults, setLatestResults] = useState<ConfigBackupResult[]>([])
   const [resultFilterText, setResultFilterText] = useState('')
+  const [resultDatacenterFilter, setResultDatacenterFilter] = useState<string>()
+  const [resultVendorFilter, setResultVendorFilter] = useState<string>()
+  const [resultDeviceTypeFilter, setResultDeviceTypeFilter] = useState<string>()
   const [notificationWebhook, setNotificationWebhook] = useState('')
   const [webhookLabel, setWebhookLabel] = useState('未填写')
   const [savingWebhook, setSavingWebhook] = useState(false)
@@ -145,10 +148,14 @@ const ConfigBackups = () => {
     }
   }
 
-  const handleSearch = async () => {
+  const handleSearch = async (silent = false) => {
     const text = keyword.trim()
     if (!text) {
-      message.warning('请输入要搜索的配置内容，例如 IP 地址')
+      setSearchItems([])
+      setSearchJob(null)
+      if (!silent) {
+        message.warning('请输入要搜索的配置内容，例如 IP 地址')
+      }
       return
     }
     setSearchLoading(true)
@@ -162,7 +169,7 @@ const ConfigBackups = () => {
       })
       setSearchItems(result.items)
       setSearchJob(result.job)
-      if (!result.items.length) {
+      if (!result.items.length && !silent) {
         message.info('最近一次成功备份中没有搜索到匹配内容')
       }
     } catch (error: any) {
@@ -236,17 +243,40 @@ const ConfigBackups = () => {
 
   const filteredLatestResults = useMemo(() => {
     const text = resultFilterText.trim().toLowerCase()
-    if (!text) return latestResults
     return latestResults.filter((item) =>
-      [
-        item.device_name,
-        item.device_ip,
-        item.datacenter_name,
-        item.vendor,
-        item.model,
-      ].some((value) => String(value || '').toLowerCase().includes(text))
+      (!text || [
+          item.device_name,
+          item.device_ip,
+          item.datacenter_name,
+          item.vendor,
+          item.model,
+          item.device_type,
+        ].some((value) => String(value || '').toLowerCase().includes(text))) &&
+      (!resultDatacenterFilter || item.datacenter_name === resultDatacenterFilter) &&
+      (!resultVendorFilter || item.vendor === resultVendorFilter) &&
+      (!resultDeviceTypeFilter || item.device_type === resultDeviceTypeFilter)
     )
-  }, [latestResults, resultFilterText])
+  }, [latestResults, resultDatacenterFilter, resultDeviceTypeFilter, resultFilterText, resultVendorFilter])
+
+  const latestResultOptions = useMemo(() => ({
+    datacenters: Array.from(new Set(latestResults.map((item) => item.datacenter_name).filter(Boolean) as string[])).sort(),
+    vendors: Array.from(new Set(latestResults.map((item) => item.vendor).filter(Boolean) as string[])).sort(),
+    deviceTypes: Array.from(new Set(latestResults.map((item) => item.device_type).filter(Boolean) as string[])).sort(),
+  }), [latestResults])
+
+  useEffect(() => {
+    const text = keyword.trim()
+    if (!text) {
+      setSearchItems([])
+      setSearchJob(null)
+      return
+    }
+    const timer = window.setTimeout(() => {
+      handleSearch(true)
+    }, 500)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keyword, datacenter, deviceIp])
 
   return (
     <div className="modern-page">
@@ -273,60 +303,125 @@ const ConfigBackups = () => {
         </Col>
       </Row>
 
-      <Card
-        title="配置备份"
-        extra={
-          <Space>
-            <Button icon={<ReloadOutlined />} onClick={() => loadJobs(jobsPage)} loading={jobsLoading}>刷新</Button>
-            <Button type="primary" icon={<CloudDownloadOutlined />} onClick={handleTrigger} loading={triggering}>
-              手动触发备份
-            </Button>
-          </Space>
-        }
-      >
-        <Space direction="vertical" size={10} style={{ width: '100%' }}>
-          <Text type="secondary">系统每天 00:00 自动对所有上线设备执行配置备份。手动触发会异步执行，完成后通过机器人推送各机房成功/失败数量。</Text>
-          {latestJob?.summary ? (
-            <Paragraph style={{ whiteSpace: 'pre-wrap', padding: 12, borderRadius: 12, background: colorFillQuaternary, marginBottom: 0 }}>
-              {latestJob.summary}
-            </Paragraph>
-          ) : null}
-        </Space>
-      </Card>
-
-      <Card title="机器人通知配置">
-        <Form layout="vertical">
-          <Form.Item
-            label="配置备份完成后推送的机器人 Webhook"
-            extra={`支持飞书 / 企业微信 / 钉钉 / 通用 Webhook，当前识别：${webhookLabel}。留空保存则不单独配置，系统会尝试回退环境变量里的系统通知地址。`}
+      <Row gutter={[16, 16]}>
+        <Col xs={24} xl={8}>
+          <Card
+            title="配置备份"
+            extra={<Button icon={<ReloadOutlined />} onClick={() => loadJobs(jobsPage, jobsPageSize)} loading={jobsLoading}>刷新</Button>}
+            style={{ height: '100%' }}
           >
-            <Space.Compact style={{ width: '100%' }}>
-              <Input
-                allowClear
-                value={notificationWebhook}
-                onChange={(event) => {
-                  setNotificationWebhook(event.target.value)
-                  setWebhookLabel(detectWebhookLabel(event.target.value))
-                }}
-                placeholder="粘贴机器人 Webhook 地址"
-              />
-              <Button onClick={handleTestWebhook} loading={testingWebhook}>测试</Button>
-              <Button type="primary" onClick={handleSaveWebhook} loading={savingWebhook}>保存</Button>
-            </Space.Compact>
-          </Form.Item>
-        </Form>
-      </Card>
+            <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <Text type="secondary">每天 00:00 自动备份所有上线设备；手动触发后异步执行，完成后推送机器人。</Text>
+              <Button block type="primary" icon={<CloudDownloadOutlined />} onClick={handleTrigger} loading={triggering}>
+                手动触发备份
+              </Button>
+              {latestJob?.summary ? (
+                <Paragraph
+                  ellipsis={{ rows: 5, expandable: true, symbol: '展开' }}
+                  style={{ whiteSpace: 'pre-wrap', padding: 12, borderRadius: 12, background: colorFillQuaternary, marginBottom: 0 }}
+                >
+                  {latestJob.summary}
+                </Paragraph>
+              ) : null}
+            </Space>
+          </Card>
+        </Col>
+        <Col xs={24} xl={8}>
+          <Card title="备份任务历史" style={{ height: '100%' }}>
+            <Table
+              size="small"
+              rowKey="id"
+              loading={jobsLoading}
+              dataSource={jobs}
+              pagination={{
+                current: jobsPage,
+                pageSize: jobsPageSize,
+                total: jobsTotal,
+                showSizeChanger: true,
+                simple: true,
+                pageSizeOptions: [5, 10, 20, 50],
+                onChange: (page, pageSize) => {
+                  setJobsPage(page)
+                  setJobsPageSize(pageSize)
+                  loadJobs(page, pageSize)
+                },
+              }}
+              columns={[
+                { title: 'ID', dataIndex: 'id', width: 64 },
+                { title: '状态', dataIndex: 'status', width: 92, render: (value: string) => <Tag color={statusColor[value] || 'default'}>{statusLabel[value] || value}</Tag> },
+                { title: '成功/失败', width: 92, render: (_: unknown, record: ConfigBackupJob) => `${record.success_count}/${record.failed_count}` },
+                { title: '完成时间', dataIndex: 'finished_at', render: formatTime },
+                { title: '操作', width: 84, render: (_: unknown, record: ConfigBackupJob) => <Button size="small" onClick={() => openJobResults(record.id)}>明细</Button> },
+              ]}
+            />
+          </Card>
+        </Col>
+        <Col xs={24} xl={8}>
+          <Card title="机器人通知配置" style={{ height: '100%' }}>
+            <Form layout="vertical">
+              <Form.Item
+                label="配置备份完成后推送的机器人 Webhook"
+                extra={`支持飞书 / 企业微信 / 钉钉 / 通用 Webhook，当前识别：${webhookLabel}`}
+              >
+                <Input.TextArea
+                  allowClear
+                  rows={3}
+                  value={notificationWebhook}
+                  onChange={(event) => {
+                    setNotificationWebhook(event.target.value)
+                    setWebhookLabel(detectWebhookLabel(event.target.value))
+                  }}
+                  placeholder="粘贴机器人 Webhook 地址"
+                />
+              </Form.Item>
+              <Space>
+                <Button onClick={handleTestWebhook} loading={testingWebhook}>测试</Button>
+                <Button type="primary" onClick={handleSaveWebhook} loading={savingWebhook}>保存</Button>
+              </Space>
+            </Form>
+          </Card>
+        </Col>
+      </Row>
 
       <Card
         title="最近备份配置文件"
         extra={
-          <Input
-            allowClear
-            placeholder="按设备 / IP / 机房过滤"
-            value={resultFilterText}
-            onChange={(event) => setResultFilterText(event.target.value)}
-            style={{ width: 260 }}
-          />
+          <Space wrap>
+            <Select
+              allowClear
+              showSearch
+              placeholder="机房"
+              value={resultDatacenterFilter}
+              onChange={setResultDatacenterFilter}
+              style={{ width: 180 }}
+              options={latestResultOptions.datacenters.map((value) => ({ value, label: value }))}
+            />
+            <Select
+              allowClear
+              showSearch
+              placeholder="厂商"
+              value={resultVendorFilter}
+              onChange={setResultVendorFilter}
+              style={{ width: 150 }}
+              options={latestResultOptions.vendors.map((value) => ({ value, label: value }))}
+            />
+            <Select
+              allowClear
+              showSearch
+              placeholder="设备类型"
+              value={resultDeviceTypeFilter}
+              onChange={setResultDeviceTypeFilter}
+              style={{ width: 150 }}
+              options={latestResultOptions.deviceTypes.map((value) => ({ value, label: value }))}
+            />
+            <Input
+              allowClear
+              placeholder="搜索设备 / IP"
+              value={resultFilterText}
+              onChange={(event) => setResultFilterText(event.target.value)}
+              style={{ width: 220 }}
+            />
+          </Space>
         }
       >
         <Table
@@ -334,11 +429,8 @@ const ConfigBackups = () => {
           dataSource={filteredLatestResults}
           pagination={{ pageSize: 20, showSizeChanger: true, showTotal: (total) => `共 ${total} 台` }}
           columns={[
-            { title: '设备', width: 280, render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text strong>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
-            { title: '机房', dataIndex: 'datacenter_name', width: 150, render: (value?: string) => value || '-' },
-            { title: '厂商/型号', width: 180, render: (_: unknown, record: ConfigBackupResult) => [record.vendor, record.model].filter(Boolean).join(' / ') || '-' },
-            { title: '命令', dataIndex: 'command', width: 180, render: (value?: string) => value || '-' },
-            { title: '行数', dataIndex: 'line_count', width: 90, render: (value?: number) => value || '-' },
+            { title: '设备', width: 320, render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text strong>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
+            { title: '机房', dataIndex: 'datacenter_name', width: 180, render: (value?: string) => value || '-' },
             { title: '状态', dataIndex: 'status', width: 100, render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : 'blue'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value}</Tag> },
             { title: '完成时间', dataIndex: 'finished_at', width: 180, render: formatTime },
             {
@@ -361,7 +453,7 @@ const ConfigBackups = () => {
             placeholder="搜索 IP / 关键字，例如 10.239.0.1"
             value={keyword}
             onChange={(event) => setKeyword(event.target.value)}
-            onPressEnter={handleSearch}
+            onPressEnter={() => handleSearch(false)}
             style={{ width: 320 }}
           />
           <Select
@@ -379,10 +471,10 @@ const ConfigBackups = () => {
             placeholder="按设备管理地址过滤"
             value={deviceIp}
             onChange={(event) => setDeviceIp(event.target.value)}
-            onPressEnter={handleSearch}
+            onPressEnter={() => handleSearch(false)}
             style={{ width: 220 }}
           />
-          <Button type="primary" icon={<SearchOutlined />} onClick={handleSearch} loading={searchLoading}>搜索</Button>
+          <Button icon={<SearchOutlined />} onClick={() => handleSearch(false)} loading={searchLoading}>手动刷新</Button>
           {searchJob ? <Text type="secondary">搜索范围：任务 #{searchJob.id}，完成时间 {formatTime(searchJob.finished_at)}</Text> : null}
         </Space>
         <Table
@@ -429,50 +521,6 @@ const ConfigBackups = () => {
               </div>
             ),
           }}
-        />
-      </Card>
-
-      <Card title="备份任务历史">
-        <Table
-          rowKey="id"
-          loading={jobsLoading}
-          dataSource={jobs}
-          pagination={{
-            current: jobsPage,
-            pageSize: jobsPageSize,
-            total: jobsTotal,
-            showSizeChanger: true,
-            showTotal: (total) => `共 ${total} 个任务`,
-            pageSizeOptions: [10, 20, 50, 100],
-            onChange: (page, pageSize) => {
-              setJobsPage(page)
-              setJobsPageSize(pageSize)
-              loadJobs(page, pageSize)
-            },
-          }}
-          columns={[
-            { title: '任务ID', dataIndex: 'id', width: 90 },
-            {
-              title: '状态',
-              dataIndex: 'status',
-              width: 120,
-              render: (value: string) => <Tag color={statusColor[value] || 'default'}>{statusLabel[value] || value}</Tag>,
-            },
-            { title: '触发方式', dataIndex: 'trigger_type', width: 110, render: (value: string) => value === 'scheduled' ? '定时' : '手动' },
-            { title: '设备数', dataIndex: 'total_devices', width: 100 },
-            { title: '成功', dataIndex: 'success_count', width: 100 },
-            { title: '失败', dataIndex: 'failed_count', width: 100 },
-            { title: '触发人', dataIndex: 'started_by', width: 120, render: (value?: string) => value || '-' },
-            { title: '开始时间', dataIndex: 'started_at', width: 180, render: formatTime },
-            { title: '完成时间', dataIndex: 'finished_at', width: 180, render: formatTime },
-            {
-              title: '操作',
-              width: 120,
-              render: (_: unknown, record: ConfigBackupJob) => (
-                <Button size="small" onClick={() => openJobResults(record.id)}>查看明细</Button>
-              ),
-            },
-          ]}
         />
       </Card>
 

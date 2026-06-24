@@ -22,6 +22,7 @@ export interface ConfigBackupResult {
   device_name: string
   device_ip: string
   datacenter_name?: string | null
+  device_type?: string | null
   vendor?: string | null
   model?: string | null
   status: 'pending' | 'running' | 'success' | 'failed'
@@ -41,6 +42,7 @@ export interface ConfigSearchMatch {
   device_name: string
   device_ip: string
   datacenter_name?: string | null
+  device_type?: string | null
   vendor?: string | null
   model?: string | null
   line_number: number

@@ -52,6 +52,7 @@ def _result_to_dict(result: ConfigBackupResult, include_content: bool = False) -
         "device_name": result.device_name,
         "device_ip": result.device_ip,
         "datacenter_name": result.datacenter_name,
+        "device_type": result.device.device_type if result.device else None,
         "vendor": result.vendor,
         "model": result.model,
         "status": result.status,

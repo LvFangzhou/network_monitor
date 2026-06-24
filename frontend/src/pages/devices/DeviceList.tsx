@@ -197,6 +197,7 @@ const DeviceList = () => {
   const [batchDeleting, setBatchDeleting] = useState(false)
   const [batchEditVisible, setBatchEditVisible] = useState(false)
   const [batchUpdating, setBatchUpdating] = useState(false)
+  const [importing, setImporting] = useState(false)
   const [filterOptions, setFilterOptions] = useState({
     datacenters: [] as Array<{ id: number; name: string; code?: string; location?: string; contact_person?: string }>,
     device_types: [] as Array<{ id: number; name: string; display_name?: string }>,
@@ -641,8 +642,11 @@ const DeviceList = () => {
       return
     }
 
+    setImporting(true)
+    const hideImporting = message.loading(`正在导入 ${file.name}，请稍等...`, 0)
     try {
       const result = await importDevices(file)
+      hideImporting()
       message.success(`导入完成：成功 ${result.imported} 条，失败 ${result.failed} 条`)
       if (result.errors.length > 0) {
         message.warning(result.errors.slice(0, 3).join('；'))
@@ -650,8 +654,10 @@ const DeviceList = () => {
       fetchDevices()
       fetchFilterOptions()
     } catch (error: any) {
+      hideImporting()
       message.error(error?.response?.data?.detail || '导入失败')
     } finally {
+      setImporting(false)
       event.target.value = ''
     }
   }
@@ -1140,8 +1146,8 @@ const DeviceList = () => {
                 onChange={handleImportFile}
               />
               <Tooltip title="导入">
-                <Button icon={<ImportOutlined />} onClick={handleImportClick}>
-                  导入
+                <Button icon={<ImportOutlined />} onClick={handleImportClick} loading={importing} disabled={importing}>
+                  {importing ? '导入中...' : '导入'}
                 </Button>
               </Tooltip>
             </>
