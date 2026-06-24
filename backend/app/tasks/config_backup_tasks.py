@@ -220,11 +220,17 @@ def _clean_config_output(output: str, command: str) -> str:
         cleaned.append(line)
     if not cleaned:
         cleaned = lines
-    while cleaned and not cleaned[0].strip():
-        cleaned.pop(0)
-    while cleaned and not cleaned[-1].strip():
-        cleaned.pop()
-    return "\n".join(cleaned).strip()
+    compacted: List[str] = []
+    for line in cleaned:
+        if not line.strip():
+            # 配置文件里空行基本没有语义，删除多余空行，保留 # / ! 这类厂商自己的段落分隔符。
+            continue
+        compacted.append(line.rstrip())
+    while compacted and not compacted[0].strip():
+        compacted.pop(0)
+    while compacted and not compacted[-1].strip():
+        compacted.pop()
+    return "\n".join(compacted).strip()
 
 
 def _handle_login_prompts(shell: Any, initial_output: str) -> str:

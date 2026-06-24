@@ -685,10 +685,10 @@ const ConfigBackups = () => {
         title={resultDetail ? `${resultDetail.device_name} (${resultDetail.device_ip}) 配置` : '配置详情'}
         open={resultDrawerOpen}
         onClose={() => setResultDrawerOpen(false)}
-        width="96vw"
+        width="min(900px, 72vw)"
       >
         <Spin spinning={resultLoading}>
-          <div style={{ background: colorFillQuaternary, borderRadius: 12, padding: 16, minHeight: '72vh', maxHeight: '78vh', overflow: 'auto' }}>
+          <div style={{ background: colorFillQuaternary, borderRadius: 12, padding: 16, minHeight: '60vh', maxHeight: '74vh', overflow: 'auto' }}>
             {renderConfigContent()}
           </div>
         </Spin>
