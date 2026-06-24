@@ -1,10 +1,13 @@
 import asyncio
+import os
 import hashlib
 import io
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core import get_logger
@@ -16,6 +19,7 @@ from app.utils import notification_manager
 from app.utils.config_backup_settings import config_backup_notification_channels
 
 logger = get_logger(__name__)
+CONFIG_BACKUP_CONCURRENCY = max(1, int(os.getenv("CONFIG_BACKUP_CONCURRENCY", "16")))
 
 
 def _utc_now() -> datetime:
@@ -279,6 +283,52 @@ def _send_backup_notification(job: ConfigBackupJob, datacenter_stats: Dict[str, 
     asyncio.run(_send_all())
 
 
+def _device_payload(device: Device) -> Dict[str, Any]:
+    return {
+        "id": device.id,
+        "name": device.name,
+        "ip_address": device.ip_address,
+        "datacenter_name": device.datacenter_ref.name if device.datacenter_ref else "未设置机房",
+        "vendor": device.vendor,
+        "model": device.model,
+        "ssh_port": device.ssh_port,
+        "ssh_username": device.ssh_username,
+        "ssh_password": device.ssh_password,
+        "ssh_key": device.ssh_key,
+    }
+
+
+def _backup_device_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    started_at = _utc_now()
+    device = SimpleNamespace(**payload)
+    try:
+        command, config = _collect_config(device)
+        return {
+            **payload,
+            "status": "success",
+            "command": command,
+            "config_content": config,
+            "config_hash": hashlib.sha256(config.encode("utf-8", errors="ignore")).hexdigest(),
+            "line_count": len(config.splitlines()),
+            "error_message": None,
+            "started_at": started_at,
+            "finished_at": _utc_now(),
+        }
+    except Exception as exc:
+        logger.warning("设备配置备份失败", device_id=payload.get("id"), ip=payload.get("ip_address"), error=str(exc))
+        return {
+            **payload,
+            "status": "failed",
+            "command": None,
+            "config_content": None,
+            "config_hash": None,
+            "line_count": 0,
+            "error_message": str(exc)[:2000],
+            "started_at": started_at,
+            "finished_at": _utc_now(),
+        }
+
+
 @celery_app.task(bind=True, name="app.tasks.config_backup_tasks.run_config_backup", time_limit=7200, soft_time_limit=6900)
 def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "manual", actor: Optional[str] = None) -> Dict[str, Any]:
     db = SessionLocal()
@@ -310,40 +360,64 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
         job.failed_count = 0
         db.commit()
 
-        for device in devices:
-            datacenter = device.datacenter_ref.name if device.datacenter_ref else "未设置机房"
+        payloads = [_device_payload(device) for device in devices]
+        result_ids: Dict[int, int] = {}
+        for payload in payloads:
             result = ConfigBackupResult(
                 job_id=job.id,
-                device_id=device.id,
-                device_name=device.name,
-                device_ip=device.ip_address,
-                datacenter_name=datacenter,
-                vendor=device.vendor,
-                model=device.model,
-                status="running",
+                device_id=payload["id"],
+                device_name=payload["name"],
+                device_ip=payload["ip_address"],
+                datacenter_name=payload["datacenter_name"],
+                vendor=payload.get("vendor"),
+                model=payload.get("model"),
+                status="pending",
                 started_at=_utc_now(),
             )
             db.add(result)
-            db.commit()
-            db.refresh(result)
-            try:
-                command, config = _collect_config(device)
-                result.command = command
-                result.config_content = config
-                result.config_hash = hashlib.sha256(config.encode("utf-8", errors="ignore")).hexdigest()
-                result.line_count = len(config.splitlines())
-                result.status = "success"
-                result.finished_at = _utc_now()
-                job.success_count += 1
-                datacenter_stats[datacenter]["success"] += 1
-            except Exception as exc:
-                result.status = "failed"
-                result.error_message = str(exc)[:2000]
-                result.finished_at = _utc_now()
-                job.failed_count += 1
-                datacenter_stats[datacenter]["failed"] += 1
-                logger.warning("设备配置备份失败", job_id=job.id, device_id=device.id, ip=device.ip_address, error=str(exc))
-            db.commit()
+            db.flush()
+            result_ids[payload["id"]] = result.id
+        db.commit()
+
+        max_workers = min(CONFIG_BACKUP_CONCURRENCY, max(1, len(payloads)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(_backup_device_payload, payload): payload for payload in payloads}
+            for future in as_completed(future_map):
+                backup_result = future.result()
+                result_id = result_ids.get(backup_result["id"])
+                if not result_id:
+                    continue
+
+                result = db.query(ConfigBackupResult).filter(ConfigBackupResult.id == result_id).first()
+                if not result:
+                    continue
+
+                result.status = backup_result["status"]
+                result.command = backup_result.get("command")
+                result.config_content = backup_result.get("config_content")
+                result.config_hash = backup_result.get("config_hash")
+                result.line_count = backup_result.get("line_count") or 0
+                result.error_message = backup_result.get("error_message")
+                result.started_at = backup_result.get("started_at")
+                result.finished_at = backup_result.get("finished_at")
+
+                datacenter = backup_result.get("datacenter_name") or "未设置机房"
+                if result.status == "success":
+                    job.success_count += 1
+                    datacenter_stats[datacenter]["success"] += 1
+                else:
+                    job.failed_count += 1
+                    datacenter_stats[datacenter]["failed"] += 1
+                db.commit()
+
+                if (job.success_count + job.failed_count) % 10 == 0:
+                    logger.info(
+                        "配置备份进度",
+                        job_id=job.id,
+                        success=job.success_count,
+                        failed=job.failed_count,
+                        total=job.total_devices,
+                    )
 
         job.status = "success" if job.failed_count == 0 else ("partial_failed" if job.success_count else "failed")
         job.finished_at = _utc_now()
