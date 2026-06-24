@@ -814,6 +814,31 @@ def _max_latest_grouped_value(device_id: int, measurement: str, field: str, grou
     return max(values) if values else None
 
 
+def _latest_snmp_system_info(device_id: int) -> Dict[str, Any]:
+    flux = f'''
+    from(bucket: "{influx_client.bucket}")
+      |> range(start: -24h)
+      |> filter(fn: (r) => r._measurement == "snmp_system_info")
+      |> filter(fn: (r) => r.device_id == "{device_id}")
+      |> filter(fn: (r) => r._field == "uptime_seconds")
+      |> last()
+    '''
+    try:
+        rows = influx_client.query(flux)
+    except Exception as exc:
+        logger.warning("读取SNMP系统信息失败", device_id=device_id, error=str(exc))
+        return {"sys_name": None, "sys_descr": None, "uptime_seconds": None}
+    if not rows:
+        uptime = _latest_numeric(device_id, "snmp_metrics", ["seconds"])
+        return {"sys_name": None, "sys_descr": None, "uptime_seconds": uptime}
+    row = rows[0]
+    return {
+        "sys_name": row.get("sys_name"),
+        "sys_descr": row.get("sys_descr"),
+        "uptime_seconds": _safe_float(row.get("value")),
+    }
+
+
 def _hardware_summary(device_id: int) -> Dict[str, Any]:
     up_rows = _latest_grouped_values(device_id, "snmp_hardware", "up", ["component_type", "component"])
     present_rows = _latest_grouped_values(device_id, "snmp_hardware", "present", ["component_type", "component"])
@@ -1158,6 +1183,7 @@ def _build_snmp_overview(
         "power_status_known": True,
     }
     protocols = _get_snmp_protocol_summary(device.id)
+    system_info = _latest_snmp_system_info(device.id)
     has_recent_data = _snmp_overview_has_recent_data(device.id, resources, hardware, protocols, sessions)
 
     if not device.snmp_version:
@@ -1188,6 +1214,7 @@ def _build_snmp_overview(
         "sessions": sessions,
         "hardware": hardware,
         "protocols": protocols,
+        "system_info": system_info,
     }
 
 
@@ -1216,6 +1243,7 @@ def _device_base_overview(device: Device) -> Dict[str, Any]:
             "power_status_known": True,
         },
         "protocols": _empty_protocol_summary(),
+        "system_info": {"sys_name": None, "sys_descr": None, "uptime_seconds": None},
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
 

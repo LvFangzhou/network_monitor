@@ -67,6 +67,13 @@ class SNMPCollector(LoggerMixin):
             "oids": {
                 "1.3.6.1.2.1.1.3.0": "sysUpTime",  # 标准
             }
+        },
+        "system_info": {
+            "name": "系统信息",
+            "oids": {
+                "1.3.6.1.2.1.1.1.0": "sysDescr",
+                "1.3.6.1.2.1.1.5.0": "sysName",
+            }
         }
     }
 
@@ -1543,6 +1550,16 @@ class SNMPCollector(LoggerMixin):
             except:
                 pass
         return None
+
+    def collect_system_info(self, device: Any) -> Dict[str, Optional[str]]:
+        """采集标准 SNMP system 信息"""
+        oids = self.OID_TEMPLATES["system_info"]["oids"]
+        sys_descr = self.snmp_get(device, "1.3.6.1.2.1.1.1.0")
+        sys_name = self.snmp_get(device, "1.3.6.1.2.1.1.5.0")
+        return {
+            "sys_descr": str(sys_descr).strip() if sys_descr is not None else None,
+            "sys_name": str(sys_name).strip() if sys_name is not None else None,
+        }
     
     def collect_device(self, device: Any) -> Dict[str, Any]:
         """采集设备所有SNMP指标"""
@@ -1767,6 +1784,21 @@ class SNMPCollector(LoggerMixin):
                 "fields": {"seconds": uptime},
                 "timestamp": timestamp
             })
+
+        # 采集标准系统信息。文本值写入 tag，避免和数值型指标混在同一 field 中。
+        system_info = self.collect_system_info(device)
+        if uptime is not None or system_info.get("sys_name") or system_info.get("sys_descr"):
+            points.append({
+                "measurement": "snmp_system_info",
+                "tags": {
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                    "sys_name": system_info.get("sys_name"),
+                    "sys_descr": system_info.get("sys_descr"),
+                },
+                "fields": {"uptime_seconds": float(uptime or 0)},
+                "timestamp": timestamp
+            })
         
         # 批量写入InfluxDB
         if points:
@@ -1809,6 +1841,10 @@ class SNMPCollector(LoggerMixin):
             "hardware_count": len(hardware_rows),
             "interfaces_count": len(interfaces),
             "uptime": uptime,
+            "system_info": {
+                **system_info,
+                "uptime_seconds": uptime,
+            },
             "points_written": len(points)
         }
 

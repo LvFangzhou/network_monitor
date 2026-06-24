@@ -235,6 +235,14 @@ const formatDuration = (seconds?: number | null, fallback?: string | null) => {
   return `${minutes}分钟`
 }
 
+const normalizeDeviceName = (value?: string | null) => String(value || '').trim().toLowerCase()
+
+const isSnmpNameMismatch = (record: DeviceOverviewItem) => {
+  const sysName = normalizeDeviceName(record.system_info?.sys_name)
+  const enteredName = normalizeDeviceName(record.device.name || record.device.hostname)
+  return Boolean(sysName && enteredName && sysName !== enteredName)
+}
+
 const OVERVIEW_CACHE_KEY = 'device-overview:last-success'
 
 type DeviceOverviewCachePayload = {
@@ -261,6 +269,8 @@ const DeviceOverview = () => {
   const filtersReadyRef = useRef(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<string[]>([
     'datacenter',
+    'snmp_name',
+    'system_info',
     'vendor',
     'connectivity',
     'cpu',
@@ -273,6 +283,8 @@ const DeviceOverview = () => {
 
   const columnOptions = [
     { label: '所属机房', value: 'datacenter' },
+    { label: 'SNMP设备名', value: 'snmp_name' },
+    { label: '系统信息', value: 'system_info' },
     { label: '厂商/型号', value: 'vendor' },
     { label: '连通性', value: 'connectivity' },
     { label: 'CPU', value: 'cpu' },
@@ -511,6 +523,56 @@ const DeviceOverview = () => {
           code={record.device.datacenter?.code}
         />
       ),
+    },
+    {
+      title: 'SNMP设备名',
+      key: 'snmp_name',
+      width: 210,
+      sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
+        String(a.system_info?.sys_name || '').localeCompare(String(b.system_info?.sys_name || ''), 'zh-CN'),
+      render: (_: any, record: DeviceOverviewItem) => {
+        const sysName = record.system_info?.sys_name
+        if (!sysName) return <Text type="secondary">-</Text>
+        const mismatch = isSnmpNameMismatch(record)
+        return (
+          <Space direction="vertical" size={2}>
+            <Tooltip title={sysName}>
+              <Text
+                type={mismatch ? 'danger' : undefined}
+                style={{ maxWidth: 170 }}
+                ellipsis
+              >
+                {sysName}
+              </Text>
+            </Tooltip>
+            {mismatch ? (
+              <Tooltip title={`录入名称：${record.device.name || record.device.hostname || '-'}`}>
+                <Tag color="red">与录入不一致</Tag>
+              </Tooltip>
+            ) : null}
+          </Space>
+        )
+      },
+    },
+    {
+      title: '系统信息',
+      key: 'system_info',
+      width: 260,
+      sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
+        (a.system_info?.uptime_seconds || -1) - (b.system_info?.uptime_seconds || -1),
+      render: (_: any, record: DeviceOverviewItem) => {
+        const sysDescr = record.system_info?.sys_descr
+        const uptime = formatDuration(record.system_info?.uptime_seconds)
+        if (!sysDescr && uptime === '-') return <Text type="secondary">-</Text>
+        return (
+          <Space direction="vertical" size={0}>
+            <Tooltip title={sysDescr || '未采集到版本描述'}>
+              <Text style={{ maxWidth: 230 }} ellipsis>{sysDescr || '-'}</Text>
+            </Tooltip>
+            <Text type="secondary">运行时间：{uptime}</Text>
+          </Space>
+        )
+      },
     },
     {
       title: '连通性',

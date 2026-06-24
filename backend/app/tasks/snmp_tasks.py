@@ -1001,6 +1001,11 @@ def collect_snmp_for_device(self, device_id: int):
                 "bgp": {"total": 0, "up": 0, "down": 0},
                 "ospf": {"total": 0, "up": 0, "down": 0},
             },
+            "system_info": result.get("system_info") or {
+                "sys_name": None,
+                "sys_descr": None,
+                "uptime_seconds": result.get("uptime"),
+            },
             "collected_at": datetime.now(timezone.utc).isoformat(),
         }
         _set_monitor_cache("overview", device.id, overview)
@@ -1254,6 +1259,7 @@ def collect_asternos_for_device(self, device_id: int):
                     ["full", "established", "up"],
                 ),
             },
+            "system_info": {"sys_name": None, "sys_descr": None, "uptime_seconds": None},
             "collected_at": collected_at,
         }
         _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at})
@@ -1292,6 +1298,7 @@ def collect_asternos_for_device(self, device_id: int):
                 "sessions": {"current": None, "total": None, "usage_percent": None},
                 "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
                 "protocols": {"bgp": {"total": 0, "up": 0, "down": 0}, "ospf": {"total": 0, "up": 0, "down": 0}},
+                "system_info": {"sys_name": None, "sys_descr": None, "uptime_seconds": None},
                 "collected_at": datetime.now(timezone.utc).isoformat(),
             })
         return {"device_id": device_id, "success": False, "error": str(exc)}

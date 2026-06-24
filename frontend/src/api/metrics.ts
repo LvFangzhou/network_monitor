@@ -321,6 +321,11 @@ export interface DeviceOverviewItem {
     bgp: DeviceProtocolSummary
     ospf: DeviceProtocolSummary
   }
+  system_info?: {
+    sys_name?: string | null
+    sys_descr?: string | null
+    uptime_seconds?: number | null
+  }
   collected_at: string
 }
 
