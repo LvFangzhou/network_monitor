@@ -77,6 +77,30 @@ const TABLE_CELL_TEXT_STYLE: React.CSSProperties = {
   textOverflow: 'ellipsis',
 }
 
+const ipToParts = (value?: string | null) => {
+  const parts = String(value || '').trim().split('.')
+  if (parts.length !== 4) return null
+  const numbers = parts.map((part) => Number(part))
+  if (numbers.some((item) => !Number.isInteger(item) || item < 0 || item > 255)) return null
+  return numbers
+}
+
+const compareIpAddress = (left?: string | null, right?: string | null) => {
+  const leftParts = ipToParts(left)
+  const rightParts = ipToParts(right)
+  if (leftParts && rightParts) {
+    for (let index = 0; index < 4; index += 1) {
+      if (leftParts[index] !== rightParts[index]) {
+        return leftParts[index] - rightParts[index]
+      }
+    }
+    return 0
+  }
+  if (leftParts) return -1
+  if (rightParts) return 1
+  return String(left || '').localeCompare(String(right || ''), undefined, { numeric: true, sensitivity: 'base' })
+}
+
 const getSearchMode = (value: string): 'fuzzy' | 'regex' => {
   const trimmed = value.trim()
   if (!trimmed) return 'fuzzy'
@@ -215,6 +239,8 @@ const DeviceList = () => {
       const requestOverrides = { ...(params || {}) }
       delete requestOverrides.columnFilters
       delete requestOverrides.silent
+      const effectiveSortField = requestOverrides.sort_by ?? sortField
+      const effectiveSortOrder = requestOverrides.sort_order ?? (sortOrder === 'descend' ? 'desc' : 'asc')
       const result = await getDevices({
         skip: (currentPage - 1) * pageSize,
         limit: pageSize,
@@ -227,11 +253,17 @@ const DeviceList = () => {
         is_monitored: monitoredFilter === undefined ? undefined : monitoredFilter === 'true',
         datacenter_id: datacenterFilter,
         ...getColumnFilterParams(effectiveColumnFilters),
-        sort_by: sortField,
-        sort_order: sortOrder === 'descend' ? 'desc' : 'asc',
+        sort_by: effectiveSortField,
+        sort_order: effectiveSortOrder,
         ...requestOverrides,
       })
-      setDevices(result.items)
+      const nextItems = effectiveSortField === 'ip_address'
+        ? [...result.items].sort((left, right) => {
+          const order = compareIpAddress(left.ip_address, right.ip_address)
+          return effectiveSortOrder === 'desc' ? -order : order
+        })
+        : result.items
+      setDevices(nextItems)
       setTotal(result.total)
     } catch (error) {
       console.error('获取设备列表失败:', error)
