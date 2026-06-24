@@ -256,6 +256,19 @@ const isSnmpModelMismatch = (record: DeviceOverviewItem) => {
 }
 
 const OVERVIEW_CACHE_KEY = 'device-overview:last-success'
+const COLUMN_ORDER_STORAGE_KEY = 'device-overview:visible-column-order-v2'
+const DEFAULT_VISIBLE_COLUMN_KEYS = [
+  'datacenter',
+  'uptime',
+  'vendor',
+  'connectivity',
+  'cpu',
+  'memory',
+  'temperature',
+  'bgp',
+  'ospf',
+  'updated_at',
+]
 
 type DeviceOverviewCachePayload = {
   items: DeviceOverviewItem[]
@@ -279,18 +292,16 @@ const DeviceOverview = () => {
   const [detailDevice, setDetailDevice] = useState<DeviceOverviewItem | null>(null)
   const [neighbors, setNeighbors] = useState<{ bgp: ProtocolNeighbor[]; ospf: ProtocolNeighbor[] }>({ bgp: [], ospf: [] })
   const filtersReadyRef = useRef(false)
-  const [visibleColumnKeys, setVisibleColumnKeys] = useState<string[]>([
-    'datacenter',
-    'uptime',
-    'vendor',
-    'connectivity',
-    'cpu',
-    'memory',
-    'temperature',
-    'bgp',
-    'ospf',
-    'updated_at',
-  ])
+  const [draggingColumnKey, setDraggingColumnKey] = useState<string | null>(null)
+  const [visibleColumnKeys, setVisibleColumnKeys] = useState<string[]>(() => {
+    try {
+      const raw = window.localStorage.getItem(COLUMN_ORDER_STORAGE_KEY)
+      const saved = raw ? JSON.parse(raw) : null
+      return Array.isArray(saved) && saved.length > 0 ? saved.map(String) : DEFAULT_VISIBLE_COLUMN_KEYS
+    } catch {
+      return DEFAULT_VISIBLE_COLUMN_KEYS
+    }
+  })
 
   const columnOptions = [
     { label: '所属机房', value: 'datacenter' },
@@ -308,6 +319,50 @@ const DeviceOverview = () => {
     { label: 'OSPF', value: 'ospf' },
     { label: '更新时间', value: 'updated_at' },
   ]
+
+  const columnLabelMap = useMemo(
+    () => new Map(columnOptions.map((item) => [item.value, item.label])),
+    []
+  )
+
+  const orderedColumnOptions = useMemo(() => {
+    const visibleSet = new Set(visibleColumnKeys)
+    const visibleItems = visibleColumnKeys
+      .map((key) => columnOptions.find((item) => item.value === key))
+      .filter(Boolean) as typeof columnOptions
+    const hiddenItems = columnOptions.filter((item) => !visibleSet.has(item.value))
+    return [...visibleItems, ...hiddenItems]
+  }, [visibleColumnKeys])
+
+  const updateVisibleColumnKeys = (updater: string[] | ((current: string[]) => string[])) => {
+    setVisibleColumnKeys((current) => {
+      const next = typeof updater === 'function' ? updater(current) : updater
+      window.localStorage.setItem(COLUMN_ORDER_STORAGE_KEY, JSON.stringify(next))
+      return next
+    })
+  }
+
+  const toggleColumnVisible = (key: string, checked: boolean) => {
+    updateVisibleColumnKeys((current) => {
+      if (checked) {
+        return current.includes(key) ? current : [...current, key]
+      }
+      return current.filter((item) => item !== key)
+    })
+  }
+
+  const moveVisibleColumn = (sourceKey: string, targetKey: string) => {
+    if (sourceKey === targetKey) return
+    updateVisibleColumnKeys((current) => {
+      const sourceIndex = current.indexOf(sourceKey)
+      const targetIndex = current.indexOf(targetKey)
+      if (sourceIndex < 0 || targetIndex < 0) return current
+      const next = [...current]
+      const [source] = next.splice(sourceIndex, 1)
+      next.splice(targetIndex, 0, source)
+      return next
+    })
+  }
 
   const loadData = async (
     nextSearch = search,
@@ -687,7 +742,12 @@ const DeviceOverview = () => {
     },
   ]
 
-  const visibleColumns = allColumns.filter((column) => column.key === 'device' || column.key === 'detail' || visibleColumnKeys.includes(column.key))
+  const columnMap = new Map(allColumns.map((column) => [String(column.key), column]))
+  const visibleColumns = [
+    columnMap.get('device'),
+    ...visibleColumnKeys.map((key) => columnMap.get(key)).filter(Boolean),
+    columnMap.get('detail'),
+  ].filter(Boolean)
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -715,16 +775,61 @@ const DeviceOverview = () => {
             <Dropdown
               trigger={['click']}
               dropdownRender={() => (
-                <Card size="small" bodyStyle={{ padding: 10, width: 160 }}>
-                  <Checkbox.Group
-                    options={columnOptions}
-                    value={visibleColumnKeys}
-                    onChange={(values) => setVisibleColumnKeys(values.map(String))}
-                  />
+                <Card size="small" bodyStyle={{ padding: 10, width: 260 }}>
+                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      勾选显示列；拖动已显示列可调整左右顺序
+                    </Text>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {orderedColumnOptions.map((item) => {
+                        const checked = visibleColumnKeys.includes(item.value)
+                        return (
+                          <div
+                            key={item.value}
+                            draggable={checked}
+                            onDragStart={() => {
+                              if (checked) setDraggingColumnKey(item.value)
+                            }}
+                            onDragOver={(event) => {
+                              if (checked && draggingColumnKey) event.preventDefault()
+                            }}
+                            onDrop={(event) => {
+                              event.preventDefault()
+                              if (checked && draggingColumnKey) {
+                                moveVisibleColumn(draggingColumnKey, item.value)
+                              }
+                              setDraggingColumnKey(null)
+                            }}
+                            onDragEnd={() => setDraggingColumnKey(null)}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              gap: 8,
+                              padding: '7px 9px',
+                              borderRadius: 8,
+                              border: checked ? '1px solid #d6e4ff' : '1px solid #f0f0f0',
+                              background: draggingColumnKey === item.value ? '#e6f4ff' : checked ? '#f8fbff' : '#fafafa',
+                              cursor: checked ? 'grab' : 'default',
+                              opacity: checked ? 1 : 0.65,
+                            }}
+                          >
+                            <Checkbox
+                              checked={checked}
+                              onChange={(event) => toggleColumnVisible(item.value, event.target.checked)}
+                            >
+                              {columnLabelMap.get(item.value) || item.label}
+                            </Checkbox>
+                            {checked ? <Text type="secondary" style={{ fontSize: 12 }}>拖动</Text> : null}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </Space>
                 </Card>
               )}
             >
-              <Button>显示/隐藏列</Button>
+              <Button>列显示/排序</Button>
             </Dropdown>
             <Button icon={<ReloadOutlined />} onClick={() => loadData()} loading={loading}>
               刷新
@@ -748,6 +853,7 @@ const DeviceOverview = () => {
           rowKey={(record) => record.device.id}
           loading={loading}
           dataSource={sortedItems}
+          sticky={{ offsetHeader: 64 }}
           scroll={{ x: 1500 }}
           pagination={{
             pageSize: tablePageSize,
