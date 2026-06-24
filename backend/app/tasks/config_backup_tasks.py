@@ -88,7 +88,11 @@ def _validate_config_content(device: Device, command: str, config: str) -> None:
 def _screen_disable_commands(device: Device) -> List[str]:
     vendor = f"{device.vendor or ''} {device.model or ''}".lower()
     commands = ["screen-length 0 temporary", "terminal length 0"]
-    if any(marker in vendor for marker in ["asteros", "asternos", "asterfusion", "星融元", "ruijie", "锐捷", "hillstone", "山石", "cisco", "nexus", "ios", "nx-os"]):
+    if any(marker in vendor for marker in ["asteros", "asternos", "asterfusion", "星融元"]):
+        # 部分 Asteros/CX308 设备不支持 terminal length/screen-length，发送后会产生 Syntax error，
+        # 反而污染后续配置采集结果；这里不下发分页命令，依靠读取循环处理分页提示。
+        return []
+    if any(marker in vendor for marker in ["ruijie", "锐捷", "hillstone", "山石", "cisco", "nexus", "ios", "nx-os"]):
         return ["terminal length 0", "screen-length 0 temporary"]
     return commands
 
@@ -165,7 +169,7 @@ def _collect_config_netmiko(device: Device) -> Tuple[str, str]:
             strip_prompt=True,
             strip_command=True,
         )
-        config = output.strip()
+        config = _clean_config_output(output, command)
         _validate_config_content(device, command, config)
         return command, config
     finally:
@@ -181,6 +185,9 @@ def _read_shell_output(shell: Any, idle_seconds: float = 0.8, timeout_seconds: f
             data = shell.recv(65535).decode("utf-8", errors="ignore")
             chunks.append(data)
             last_data = time.monotonic()
+            lowered = data.lower()
+            if "--more--" in lowered or "---- more ----" in lowered:
+                shell.send(" ")
             continue
         if chunks and time.monotonic() - last_data >= idle_seconds:
             break
@@ -190,8 +197,14 @@ def _read_shell_output(shell: Any, idle_seconds: float = 0.8, timeout_seconds: f
 
 def _clean_config_output(output: str, command: str) -> str:
     text = output.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"\x1b\\[[0-9;?]*[A-Za-z]", "", text)
-    text = text.replace("--More--", "")
+    # 清理 ANSI/VT 控制序列。Asteros 部分设备会输出 ESC[?1h、ESC=、ESC[m 等终端控制符。
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"\x1b[()][A-Za-z0-9]", "", text)
+    text = re.sub(r"\x1b[=>]", "", text)
+    text = re.sub(r"\x1b[@-Z\\-_]", "", text)
+    text = text.replace("\x1b", "")
+    text = text.replace("\x07", "")
+    text = text.replace("--More--", "").replace("---- More ----", "")
     lines = [line.rstrip() for line in text.splitlines()]
     cleaned: List[str] = []
     command_seen = False
@@ -222,13 +235,49 @@ def _handle_login_prompts(shell: Any, initial_output: str) -> str:
     return output
 
 
+def _run_shell_config_command(shell: Any, device: Device, command: str) -> str:
+    attempts = 3 if _is_asteros(device) else 1
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        # 清空上一次非法命令/提示符残留，避免把残留误认为配置内容。
+        shell.send("\n")
+        _read_shell_output(shell, idle_seconds=0.8, timeout_seconds=4)
+        if _is_asteros(device):
+            time.sleep(3 if attempt == 1 else 5)
+        shell.send(command + "\n")
+        output = _read_shell_output(
+            shell,
+            idle_seconds=2.5 if _is_asteros(device) else 1.2,
+            timeout_seconds=180 if _is_asteros(device) else 90,
+        )
+        config = _clean_config_output(output, command)
+        try:
+            _validate_config_content(device, command, config)
+            return config
+        except Exception as exc:
+            last_error = exc
+            logger.info(
+                "配置输出校验失败，准备重试",
+                device_id=getattr(device, "id", None),
+                ip=getattr(device, "ip_address", None),
+                attempt=attempt,
+                attempts=attempts,
+                error=str(exc),
+            )
+            time.sleep(3)
+    raise RuntimeError(str(last_error) if last_error else "配置备份失败")
+
+
 def _collect_config(device: Device) -> Tuple[str, str]:
     netmiko_error: Optional[Exception] = None
-    try:
-        return _collect_config_netmiko(device)
-    except Exception as exc:
-        netmiko_error = exc
-        logger.info("Netmiko配置备份失败，回退Paramiko", device_id=device.id, ip=device.ip_address, error=str(exc))
+    if not _is_asteros(device):
+        try:
+            return _collect_config_netmiko(device)
+        except Exception as exc:
+            netmiko_error = exc
+            logger.info("Netmiko配置备份失败，回退Paramiko", device_id=device.id, ip=device.ip_address, error=str(exc))
+    else:
+        logger.info("Asteros设备使用Paramiko交互模式备份配置", device_id=device.id, ip=device.ip_address)
 
     try:
         import paramiko
@@ -282,13 +331,8 @@ def _collect_config(device: Device) -> Tuple[str, str]:
         _handle_login_prompts(shell, initial_output)
         for disable_command in _screen_disable_commands(device):
             shell.send(disable_command + "\n")
-            _read_shell_output(shell, idle_seconds=0.3, timeout_seconds=3)
-        if _is_asteros(device):
-            time.sleep(5)
-        shell.send(command + "\n")
-        output = _read_shell_output(shell, idle_seconds=1.2, timeout_seconds=90)
-        config = _clean_config_output(output, command)
-        _validate_config_content(device, command, config)
+            _read_shell_output(shell, idle_seconds=0.5, timeout_seconds=4)
+        config = _run_shell_config_command(shell, device, command)
         return command, config
     finally:
         client.close()
