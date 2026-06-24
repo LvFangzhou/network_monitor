@@ -188,6 +188,8 @@ def _read_shell_output(shell: Any, idle_seconds: float = 0.8, timeout_seconds: f
             lowered = data.lower()
             if "--more--" in lowered or "---- more ----" in lowered:
                 shell.send(" ")
+            if "press return" in lowered or "press enter" in lowered:
+                shell.send("\n")
             continue
         if chunks and time.monotonic() - last_data >= idle_seconds:
             break
@@ -195,8 +197,17 @@ def _read_shell_output(shell: Any, idle_seconds: float = 0.8, timeout_seconds: f
     return "".join(chunks)
 
 
+def _strip_backspace_overstrikes(text: str) -> str:
+    """清理 h\\bho\\bow 这类终端退格重绘输出。"""
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r".\x08", "", text)
+    return text
+
+
 def _clean_config_output(output: str, command: str) -> str:
-    text = output.replace("\r\n", "\n").replace("\r", "\n")
+    text = _strip_backspace_overstrikes(output).replace("\r\n", "\n").replace("\r", "\n")
     # 清理 ANSI/VT 控制序列。Asteros 部分设备会输出 ESC[?1h、ESC=、ESC[m 等终端控制符。
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
     text = re.sub(r"\x1b[()][A-Za-z0-9]", "", text)
@@ -256,6 +267,13 @@ def _run_shell_config_command(shell: Any, device: Device, command: str) -> str:
             idle_seconds=2.5 if _is_asteros(device) else 1.2,
             timeout_seconds=180 if _is_asteros(device) else 90,
         )
+        if re.search(r"press\s+(return|enter)", output, re.IGNORECASE):
+            shell.send("\n")
+            output += _read_shell_output(
+                shell,
+                idle_seconds=2.5 if _is_asteros(device) else 1.2,
+                timeout_seconds=90 if _is_asteros(device) else 30,
+            )
         config = _clean_config_output(output, command)
         try:
             _validate_config_content(device, command, config)
