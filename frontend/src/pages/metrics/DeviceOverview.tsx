@@ -236,6 +236,39 @@ const formatDuration = (seconds?: number | null, fallback?: string | null) => {
   return `${minutes}分钟`
 }
 
+const formatSoftwareVersion = (value?: string | null) => {
+  const text = String(value || '').trim()
+  if (!text) return ''
+
+  const softwareMatch = text.match(/Software\s+Version\s+([^,\r\n]+)(?:,\s*(Release\s+[^\r\n,]+))?/i)
+  if (softwareMatch) {
+    return [
+      `Software Version ${softwareMatch[1].trim()}`,
+      softwareMatch[2]?.trim(),
+    ].filter(Boolean).join(', ')
+  }
+
+  const versionMatch = text.match(/^Version\s+([^,\r\n]+)(?:,\s*(Release\s+[^\r\n,]+))?$/i)
+  if (versionMatch) {
+    return [
+      `Software Version ${versionMatch[1].trim()}`,
+      versionMatch[2]?.trim(),
+    ].filter(Boolean).join(', ')
+  }
+
+  const asterosSoftwareMatch = text.match(/(?:^|[\/\s])Software\s+([A-Za-z]?\d[^\s\/,\r\n]*)/i)
+  if (asterosSoftwareMatch) {
+    return `Software ${asterosSoftwareMatch[1].trim()}`
+  }
+
+  const asterosVersionMatch = text.match(/^[A-Za-z]?\d[\w.-]*$/)
+  if (asterosVersionMatch) {
+    return `Software ${text}`
+  }
+
+  return text
+}
+
 const normalizeDeviceName = (value?: string | null) => String(value || '').trim().toLowerCase()
 
 const isSnmpNameMismatch = (record: DeviceOverviewItem) => {
@@ -625,12 +658,12 @@ const DeviceOverview = () => {
       key: 'software_version',
       width: 210,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
-        String(a.system_info?.software_version || '').localeCompare(String(b.system_info?.software_version || '')),
+        formatSoftwareVersion(a.system_info?.software_version).localeCompare(formatSoftwareVersion(b.system_info?.software_version)),
       render: (_: any, record: DeviceOverviewItem) => {
-        const version = record.system_info?.software_version
+        const version = formatSoftwareVersion(record.system_info?.software_version)
         if (!version) return <Text type="secondary">-</Text>
         return (
-          <Tooltip title={record.system_info?.sys_descr || version}>
+          <Tooltip title={version}>
             <Text style={{ maxWidth: 180 }} ellipsis>{version}</Text>
           </Tooltip>
         )

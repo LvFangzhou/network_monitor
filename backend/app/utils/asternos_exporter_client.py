@@ -118,13 +118,14 @@ class AsterNOSExporterClient:
 
         hostname = info_labels.get("hostname")
         product_name = info_labels.get("product_name") or info_labels.get("platform_name")
-        software_version = info_labels.get("software_version")
+        raw_software_version = (info_labels.get("software_version") or "").strip()
+        software_version = f"Software {raw_software_version}" if raw_software_version else None
         serial_number = info_labels.get("serial_number")
         platform_name = info_labels.get("platform_name")
         sys_descr_parts = [
             part for part in [
                 product_name,
-                f"Software {software_version}" if software_version else None,
+                software_version,
                 f"Serial {serial_number}" if serial_number else None,
             ]
             if part

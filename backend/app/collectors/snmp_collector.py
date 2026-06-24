@@ -1577,7 +1577,7 @@ class SNMPCollector(LoggerMixin):
                 re.IGNORECASE,
             )
             if version_match:
-                software_version = f"Version {version_match.group(1).strip()}"
+                software_version = f"Software Version {version_match.group(1).strip()}"
                 if version_match.group(2):
                     software_version = f"{software_version}, {version_match.group(2).strip()}"
             model_match = re.search(r"^\s*Densivelo\s+([A-Za-z0-9._/-]+)", sys_descr_text, re.IGNORECASE | re.MULTILINE)
