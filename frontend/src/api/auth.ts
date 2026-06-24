@@ -20,6 +20,7 @@ export interface User {
   roles: string[]
   last_login?: string | null
   online?: boolean
+  last_offline_at?: string | null
 }
 
 export interface AuditLog {

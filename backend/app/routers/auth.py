@@ -96,9 +96,14 @@ def _online_key(user_id: int) -> str:
     return f"auth:online:user:{user_id}"
 
 
+def _last_seen_key(user_id: int) -> str:
+    return f"auth:online:last_seen:user:{user_id}"
+
+
 def _touch_online_user(user: User) -> None:
     try:
         redis_client.setex(_online_key(user.id), ONLINE_USER_TTL_SECONDS, "1")
+        redis_client.set(_last_seen_key(user.id), str(datetime.utcnow().timestamp()))
     except Exception as exc:
         logger.warning("更新用户在线状态失败", username=user.username, error=str(exc))
 
@@ -109,6 +114,22 @@ def _is_online_user(user_id: int) -> bool:
     except Exception as exc:
         logger.warning("读取用户在线状态失败", user_id=user_id, error=str(exc))
         return False
+
+
+def _last_offline_at(user_id: int, online: bool) -> Optional[str]:
+    if online:
+        return None
+    try:
+        value = redis_client.get(_last_seen_key(user_id))
+        if not value:
+            return None
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+        offline_at = datetime.utcfromtimestamp(float(value) + ONLINE_USER_TTL_SECONDS)
+        return offline_at.isoformat()
+    except Exception as exc:
+        logger.warning("读取用户最后离线时间失败", user_id=user_id, error=str(exc))
+        return None
 
 
 def create_user_record(db: Session, user_data: UserCreate) -> User:
@@ -440,13 +461,15 @@ async def list_users(
         check_permission(current_user, "user:view")
     _touch_online_user(current_user)
     users = db.query(User).order_by(User.id.asc()).all()
+    user_online_states = {user.id: _is_online_user(user.id) for user in users}
     return {
         "total": len(users),
         "items": [
             {
                 **user.to_dict(),
                 "allowed_menus": normalize_allowed_menus(user.allowed_menus, user.is_superuser),
-                "online": _is_online_user(user.id),
+                "online": user_online_states.get(user.id, False),
+                "last_offline_at": _last_offline_at(user.id, user_online_states.get(user.id, False)),
             }
             for user in users
         ],

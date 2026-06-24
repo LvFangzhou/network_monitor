@@ -233,7 +233,7 @@ const Settings = () => {
                   </Space>
                 }
               >
-                <Table
+                <Table<User>
                   rowKey="id"
                   loading={loading}
                   dataSource={users}
@@ -272,6 +272,12 @@ const Settings = () => {
                       render: (value?: boolean) => (
                         <Tag color={value ? 'success' : 'default'}>{value ? '在线' : '离线'}</Tag>
                       ),
+                    },
+                    {
+                      title: '最后离线时间',
+                      dataIndex: 'last_offline_at',
+                      key: 'last_offline_at',
+                      render: (value?: string | null, record?: User) => record?.online ? '-' : (value ? new Date(value).toLocaleString() : '-'),
                     },
                     {
                       title: '可访问菜单',
