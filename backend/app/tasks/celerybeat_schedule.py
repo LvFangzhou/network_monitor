@@ -2,45 +2,52 @@
 Celery Beat 定时任务调度配置
 """
 from celery.schedules import crontab
+from app.config import settings
+
+
+SNMP_SCHEDULER_INTERVAL_SECONDS = max(1.0, float(settings.SNMP_SCHEDULER_INTERVAL_SECONDS))
+SNMP_TASK_EXPIRES_SECONDS = max(1.0, SNMP_SCHEDULER_INTERVAL_SECONDS - 1.0)
+ASTERNOS_SCHEDULER_INTERVAL_SECONDS = max(1.0, float(settings.ASTERNOS_SCHEDULER_INTERVAL_SECONDS))
+ASTERNOS_TASK_EXPIRES_SECONDS = max(1.0, ASTERNOS_SCHEDULER_INTERVAL_SECONDS - 1.0)
 
 # 定时任务配置
 beat_schedule = {
-    # SNMP全量采集调度 - 每10秒调度一批设备，每台设备约60秒完整采集一轮
+    # SNMP全量采集调度 - 按配置分桶调度，避免 Beat 间隔和分桶间隔不一致导致部分桶永远扫不到。
     'collect-snmp-every-10s': {
         'task': 'app.tasks.snmp_tasks.collect_all_snmp',
-        'schedule': 10.0,
+        'schedule': SNMP_SCHEDULER_INTERVAL_SECONDS,
         'options': {
-            'expires': 8.0,
+            'expires': SNMP_TASK_EXPIRES_SECONDS,
         }
     },
     # SNMP接口高频采集 - 端口出入流量独立高频轮询，不受15分钟全量资源采集影响
     'collect-snmp-interface-realtime-every-10s': {
         'task': 'app.tasks.snmp_tasks.collect_all_snmp_interface_realtime',
-        'schedule': 10.0,
+        'schedule': SNMP_SCHEDULER_INTERVAL_SECONDS,
         'options': {
-            'expires': 8.0,
+            'expires': SNMP_TASK_EXPIRES_SECONDS,
         }
     },
     # 线路绑定端口轻量采集 - 重点公网/专线端口保持10秒级曲线
     'collect-circuit-interface-realtime-every-10s': {
         'task': 'app.tasks.snmp_tasks.collect_circuit_interface_realtime',
-        'schedule': 10.0,
+        'schedule': SNMP_SCHEDULER_INTERVAL_SECONDS,
         'options': {
-            'expires': 8.0,
+            'expires': SNMP_TASK_EXPIRES_SECONDS,
         }
     },
     'collect-asternos-interface-realtime-every-10s': {
         'task': 'app.tasks.snmp_tasks.collect_all_asternos_interface_realtime',
-        'schedule': 10.0,
+        'schedule': ASTERNOS_SCHEDULER_INTERVAL_SECONDS,
         'options': {
-            'expires': 8.0,
+            'expires': ASTERNOS_TASK_EXPIRES_SECONDS,
         }
     },
     'collect-asternos-exporter-every-10s': {
         'task': 'app.tasks.snmp_tasks.collect_all_asternos_exporter',
-        'schedule': 10.0,
+        'schedule': ASTERNOS_SCHEDULER_INTERVAL_SECONDS,
         'options': {
-            'expires': 8.0,
+            'expires': ASTERNOS_TASK_EXPIRES_SECONDS,
         }
     },
     'verify-unreachable-snmp-every-1m': {
