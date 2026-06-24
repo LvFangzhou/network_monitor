@@ -1155,6 +1155,7 @@ async def _build_asternos_overview(device: Device) -> Dict[str, Any]:
                 ["full", "established", "up"],
             ),
         },
+        "system_info": asternos_exporter_client.system_info(metrics),
     }
 
 

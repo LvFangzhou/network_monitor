@@ -512,8 +512,8 @@ const DeviceOverview = () => {
             <Text strong type={mismatch ? 'danger' : undefined}>{enteredName}</Text>
             <Text type="secondary">{record.device.ip_address}</Text>
             {mismatch ? (
-              <Tooltip title={`录入：${enteredName}；SNMP：${sysName}`}>
-                <Tag color="red">SNMP名称：{sysName}</Tag>
+              <Tooltip title={`录入：${enteredName}；采集：${sysName}`}>
+                <Tag color="red">采集名称：{sysName}</Tag>
               </Tooltip>
             ) : null}
           </Space>
@@ -534,8 +534,8 @@ const DeviceOverview = () => {
             <Text>{record.device.vendor || '-'}</Text>
             <Text type={mismatch ? 'danger' : 'secondary'}>{enteredModel}</Text>
             {mismatch ? (
-              <Tooltip title={`录入型号：${enteredModel}；SNMP型号：${snmpModel}`}>
-                <Tag color="red">SNMP型号：{snmpModel}</Tag>
+              <Tooltip title={`录入型号：${enteredModel}；采集型号：${snmpModel}`}>
+                <Tag color="red">采集型号：{snmpModel}</Tag>
               </Tooltip>
             ) : null}
           </Space>

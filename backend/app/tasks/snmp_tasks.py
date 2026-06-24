@@ -1261,7 +1261,7 @@ def collect_asternos_for_device(self, device_id: int):
                     ["full", "established", "up"],
                 ),
             },
-            "system_info": {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "uptime_seconds": None},
+            "system_info": asternos_exporter_client.system_info(metrics),
             "collected_at": collected_at,
         }
         _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at})

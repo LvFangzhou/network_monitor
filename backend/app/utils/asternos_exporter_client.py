@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -99,6 +100,44 @@ class AsterNOSExporterClient:
     def _first(cls, metrics: Dict[str, List[Dict[str, Any]]], base_name: str) -> Optional[float]:
         rows = cls._rows(metrics, base_name)
         return rows[0].get("value") if rows else None
+
+    @classmethod
+    def system_info(cls, metrics: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        """提取 AsterNOS 设备基础信息，用于设备总览一致性对比。"""
+        info_labels = (cls._rows(metrics, "device_info") or [{}])[0].get("metric", {}) or {}
+        raw_uptime = cls._first(metrics, "device_up_time")
+        uptime_seconds = None
+        if raw_uptime is not None:
+            now = time.time()
+            # AsterNOS exporter 的 device_up_time 在现网中表现为启动时间戳；
+            # 兼容少数 exporter 直接返回运行秒数的情况。
+            if 946684800 <= raw_uptime <= now + 86400:
+                uptime_seconds = max(0, now - raw_uptime)
+            else:
+                uptime_seconds = max(0, raw_uptime)
+
+        hostname = info_labels.get("hostname")
+        product_name = info_labels.get("product_name") or info_labels.get("platform_name")
+        software_version = info_labels.get("software_version")
+        serial_number = info_labels.get("serial_number")
+        platform_name = info_labels.get("platform_name")
+        sys_descr_parts = [
+            part for part in [
+                product_name,
+                f"Software {software_version}" if software_version else None,
+                f"Serial {serial_number}" if serial_number else None,
+            ]
+            if part
+        ]
+        return {
+            "sys_name": hostname,
+            "sys_descr": " / ".join(sys_descr_parts) or None,
+            "software_version": software_version,
+            "snmp_model": product_name,
+            "serial_number": serial_number,
+            "platform_name": platform_name,
+            "uptime_seconds": uptime_seconds,
+        }
 
     async def list_interfaces(self, device: Any) -> List[Dict[str, Any]]:
         metrics = await self.scrape(device)
