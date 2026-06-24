@@ -294,6 +294,7 @@ const DeviceOverview = () => {
   const [neighbors, setNeighbors] = useState<{ bgp: ProtocolNeighbor[]; ospf: ProtocolNeighbor[] }>({ bgp: [], ospf: [] })
   const filtersReadyRef = useRef(false)
   const [draggingColumnKey, setDraggingColumnKey] = useState<string | null>(null)
+  const [dragOverColumnKey, setDragOverColumnKey] = useState<string | null>(null)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<string[]>(() => {
     try {
       const raw = window.localStorage.getItem(COLUMN_ORDER_STORAGE_KEY)
@@ -752,20 +753,31 @@ const DeviceOverview = () => {
       ...column,
       title: (
         <Tooltip title="按住表头左右拖动，可调整列顺序">
-          <span style={{ cursor: 'grab', userSelect: 'none' }}>{column.title}</span>
+          <span style={{ cursor: 'grab', userSelect: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            {column.title}
+            <span style={{ color: '#1677ff', fontSize: 12, opacity: draggingColumnKey === key ? 1 : 0.45 }}>↔</span>
+          </span>
         </Tooltip>
       ),
       onHeaderCell: () => ({
         draggable: true,
         onDragStart: (event: DragEvent<HTMLElement>) => {
           setDraggingColumnKey(key)
+          setDragOverColumnKey(null)
           event.dataTransfer.effectAllowed = 'move'
           event.dataTransfer.setData('text/plain', key)
+        },
+        onDragEnter: (event: DragEvent<HTMLElement>) => {
+          if (draggingColumnKey && draggingColumnKey !== key) {
+            event.preventDefault()
+            setDragOverColumnKey(key)
+          }
         },
         onDragOver: (event: DragEvent<HTMLElement>) => {
           if (draggingColumnKey && draggingColumnKey !== key) {
             event.preventDefault()
             event.dataTransfer.dropEffect = 'move'
+            setDragOverColumnKey(key)
           }
         },
         onDrop: (event: DragEvent<HTMLElement>) => {
@@ -773,11 +785,23 @@ const DeviceOverview = () => {
           const sourceKey = draggingColumnKey || event.dataTransfer.getData('text/plain')
           if (sourceKey) moveVisibleColumn(sourceKey, key)
           setDraggingColumnKey(null)
+          setDragOverColumnKey(null)
         },
-        onDragEnd: () => setDraggingColumnKey(null),
+        onDragEnd: () => {
+          setDraggingColumnKey(null)
+          setDragOverColumnKey(null)
+        },
         style: {
           cursor: 'grab',
-          background: draggingColumnKey === key ? '#e6f4ff' : undefined,
+          background: draggingColumnKey === key
+            ? '#d6e4ff'
+            : dragOverColumnKey === key
+              ? '#e6f4ff'
+              : undefined,
+          outline: dragOverColumnKey === key ? '2px dashed #1677ff' : undefined,
+          outlineOffset: '-4px',
+          boxShadow: dragOverColumnKey === key ? 'inset 4px 0 0 #1677ff, 0 0 0 999px rgba(22,119,255,0.04) inset' : undefined,
+          transition: 'background 0.18s ease, box-shadow 0.18s ease, outline-color 0.18s ease',
         },
       }),
     }
@@ -892,8 +916,7 @@ const DeviceOverview = () => {
           rowKey={(record) => record.device.id}
           loading={loading}
           dataSource={sortedItems}
-          sticky={{ offsetHeader: 0 }}
-          scroll={{ x: 1500 }}
+          scroll={{ x: 1500, y: 'calc(100vh - 360px)' }}
           pagination={{
             pageSize: tablePageSize,
             showSizeChanger: true,
