@@ -116,6 +116,7 @@ def _split_silence_values(value: Optional[str]) -> List[str]:
 def _build_alert_history_query(
     db: Session,
     *,
+    view: Optional[str] = None,
     status: Optional[str] = None,
     device_id: Optional[int] = None,
     rule_id: Optional[int] = None,
@@ -138,6 +139,17 @@ def _build_alert_history_query(
             query = query.filter(Device.datacenter_id.is_(None))
         else:
             query = query.filter(Datacenter.name == datacenter_name)
+
+    if view == "active":
+        query = query.filter(AlertHistory.status == "firing")
+        query = query.filter(AlertRule.severity.in_(_severity_filter_values("P0") + _severity_filter_values("P1") + _severity_filter_values("P2")))
+    elif view == "audit":
+        query = query.filter(
+            or_(
+                AlertHistory.status == "ignored",
+                AlertRule.severity.in_(_severity_filter_values("P3")),
+            )
+        )
 
     if status:
         query = query.filter(AlertHistory.status == status)
@@ -793,6 +805,7 @@ async def list_alert_history(
     db: Session = Depends(get_db),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=1000),
+    view: Optional[str] = Query(None, pattern="^(active|audit)$"),
     status: Optional[str] = None,
     device_id: Optional[int] = None,
     rule_id: Optional[int] = None,
@@ -805,6 +818,7 @@ async def list_alert_history(
     """获取告警历史列表"""
     query = _build_alert_history_query(
         db,
+        view=view,
         status=status,
         device_id=device_id,
         rule_id=rule_id,
@@ -827,6 +841,7 @@ async def list_alert_history(
 @router.get("/history/summary", response_model=dict)
 async def get_alert_history_summary(
     db: Session = Depends(get_db),
+    view: Optional[str] = Query(None, pattern="^(active|audit)$"),
     status: Optional[str] = None,
     device_id: Optional[int] = None,
     rule_id: Optional[int] = None,
@@ -841,6 +856,7 @@ async def get_alert_history_summary(
     """按当前筛选条件聚合告警历史。"""
     base_query = _build_alert_history_query(
         db,
+        view=view,
         status=status,
         device_id=device_id,
         rule_id=rule_id,
@@ -894,6 +910,24 @@ async def get_alert_history_summary(
             .all()
         )
     ]
+    statuses = {
+        str(status_value): int(count or 0)
+        for status_value, count in (
+            base_query
+            .with_entities(AlertHistory.status, func.count(AlertHistory.id))
+            .group_by(AlertHistory.status)
+            .all()
+        )
+    }
+    severities: Dict[str, int] = {}
+    for severity_value, count in (
+        base_query
+        .with_entities(AlertRule.severity, func.count(AlertHistory.id))
+        .group_by(AlertRule.severity)
+        .all()
+    ):
+        key = _normalize_severity(str(severity_value))
+        severities[key] = severities.get(key, 0) + int(count or 0)
 
     return {
         "total": total,
@@ -902,6 +936,8 @@ async def get_alert_history_summary(
         "datacenters": datacenters,
         "days": days,
         "devices": devices,
+        "statuses": statuses,
+        "severities": severities,
     }
 
 
@@ -917,6 +953,7 @@ async def clear_alert_history(
 
     query = _build_alert_history_query(
         db,
+        view=payload.view,
         status=payload.status,
         device_id=payload.device_id,
         rule_id=payload.rule_id,

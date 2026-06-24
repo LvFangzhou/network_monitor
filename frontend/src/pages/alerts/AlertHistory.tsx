@@ -21,12 +21,10 @@ import {
   clearAlertHistory,
   getAlertHistory,
   getAlertHistorySummary,
-  getAlertStats,
   ignoreAlert,
   resolveAlert,
   type AlertHistory as AlertHistoryItem,
   type AlertHistorySummary,
-  type AlertStats,
 } from '../../api/alerts'
 import { getDatacenters, type Datacenter } from '../../api/devices'
 import { useAuthStore } from '../../store/auth'
@@ -211,10 +209,24 @@ const displayTargetName = (record: AlertHistoryItem) => {
 
 const isOperationRecord = (record: AlertHistoryItem) => record.severity === 'P3'
 
-const AlertHistory = () => {
+const getOperationRecordType = (record: AlertHistoryItem) => {
+  const text = normalizeTrapText([record.message, record.alert_target_name, record.alert_target_key].filter(Boolean).join(' ')).toLowerCase()
+  const info = operationMessageInfo(record)
+  const ruleText = `${info.ruleName || ''} ${text}`.toLowerCase()
+  if (/登录失败|ssh|login|failed/.test(ruleText)) return '登录失败Trap'
+  if (/配置变更|config/.test(ruleText)) return '配置变更Trap'
+  return 'P3 Trap日志'
+}
+
+type AlertHistoryMode = 'active' | 'audit'
+
+interface AlertHistoryProps {
+  mode?: AlertHistoryMode
+}
+
+const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
   const { token: themeToken } = theme.useToken()
   const [items, setItems] = useState<AlertHistoryItem[]>([])
-  const [stats, setStats] = useState<AlertStats | null>(null)
   const [summary, setSummary] = useState<AlertHistorySummary | null>(null)
   const [loading, setLoading] = useState(false)
   const [summaryLoading, setSummaryLoading] = useState(false)
@@ -232,6 +244,11 @@ const AlertHistory = () => {
   const currentUser = useAuthStore((state) => state.user)
   const canModify = Boolean(token && !currentUser?.read_only)
   const initialAlertId = new URLSearchParams(window.location.search).get('alert_id')
+
+  const isAuditMode = mode === 'audit'
+  const tableTitle = isAuditMode ? '告警日志详情' : '正在触发告警'
+  const statusCounts = summary?.statuses || {}
+  const severityCounts = summary?.severities || {}
 
   const datacenterChartData = useMemo(
     () => (summary?.datacenters || []).map((item) => ({ ...item, value: item.count })),
@@ -260,8 +277,9 @@ const AlertHistory = () => {
   }
 
   const buildFilterParams = () => ({
-    status: statusFilter,
-    severity: severityFilter,
+    view: mode,
+    status: isAuditMode ? statusFilter : undefined,
+    severity: isAuditMode ? severityFilter : undefined,
     datacenter: datacenterFilter,
     alert_id: initialAlertId ? Number(initialAlertId) : undefined,
     search: searchText || undefined,
@@ -272,17 +290,13 @@ const AlertHistory = () => {
       setLoading(true)
     }
     try {
-      const [historyResult, statsResult] = await Promise.all([
-        getAlertHistory({
-          skip: (nextPage - 1) * nextPageSize,
-          limit: nextPageSize,
-          ...buildFilterParams(),
-        }),
-        getAlertStats(),
-      ])
+      const historyResult = await getAlertHistory({
+        skip: (nextPage - 1) * nextPageSize,
+        limit: nextPageSize,
+        ...buildFilterParams(),
+      })
       setItems(historyResult.items)
       setTotal(historyResult.total)
-      setStats(statsResult)
     } catch (error) {
       if (!silent) {
         message.error('获取告警历史失败')
@@ -329,7 +343,7 @@ const AlertHistory = () => {
     }, 300)
     return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter, severityFilter, datacenterFilter, searchText])
+  }, [mode, statusFilter, severityFilter, datacenterFilter, searchText])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -338,7 +352,7 @@ const AlertHistory = () => {
     }, 10000)
     return () => window.clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, pageSize, statusFilter, severityFilter, datacenterFilter, searchText])
+  }, [mode, page, pageSize, statusFilter, severityFilter, datacenterFilter, searchText])
 
   const handleResetFilters = () => {
     setStatusFilter(undefined)
@@ -444,17 +458,17 @@ const AlertHistory = () => {
       <Row gutter={[16, 16]}>
         <Col span={8}>
           <Card bodyStyle={metricCardBodyStyle}>
-            <Statistic title="正在触发" value={stats?.total_firing || 0} />
+            <Statistic title={isAuditMode ? '日志记录数' : '正在触发'} value={summary?.total ?? total} />
           </Card>
         </Col>
         <Col span={8}>
           <Card bodyStyle={metricCardBodyStyle}>
-            <Statistic title="已解决" value={stats?.total_resolved || 0} />
+            <Statistic title={isAuditMode ? '已忽略' : 'P0告警'} value={isAuditMode ? (statusCounts.ignored || 0) : (severityCounts.P0 || 0)} />
           </Card>
         </Col>
         <Col span={8}>
           <Card bodyStyle={metricCardBodyStyle}>
-            <Statistic title="历史记录数" value={total} />
+            <Statistic title={isAuditMode ? 'P3 Trap日志' : 'P1/P2告警'} value={isAuditMode ? (severityCounts.P3 || 0) : ((severityCounts.P1 || 0) + (severityCounts.P2 || 0))} />
           </Card>
         </Col>
       </Row>
@@ -596,9 +610,10 @@ const AlertHistory = () => {
       </Row>
 
       <Card
-        title="告警历史"
+        title={tableTitle}
         extra={
           <Space>
+            {isAuditMode ? (
             <Select
               allowClear
               placeholder="状态"
@@ -613,6 +628,8 @@ const AlertHistory = () => {
                 { value: 'snoozed', label: '暂停复查' },
               ]}
             />
+            ) : null}
+            {isAuditMode ? (
             <Select
               allowClear
               placeholder="级别"
@@ -626,6 +643,7 @@ const AlertHistory = () => {
                 { value: 'P3', label: 'P3' },
               ]}
             />
+            ) : null}
             <Select
               allowClear
               showSearch
@@ -653,7 +671,7 @@ const AlertHistory = () => {
                 重置
               </Button>
             </Tooltip>
-            {canModify ? (
+            {canModify && isAuditMode ? (
               <Space.Compact>
                 {cleanupOptions.map((option) => (
                   <Tooltip
@@ -735,7 +753,7 @@ const AlertHistory = () => {
                       <div style={operationMessageStyle}>
                         <div style={compactTextStyle}>
                           <span style={operationLabelStyle}>记录类型：</span>
-                          <span style={operationValueStyle}>{info.ruleName || '山石配置变更Trap'}</span>
+                          <span style={operationValueStyle}>{getOperationRecordType(record)}</span>
                         </div>
                         {info.trapTime ? (
                           <div style={compactTextStyle}>
@@ -773,7 +791,7 @@ const AlertHistory = () => {
               onCell: () => ({ style: { verticalAlign: 'top' } }),
               render: (value: string, record: AlertHistoryItem) => (
                 isOperationRecord(record)
-                  ? <Tag color="default">变更记录</Tag>
+                  ? <Tag color={getOperationRecordType(record).includes('登录失败') ? 'orange' : 'default'}>{getOperationRecordType(record)}</Tag>
                   : <Tag color={statusColors[value] || 'default'}>{statusLabels[value] || value}</Tag>
               ),
             },

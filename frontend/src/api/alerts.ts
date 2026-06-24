@@ -65,6 +65,8 @@ export interface AlertHistorySummary {
   datacenters: Array<{ name: string; count: number }>
   days: Array<{ day: string; count: number }>
   devices: Array<{ device_id: number; device_name: string; device_ip?: string | null; count: number }>
+  statuses?: Record<string, number>
+  severities?: Record<string, number>
 }
 
 export interface AlertSilence {
@@ -205,6 +207,7 @@ export const getAlertRuleStatus = async (
 export const getAlertHistory = async (params?: {
   skip?: number
   limit?: number
+  view?: 'active' | 'audit'
   status?: string
   device_id?: number
   rule_id?: number
@@ -218,6 +221,7 @@ export const getAlertHistory = async (params?: {
 }
 
 export const getAlertHistorySummary = async (params?: {
+  view?: 'active' | 'audit'
   status?: string
   device_id?: number
   rule_id?: number
@@ -233,6 +237,7 @@ export const getAlertHistorySummary = async (params?: {
 }
 
 export const clearAlertHistory = async (data: {
+  view?: 'active' | 'audit'
   status?: string
   device_id?: number
   rule_id?: number

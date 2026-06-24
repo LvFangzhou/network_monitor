@@ -41,7 +41,7 @@ const Layout = () => {
     token: { colorBgLayout, colorText, colorTextSecondary },
   } = theme.useToken()
 
-  const publicMenus = ['/alerts/history', '/port-query']
+  const publicMenus = ['/alerts/history', '/alerts/audit', '/port-query']
   const allowedMenus = !token ? publicMenus : (user?.is_superuser ? ['*'] : (user?.allowed_menus || []))
   const canAccessMenu = (path: string) =>
     allowedMenus.includes('*') ||
@@ -108,6 +108,7 @@ const Layout = () => {
       children: [
         { key: '/alerts/rules', label: '告警规则' },
         { key: '/alerts/history', label: '告警历史' },
+        { key: '/alerts/audit', label: '告警日志' },
         { key: '/alerts/silences', label: '告警屏蔽' },
       ],
     },

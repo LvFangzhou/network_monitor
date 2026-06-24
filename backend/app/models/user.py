@@ -192,6 +192,7 @@ DEFAULT_MENU_PERMISSIONS = [
     "/ipdb",
     "/alerts/rules",
     "/alerts/history",
+    "/alerts/audit",
     "/alerts/silences",
     "/port-query",
     "/device-overview",

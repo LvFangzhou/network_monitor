@@ -57,6 +57,7 @@ MENU_OPTIONS = [
     {"label": "IPDB", "value": "/ipdb"},
     {"label": "告警规则", "value": "/alerts/rules"},
     {"label": "告警历史", "value": "/alerts/history"},
+    {"label": "告警日志", "value": "/alerts/audit"},
     {"label": "告警屏蔽", "value": "/alerts/silences"},
     {"label": "端口查询", "value": "/port-query"},
     {"label": "IP流量查询", "value": "/ip-flow-query"},

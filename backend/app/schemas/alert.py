@@ -118,6 +118,7 @@ class AlertIgnore(BaseModel):
 
 class AlertHistoryClear(BaseModel):
     """批量清除告警历史"""
+    view: Optional[str] = None
     status: Optional[str] = None
     severity: Optional[str] = None
     datacenter: Optional[str] = None

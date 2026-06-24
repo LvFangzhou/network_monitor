@@ -19,6 +19,7 @@ const loadPrivateCircuitList = () => import('./pages/resources/PrivateCircuitLis
 const loadIPDBList = () => import('./pages/resources/IPDBList')
 const loadAlertRules = () => import('./pages/alerts/AlertRules')
 const loadAlertHistory = () => import('./pages/alerts/AlertHistory')
+const loadAlertAudit = () => import('./pages/alerts/AlertAudit')
 const loadAlertSilences = () => import('./pages/alerts/AlertSilences')
 const loadMetrics = () => import('./pages/metrics/Metrics')
 const loadDeviceOverview = () => import('./pages/metrics/DeviceOverview')
@@ -40,6 +41,7 @@ const PrivateCircuitList = lazy(loadPrivateCircuitList)
 const IPDBList = lazy(loadIPDBList)
 const AlertRules = lazy(loadAlertRules)
 const AlertHistory = lazy(loadAlertHistory)
+const AlertAudit = lazy(loadAlertAudit)
 const AlertSilences = lazy(loadAlertSilences)
 const Metrics = lazy(loadMetrics)
 const DeviceOverview = lazy(loadDeviceOverview)
@@ -60,6 +62,7 @@ const preloadRouteModules = () => {
     loadIPDBList(),
     loadAlertRules(),
     loadAlertHistory(),
+    loadAlertAudit(),
     loadAlertSilences(),
     loadMetrics(),
     loadDeviceOverview(),
@@ -70,7 +73,7 @@ const preloadRouteModules = () => {
 }
 
 const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/device-overview', '/port-query', '/ip-flow-query']
-const PUBLIC_MENU_PATHS = ['/alerts/history', '/port-query']
+const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/port-query']
 const ROUTE_ALIASES: Record<string, string[]> = {
   '/port-query': ['/metrics'],
   '/device-overview': ['/metrics'],
@@ -202,6 +205,7 @@ function App() {
             <Route path="devices/:id" element={<MenuRoute menuPath="/devices"><DeviceDetail /></MenuRoute>} />
             <Route path="alerts/rules" element={<MenuRoute menuPath="/alerts/rules"><AlertRules /></MenuRoute>} />
             <Route path="alerts/history" element={<MenuRoute menuPath="/alerts/history"><AlertHistory /></MenuRoute>} />
+            <Route path="alerts/audit" element={<MenuRoute menuPath="/alerts/audit"><AlertAudit /></MenuRoute>} />
             <Route path="alerts/silences" element={<MenuRoute menuPath="/alerts/silences"><AlertSilences /></MenuRoute>} />
             <Route path="port-query" element={<MenuRoute menuPath="/port-query"><Metrics /></MenuRoute>} />
             <Route path="ip-flow-query" element={<MenuRoute menuPath="/ip-flow-query"><IPFlowQuery /></MenuRoute>} />
