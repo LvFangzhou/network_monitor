@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useState } from 'react'
+import { startTransition, useEffect, useState, type Key } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
   Layout as AntLayout,
@@ -150,7 +150,66 @@ const Layout = () => {
     }
   })
 
-  const menuItems = addMenuTooltips(filterMenuItems(baseMenuItems))
+  const fullMenuItems = addMenuTooltips(filterMenuItems(baseMenuItems))
+  const firstRouteKey = (item: ItemType): string | null => {
+    if (!item || !('key' in item)) return null
+    if (String(item.key).startsWith('/')) return String(item.key)
+    if ('children' in item && item.children?.length) {
+      for (const child of item.children as ItemType[]) {
+        const route = firstRouteKey(child)
+        if (route) return route
+      }
+    }
+    return null
+  }
+  const collapsedMenuItems = fullMenuItems
+    .map((item) => {
+      if (!item || !('key' in item)) return item
+      const routeKey = firstRouteKey(item)
+      const label = 'label' in item ? item.label : undefined
+      return {
+        key: routeKey || String(item.key),
+        icon: 'icon' in item ? item.icon : undefined,
+        label,
+        title: typeof label === 'string' ? label : undefined,
+      }
+    })
+    .filter((item) => item && 'key' in item && String(item.key).startsWith('/')) as ItemType[]
+  const menuItems = collapsed ? collapsedMenuItems : fullMenuItems
+  const selectedCollapsedKey = collapsedMenuItems.find((item) => {
+    if (!item || !('key' in item)) return false
+    const itemKey = String(item.key)
+    const sourceItem = fullMenuItems.find((fullItem) => firstRouteKey(fullItem) === itemKey)
+    if (!sourceItem || !('children' in sourceItem) || !sourceItem.children) {
+      return selectedMenuKey === itemKey
+    }
+    const childKeys = (sourceItem.children as ItemType[])
+      .filter((child) => child && 'key' in child)
+      .map((child) => String((child as { key: Key }).key))
+    return childKeys.some((key) => selectedMenuKey === key || selectedMenuKey.startsWith(`${key}/`))
+  })
+  const activeMenuKey = collapsed && selectedCollapsedKey && 'key' in selectedCollapsedKey
+    ? String(selectedCollapsedKey.key)
+    : selectedMenuKey
+  const routeParentKey = (items: ItemType[], route: string): string | null => {
+    for (const item of items) {
+      if (!item || !('key' in item)) continue
+      if ('children' in item && item.children?.length) {
+        const children = item.children as ItemType[]
+        const matched = children.some((child) => child && 'key' in child && (route === String(child.key) || route.startsWith(`${String(child.key)}/`)))
+        if (matched) return String(item.key)
+        const nested = routeParentKey(children, route)
+        if (nested) return String(item.key)
+      }
+    }
+    return null
+  }
+  const currentParentKey = routeParentKey(fullMenuItems, selectedMenuKey)
+  const [openKeys, setOpenKeys] = useState<string[]>(() => currentParentKey ? [currentParentKey] : [])
+
+  useEffect(() => {
+    setOpenKeys(collapsed || !currentParentKey ? [] : [currentParentKey])
+  }, [collapsed, currentParentKey])
 
   const userMenuItems = token ? [
     {
@@ -194,7 +253,7 @@ const Layout = () => {
   return (
     <AntLayout data-theme={appTheme} style={{ minHeight: '100vh', background: colorBgLayout }}>
       <Sider
-        className="modern-sider"
+        className={`modern-sider${collapsed ? ' modern-sider-collapsed' : ''}`}
         trigger={null}
         collapsible
         collapsed={collapsed}
@@ -249,9 +308,10 @@ const Layout = () => {
         <Menu
           theme="dark"
           mode="inline"
-          inlineCollapsed={collapsed}
-          selectedKeys={[selectedMenuKey]}
-          defaultOpenKeys={['resource-management', '/alerts', 'monitor-center', 'tacacs-management']}
+          inlineCollapsed={false}
+          selectedKeys={[activeMenuKey]}
+          openKeys={collapsed ? [] : openKeys}
+          onOpenChange={(keys) => setOpenKeys((keys.length ? [String(keys[keys.length - 1])] : []))}
           items={menuItems}
           onClick={handleMenuClick}
           style={{ borderRight: 0, background: 'transparent', fontWeight: 600 }}
