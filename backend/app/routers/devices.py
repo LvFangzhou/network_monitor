@@ -906,6 +906,14 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
         db_device.gnmi_tls_cert = gnmi.get("tls_cert", db_device.gnmi_tls_cert)
         db_device.gnmi_skip_verify = 1 if gnmi.get("skip_verify") else 0
         db_device.gnmi_subscriptions = gnmi.get("subscriptions", db_device.gnmi_subscriptions)
+
+    # 处理SSH配置（配置备份使用）
+    if "ssh" in update_data and update_data["ssh"]:
+        ssh = update_data.pop("ssh")
+        db_device.ssh_port = ssh.get("port", db_device.ssh_port)
+        db_device.ssh_username = ssh.get("username", db_device.ssh_username)
+        db_device.ssh_password = ssh.get("password", db_device.ssh_password)
+        db_device.ssh_key = ssh.get("key", db_device.ssh_key)
     
     # 处理标签
     if "tags" in update_data and update_data["tags"] is not None:

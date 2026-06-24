@@ -22,7 +22,8 @@ router = APIRouter()
 REQUIRED_IMPORT_HEADERS = {'name', 'ip_address'}
 DEVICE_CSV_HEADERS = [
     'name', 'status', 'ip_address', 'device_role', 'device_type', 'vendor', 'model', 'serial_number',
-    'datacenter_name', 'datacenter_code', 'is_monitored'
+    'datacenter_name', 'datacenter_code', 'is_monitored',
+    'ssh_port', 'ssh_username', 'ssh_password', 'ssh_key'
 ]
 
 
@@ -72,6 +73,79 @@ def normalize_is_monitored(raw_value: Optional[str]) -> bool:
     if value in {'', '0', 'false', 'no', 'n', '否', '不加入', '未监控'}:
         return False
     raise ValueError("is_monitored 仅支持 是/否、true/false 或 1/0")
+
+
+def csv_value(row: dict[str, str], key: str) -> Optional[str]:
+    value = row.get(key)
+    if value is None:
+        return None
+    value = value.strip()
+    return value if value else None
+
+
+def normalize_ssh_port(raw_value: Optional[str]) -> int:
+    value = (raw_value or "").strip()
+    if not value:
+        return 22
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise ValueError("ssh_port 必须是 1-65535 的整数") from exc
+    if port < 1 or port > 65535:
+        raise ValueError("ssh_port 必须是 1-65535 的整数")
+    return port
+
+
+def apply_device_import_row(device: Device, row: dict[str, str], db: Session, group_id: Optional[int] = None) -> None:
+    """将 CSV 行应用到新建或已有设备；空字段不覆盖已有非空值。"""
+    if csv_value(row, 'name'):
+        device.name = csv_value(row, 'name')
+    if csv_value(row, 'ip_address'):
+        device.ip_address = csv_value(row, 'ip_address')
+    if csv_value(row, 'hostname'):
+        device.hostname = csv_value(row, 'hostname')
+    if csv_value(row, 'status'):
+        device.status = normalize_inventory_status(row.get('status'))
+    if csv_value(row, 'model'):
+        device.model = csv_value(row, 'model')
+    if csv_value(row, 'serial_number'):
+        device.serial_number = csv_value(row, 'serial_number')
+
+    if csv_value(row, 'device_type'):
+        device_type_id, device_type_name = find_or_create_device_type(db, row.get('device_type'))
+        device.device_type_id = device_type_id
+        device.device_type = device_type_name or device.device_type or 'unknown'
+    elif not device.device_type:
+        device.device_type = 'unknown'
+
+    if csv_value(row, 'device_role'):
+        device.device_role = ensure_device_role_catalog(db, row.get('device_role'))
+    if csv_value(row, 'vendor'):
+        device.vendor = ensure_device_vendor_catalog(db, row.get('vendor'))
+
+    if row.get('datacenter_name') or row.get('datacenter_code'):
+        datacenter_id = find_existing_datacenter_id(db, row.get('datacenter_name'), row.get('datacenter_code'))
+        if datacenter_id is None:
+            datacenter_hint = row.get('datacenter_name') or row.get('datacenter_code')
+            raise ValueError(f"机房 {datacenter_hint} 不存在，请先在机房管理中创建")
+        device.datacenter_id = datacenter_id
+
+    if row.get('is_monitored') not in {None, ''}:
+        device.is_monitored = normalize_is_monitored(row.get('is_monitored'))
+
+    if group_id or csv_value(row, 'group_id'):
+        device.group_id = group_id or row.get('group_id') or None
+
+    if row.get('ssh_port') not in {None, ''}:
+        device.ssh_port = normalize_ssh_port(row.get('ssh_port'))
+    elif not device.ssh_port:
+        device.ssh_port = 22
+    if 'ssh_username' in row and csv_value(row, 'ssh_username') is not None:
+        device.ssh_username = csv_value(row, 'ssh_username')
+    if 'ssh_password' in row and csv_value(row, 'ssh_password') is not None:
+        device.ssh_password = csv_value(row, 'ssh_password')
+    if 'ssh_key' in row and csv_value(row, 'ssh_key') is not None:
+        device.ssh_key = csv_value(row, 'ssh_key')
 
 
 def find_or_create_datacenter(
@@ -224,56 +298,26 @@ async def import_devices(
                 errors.append(f"第{row_num}行: 设备名称 {row['name']} 在导入文件中重复")
                 continue
             
-            # 检查IP是否已存在
-            existing = db.query(Device).filter(
-                Device.ip_address == row['ip_address']
-            ).first()
-            if existing:
-                failed += 1
-                errors.append(f"第{row_num}行: IP地址 {row['ip_address']} 已存在")
-                continue
-
+            existing = db.query(Device).filter(Device.ip_address == row['ip_address']).first()
             existing_name = db.query(Device).filter(Device.name == row['name']).first()
-            if existing_name:
+            if existing_name and (not existing or existing_name.id != existing.id):
                 failed += 1
-                errors.append(f"第{row_num}行: 设备名称 {row['name']} 已存在")
+                errors.append(f"第{row_num}行: 设备名称 {row['name']} 已被其他设备使用")
                 continue
-
-            datacenter_id = find_existing_datacenter_id(
-                db,
-                row.get('datacenter_name'),
-                row.get('datacenter_code'),
-            )
-            if (row.get('datacenter_name') or row.get('datacenter_code')) and datacenter_id is None:
-                failed += 1
-                datacenter_hint = row.get('datacenter_name') or row.get('datacenter_code')
-                errors.append(f"第{row_num}行: 机房 {datacenter_hint} 不存在，请先在机房管理中创建")
-                continue
-            
-            device_type_id, device_type_name = find_or_create_device_type(db, row.get('device_type', 'unknown'))
-            device_role_name = ensure_device_role_catalog(db, row.get('device_role'))
-            vendor_name = ensure_device_vendor_catalog(db, row.get('vendor'))
 
             with db.begin_nested():
-                # 创建设备
-                device = Device(
+                device = existing or Device(
                     name=row['name'],
                     ip_address=row['ip_address'],
-                    hostname=row.get('hostname'),
-                    device_type=device_type_name or 'unknown',
-                    device_type_id=device_type_id,
-                    device_role=device_role_name,
-                    vendor=vendor_name,
-                    model=row.get('model'),
-                    serial_number=row.get('serial_number'),
-                    status=normalize_inventory_status(row.get('status')),
-                    datacenter_id=datacenter_id,
-                    group_id=group_id or row.get('group_id') or None,
-                    is_monitored=normalize_is_monitored(row.get('is_monitored')),
+                    device_type='unknown',
+                    status='in_stock',
+                    ssh_port=22,
                 )
+                apply_device_import_row(device, row, db, group_id)
 
                 # 处理标签
                 if row.get('tags'):
+                    device.tags = []
                     tag_names = [t.strip() for t in row['tags'].split(',') if t.strip()]
                     for tag_name in tag_names:
                         tag = db.query(Tag).filter(Tag.name == tag_name).first()
@@ -283,7 +327,8 @@ async def import_devices(
                             db.flush()
                         device.tags.append(tag)
 
-                db.add(device)
+                if not existing:
+                    db.add(device)
                 db.flush()
 
             imported += 1
@@ -332,18 +377,22 @@ def build_device_csv(devices: list[Device]) -> bytes:
             device.datacenter_ref.name if device.datacenter_ref else None,
             device.datacenter_ref.code if device.datacenter_ref else None,
             '是' if device.is_monitored else '否',
+            device.ssh_port or 22,
+            device.ssh_username,
+            device.ssh_password,
+            device.ssh_key,
         ])
     return output.getvalue().encode('utf-8-sig')
 
 
 @router.get("/devices/template")
 async def export_device_template():
-    """下载设备导入模板；SNMP 团体字由系统后台默认配置，不出现在模板中。"""
+    """下载设备导入模板；包含 SSH 字段，便于批量补充配置备份账号。"""
     from fastapi.responses import StreamingResponse
     content = io.StringIO()
     writer = csv.writer(content)
     writer.writerow(DEVICE_CSV_HEADERS)
-    writer.writerow(['示例交换机', 'in_stock', '192.0.2.10', '接入交换机', 'switch', 'H3C', '', '', '', '', '是'])
+    writer.writerow(['示例交换机', 'in_stock', '192.0.2.10', '接入交换机', 'switch', 'H3C', '', '', '', '', '是', '22', 'backup', '', ''])
     return StreamingResponse(
         io.BytesIO(content.getvalue().encode('utf-8-sig')),
         media_type="text/csv; charset=utf-8",

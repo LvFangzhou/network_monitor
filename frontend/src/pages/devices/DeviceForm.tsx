@@ -92,6 +92,9 @@ const DeviceForm = () => {
           port: 161,
           community: 'para@2026',
         },
+        ssh: {
+          port: 22,
+        },
       })
     }
   }, [id])
@@ -153,6 +156,12 @@ const DeviceForm = () => {
           priv_protocol: device.snmp?.priv_protocol,
           priv_password: device.snmp?.priv_password,
           security_level: device.snmp?.security_level,
+        },
+        ssh: {
+          port: device.ssh?.port || 22,
+          username: device.ssh?.username,
+          password: device.ssh?.password,
+          key: device.ssh?.key,
         },
         custom_fields_text: device.custom_fields ? JSON.stringify(device.custom_fields, null, 2) : '',
       })
@@ -219,6 +228,12 @@ const DeviceForm = () => {
           tls_cert: values.gnmi?.tls_cert,
           skip_verify: values.gnmi?.skip_verify ?? true,
           subscriptions: Array.isArray(gnmiSubscriptions) ? gnmiSubscriptions : [],
+        },
+        ssh: {
+          port: values.ssh?.port || 22,
+          username: values.ssh?.username,
+          password: values.ssh?.password,
+          key: values.ssh?.key,
         },
         custom_fields: parsedCustomFields,
       }
@@ -570,6 +585,32 @@ const DeviceForm = () => {
                       </Form.Item>
                     )
                   }}
+                </Form.Item>
+
+                <Divider orientation="left">SSH / 配置备份账号</Divider>
+
+                <Form.Item
+                  name={['ssh', 'port']}
+                  label="SSH端口"
+                  extra="配置备份会优先使用这里的 SSH 参数登录设备。"
+                >
+                  <InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder="默认 22" />
+                </Form.Item>
+
+                <Form.Item name={['ssh', 'username']} label="SSH用户名">
+                  <Input placeholder="例如：admin / backup" autoComplete="off" />
+                </Form.Item>
+
+                <Form.Item name={['ssh', 'password']} label="SSH密码">
+                  <Input.Password visibilityToggle={false} placeholder="用于配置备份，可留空改用私钥" autoComplete="new-password" />
+                </Form.Item>
+
+                <Form.Item
+                  name={['ssh', 'key']}
+                  label="SSH私钥"
+                  extra="可选。仅当设备支持密钥登录时填写，密码和私钥至少配置一种。"
+                >
+                  <Input.TextArea rows={4} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
                 </Form.Item>
 
                 <Form.Item

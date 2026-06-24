@@ -1093,7 +1093,7 @@ const DeviceList = () => {
         </div>
         <div style={{ marginTop: 12 }}>
           <Text type="secondary">
-            导入/导出字段：设备名称、运行状态、IP地址、设备角色、设备类型、厂商、型号、序列号、机房名称、机房编号、是否加入监控
+            导入/导出字段：设备名称、运行状态、IP地址、设备角色、设备类型、厂商、型号、序列号、机房名称、机房编号、是否加入监控、SSH端口、SSH用户名、SSH密码、SSH私钥
           </Text>
         </div>
       </div>
