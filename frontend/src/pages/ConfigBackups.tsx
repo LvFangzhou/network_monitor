@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Card, Col, Drawer, Input, Row, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
+import { Button, Card, Col, Drawer, Form, Input, Row, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
 import { CloudDownloadOutlined, EyeOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import {
   getConfigBackupFilters,
   getConfigBackupJob,
   getConfigBackupJobs,
+  getConfigBackupSettings,
   getConfigBackupResult,
   getLatestConfigBackupJob,
+  saveConfigBackupSettings,
   searchConfigBackups,
+  testConfigBackupNotification,
   triggerConfigBackup,
   type ConfigBackupJob,
   type ConfigBackupResult,
@@ -15,6 +18,15 @@ import {
 } from '../api/configBackups'
 
 const { Text, Paragraph } = Typography
+
+const detectWebhookLabel = (url?: string) => {
+  const value = (url || '').toLowerCase()
+  if (!value) return '未填写'
+  if (value.includes('work.weixin.qq.com') || value.includes('qyapi.weixin.qq.com')) return '企业微信'
+  if (value.includes('oapi.dingtalk.com') || value.includes('api.dingtalk.com')) return '钉钉'
+  if (value.includes('open.feishu.cn') || value.includes('open.larksuite.com')) return '飞书'
+  return '通用 Webhook'
+}
 
 const statusColor: Record<string, string> = {
   pending: 'blue',
@@ -55,6 +67,7 @@ const ConfigBackups = () => {
   const [jobs, setJobs] = useState<ConfigBackupJob[]>([])
   const [jobsTotal, setJobsTotal] = useState(0)
   const [jobsPage, setJobsPage] = useState(1)
+  const [jobsPageSize, setJobsPageSize] = useState(10)
   const [jobsLoading, setJobsLoading] = useState(false)
   const [triggering, setTriggering] = useState(false)
   const [keyword, setKeyword] = useState('')
@@ -68,19 +81,40 @@ const ConfigBackups = () => {
   const [resultDetail, setResultDetail] = useState<ConfigBackupResult | null>(null)
   const [jobResultsOpen, setJobResultsOpen] = useState(false)
   const [jobResults, setJobResults] = useState<ConfigBackupResult[]>([])
+  const [latestResults, setLatestResults] = useState<ConfigBackupResult[]>([])
+  const [resultFilterText, setResultFilterText] = useState('')
+  const [notificationWebhook, setNotificationWebhook] = useState('')
+  const [webhookLabel, setWebhookLabel] = useState('未填写')
+  const [savingWebhook, setSavingWebhook] = useState(false)
+  const [testingWebhook, setTestingWebhook] = useState(false)
 
-  const loadJobs = async (page = jobsPage) => {
+  const loadJobs = async (page = jobsPage, pageSize = jobsPageSize) => {
     setJobsLoading(true)
     try {
-      const [latest, result, filters] = await Promise.all([
+      const [latest, result, filters, settings] = await Promise.all([
         getLatestConfigBackupJob(),
-        getConfigBackupJobs({ skip: (page - 1) * 10, limit: 10 }),
+        getConfigBackupJobs({ skip: (page - 1) * pageSize, limit: pageSize }),
         getConfigBackupFilters(),
+        getConfigBackupSettings(),
       ])
       setLatestJob(latest.job)
       setJobs(result.items)
       setJobsTotal(result.total)
       setDatacenters(filters.datacenters || [])
+      const channel = settings.settings?.notification_channels?.[0]
+      const webhook = channel?.webhook || channel?.url || ''
+      setNotificationWebhook(webhook)
+      setWebhookLabel(detectWebhookLabel(webhook))
+      if (latest.job?.id) {
+        try {
+          const detail = await getConfigBackupJob(latest.job.id)
+          setLatestResults(detail.results || [])
+        } catch {
+          setLatestResults([])
+        }
+      } else {
+        setLatestResults([])
+      }
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取配置备份信息失败')
     } finally {
@@ -102,7 +136,7 @@ const ConfigBackups = () => {
     try {
       const result = await triggerConfigBackup()
       message.success(result.message || '已提交配置备份任务')
-      await loadJobs(1)
+      await loadJobs(1, jobsPageSize)
       setJobsPage(1)
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '触发配置备份失败')
@@ -158,10 +192,61 @@ const ConfigBackups = () => {
     }
   }
 
+  const handleSaveWebhook = async () => {
+    setSavingWebhook(true)
+    try {
+      const result = await saveConfigBackupSettings({
+        notification_channels: notificationWebhook.trim()
+          ? [{ webhook: notificationWebhook.trim() }]
+          : [],
+      })
+      const channel = result.settings.notification_channels?.[0]
+      const webhook = channel?.webhook || channel?.url || ''
+      setNotificationWebhook(webhook)
+      setWebhookLabel(detectWebhookLabel(webhook))
+      message.success(result.message || '机器人通知已保存')
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '保存机器人通知失败')
+    } finally {
+      setSavingWebhook(false)
+    }
+  }
+
+  const handleTestWebhook = async () => {
+    const url = notificationWebhook.trim()
+    if (!url) {
+      message.warning('请先填写机器人 Webhook 地址')
+      return
+    }
+    setTestingWebhook(true)
+    try {
+      const result = await testConfigBackupNotification(url)
+      message.success(result.message || '测试消息发送成功')
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '测试消息发送失败')
+    } finally {
+      setTestingWebhook(false)
+    }
+  }
+
   const successRate = useMemo(() => {
     if (!latestJob?.total_devices) return 0
     return Math.round((latestJob.success_count / latestJob.total_devices) * 100)
   }, [latestJob])
+
+  const filteredLatestResults = useMemo(() => {
+    const text = resultFilterText.trim().toLowerCase()
+    if (!text) return latestResults
+    return latestResults.filter((item) =>
+      [
+        item.device_name,
+        item.device_ip,
+        item.datacenter_name,
+        item.vendor,
+        item.model,
+      ].some((value) => String(value || '').toLowerCase().includes(text))
+    )
+  }, [latestResults, resultFilterText])
 
   return (
     <div className="modern-page">
@@ -207,6 +292,65 @@ const ConfigBackups = () => {
             </Paragraph>
           ) : null}
         </Space>
+      </Card>
+
+      <Card title="机器人通知配置">
+        <Form layout="vertical">
+          <Form.Item
+            label="配置备份完成后推送的机器人 Webhook"
+            extra={`支持飞书 / 企业微信 / 钉钉 / 通用 Webhook，当前识别：${webhookLabel}。留空保存则不单独配置，系统会尝试回退环境变量里的系统通知地址。`}
+          >
+            <Space.Compact style={{ width: '100%' }}>
+              <Input
+                allowClear
+                value={notificationWebhook}
+                onChange={(event) => {
+                  setNotificationWebhook(event.target.value)
+                  setWebhookLabel(detectWebhookLabel(event.target.value))
+                }}
+                placeholder="粘贴机器人 Webhook 地址"
+              />
+              <Button onClick={handleTestWebhook} loading={testingWebhook}>测试</Button>
+              <Button type="primary" onClick={handleSaveWebhook} loading={savingWebhook}>保存</Button>
+            </Space.Compact>
+          </Form.Item>
+        </Form>
+      </Card>
+
+      <Card
+        title="最近备份配置文件"
+        extra={
+          <Input
+            allowClear
+            placeholder="按设备 / IP / 机房过滤"
+            value={resultFilterText}
+            onChange={(event) => setResultFilterText(event.target.value)}
+            style={{ width: 260 }}
+          />
+        }
+      >
+        <Table
+          rowKey="id"
+          dataSource={filteredLatestResults}
+          pagination={{ pageSize: 20, showSizeChanger: true, showTotal: (total) => `共 ${total} 台` }}
+          columns={[
+            { title: '设备', width: 280, render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text strong>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
+            { title: '机房', dataIndex: 'datacenter_name', width: 150, render: (value?: string) => value || '-' },
+            { title: '厂商/型号', width: 180, render: (_: unknown, record: ConfigBackupResult) => [record.vendor, record.model].filter(Boolean).join(' / ') || '-' },
+            { title: '命令', dataIndex: 'command', width: 180, render: (value?: string) => value || '-' },
+            { title: '行数', dataIndex: 'line_count', width: 90, render: (value?: number) => value || '-' },
+            { title: '状态', dataIndex: 'status', width: 100, render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : 'blue'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value}</Tag> },
+            { title: '完成时间', dataIndex: 'finished_at', width: 180, render: formatTime },
+            {
+              title: '操作',
+              width: 120,
+              render: (_: unknown, record: ConfigBackupResult) => (
+                <Button size="small" icon={<EyeOutlined />} disabled={record.status !== 'success'} onClick={() => openResult(record.id)}>查看配置</Button>
+              ),
+            },
+          ]}
+        />
+        <Text type="secondary">这里展示最近一次备份任务生成的配置文件。要查某个 IP 配在哪台设备上，可以继续使用下面的“配置内容搜索”。</Text>
       </Card>
 
       <Card title="配置内容搜索">
@@ -295,11 +439,15 @@ const ConfigBackups = () => {
           dataSource={jobs}
           pagination={{
             current: jobsPage,
-            pageSize: 10,
+            pageSize: jobsPageSize,
             total: jobsTotal,
-            onChange: (page) => {
+            showSizeChanger: true,
+            showTotal: (total) => `共 ${total} 个任务`,
+            pageSizeOptions: [10, 20, 50, 100],
+            onChange: (page, pageSize) => {
               setJobsPage(page)
-              loadJobs(page)
+              setJobsPageSize(pageSize)
+              loadJobs(page, pageSize)
             },
           }}
           columns={[
@@ -343,7 +491,7 @@ const ConfigBackups = () => {
         <Table
           rowKey="id"
           dataSource={jobResults}
-          pagination={{ pageSize: 20 }}
+          pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total) => `共 ${total} 台` }}
           columns={[
             { title: '设备', width: 260, render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
             { title: '机房', dataIndex: 'datacenter_name', width: 150, render: (value?: string) => value || '-' },
@@ -352,6 +500,13 @@ const ConfigBackups = () => {
             { title: '状态', dataIndex: 'status', width: 100, render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : 'blue'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value}</Tag> },
             { title: '错误信息', dataIndex: 'error_message', ellipsis: true, render: (value?: string) => value ? <Tooltip title={value}>{value}</Tooltip> : <Text type="secondary">-</Text> },
             { title: '完成时间', dataIndex: 'finished_at', width: 180, render: formatTime },
+            {
+              title: '操作',
+              width: 120,
+              render: (_: unknown, record: ConfigBackupResult) => (
+                <Button size="small" icon={<EyeOutlined />} disabled={record.status !== 'success'} onClick={() => openResult(record.id)}>查看配置</Button>
+              ),
+            },
           ]}
         />
         <Text type="secondary" style={{ display: 'block', marginTop: 12 }}>失败设备通常是 SSH 账号、密码、ACL、登录超时或厂商分页命令不兼容导致。</Text>

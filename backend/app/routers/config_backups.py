@@ -14,6 +14,12 @@ from app.database import get_db
 from app.models import ConfigBackupJob, ConfigBackupResult, Datacenter, Device, User
 from app.routers.auth import get_current_active_user
 from app.tasks.config_backup_tasks import run_config_backup
+from app.utils import notification_manager
+from app.utils.config_backup_settings import (
+    detect_webhook_type,
+    load_config_backup_settings,
+    save_config_backup_settings,
+)
 
 router = APIRouter()
 
@@ -205,3 +211,63 @@ async def get_config_backup_filters(db: Session = Depends(get_db)):
         )
     ]
     return {"datacenters": datacenters}
+
+
+@router.get("/settings", response_model=dict)
+async def get_config_backup_page_settings(current_user: User = Depends(get_current_active_user)):
+    """获取配置备份页面设置。"""
+    return {"settings": load_config_backup_settings()}
+
+
+@router.post("/settings", response_model=dict)
+async def save_config_backup_page_settings(
+    payload: Dict[str, Any],
+    current_user: User = Depends(get_current_active_user),
+):
+    """保存配置备份页面设置。"""
+    raw_channels = payload.get("notification_channels") or []
+    if not isinstance(raw_channels, list):
+        raise HTTPException(status_code=400, detail="机器人通知配置格式不正确")
+
+    channels = []
+    for channel in raw_channels:
+        webhook = str((channel or {}).get("webhook") or (channel or {}).get("url") or "").strip()
+        if not webhook:
+            continue
+        channels.append({
+            "type": detect_webhook_type(webhook),
+            "webhook": webhook,
+        })
+    settings_payload = save_config_backup_settings({"notification_channels": channels})
+    return {"message": "配置备份机器人通知已保存", "settings": settings_payload}
+
+
+@router.post("/test-notification", response_model=dict)
+async def test_config_backup_notification(
+    payload: Dict[str, Any],
+    current_user: User = Depends(get_current_active_user),
+):
+    """测试配置备份机器人/Webhook 是否可用。"""
+    webhook_url = str(payload.get("url") or payload.get("webhook") or "").strip()
+    if not webhook_url:
+        raise HTTPException(status_code=400, detail="请先填写机器人 Webhook 地址")
+    channel_type = detect_webhook_type(webhook_url)
+    config = {"url": webhook_url} if channel_type == "webhook" else {"webhook": webhook_url}
+    success = await notification_manager.send_notification(
+        channel_type,
+        config,
+        "配置备份机器人测试",
+        "这是一条配置备份测试消息，用于验证机器人 webhook 是否配置正确。",
+        {
+            "severity": "P2",
+            "notification_kind": "config_backup",
+            "rows": [
+                {"label": "模块", "value": "配置备份"},
+                {"label": "测试人", "value": current_user.username},
+            ],
+        },
+    )
+    if not success:
+        detail = notification_manager.last_error_message or "测试消息发送失败，请检查 webhook 地址或机器人配置"
+        raise HTTPException(status_code=400, detail=detail)
+    return {"success": True, "channel_type": channel_type, "message": "测试消息发送成功"}

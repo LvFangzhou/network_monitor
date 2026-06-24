@@ -55,6 +55,7 @@ MENU_OPTIONS = [
     {"label": "公网管理", "value": "/public-circuits"},
     {"label": "专线管理", "value": "/private-circuits"},
     {"label": "IPDB", "value": "/ipdb"},
+    {"label": "配置备份", "value": "/config-backups"},
     {"label": "告警规则", "value": "/alerts/rules"},
     {"label": "告警历史", "value": "/alerts/history"},
     {"label": "告警日志", "value": "/alerts/audit"},
@@ -62,7 +63,6 @@ MENU_OPTIONS = [
     {"label": "端口查询", "value": "/port-query"},
     {"label": "IP流量查询", "value": "/ip-flow-query"},
     {"label": "设备总览", "value": "/device-overview"},
-    {"label": "配置备份", "value": "/config-backups"},
     {"label": "系统设置", "value": "/settings"},
     {"label": "Tacacs管理", "value": "/tacacs"},
 ]

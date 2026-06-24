@@ -48,6 +48,12 @@ export interface ConfigSearchMatch {
   context: Array<{ line_number: number; text: string }>
 }
 
+export interface ConfigBackupNotificationChannel {
+  type?: string
+  webhook?: string
+  url?: string
+}
+
 export const triggerConfigBackup = async (): Promise<{ message: string; task_id?: string; job: ConfigBackupJob }> => {
   return await request.post('/config-backups/run') as { message: string; task_id?: string; job: ConfigBackupJob }
 }
@@ -80,4 +86,16 @@ export const searchConfigBackups = async (params: {
 
 export const getConfigBackupFilters = async (): Promise<{ datacenters: Array<{ name: string }> }> => {
   return await request.get('/config-backups/filters') as { datacenters: Array<{ name: string }> }
+}
+
+export const getConfigBackupSettings = async (): Promise<{ settings: { notification_channels: ConfigBackupNotificationChannel[] } }> => {
+  return await request.get('/config-backups/settings') as { settings: { notification_channels: ConfigBackupNotificationChannel[] } }
+}
+
+export const saveConfigBackupSettings = async (payload: { notification_channels: ConfigBackupNotificationChannel[] }): Promise<{ message: string; settings: { notification_channels: ConfigBackupNotificationChannel[] } }> => {
+  return await request.post('/config-backups/settings', payload) as { message: string; settings: { notification_channels: ConfigBackupNotificationChannel[] } }
+}
+
+export const testConfigBackupNotification = async (url: string): Promise<{ success: boolean; channel_type: string; message: string }> => {
+  return await request.post('/config-backups/test-notification', { url }) as { success: boolean; channel_type: string; message: string }
 }

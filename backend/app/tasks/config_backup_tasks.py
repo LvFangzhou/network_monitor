@@ -13,6 +13,7 @@ from app.models import ConfigBackupJob, ConfigBackupResult, Device
 from app.tasks import celery_app
 from app.tasks.system_tasks import _notification_channels
 from app.utils import notification_manager
+from app.utils.config_backup_settings import config_backup_notification_channels
 
 logger = get_logger(__name__)
 
@@ -252,7 +253,7 @@ def _build_notification_content(job: ConfigBackupJob, datacenter_stats: Dict[str
 
 
 def _send_backup_notification(job: ConfigBackupJob, datacenter_stats: Dict[str, Dict[str, int]]) -> None:
-    channels = _notification_channels()
+    channels = config_backup_notification_channels() or _notification_channels()
     if not channels:
         logger.warning("配置备份完成但没有配置机器人通知", job_id=job.id)
         return

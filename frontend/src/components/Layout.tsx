@@ -99,6 +99,7 @@ const Layout = () => {
         { key: '/public-circuits', label: '公网管理' },
         { key: '/private-circuits', label: '专线管理' },
         { key: '/ipdb', label: 'IPDB' },
+        { key: '/config-backups', label: '配置备份' },
       ],
     },
     {
@@ -120,7 +121,6 @@ const Layout = () => {
         { key: '/device-overview', label: '设备总览' },
         { key: '/port-query', label: '端口查询' },
         { key: '/ip-flow-query', label: 'IP流量查询' },
-        { key: '/config-backups', label: '配置备份' },
       ],
     },
     {
