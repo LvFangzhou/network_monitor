@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_
+from sqlalchemy import func, or_
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -196,7 +197,7 @@ async def search_config_backups(
     limit: int = Query(100, ge=1, le=500),
     context_lines: int = Query(1, ge=0, le=5),
 ):
-    """在最近一次成功/部分成功任务的配置中搜索关键字。"""
+    """在每台设备最新一次成功获取的配置中搜索关键字。"""
     latest_job = (
         db.query(ConfigBackupJob)
         .filter(ConfigBackupJob.status.in_(["success", "partial_failed"]))
@@ -206,23 +207,40 @@ async def search_config_backups(
     if not latest_job:
         return {"total": 0, "items": [], "job": None}
 
-    query = (
-        db.query(ConfigBackupResult)
+    ranked_latest_results = (
+        db.query(
+            ConfigBackupResult.id.label("id"),
+            func.row_number().over(
+                partition_by=ConfigBackupResult.device_id,
+                order_by=(
+                    ConfigBackupResult.finished_at.desc().nullslast(),
+                    ConfigBackupResult.id.desc(),
+                ),
+            ).label("rank"),
+        )
         .filter(
-            ConfigBackupResult.job_id == latest_job.id,
             ConfigBackupResult.status == "success",
             ConfigBackupResult.config_content.isnot(None),
-            ConfigBackupResult.config_content.ilike(f"%{keyword}%"),
+        )
+        .subquery()
+    )
+    latest_result = aliased(ConfigBackupResult)
+    query = (
+        db.query(latest_result)
+        .join(ranked_latest_results, ranked_latest_results.c.id == latest_result.id)
+        .filter(
+            ranked_latest_results.c.rank == 1,
+            latest_result.config_content.ilike(f"%{keyword}%"),
         )
     )
     if datacenter:
-        query = query.filter(ConfigBackupResult.datacenter_name == datacenter)
+        query = query.filter(latest_result.datacenter_name == datacenter)
     if device_id:
-        query = query.filter(ConfigBackupResult.device_id == device_id)
+        query = query.filter(latest_result.device_id == device_id)
     if device_ip:
-        query = query.filter(ConfigBackupResult.device_ip.ilike(f"%{device_ip.strip()}%"))
+        query = query.filter(latest_result.device_ip.ilike(f"%{device_ip.strip()}%"))
 
-    results = query.order_by(ConfigBackupResult.device_ip.asc()).limit(limit).all()
+    results = query.order_by(latest_result.device_ip.asc()).limit(limit).all()
     pattern = re.compile(re.escape(keyword), re.IGNORECASE)
     items: List[Dict[str, Any]] = []
     for result in results:

@@ -224,7 +224,7 @@ const ConfigBackups = () => {
   }
 
   useEffect(() => {
-    loadJobs(1)
+    loadJobs(jobsPage, jobsPageSize)
     const timer = window.setInterval(() => {
       refreshJobProgress(jobsPage, jobsPageSize).catch(() => undefined)
     }, latestJob && ['pending', 'running'].includes(latestJob.status) ? 2000 : 5000)
@@ -531,7 +531,6 @@ const ConfigBackups = () => {
                 onChange: (page, pageSize) => {
                   setJobsPage(page)
                   setJobsPageSize(pageSize)
-                  loadJobs(page, pageSize)
                 },
               }}
               columns={[
