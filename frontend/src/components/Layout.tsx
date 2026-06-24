@@ -254,9 +254,6 @@ const Layout = () => {
             alignItems: 'center',
             justifyContent: 'space-between',
             boxShadow: appTheme === 'dark' ? '0 1px 0 rgba(148,163,184,0.10)' : '0 1px 0 rgba(15,23,42,0.06)',
-            position: 'sticky',
-            top: 0,
-            zIndex: 30,
             flexShrink: 0,
           }}
         >

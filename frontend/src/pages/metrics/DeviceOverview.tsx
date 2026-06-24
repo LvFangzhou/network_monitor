@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { DragEvent } from 'react'
 import {
   Button,
   Card,
@@ -743,11 +744,49 @@ const DeviceOverview = () => {
   ]
 
   const columnMap = new Map(allColumns.map((column) => [String(column.key), column]))
+  const withHeaderDrag = (column: any) => {
+    const key = String(column?.key || '')
+    const draggable = visibleColumnKeys.includes(key)
+    if (!draggable) return column
+    return {
+      ...column,
+      title: (
+        <Tooltip title="按住表头左右拖动，可调整列顺序">
+          <span style={{ cursor: 'grab', userSelect: 'none' }}>{column.title}</span>
+        </Tooltip>
+      ),
+      onHeaderCell: () => ({
+        draggable: true,
+        onDragStart: (event: DragEvent<HTMLElement>) => {
+          setDraggingColumnKey(key)
+          event.dataTransfer.effectAllowed = 'move'
+          event.dataTransfer.setData('text/plain', key)
+        },
+        onDragOver: (event: DragEvent<HTMLElement>) => {
+          if (draggingColumnKey && draggingColumnKey !== key) {
+            event.preventDefault()
+            event.dataTransfer.dropEffect = 'move'
+          }
+        },
+        onDrop: (event: DragEvent<HTMLElement>) => {
+          event.preventDefault()
+          const sourceKey = draggingColumnKey || event.dataTransfer.getData('text/plain')
+          if (sourceKey) moveVisibleColumn(sourceKey, key)
+          setDraggingColumnKey(null)
+        },
+        onDragEnd: () => setDraggingColumnKey(null),
+        style: {
+          cursor: 'grab',
+          background: draggingColumnKey === key ? '#e6f4ff' : undefined,
+        },
+      }),
+    }
+  }
   const visibleColumns = [
     columnMap.get('device'),
     ...visibleColumnKeys.map((key) => columnMap.get(key)).filter(Boolean),
     columnMap.get('detail'),
-  ].filter(Boolean)
+  ].filter(Boolean).map(withHeaderDrag)
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -853,7 +892,7 @@ const DeviceOverview = () => {
           rowKey={(record) => record.device.id}
           loading={loading}
           dataSource={sortedItems}
-          sticky={{ offsetHeader: 64 }}
+          sticky={{ offsetHeader: 0 }}
           scroll={{ x: 1500 }}
           pagination={{
             pageSize: tablePageSize,
