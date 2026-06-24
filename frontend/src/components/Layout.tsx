@@ -204,12 +204,17 @@ const Layout = () => {
     }
     return null
   }
-  const currentParentKey = routeParentKey(fullMenuItems, selectedMenuKey)
-  const [openKeys, setOpenKeys] = useState<string[]>(() => currentParentKey ? [currentParentKey] : [])
+  const [openKeys, setOpenKeys] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('layoutOpenKeys') || '[]')
+    } catch {
+      return []
+    }
+  })
 
   useEffect(() => {
-    setOpenKeys(collapsed || !currentParentKey ? [] : [currentParentKey])
-  }, [collapsed, currentParentKey])
+    localStorage.setItem('layoutOpenKeys', JSON.stringify(openKeys))
+  }, [openKeys])
 
   const userMenuItems = token ? [
     {
@@ -311,7 +316,7 @@ const Layout = () => {
           inlineCollapsed={false}
           selectedKeys={[activeMenuKey]}
           openKeys={collapsed ? [] : openKeys}
-          onOpenChange={(keys) => setOpenKeys((keys.length ? [String(keys[keys.length - 1])] : []))}
+          onOpenChange={(keys) => setOpenKeys(keys.map(String))}
           items={menuItems}
           onClick={handleMenuClick}
           style={{ borderRight: 0, background: 'transparent', fontWeight: 600 }}
