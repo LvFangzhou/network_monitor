@@ -49,21 +49,27 @@ const formatNumber = (value?: number | string | null) => {
   return Number.isFinite(numeric) ? numeric : null
 }
 
+const isInvalidOpticalRawValue = (value: number | null) => {
+  if (value === null) return true
+  // 控制器/设备常用 int32 最大值作为“未采集到/无效值”占位，不能参与换算和阈值判断。
+  return value >= 2147483647 || value <= -2147483648
+}
+
 const normalizePower = (value?: number | string | null) => {
   const numeric = formatNumber(value)
-  if (numeric === null) return null
+  if (numeric === null || isInvalidOpticalRawValue(numeric)) return null
   return numeric * 0.01
 }
 
 const normalizeTemperature = (value?: number | string | null) => {
   const numeric = formatNumber(value)
-  if (numeric === null) return null
+  if (numeric === null || isInvalidOpticalRawValue(numeric)) return null
   return Math.abs(numeric) > 1000 ? numeric / 1000 : numeric
 }
 
 const normalizeVoltage = (value?: number | string | null) => {
   const numeric = formatNumber(value)
-  if (numeric === null) return null
+  if (numeric === null || isInvalidOpticalRawValue(numeric)) return null
   if (Math.abs(numeric) > 1000) return numeric / 10000
   return numeric
 }
@@ -112,7 +118,13 @@ const isMetricAbnormal = (value: number | null, targetRange?: MetricRange) =>
   value !== null && Boolean(targetRange) && (value < targetRange!.min || value > targetRange!.max)
 
 const MetricText = ({ value, unit, danger, targetRange }: { value: number | null; unit: string; danger: boolean; targetRange?: MetricRange }) => {
-  if (value === null) return <Text type="secondary">-</Text>
+  if (value === null) {
+    return (
+      <Tooltip title="控制器返回无效占位值，通常表示该模块本次未采集到有效数据">
+        <Text type="secondary">未读到</Text>
+      </Tooltip>
+    )
+  }
   return (
     <Tooltip title={targetRange ? `${targetRange.source} 正常范围：${targetRange.min}～${targetRange.max} ${unit}` : undefined}>
       <Text type={danger ? 'danger' : undefined} strong={danger}>
