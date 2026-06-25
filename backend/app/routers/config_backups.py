@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, selectinload
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -173,7 +173,16 @@ async def get_latest_config_backup_job(db: Session = Depends(get_db)):
 
 @router.get("/jobs/{job_id}", response_model=dict)
 async def get_config_backup_job(job_id: int, db: Session = Depends(get_db)):
-    job = db.query(ConfigBackupJob).filter(ConfigBackupJob.id == job_id).first()
+    job = (
+        db.query(ConfigBackupJob)
+        .options(
+            selectinload(ConfigBackupJob.results)
+            .defer(ConfigBackupResult.config_content)
+            .selectinload(ConfigBackupResult.device)
+        )
+        .filter(ConfigBackupJob.id == job_id)
+        .first()
+    )
     if not job:
         raise HTTPException(status_code=404, detail="配置备份任务不存在")
     return _job_to_dict(job, include_results=True)

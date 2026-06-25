@@ -169,6 +169,37 @@ const ConfigBackups = () => {
     </div>
   )
 
+  const loadLatestResults = async (jobId?: number | null, clearOnEmpty = true) => {
+    if (!jobId) {
+      if (clearOnEmpty) setLatestResults([])
+      return
+    }
+    try {
+      const detail = await getConfigBackupJob(jobId)
+      setLatestResults(detail.results || [])
+    } catch {
+      if (clearOnEmpty) setLatestResults([])
+    }
+  }
+
+  const loadPageMeta = async () => {
+    try {
+      const [filters, settings] = await Promise.all([
+        getConfigBackupFilters(),
+        getConfigBackupSettings(),
+      ])
+      setDatacenters(filters.datacenters || [])
+      const channel = settings.settings?.notification_channels?.[0]
+      const webhook = channel?.webhook || channel?.url || ''
+      setNotificationWebhook(webhook)
+      setSavedNotificationWebhook(webhook)
+      setWebhookLabel(detectWebhookLabel(webhook))
+      setWebhookEditing(!webhook)
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '获取配置备份页面配置失败')
+    }
+  }
+
   const refreshJobProgress = async (page = jobsPage, pageSize = jobsPageSize) => {
     const [latest, result] = await Promise.all([
       getLatestConfigBackupJob(),
@@ -178,50 +209,34 @@ const ConfigBackups = () => {
     setJobs(result.items)
     setJobsTotal(result.total)
     if (latest.job?.id) {
-      try {
-        const detail = await getConfigBackupJob(latest.job.id)
-        setLatestResults(detail.results || [])
-      } catch {
-        // 保持已有数据，避免轮询瞬时失败导致表格闪空。
-      }
+      await loadLatestResults(latest.job.id, false)
     }
   }
 
   const loadJobs = async (page = jobsPage, pageSize = jobsPageSize, silent = false) => {
     if (!silent) setJobsLoading(true)
     try {
-      const [latest, result, filters, settings] = await Promise.all([
+      const [latest, result] = await Promise.all([
         getLatestConfigBackupJob(),
         getConfigBackupJobs({ skip: (page - 1) * pageSize, limit: pageSize }),
-        getConfigBackupFilters(),
-        getConfigBackupSettings(),
       ])
       setLatestJob(latest.job)
       setJobs(result.items)
       setJobsTotal(result.total)
-      setDatacenters(filters.datacenters || [])
-      const channel = settings.settings?.notification_channels?.[0]
-      const webhook = channel?.webhook || channel?.url || ''
-      setNotificationWebhook(webhook)
-      setSavedNotificationWebhook(webhook)
-      setWebhookLabel(detectWebhookLabel(webhook))
-      setWebhookEditing(!webhook)
-      if (latest.job?.id) {
-        try {
-          const detail = await getConfigBackupJob(latest.job.id)
-          setLatestResults(detail.results || [])
-        } catch {
-          setLatestResults([])
-        }
-      } else {
-        setLatestResults([])
-      }
     } catch (error: any) {
       if (!silent) message.error(error?.response?.data?.detail || '获取配置备份信息失败')
     } finally {
       if (!silent) setJobsLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadPageMeta()
+    getLatestConfigBackupJob()
+      .then((latest) => loadLatestResults(latest.job?.id))
+      .catch(() => undefined)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     loadJobs(jobsPage, jobsPageSize)

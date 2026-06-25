@@ -108,7 +108,7 @@ const AlertSilences = () => {
     }
     try {
       const result = await getAlertSilences({
-        include_match_counts: Boolean(options?.silent),
+        include_match_counts: false,
         include_total_match_counts: false,
       })
       setItems(result.items)
@@ -123,10 +123,6 @@ const AlertSilences = () => {
 
   useEffect(() => {
     fetchData()
-    const timer = window.setTimeout(() => {
-      void fetchData({ silent: true })
-    }, 100)
-    return () => window.clearTimeout(timer)
   }, [])
 
   const openCreate = () => {
@@ -286,17 +282,10 @@ const AlertSilences = () => {
               const activeCount = record.matched_active_alerts || 0
               const totalCount = record.matched_total_alerts || 0
               if (countsLoading) {
-                return record.matched_active_alerts === null ? (
-                  <Tag color="processing">统计中</Tag>
-                ) : (
+                return (
                   <Space size={6}>
-                    <Tooltip title="当前仍处于触发、确认、忽略或暂缓状态的命中告警">
-                      <Tag color={activeCount > 0 ? 'red' : 'default'}>当前 {activeCount} 条</Tag>
-                    </Tooltip>
-                    <Tooltip title="历史命中数较重，点开后按需统计">
-                      <Tag color="default">历史 点击查看</Tag>
-                    </Tooltip>
-                    <Tooltip title="查看历史命中告警">
+                    <Tag color="default">按需查看</Tag>
+                    <Tooltip title="查看命中告警，点开后再统计，避免进入菜单时卡顿">
                       <Button
                         type="text"
                         size="small"
