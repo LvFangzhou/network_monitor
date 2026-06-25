@@ -11,6 +11,7 @@ import {
 const { Text } = Typography
 
 const COLUMN_ORDER_STORAGE_KEY = 'module-info-visible-columns-v2'
+const MODULE_REFRESH_INTERVAL_MS = 600 * 1000
 const DEFAULT_VISIBLE_COLUMN_KEYS = [
   'datacenterName',
   'source',
@@ -304,6 +305,16 @@ const ModuleInfoQuery = () => {
     }, 350)
     return () => window.clearTimeout(timer)
   }, [search, deviceIp, interfaceName, vendorName])
+
+  useEffect(() => {
+    if (!controllerId) return undefined
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        loadData(page, pageSize)
+      }
+    }, MODULE_REFRESH_INTERVAL_MS)
+    return () => window.clearInterval(timer)
+  }, [controllerId, page, pageSize, search, deviceIp, interfaceName, vendorName])
 
   const updateVisibleColumnKeys = (updater: string[] | ((current: string[]) => string[])) => {
     setVisibleColumnKeys((current) => {
@@ -645,7 +656,7 @@ const ModuleInfoQuery = () => {
         <Space wrap style={{ marginTop: 12 }}>
           <Tag color="blue">模块 {total}</Tag>
           <Tag>当前页 {items.length}</Tag>
-          <Text type="secondary">数据窗口：最近3小时；只用于向控制器读取当前健康分析缓存，不展示历史趋势。</Text>
+          <Text type="secondary">数据窗口：最近3小时；页面每600秒自动刷新一次，仅在当前页面可见时刷新。</Text>
         </Space>
       </Card>
 

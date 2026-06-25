@@ -265,7 +265,7 @@ class ControllerClient:
                     "endTime": end_time,
                     "level": 0,
                     "history": "false",
-                    "interval": 1800000,
+                    "interval": 600000,
                 },
             ),
             (
@@ -309,7 +309,7 @@ class ControllerClient:
             "endTime": end_time,
             "level": level,
             "history": "false",
-            "interval": 1800000,
+            "interval": 600000,
         }
         if search:
             params["searchName"] = search

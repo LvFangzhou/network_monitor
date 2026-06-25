@@ -10,6 +10,7 @@ import {
 } from '../../api/controller'
 
 const { Text } = Typography
+const LOSSLESS_REFRESH_INTERVAL_MS = 120 * 1000
 
 const hourOptions = [
   { value: 3, label: '最近3小时' },
@@ -130,6 +131,18 @@ const LosslessInfoQuery = () => {
     }
   }, [controllerId])
 
+  useEffect(() => {
+    if (!controllerId) return undefined
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return
+      loadOverrunDevices()
+      if (assetId) {
+        loadBufferDetails(page, pageSize)
+      }
+    }, LOSSLESS_REFRESH_INTERVAL_MS)
+    return () => window.clearInterval(timer)
+  }, [controllerId, hours, assetId, page, pageSize, ifIndex, sortColumn])
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <Card>
@@ -142,6 +155,7 @@ const LosslessInfoQuery = () => {
             onChange={setControllerId}
           />
           <Select style={{ width: 130 }} value={hours} options={hourOptions} onChange={setHours} />
+          <Tag color="blue">每120秒自动刷新</Tag>
           <Button icon={<ReloadOutlined />} onClick={loadOverrunDevices} disabled={!controllerId}>
             刷新拥塞概览
           </Button>
