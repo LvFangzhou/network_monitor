@@ -61,6 +61,26 @@ def _looks_like_interactive_prompt(text: str) -> bool:
     return any(marker in normalized for marker in prompt_markers)
 
 
+def _looks_like_byte_pager(text: str) -> bool:
+    """Asteros/CX 系列分页提示可能只显示 `byte 19082`。"""
+    return bool(re.search(r"(?:^|\n)\s*byte\s+\d+\s*$", text, re.IGNORECASE))
+
+
+def _expects_config_end(device: Device, command: str) -> bool:
+    vendor = _vendor_text(device)
+    return (
+        command.strip().lower() == "show running-config"
+        and any(marker in vendor for marker in ["asteros", "asternos", "asterfusion", "星融元", "ruijie", "锐捷", "cisco", "nexus", "ios", "nx-os"])
+    )
+
+
+def _has_config_end(config: str) -> bool:
+    lines = [line.strip().lower() for line in (config or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    return "end" in lines[-20:]
+
+
 def _validate_config_content(device: Device, command: str, config: str) -> None:
     """确认备份结果不是登录提示/命令回显/交互提示，而是真实配置内容。"""
     text = (config or "").strip()
@@ -83,6 +103,10 @@ def _validate_config_content(device: Device, command: str, config: str) -> None:
     if len(lines) < min_lines:
         preview = " / ".join(line.strip() for line in lines[:3])[:160]
         raise RuntimeError(f"备份内容过短：仅 {len(lines)} 行，疑似未完整输出配置。预览：{preview}")
+
+    if _expects_config_end(device, command) and not _has_config_end(text):
+        preview = " / ".join(line.strip() for line in lines[-5:])[:220]
+        raise RuntimeError(f"备份内容未读取到配置结束标记 end，疑似分页或输出截断。尾部预览：{preview}")
 
 
 def _screen_disable_commands(device: Device) -> List[str]:
@@ -188,6 +212,8 @@ def _read_shell_output(shell: Any, idle_seconds: float = 0.8, timeout_seconds: f
             lowered = data.lower()
             if "--more--" in lowered or "---- more ----" in lowered:
                 shell.send(" ")
+            if _looks_like_byte_pager(data):
+                shell.send(" ")
             if "press return" in lowered or "press enter" in lowered:
                 shell.send("\n")
             continue
@@ -225,6 +251,8 @@ def _clean_config_output(output: str, command: str) -> str:
             if command in stripped:
                 command_seen = True
             continue
+        if re.fullmatch(r"byte\s+\d+", stripped, re.IGNORECASE):
+            continue
         if stripped.lower() in {"return", "end"}:
             cleaned.append(stripped)
             continue
@@ -241,6 +269,10 @@ def _clean_config_output(output: str, command: str) -> str:
         compacted.pop(0)
     while compacted and not compacted[-1].strip():
         compacted.pop()
+    if compacted:
+        tail = compacted[-1].strip()
+        if re.fullmatch(r"(?:<[^<>\s]{1,128}>|[A-Za-z0-9_.:/-]{1,128}#)", tail):
+            compacted.pop()
     return "\n".join(compacted).strip()
 
 
@@ -264,14 +296,14 @@ def _run_shell_config_command(shell: Any, device: Device, command: str) -> str:
         shell.send(command + "\n")
         output = _read_shell_output(
             shell,
-            idle_seconds=2.5 if _is_asteros(device) else 1.2,
+            idle_seconds=4.0 if _is_asteros(device) else 1.2,
             timeout_seconds=180 if _is_asteros(device) else 90,
         )
         if re.search(r"press\s+(return|enter)", output, re.IGNORECASE):
             shell.send("\n")
             output += _read_shell_output(
                 shell,
-                idle_seconds=2.5 if _is_asteros(device) else 1.2,
+                idle_seconds=4.0 if _is_asteros(device) else 1.2,
                 timeout_seconds=90 if _is_asteros(device) else 30,
             )
         config = _clean_config_output(output, command)
@@ -350,7 +382,7 @@ def _collect_config(device: Device) -> Tuple[str, str]:
     command = _backup_command(device)
     try:
         client.connect(**connect_kwargs)
-        shell = client.invoke_shell(width=240, height=1000)
+        shell = client.invoke_shell(width=240, height=5000)
         initial_output = _read_shell_output(shell, idle_seconds=0.8, timeout_seconds=8)
         _handle_login_prompts(shell, initial_output)
         for disable_command in _screen_disable_commands(device):
