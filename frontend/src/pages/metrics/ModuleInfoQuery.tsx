@@ -62,7 +62,8 @@ const normalizePower = (value?: number | string | null) => {
   // 控制器不同型号返回并不完全一致：
   // 1) 127 / 237 这种小正数多为 0.01dBm，表示 1.27 / 2.37dBm；
   // 2) -1710 这种负数多为 0.01dBm，表示 -17.10dBm；
-  // 3) 31622 / 4073 这种通常出现在阈值字段，才是 0.1uW 线性功率。
+  // 3) 7300 / 8200 / 31622 这种大正数多为 0.1uW 线性功率。
+  if (numeric > 1000) return 10 * Math.log10(numeric / 10000)
   if (Math.abs(numeric) > 100) return numeric / 100
   if (Number.isInteger(numeric)) return numeric / 100
   return numeric
