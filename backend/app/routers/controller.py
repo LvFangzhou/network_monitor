@@ -39,6 +39,22 @@ async def get_controller_settings(current_user: User = Depends(get_current_activ
     return load_controller_settings(mask_secret=True)
 
 
+@router.get("/options", response_model=dict)
+async def get_controller_options(current_user: User = Depends(get_current_active_user)):
+    settings = load_controller_settings(mask_secret=True)
+    controllers = [
+        {
+            "id": item.get("id"),
+            "name": item.get("name") or item.get("base_url"),
+            "base_url": item.get("base_url"),
+            "enabled": bool(item.get("enabled")),
+        }
+        for item in settings.get("controllers") or []
+        if item.get("enabled")
+    ]
+    return {"items": controllers}
+
+
 @router.put("/settings", response_model=dict)
 async def update_controller_settings(
     payload: Dict[str, Any],
@@ -81,8 +97,55 @@ async def list_controller_opticals(
     page_size: int = Query(20, ge=1, le=200),
     search: Optional[str] = Query(None),
     device_ip: Optional[str] = Query(None),
+    interface_name: Optional[str] = Query(None),
+    vendor_name: Optional[str] = Query(None),
+    level: int = Query(0, ge=0, le=4),
     hours: int = Query(3, ge=1, le=168),
     controller_id: Optional[str] = Query(None),
 ):
     client = _client_from_saved(controller_id=controller_id)
-    return await client.list_opticals(page=page, page_size=page_size, search=search, device_ip=device_ip, hours=hours)
+    return await client.list_opticals(
+        page=page,
+        page_size=page_size,
+        search=search,
+        device_ip=device_ip,
+        interface_name=interface_name,
+        vendor_name=vendor_name,
+        level=level,
+        hours=hours,
+    )
+
+
+@router.get("/lossless/overrun-devices", response_model=dict)
+async def list_lossless_overrun_devices(
+    current_user: User = Depends(get_current_active_user),
+    controller_id: Optional[str] = Query(None),
+    hours: int = Query(3, ge=1, le=168),
+    tag: str = Query("3h"),
+):
+    client = _client_from_saved(controller_id=controller_id)
+    return await client.list_lossless_overrun_devices(hours=hours, tag=tag)
+
+
+@router.get("/lossless/buffer-details", response_model=dict)
+async def list_lossless_buffer_details(
+    current_user: User = Depends(get_current_active_user),
+    controller_id: Optional[str] = Query(None),
+    asset_id: str = Query(..., min_length=1),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    hours: int = Query(3, ge=1, le=168),
+    if_index: Optional[str] = Query(None),
+    sort_column: str = Query("outDroppedPkts"),
+    order_type: str = Query("desc"),
+):
+    client = _client_from_saved(controller_id=controller_id)
+    return await client.list_lossless_buffer_details(
+        asset_id=asset_id,
+        page=page,
+        page_size=page_size,
+        hours=hours,
+        if_index=if_index,
+        sort_column=sort_column,
+        order_type=order_type,
+    )

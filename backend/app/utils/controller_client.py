@@ -205,6 +205,9 @@ class ControllerClient:
         page_size: int = 20,
         search: str | None = None,
         device_ip: str | None = None,
+        interface_name: str | None = None,
+        vendor_name: str | None = None,
+        level: int = 0,
         hours: int = 3,
     ) -> Dict[str, Any]:
         end_time = int(time.time() * 1000)
@@ -214,7 +217,7 @@ class ControllerClient:
             "pageSize": page_size,
             "beginTime": start_time,
             "endTime": end_time,
-            "level": 0,
+            "level": level,
             "history": "false",
             "interval": 1800000,
         }
@@ -224,6 +227,10 @@ class ControllerClient:
             params["searchIp"] = search
         if device_ip:
             params["deviceIp"] = device_ip
+        if interface_name:
+            params["interfaceName"] = interface_name
+        if vendor_name:
+            params["vendorName"] = vendor_name
         data = await self.get("/DataCore/healthAnalysis/v1/optical/page", params=params)
         result = data.get("result") if isinstance(data, dict) else {}
         return {
@@ -231,4 +238,63 @@ class ControllerClient:
             "items": (result or {}).get("recordList") or [],
             "currentPage": (result or {}).get("currentPage") or page,
             "pageSize": (result or {}).get("pageSize") or page_size,
+        }
+
+    async def list_lossless_overrun_devices(self, hours: int = 3, tag: str = "3h") -> Dict[str, Any]:
+        end_time = int(time.time() * 1000)
+        start_time = end_time - max(hours, 1) * 3600 * 1000
+        data = await self.get(
+            "/DataCore/healthAnalysis/telemetry/getInterfaceOverrunDevice",
+            params={
+                "startTime": start_time,
+                "endTime": end_time,
+                "tag": tag,
+                "areaType": self.area_type,
+            },
+        )
+        result = data.get("result") if isinstance(data, dict) else {}
+        ip_list = (result or {}).get("ip") or []
+        name_list = (result or {}).get("name") or []
+        items = [
+            {"ip": ip, "name": name_list[index] if index < len(name_list) else ""}
+            for index, ip in enumerate(ip_list)
+        ]
+        return {"total": len(items), "items": items, "raw": result or {}}
+
+    async def list_lossless_buffer_details(
+        self,
+        asset_id: str,
+        page: int = 1,
+        page_size: int = 20,
+        hours: int = 3,
+        if_index: str | None = None,
+        sort_column: str = "outDroppedPkts",
+        order_type: str = "desc",
+    ) -> Dict[str, Any]:
+        end_time = int(time.time() * 1000)
+        start_time = end_time - max(hours, 1) * 3600 * 1000
+        params: Dict[str, Any] = {
+            "startTime": start_time,
+            "endTime": end_time,
+            "pageNum": page,
+            "pageSize": page_size,
+            "assetId": asset_id,
+            "sortColumn": sort_column,
+            "orderType": order_type,
+        }
+        if if_index:
+            params["ifIndex"] = if_index
+        data = await self.get("/DataCore/healthAnalysis/buffer/getBuffMonitorDetail", params=params)
+        raw_items = []
+        if isinstance(data, dict):
+            data_payload = data.get("data") or {}
+            if isinstance(data_payload, dict):
+                raw_items = data_payload.get("ifIndexList") or []
+            elif isinstance(data_payload, list):
+                raw_items = data_payload
+        return {
+            "total": int((data or {}).get("total") or len(raw_items)) if isinstance(data, dict) else len(raw_items),
+            "items": raw_items,
+            "page": page,
+            "pageSize": page_size,
         }

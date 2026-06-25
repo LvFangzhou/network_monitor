@@ -196,6 +196,8 @@ DEFAULT_MENU_PERMISSIONS = [
     "/alerts/silences",
     "/port-query",
     "/device-overview",
+    "/module-info-query",
+    "/lossless-info-query",
     "/config-backups",
     "/settings",
     "/tacacs",

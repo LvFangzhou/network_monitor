@@ -24,6 +24,8 @@ const loadAlertSilences = () => import('./pages/alerts/AlertSilences')
 const loadMetrics = () => import('./pages/metrics/Metrics')
 const loadDeviceOverview = () => import('./pages/metrics/DeviceOverview')
 const loadIPFlowQuery = () => import('./pages/metrics/IPFlowQuery')
+const loadModuleInfoQuery = () => import('./pages/metrics/ModuleInfoQuery')
+const loadLosslessInfoQuery = () => import('./pages/metrics/LosslessInfoQuery')
 const loadSettings = () => import('./pages/Settings')
 const loadTacacsManager = () => import('./pages/TacacsManager')
 const loadConfigBackups = () => import('./pages/ConfigBackups')
@@ -47,6 +49,8 @@ const AlertSilences = lazy(loadAlertSilences)
 const Metrics = lazy(loadMetrics)
 const DeviceOverview = lazy(loadDeviceOverview)
 const IPFlowQuery = lazy(loadIPFlowQuery)
+const ModuleInfoQuery = lazy(loadModuleInfoQuery)
+const LosslessInfoQuery = lazy(loadLosslessInfoQuery)
 const Settings = lazy(loadSettings)
 const TacacsManager = lazy(loadTacacsManager)
 const ConfigBackups = lazy(loadConfigBackups)
@@ -69,17 +73,21 @@ const preloadRouteModules = () => {
     loadMetrics(),
     loadDeviceOverview(),
     loadIPFlowQuery(),
+    loadModuleInfoQuery(),
+    loadLosslessInfoQuery(),
     loadSettings(),
     loadTacacsManager(),
     loadConfigBackups(),
   ])
 }
 
-const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/device-overview', '/port-query', '/ip-flow-query', '/config-backups']
+const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/device-overview', '/port-query', '/ip-flow-query', '/module-info-query', '/lossless-info-query', '/config-backups']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/port-query']
 const ROUTE_ALIASES: Record<string, string[]> = {
   '/port-query': ['/metrics'],
   '/device-overview': ['/metrics'],
+  '/module-info-query': ['/metrics'],
+  '/lossless-info-query': ['/metrics'],
 }
 
 const getInitialRoute = (allowedMenus: string[] = []) => {
@@ -213,6 +221,8 @@ function App() {
             <Route path="port-query" element={<MenuRoute menuPath="/port-query"><Metrics /></MenuRoute>} />
             <Route path="ip-flow-query" element={<MenuRoute menuPath="/ip-flow-query"><IPFlowQuery /></MenuRoute>} />
             <Route path="device-overview" element={<MenuRoute menuPath="/device-overview"><DeviceOverview /></MenuRoute>} />
+            <Route path="module-info-query" element={<MenuRoute menuPath="/module-info-query"><ModuleInfoQuery /></MenuRoute>} />
+            <Route path="lossless-info-query" element={<MenuRoute menuPath="/lossless-info-query"><LosslessInfoQuery /></MenuRoute>} />
             <Route path="config-backups" element={<MenuRoute menuPath="/config-backups"><ConfigBackups /></MenuRoute>} />
             <Route path="metrics" element={<Navigate to="/port-query" replace />} />
             <Route path="settings" element={<MenuRoute menuPath="/settings"><Settings /></MenuRoute>} />
