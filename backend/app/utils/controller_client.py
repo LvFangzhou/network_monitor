@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+import re
 
 import httpx
 
@@ -62,6 +63,92 @@ def _find_token(data: Any) -> Optional[str]:
             if found:
                 return found
     return None
+
+
+def _looks_like_ip_fragment(value: str | None) -> bool:
+    text = str(value or "").strip()
+    return bool(text and all(part.isdigit() for part in text.split(".") if part))
+
+
+def _record_value(record: Dict[str, Any], *keys: str) -> str:
+    values = []
+    for key in keys:
+        value = record.get(key)
+        if value is not None:
+            values.append(str(value))
+    return " ".join(values)
+
+
+def _filter_optical_records(
+    records: list[Dict[str, Any]],
+    search: str | None = None,
+    vendor_name: str | None = None,
+) -> list[Dict[str, Any]]:
+    search_text = str(search or "").strip().lower()
+    vendor_text = str(vendor_name or "").strip().lower()
+    result: list[Dict[str, Any]] = []
+    for record in records:
+        haystack = _record_value(
+            record,
+            "deviceName",
+            "name",
+            "deviceIp",
+            "ip",
+            "ifDesc",
+            "interfaceName",
+            "ifName",
+            "vendorName",
+            "serialNumber",
+            "transceiveType",
+            "transceiverSpeed",
+            "speed",
+            "assetId",
+        ).lower()
+        if search_text and search_text not in haystack:
+            continue
+        if vendor_text and vendor_text not in str(record.get("vendorName") or "").lower():
+            continue
+        result.append(record)
+    return result
+
+
+def _normalize_optical_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    item = dict(record)
+    item.setdefault("source", "控制器API")
+    item.setdefault("sourceType", "controller_api")
+    item.setdefault("datacenterName", item.get("areaName") or item.get("areaPath") or item.get("roomName") or item.get("regionName"))
+    return item
+
+
+def _natural_parts(value: Any) -> list[Any]:
+    text = str(value or "")
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
+def _ip_parts(value: Any) -> tuple[int, int, int, int, str]:
+    text = str(value or "")
+    parts = text.split(".")
+    if len(parts) != 4:
+        return (999, 999, 999, 999, text)
+    numbers: list[int] = []
+    for part in parts:
+        if not part.isdigit():
+            return (999, 999, 999, 999, text)
+        number = int(part)
+        if number < 0 or number > 255:
+            return (999, 999, 999, 999, text)
+        numbers.append(number)
+    return (numbers[0], numbers[1], numbers[2], numbers[3], text)
+
+
+def _sort_optical_records(records: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    return sorted(
+        records,
+        key=lambda item: (
+            _ip_parts(item.get("deviceIp") or item.get("ip")),
+            _natural_parts(item.get("ifDesc") or item.get("interfaceName") or item.get("ifName")),
+        ),
+    )
 
 
 class ControllerClient:
@@ -212,9 +299,12 @@ class ControllerClient:
     ) -> Dict[str, Any]:
         end_time = int(time.time() * 1000)
         start_time = end_time - max(hours, 1) * 3600 * 1000
+        has_local_filter = bool((search or "").strip() or (vendor_name or "").strip())
+        fetch_page = 1 if has_local_filter else page
+        fetch_page_size = 200 if has_local_filter else page_size
         params: Dict[str, Any] = {
-            "currentPage": page,
-            "pageSize": page_size,
+            "currentPage": fetch_page,
+            "pageSize": fetch_page_size,
             "beginTime": start_time,
             "endTime": end_time,
             "level": level,
@@ -225,19 +315,45 @@ class ControllerClient:
             params["searchName"] = search
             params["searchInterface"] = search
             params["searchIp"] = search
+            if _looks_like_ip_fragment(search):
+                params["deviceIp"] = search
         if device_ip:
             params["deviceIp"] = device_ip
         if interface_name:
             params["interfaceName"] = interface_name
         if vendor_name:
             params["vendorName"] = vendor_name
-        data = await self.get("/DataCore/healthAnalysis/v1/optical/page", params=params)
+        path = "/DataCore/healthAnalysis/v1/optical/page"
+        data = await self.get(path, params=params)
         result = data.get("result") if isinstance(data, dict) else {}
+        records = (result or {}).get("recordList") or []
+        total = int((result or {}).get("totalSize") or 0)
+
+        if has_local_filter:
+            all_records = list(records)
+            total_pages = max(1, (total + fetch_page_size - 1) // fetch_page_size)
+            for next_page in range(2, min(total_pages, 60) + 1):
+                next_params = {**params, "currentPage": next_page}
+                next_data = await self.get(path, params=next_params)
+                next_result = next_data.get("result") if isinstance(next_data, dict) else {}
+                next_records = (next_result or {}).get("recordList") or []
+                if not next_records:
+                    break
+                all_records.extend(next_records)
+            records = _filter_optical_records(all_records, search=search, vendor_name=vendor_name)
+            records = _sort_optical_records(records)
+            total = len(records)
+            start_index = (page - 1) * page_size
+            records = records[start_index:start_index + page_size]
+        else:
+            records = _sort_optical_records(records)
+
+        records = [_normalize_optical_record(item) for item in records]
         return {
-            "total": int((result or {}).get("totalSize") or 0),
-            "items": (result or {}).get("recordList") or [],
-            "currentPage": (result or {}).get("currentPage") or page,
-            "pageSize": (result or {}).get("pageSize") or page_size,
+            "total": total,
+            "items": records,
+            "currentPage": page,
+            "pageSize": page_size,
         }
 
     async def list_lossless_overrun_devices(self, hours: int = 3, tag: str = "3h") -> Dict[str, Any]:
