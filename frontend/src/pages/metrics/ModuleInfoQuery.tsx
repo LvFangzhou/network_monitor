@@ -59,14 +59,28 @@ const isInvalidOpticalRawValue = (value: number | null) => {
 const normalizePower = (value?: number | string | null) => {
   const numeric = formatNumber(value)
   if (numeric === null || isInvalidOpticalRawValue(numeric)) return null
-  // 控制器/H3C 设备诊断接口常以 0.1uW 为原始单位返回光功率，
-  // 例如 31622 => 10*log10(31622/10000)=5.00dBm。
-  // 其他采集来源如果已经是 dBm，通常会落在 -60～30 范围内，直接保留。
-  if (numeric > 100 || numeric < -100) {
-    if (numeric <= 0) return null
-    return 10 * Math.log10(numeric / 10000)
-  }
+  // 控制器不同型号返回并不完全一致：
+  // 1) 127 / 237 这种小正数多为 0.01dBm，表示 1.27 / 2.37dBm；
+  // 2) -1710 这种负数多为 0.01dBm，表示 -17.10dBm；
+  // 3) 31622 / 4073 这种通常出现在阈值字段，才是 0.1uW 线性功率。
+  if (Math.abs(numeric) > 100) return numeric / 100
+  if (Number.isInteger(numeric)) return numeric / 100
   return numeric
+}
+
+const normalizeDisplayPower = (value?: number | string | null) => {
+  const normalized = normalizePower(value)
+  if (normalized === null) return null
+  // 光模块通道功率正常不会达到这个量级；超过范围通常仍是厂商占位/异常编码。
+  if (normalized > 30 || normalized < -60) return null
+  return normalized
+}
+
+const normalizeControllerPowerThreshold = (value?: number | string | null) => {
+  const numeric = formatNumber(value)
+  if (numeric === null || isInvalidOpticalRawValue(numeric)) return null
+  if (numeric > 0 && Math.abs(numeric) > 1000) return 10 * Math.log10(numeric / 10000)
+  return normalizePower(numeric)
 }
 
 const normalizeTemperature = (value?: number | string | null) => {
@@ -218,10 +232,10 @@ const getH3cPowerThresholds = (record: any) => {
 }
 
 const getControllerPowerThresholds = (record: any) => {
-  const rxLo = normalizePower(record?.rcvPwrLoAlarm)
-  const rxHi = normalizePower(record?.rcvPwrHiAlarm)
-  const txLo = normalizePower(record?.pwrOutLoAlarm)
-  const txHi = normalizePower(record?.pwrOutHiAlarm)
+  const rxLo = normalizeControllerPowerThreshold(record?.rcvPwrLoAlarm)
+  const rxHi = normalizeControllerPowerThreshold(record?.rcvPwrHiAlarm)
+  const txLo = normalizeControllerPowerThreshold(record?.pwrOutLoAlarm)
+  const txHi = normalizeControllerPowerThreshold(record?.pwrOutHiAlarm)
   return {
     rxPower: rxLo !== null && rxHi !== null && rxLo < rxHi ? range(rxLo, rxHi, '控制器模块 RX 告警阈值') : undefined,
     txPower: txLo !== null && txHi !== null && txLo < txHi ? range(txLo, txHi, '控制器模块 TX 告警阈值') : undefined,
@@ -454,10 +468,10 @@ const ModuleInfoQuery = () => {
       key: 'curRxPower',
       dataIndex: 'curRxPower',
       width: 120,
-      sorter: (a: any, b: any) => (normalizePower(a.curRxPower) ?? -999) - (normalizePower(b.curRxPower) ?? -999),
+      sorter: (a: any, b: any) => (normalizeDisplayPower(a.curRxPower) ?? -999) - (normalizeDisplayPower(b.curRxPower) ?? -999),
       render: (value: any, record: any) => {
         const thresholds = getOpticalThresholds(record)
-        const normalized = normalizePower(value)
+        const normalized = normalizeDisplayPower(value)
         return <MetricText value={normalized} unit="dBm" targetRange={thresholds.rxPower} danger={isInterfaceUp(record) && isPowerAbnormal(normalized, thresholds.rxPower)} />
       },
     },
@@ -466,10 +480,10 @@ const ModuleInfoQuery = () => {
       key: 'curTxPower',
       dataIndex: 'curTxPower',
       width: 120,
-      sorter: (a: any, b: any) => (normalizePower(a.curTxPower) ?? -999) - (normalizePower(b.curTxPower) ?? -999),
+      sorter: (a: any, b: any) => (normalizeDisplayPower(a.curTxPower) ?? -999) - (normalizeDisplayPower(b.curTxPower) ?? -999),
       render: (value: any, record: any) => {
         const thresholds = getOpticalThresholds(record)
-        const normalized = normalizePower(value)
+        const normalized = normalizeDisplayPower(value)
         return <MetricText value={normalized} unit="dBm" targetRange={thresholds.txPower} danger={isInterfaceUp(record) && isPowerAbnormal(normalized, thresholds.txPower)} />
       },
     },
