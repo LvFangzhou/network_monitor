@@ -240,7 +240,7 @@ const ControllerIntegrationPanel = () => {
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 16 }}>
         <Card
-          title={`资产样例${assetTotal ? `（共 ${assetTotal} 条）` : ''}`}
+          title={`资产样例${assetTotal ? `（总数 ${assetTotal} 条，仅展示前 10 条）` : '（仅展示前 10 条）'}`}
           extra={<Button onClick={loadAssetSample} loading={assetsLoading}>读取样例</Button>}
         >
           <Table
@@ -259,7 +259,7 @@ const ControllerIntegrationPanel = () => {
           />
         </Card>
         <Card
-          title={`光模块样例${opticalTotal ? `（共 ${opticalTotal} 条）` : ''}`}
+          title={`光模块样例${opticalTotal ? `（总数 ${opticalTotal} 条，仅展示前 10 条）` : '（仅展示前 10 条）'}`}
           extra={<Button onClick={loadOpticalSample} loading={opticalsLoading}>读取样例</Button>}
         >
           <Table
