@@ -82,9 +82,13 @@ def _record_value(record: Dict[str, Any], *keys: str) -> str:
 def _filter_optical_records(
     records: list[Dict[str, Any]],
     search: str | None = None,
+    device_ip: str | None = None,
+    interface_name: str | None = None,
     vendor_name: str | None = None,
 ) -> list[Dict[str, Any]]:
     search_text = str(search or "").strip().lower()
+    device_ip_text = str(device_ip or "").strip().lower()
+    interface_text = str(interface_name or "").strip().lower()
     vendor_text = str(vendor_name or "").strip().lower()
     result: list[Dict[str, Any]] = []
     for record in records:
@@ -104,7 +108,13 @@ def _filter_optical_records(
             "speed",
             "assetId",
         ).lower()
+        device_ip_value = _record_value(record, "deviceIp", "ip").lower()
+        interface_value = _record_value(record, "ifDesc", "interfaceName", "ifName").lower()
         if search_text and search_text not in haystack:
+            continue
+        if device_ip_text and device_ip_text not in device_ip_value:
+            continue
+        if interface_text and interface_text not in interface_value:
             continue
         if vendor_text and vendor_text not in str(record.get("vendorName") or "").lower():
             continue
@@ -299,7 +309,12 @@ class ControllerClient:
     ) -> Dict[str, Any]:
         end_time = int(time.time() * 1000)
         start_time = end_time - max(hours, 1) * 3600 * 1000
-        has_local_filter = bool((search or "").strip() or (vendor_name or "").strip())
+        has_local_filter = bool(
+            (search or "").strip()
+            or (device_ip or "").strip()
+            or (interface_name or "").strip()
+            or (vendor_name or "").strip()
+        )
         fetch_page = 1 if has_local_filter else page
         fetch_page_size = 200 if has_local_filter else page_size
         params: Dict[str, Any] = {
@@ -311,18 +326,19 @@ class ControllerClient:
             "history": "false",
             "interval": 600000,
         }
-        if search:
-            params["searchName"] = search
-            params["searchInterface"] = search
-            params["searchIp"] = search
-            if _looks_like_ip_fragment(search):
-                params["deviceIp"] = search
-        if device_ip:
-            params["deviceIp"] = device_ip
-        if interface_name:
-            params["interfaceName"] = interface_name
-        if vendor_name:
-            params["vendorName"] = vendor_name
+        if not has_local_filter:
+            if search:
+                params["searchName"] = search
+                params["searchInterface"] = search
+                params["searchIp"] = search
+                if _looks_like_ip_fragment(search):
+                    params["deviceIp"] = search
+            if device_ip:
+                params["deviceIp"] = device_ip
+            if interface_name:
+                params["interfaceName"] = interface_name
+            if vendor_name:
+                params["vendorName"] = vendor_name
         path = "/DataCore/healthAnalysis/v1/optical/page"
         data = await self.get(path, params=params)
         result = data.get("result") if isinstance(data, dict) else {}
@@ -340,7 +356,13 @@ class ControllerClient:
                 if not next_records:
                     break
                 all_records.extend(next_records)
-            records = _filter_optical_records(all_records, search=search, vendor_name=vendor_name)
+            records = _filter_optical_records(
+                all_records,
+                search=search,
+                device_ip=device_ip,
+                interface_name=interface_name,
+                vendor_name=vendor_name,
+            )
             records = _sort_optical_records(records)
             total = len(records)
             start_index = (page - 1) * page_size

@@ -11,6 +11,7 @@ import {
 const { Text } = Typography
 
 const COLUMN_ORDER_STORAGE_KEY = 'module-info-visible-columns-v2'
+const COLUMN_WIDTH_STORAGE_KEY = 'module-info-column-widths-v1'
 const MODULE_REFRESH_INTERVAL_MS = 600 * 1000
 const DEFAULT_VISIBLE_COLUMN_KEYS = [
   'datacenterName',
@@ -283,7 +284,15 @@ const ModuleInfoQuery = () => {
   const [vendorName, setVendorName] = useState('')
   const [draggingColumnKey, setDraggingColumnKey] = useState<string | null>(null)
   const [dragOverColumnKey, setDragOverColumnKey] = useState<string | null>(null)
-  const [columnWidths, setColumnWidths] = useState<Record<string, number>>({})
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
+    try {
+      const raw = window.localStorage.getItem(COLUMN_WIDTH_STORAGE_KEY)
+      const saved = raw ? JSON.parse(raw) : null
+      return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {}
+    } catch {
+      return {}
+    }
+  })
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<string[]>(() => {
     try {
       const raw = window.localStorage.getItem(COLUMN_ORDER_STORAGE_KEY)
@@ -428,7 +437,11 @@ const ModuleInfoQuery = () => {
     const startWidth = columnWidths[key] || Number(allColumns.find((column) => column.key === key)?.width || 140)
     const onMouseMove = (moveEvent: MouseEvent) => {
       const nextWidth = Math.max(90, startWidth + moveEvent.clientX - startX)
-      setColumnWidths((current) => ({ ...current, [key]: nextWidth }))
+      setColumnWidths((current) => {
+        const next = { ...current, [key]: nextWidth }
+        window.localStorage.setItem(COLUMN_WIDTH_STORAGE_KEY, JSON.stringify(next))
+        return next
+      })
     }
     const onMouseUp = () => {
       window.removeEventListener('mousemove', onMouseMove)
@@ -600,6 +613,7 @@ const ModuleInfoQuery = () => {
     columnMap.get('interface'),
     ...visibleColumnKeys.map((key) => columnMap.get(key)).filter(Boolean),
   ].filter(Boolean).map(withHeaderTools)
+  const tableScrollX = visibleColumns.reduce((sum, column) => sum + Number(column.width || 140), 0)
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -716,7 +730,8 @@ const ModuleInfoQuery = () => {
           rowClassName={(record) => isInterfaceUp(record) ? '' : 'module-interface-down-row'}
           loading={loading}
           dataSource={items}
-          scroll={{ x: 1900, y: 'calc(100vh - 360px)' }}
+          tableLayout="fixed"
+          scroll={{ x: Math.max(tableScrollX, 1200), y: 'calc(100vh - 360px)' }}
           pagination={{
             current: page,
             pageSize,
