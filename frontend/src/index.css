@@ -541,6 +541,26 @@ html[data-theme='dark'] .route-spin-card {
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.28);
 }
 
+.ant-table-wrapper .ant-table-tbody > tr.module-interface-down-row > td {
+  background: #fff5f5 !important;
+}
+
+.ant-table-wrapper .ant-table-tbody > tr.module-interface-down-row:hover > td {
+  background: #ffecec !important;
+}
+
+.ant-table-wrapper .ant-table-tbody > tr.module-interface-down-row > td:first-child {
+  box-shadow: inset 4px 0 0 #ff4d4f;
+}
+
+html[data-theme='dark'] .ant-table-wrapper .ant-table-tbody > tr.module-interface-down-row > td {
+  background: rgba(127, 29, 29, 0.22) !important;
+}
+
+html[data-theme='dark'] .ant-table-wrapper .ant-table-tbody > tr.module-interface-down-row:hover > td {
+  background: rgba(153, 27, 27, 0.28) !important;
+}
+
 /* 自定义滚动条 */
 ::-webkit-scrollbar {
   width: 6px;

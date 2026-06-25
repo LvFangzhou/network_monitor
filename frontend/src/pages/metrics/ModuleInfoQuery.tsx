@@ -207,6 +207,14 @@ const getSpeedGbps = (record: any) => {
   return matched ? Number(matched[1]) : null
 }
 
+const formatSpeed = (record: any) => {
+  const speed = getSpeedGbps(record)
+  if (speed === null || speed <= 0) return <Text type="secondary">未知</Text>
+  const rounded = Math.round(speed)
+  const label = rounded >= 1000 ? `${Number((rounded / 1000).toFixed(1))}T` : `${rounded}G`
+  return <Tag color={rounded >= 400 ? 'purple' : rounded >= 100 ? 'blue' : rounded >= 25 ? 'cyan' : 'default'}>{label}</Tag>
+}
+
 function isSpeed(record: any, speed: number) {
   const actual = getSpeedGbps(record)
   if (actual === null) return false
@@ -463,7 +471,7 @@ const ModuleInfoQuery = () => {
     { title: '厂商', key: 'vendorName', dataIndex: 'vendorName', width: 150, ellipsis: true, sorter: (a: any, b: any) => compareNatural(a.vendorName, b.vendorName), render: (value: string) => value || '-' },
     { title: '序列号', key: 'serialNumber', dataIndex: 'serialNumber', width: 180, ellipsis: true, sorter: (a: any, b: any) => compareNatural(a.serialNumber, b.serialNumber), render: (value: string) => value || '-' },
     { title: '类型', key: 'transceiveType', dataIndex: 'transceiveType', width: 160, ellipsis: true, sorter: (a: any, b: any) => compareNatural(a.transceiveType, b.transceiveType), render: (value: string) => value || '-' },
-    { title: '速率', key: 'transceiverSpeed', dataIndex: 'transceiverSpeed', width: 120, sorter: (a: any, b: any) => compareNatural(a.transceiverSpeed, b.transceiverSpeed), render: (value: string) => value || '-' },
+    { title: '速率', key: 'transceiverSpeed', dataIndex: 'transceiverSpeed', width: 120, sorter: (a: any, b: any) => (getSpeedGbps(a) || -1) - (getSpeedGbps(b) || -1), render: (_: any, record: any) => formatSpeed(record) },
     {
       title: '收光',
       key: 'curRxPower',
@@ -705,6 +713,7 @@ const ModuleInfoQuery = () => {
       <Card title={`模块信息查询${total ? `（共 ${total} 条）` : ''}`} bodyStyle={{ padding: 0 }}>
         <Table
           rowKey={(record) => `${record.assetId || getDeviceIp(record)}-${record.ifIndex || getInterfaceName(record)}-${record.serialNumber || ''}`}
+          rowClassName={(record) => isInterfaceUp(record) ? '' : 'module-interface-down-row'}
           loading={loading}
           dataSource={items}
           scroll={{ x: 1900, y: 'calc(100vh - 360px)' }}
