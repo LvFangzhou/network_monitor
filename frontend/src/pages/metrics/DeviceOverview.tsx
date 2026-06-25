@@ -149,9 +149,17 @@ const percentStatus = (value?: number | null) => {
   return 'success'
 }
 
-const ResourceCell = ({ value }: { value?: number | null }) => {
+const sourceLabel = (value?: string) => {
+  if (value === 'controller_api') return '控制器'
+  if (value === 'snmp') return 'SNMP'
+  if (value === 'asternos_exporter') return 'Exporter'
+  return ''
+}
+
+const ResourceCell = ({ value, source }: { value?: number | null; source?: string }) => {
   const normalized = normalizePercent(value)
   if (normalized === null) return <Text type="secondary">-</Text>
+  const label = sourceLabel(source)
   return (
     <div style={{ minWidth: 100 }}>
       <Progress
@@ -160,6 +168,7 @@ const ResourceCell = ({ value }: { value?: number | null }) => {
         status={percentStatus(value)}
         format={() => formatPercent(value)}
       />
+      {label ? <Tag color="blue" style={{ marginTop: 4 }}>{label}</Tag> : null}
     </div>
   )
 }
@@ -180,12 +189,14 @@ const HardwareCell = ({
   return <Tag color={down > 0 ? 'red' : 'green'}>{label} {total - down}/{total}</Tag>
 }
 
-const ProtocolCell = ({ data }: { data: DeviceProtocolSummary }) => {
+const ProtocolCell = ({ data, source }: { data: DeviceProtocolSummary; source?: string }) => {
   if (!data || data.total <= 0) return <Text type="secondary">-</Text>
   const color = data.down > 0 ? 'red' : 'green'
+  const label = sourceLabel(source)
   return (
     <Space size={4}>
       <Tag color={color}>{data.up}/{data.total}</Tag>
+      {label ? <Tag color="blue">{label}</Tag> : null}
       {data.down > 0 ? <Text type="danger">异常 {data.down}</Text> : null}
     </Space>
   )
@@ -748,14 +759,14 @@ const DeviceOverview = () => {
       key: 'cpu',
       width: 130,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => (normalizePercent(a.resources.cpu_percent) || -1) - (normalizePercent(b.resources.cpu_percent) || -1),
-      render: (_: any, record: DeviceOverviewItem) => <ResourceCell value={record.resources.cpu_percent} />,
+      render: (_: any, record: DeviceOverviewItem) => <ResourceCell value={record.resources.cpu_percent} source={record.data_sources?.resources?.cpu_percent} />,
     },
     {
       title: '内存',
       key: 'memory',
       width: 130,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => (normalizePercent(a.resources.memory_percent) || -1) - (normalizePercent(b.resources.memory_percent) || -1),
-      render: (_: any, record: DeviceOverviewItem) => <ResourceCell value={record.resources.memory_percent} />,
+      render: (_: any, record: DeviceOverviewItem) => <ResourceCell value={record.resources.memory_percent} source={record.data_sources?.resources?.memory_percent} />,
     },
     {
       title: '温度',
@@ -805,14 +816,14 @@ const DeviceOverview = () => {
       key: 'bgp',
       width: 120,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => a.protocols.bgp.down - b.protocols.bgp.down,
-      render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.bgp} />,
+      render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.bgp} source={record.data_sources?.protocols?.bgp} />,
     },
     {
       title: 'OSPF',
       key: 'ospf',
       width: 120,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => a.protocols.ospf.down - b.protocols.ospf.down,
-      render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.ospf} />,
+      render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.ospf} source={record.data_sources?.protocols?.ospf} />,
     },
     {
       title: '更新时间',

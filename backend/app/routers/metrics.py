@@ -28,6 +28,8 @@ from app.config import settings
 from app.collectors import snmp_collector
 from app.services.flow_listener import flow_listener
 from app.utils.snmp_system_info import extract_snmp_model
+from app.utils.controller_client import ControllerClient
+from app.utils.controller_settings import find_controller_settings
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -990,6 +992,138 @@ def _normalize_percent(value: Optional[float]) -> Optional[float]:
     return round(value * 100, 1) if 0 <= value <= 1 else round(value, 1)
 
 
+def _source_value_is_missing(value: Any) -> bool:
+    return value is None or value == "" or (isinstance(value, float) and math.isnan(value))
+
+
+def _overview_field_sources(item: Dict[str, Any]) -> Dict[str, Any]:
+    sources = item.get("data_sources")
+    if not isinstance(sources, dict):
+        sources = {"resources": {}, "protocols": {}, "system_info": {}}
+        item["data_sources"] = sources
+    sources.setdefault("resources", {})
+    sources.setdefault("protocols", {})
+    sources.setdefault("system_info", {})
+    return sources
+
+
+def _controller_resource_usage(resource_row: Dict[str, Any], key: str) -> Optional[float]:
+    values: List[float] = []
+    for threshold in resource_row.get("capacity_thresholds") or []:
+        if not isinstance(threshold, dict):
+            continue
+        usage = _safe_float((threshold.get(key) or {}).get("usage"))
+        if usage is not None:
+            values.append(usage)
+    return _normalize_percent(max(values)) if values else None
+
+
+async def _load_controller_overview_fallbacks() -> Dict[str, Any]:
+    """Fetch controller-side overview data once per request.
+
+    Controller data is only a fallback. Local SNMP/exporter data remains the
+    authoritative source when present.
+    """
+    cache_key = "controller:overview:fallbacks"
+    cached = redis_client.get(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
+    result = {
+        "resources_by_ip": {},
+        "bgp_by_ip": {},
+        "available": False,
+    }
+    try:
+        settings_payload = find_controller_settings(require_enabled=True)
+    except Exception:
+        return result
+
+    client = ControllerClient(settings_payload)
+
+    try:
+        resource_payload = await client.list_device_resources(page_size=200)
+        for row in resource_payload.get("items") or []:
+            if not isinstance(row, dict):
+                continue
+            ip = str(row.get("management_ip") or row.get("mngIp") or row.get("deviceIp") or row.get("ip") or "").strip()
+            if not ip:
+                continue
+            result["resources_by_ip"][ip] = {
+                "cpu_percent": _controller_resource_usage(row, "cpu"),
+                "memory_percent": _controller_resource_usage(row, "memory"),
+                "device_status": row.get("device_status"),
+                "device_name": row.get("device_name"),
+                "score": row.get("score"),
+                "raw": row,
+            }
+        result["available"] = True
+    except Exception as exc:
+        logger.warning("读取控制器设备资源容量失败", error=str(exc))
+
+    try:
+        bgp_payload = await client.list_bgp_instances(page_size=200)
+        bgp_summary: Dict[str, Dict[str, int]] = {}
+        for instance in bgp_payload.get("items") or []:
+            if not isinstance(instance, dict):
+                continue
+            for peer in instance.get("bgp_peers") or []:
+                if not isinstance(peer, dict):
+                    continue
+                for state in peer.get("bgp_peer_states") or []:
+                    if not isinstance(state, dict):
+                        continue
+                    node_ip = str(state.get("bgp_node_ip") or "").strip()
+                    if not node_ip:
+                        continue
+                    entry = bgp_summary.setdefault(node_ip, {"total": 0, "up": 0, "down": 0})
+                    entry["total"] += 1
+                    if str(state.get("bgp_peer_state") or "").lower() == "established":
+                        entry["up"] += 1
+                    else:
+                        entry["down"] += 1
+        result["bgp_by_ip"] = bgp_summary
+        if bgp_summary:
+            result["available"] = True
+    except Exception as exc:
+        logger.warning("读取控制器BGP实例失败", error=str(exc))
+
+    if result.get("available"):
+        redis_client.setex(cache_key, 120, json.dumps(result, ensure_ascii=False))
+    return result
+
+
+def _apply_controller_overview_fallback(item: Dict[str, Any], controller_data: Dict[str, Any]) -> None:
+    device = item.get("device") or {}
+    ip = str(device.get("ip_address") or "").strip()
+    if not ip:
+        return
+
+    resource = (controller_data.get("resources_by_ip") or {}).get(ip)
+    sources = _overview_field_sources(item)
+    if resource:
+        resources = item.setdefault("resources", {})
+        for field in ["cpu_percent", "memory_percent"]:
+            if _source_value_is_missing(resources.get(field)) and not _source_value_is_missing(resource.get(field)):
+                resources[field] = resource.get(field)
+                sources["resources"][field] = "controller_api"
+
+        if item.get("connectivity", {}).get("status") in {"unknown", "not_configured"} and str(resource.get("device_status") or "").lower() == "active":
+            item["connectivity"] = {
+                "type": item.get("connectivity", {}).get("type") or item.get("monitor_source") or "controller_api",
+                "status": "reachable",
+                "message": "本地采集暂无有效数据，控制器显示设备 Active",
+            }
+
+    bgp = (controller_data.get("bgp_by_ip") or {}).get(ip)
+    if bgp and (item.get("protocols", {}).get("bgp", {}).get("total") or 0) <= 0:
+        item.setdefault("protocols", {})["bgp"] = bgp
+        sources["protocols"]["bgp"] = "controller_api"
+
+
 def _parse_duration_text(text: str | None) -> Optional[int]:
     if not text:
         return None
@@ -1262,6 +1396,7 @@ def _device_base_overview(device: Device) -> Dict[str, Any]:
         },
         "protocols": _empty_protocol_summary(),
         "system_info": {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "uptime_seconds": None},
+        "data_sources": {"resources": {}, "protocols": {}, "system_info": {}},
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -2003,6 +2138,7 @@ async def get_monitor_devices_overview(
 
     devices = query.order_by(Device.ip_address.asc()).limit(limit).all()
     items: List[Dict[str, Any]] = []
+    controller_data = await _load_controller_overview_fallbacks()
     for device in devices:
         item = _device_base_overview(device)
         if not device.is_monitored:
@@ -2063,6 +2199,7 @@ async def get_monitor_devices_overview(
                 )
                 item.update(overview)
         _ensure_snmp_system_info_model(item)
+        _apply_controller_overview_fallback(item, controller_data)
         item["collected_at"] = item.get("collected_at") or datetime.now(timezone.utc).isoformat()
         if not connectivity or item["connectivity"]["status"] == connectivity:
             items.append(item)

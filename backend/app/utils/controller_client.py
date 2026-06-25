@@ -296,6 +296,50 @@ class ControllerClient:
             "items": (payload or {}).get("assetList") or [],
         }
 
+    async def list_device_resources(self, page_size: int = 200, max_pages: int = 20) -> Dict[str, Any]:
+        """List controller-side device resource capacity data.
+
+        This endpoint is the controller's own view of physical device CPU,
+        memory and resource capacity. It is used as a fallback for the local
+        device overview when SNMP/exporter data is missing.
+        """
+        path = "/sdn/ui/ctl/app/rs/fabric/monitor/resource"
+        items: list[Dict[str, Any]] = []
+        total = 0
+        for page in range(1, max_pages + 1):
+            data = await self.get(path, params={"page": page, "pageSize": page_size})
+            rows = (data or {}).get("rows") or (data or {}).get("resources") or []
+            if not isinstance(rows, list):
+                rows = []
+            items.extend(rows)
+            total = int((data or {}).get("total") or len(items))
+            max_page = int((data or {}).get("maxPage") or 0)
+            if not rows or (max_page and page >= max_page) or len(items) >= total:
+                break
+        return {"total": total or len(items), "items": items}
+
+    async def list_bgp_instances(self, page_size: int = 200, max_pages: int = 20) -> Dict[str, Any]:
+        """List controller BGP instances and peer states when available."""
+        path = "/bgpm/v1.0/bgpinstances"
+        items: list[Dict[str, Any]] = []
+        total = 0
+        for page in range(1, max_pages + 1):
+            data = await self.get(path, params={"page": page, "pageSize": page_size})
+            rows = (
+                (data or {}).get("bgp_instances")
+                or (data or {}).get("rows")
+                or (data or {}).get("items")
+                or []
+            )
+            if not isinstance(rows, list):
+                rows = []
+            items.extend(rows)
+            total = int((data or {}).get("total") or len(items))
+            max_page = int((data or {}).get("maxPage") or 0)
+            if not rows or (max_page and page >= max_page) or len(items) >= total:
+                break
+        return {"total": total or len(items), "items": items}
+
     async def list_opticals(
         self,
         page: int = 1,
