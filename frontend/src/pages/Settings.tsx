@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
+  Alert,
   Button,
   Card,
   Form,
@@ -28,6 +29,15 @@ import {
   type AuditLog,
   type User,
 } from '../api/auth'
+import {
+  getControllerAssets,
+  getControllerOpticals,
+  getControllerSettings,
+  testController,
+  updateControllerSettings,
+  type ControllerCheck,
+  type ControllerSettings,
+} from '../api/controller'
 import { useAuthStore } from '../store/auth'
 
 const tablePagination = {
@@ -35,6 +45,242 @@ const tablePagination = {
   showSizeChanger: true,
   pageSizeOptions: [10, 20, 50, 100],
   showTotal: (total: number, range: [number, number]) => `第 ${range[0]}-${range[1]} 条 / 共 ${total} 条`,
+}
+
+const ControllerIntegrationPanel = () => {
+  const [form] = Form.useForm<ControllerSettings>()
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [checks, setChecks] = useState<ControllerCheck[]>([])
+  const [assetsLoading, setAssetsLoading] = useState(false)
+  const [opticalsLoading, setOpticalsLoading] = useState(false)
+  const [assets, setAssets] = useState<any[]>([])
+  const [opticals, setOpticals] = useState<any[]>([])
+  const [assetTotal, setAssetTotal] = useState(0)
+  const [opticalTotal, setOpticalTotal] = useState(0)
+
+  const loadSettings = async () => {
+    setLoading(true)
+    try {
+      const settings = await getControllerSettings()
+      form.setFieldsValue(settings)
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '获取控制器配置失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadSettings()
+  }, [])
+
+  const handleSave = async () => {
+    try {
+      const values = await form.validateFields()
+      setSaving(true)
+      const saved = await updateControllerSettings(values)
+      form.setFieldsValue(saved)
+      message.success('控制器配置已保存')
+    } catch (error: any) {
+      if (!error?.errorFields) {
+        message.error(error?.response?.data?.detail || '保存控制器配置失败')
+      }
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleTest = async () => {
+    try {
+      const values = await form.validateFields()
+      setTesting(true)
+      const result = await testController(values)
+      setChecks(result.checks || [])
+      if (result.ok) {
+        message.success('控制器连通性测试通过')
+      } else {
+        message.warning('控制器部分接口测试失败，请查看明细')
+      }
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '测试控制器失败')
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const loadAssetSample = async () => {
+    setAssetsLoading(true)
+    try {
+      const result = await getControllerAssets({ page: 1, page_size: 10 })
+      setAssets(result.items || [])
+      setAssetTotal(result.total || 0)
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '读取控制器资产失败')
+    } finally {
+      setAssetsLoading(false)
+    }
+  }
+
+  const loadOpticalSample = async () => {
+    setOpticalsLoading(true)
+    try {
+      const result = await getControllerOpticals({ page: 1, page_size: 10, hours: 3 })
+      setOpticals(result.items || [])
+      setOpticalTotal(result.total || 0)
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '读取光模块数据失败')
+    } finally {
+      setOpticalsLoading(false)
+    }
+  }
+
+  return (
+    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Alert
+        type="info"
+        showIcon
+        message="控制器集成先用于验证北向 API 能力"
+        description="当前不会替换现有 SNMP/SSH 采集，只提供配置、连通性测试和样例数据读取；确认稳定后再接入光模块信息查询和高精度无损菜单。"
+      />
+      <Card
+        title="控制器 API 配置"
+        loading={loading}
+        extra={
+          <Space>
+            <Button icon={<ReloadOutlined />} onClick={loadSettings}>
+              刷新
+            </Button>
+            <Button onClick={handleTest} loading={testing}>
+              测试连通性
+            </Button>
+            <Button type="primary" onClick={handleSave} loading={saving}>
+              保存配置
+            </Button>
+          </Space>
+        }
+      >
+        <Form
+          form={form}
+          layout="vertical"
+          initialValues={{
+            enabled: true,
+            base_url: 'http://10.239.16.1:30000',
+            username: 'admin',
+            user_id: '1',
+            effective_time: 7200,
+            timeout: 5,
+            area_type: 1,
+            insecure: false,
+          }}
+        >
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(180px, 1fr))', gap: 16 }}>
+            <Form.Item name="enabled" label="启用控制器集成" valuePropName="checked">
+              <Switch checkedChildren="启用" unCheckedChildren="停用" />
+            </Form.Item>
+            <Form.Item name="base_url" label="北向 API 地址" rules={[{ required: true, message: '请输入控制器 API 地址' }]}>
+              <Input placeholder="http://10.239.16.1:30000" />
+            </Form.Item>
+            <Form.Item name="username" label="用户名" rules={[{ required: true, message: '请输入用户名' }]}>
+              <Input placeholder="admin" />
+            </Form.Item>
+            <Form.Item name="password" label="密码" rules={[{ required: true, message: '请输入密码' }]}>
+              <Input.Password visibilityToggle={false} placeholder="保存后再次打开会隐藏" />
+            </Form.Item>
+            <Form.Item name="user_id" label="认证 ID">
+              <Input placeholder="1" />
+            </Form.Item>
+            <Form.Item name="region_id" label="Region ID">
+              <Input placeholder="可为空" />
+            </Form.Item>
+            <Form.Item name="effective_time" label="Token 有效期/秒">
+              <Input type="number" />
+            </Form.Item>
+            <Form.Item name="timeout" label="请求超时/秒">
+              <Input type="number" />
+            </Form.Item>
+            <Form.Item name="area_type" label="区域类型">
+              <Select
+                options={[
+                  { value: 0, label: '0' },
+                  { value: 1, label: '1' },
+                  { value: 2, label: '2' },
+                ]}
+              />
+            </Form.Item>
+            <Form.Item name="insecure" label="HTTPS 证书校验" valuePropName="checked">
+              <Switch checkedChildren="忽略" unCheckedChildren="校验" />
+            </Form.Item>
+          </div>
+        </Form>
+      </Card>
+
+      <Card title="连通性测试结果">
+        <Table<ControllerCheck>
+          rowKey="name"
+          size="small"
+          dataSource={checks}
+          pagination={false}
+          locale={{ emptyText: '点击“测试连通性”后展示结果' }}
+          columns={[
+            { title: '检查项', dataIndex: 'name', width: 180 },
+            {
+              title: '结果',
+              dataIndex: 'ok',
+              width: 100,
+              render: (value: boolean) => <Tag color={value ? 'success' : 'error'}>{value ? '通过' : '失败'}</Tag>,
+            },
+            { title: '耗时', dataIndex: 'elapsed_ms', width: 100, render: (value: number) => `${value}ms` },
+            { title: '详情', dataIndex: 'detail', width: 260 },
+            { title: '响应预览', dataIndex: 'preview', ellipsis: true, render: (value?: string) => value || '-' },
+          ]}
+        />
+      </Card>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 16 }}>
+        <Card
+          title={`资产样例${assetTotal ? `（共 ${assetTotal} 条）` : ''}`}
+          extra={<Button onClick={loadAssetSample} loading={assetsLoading}>读取样例</Button>}
+        >
+          <Table
+            rowKey={(record) => record.id || record.ucAssetId || record.ip}
+            size="small"
+            loading={assetsLoading}
+            dataSource={assets}
+            pagination={false}
+            scroll={{ y: 300 }}
+            columns={[
+              { title: '设备', dataIndex: 'name', ellipsis: true },
+              { title: 'IP', dataIndex: 'ip', width: 130 },
+              { title: '型号', dataIndex: 'model', width: 140, ellipsis: true },
+              { title: '状态', dataIndex: 'status', width: 80, render: (value: number) => value === 1 ? <Tag color="success">在线</Tag> : <Tag>离线</Tag> },
+            ]}
+          />
+        </Card>
+        <Card
+          title={`光模块样例${opticalTotal ? `（共 ${opticalTotal} 条）` : ''}`}
+          extra={<Button onClick={loadOpticalSample} loading={opticalsLoading}>读取样例</Button>}
+        >
+          <Table
+            rowKey={(record) => `${record.assetId || record.deviceIp}-${record.ifIndex || record.ifDesc}-${record.serialNumber || ''}`}
+            size="small"
+            loading={opticalsLoading}
+            dataSource={opticals}
+            pagination={false}
+            scroll={{ y: 300 }}
+            columns={[
+              { title: '设备', dataIndex: 'deviceName', ellipsis: true },
+              { title: 'IP', dataIndex: 'deviceIp', width: 120 },
+              { title: '接口', dataIndex: 'ifDesc', width: 130, ellipsis: true },
+              { title: '收光', dataIndex: 'curRxPower', width: 90, render: (value: number) => value ?? '-' },
+              { title: '发光', dataIndex: 'curTxPower', width: 90, render: (value: number) => value ?? '-' },
+            ]}
+          />
+        </Card>
+      </div>
+    </Space>
+  )
 }
 
 const Settings = () => {
@@ -419,6 +665,11 @@ const Settings = () => {
                 />
               </Card>
             ),
+          },
+          {
+            key: 'controller',
+            label: '控制器集成',
+            children: <ControllerIntegrationPanel />,
           },
         ]}
         onChange={(key) => {
