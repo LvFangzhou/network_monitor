@@ -35,6 +35,14 @@ const SOURCE_LABELS: Record<string, string> = {
   gnmi: 'gNMI Telemetry',
 }
 
+type MetricRange = { min: number; max: number; source: string }
+type OpticalThresholds = {
+  rxPower?: MetricRange
+  txPower?: MetricRange
+  temperature?: MetricRange
+  voltage?: MetricRange
+}
+
 const formatNumber = (value?: number | string | null) => {
   if (value === undefined || value === null || value === '') return null
   const numeric = Number(value)
@@ -56,17 +64,57 @@ const normalizeTemperature = (value?: number | string | null) => {
 const normalizeVoltage = (value?: number | string | null) => {
   const numeric = formatNumber(value)
   if (numeric === null) return null
-  return numeric * 0.01
+  if (Math.abs(numeric) > 1000) return numeric / 10000
+  return numeric
 }
 
-const isPowerAbnormal = (value: number | null) => value !== null && (value < -10 || value > 3)
-const isTemperatureAbnormal = (value: number | null) => value !== null && (value < 0 || value > 70)
-const isVoltageAbnormal = (value: number | null) => value !== null && (value < 3 || value > 3.6)
+const range = (min: number, max: number, source: string): MetricRange => ({ min, max, source })
 
-const MetricText = ({ value, unit, danger }: { value: number | null; unit: string; danger: boolean }) => {
+const H3C_OPTICAL_RANGES: Array<{ match: (record: any) => boolean; rx: MetricRange; tx: MetricRange }> = [
+  // 400G，来源：H3C 400G 系列光模块接口指标表
+  { match: (r) => isSpeed(r, 400) && hasAny(r, ['SR8']), tx: range(-6.5, 4, 'H3C 400G SR8'), rx: range(-8.4, 4, 'H3C 400G SR8') },
+  { match: (r) => isSpeed(r, 400) && hasAny(r, ['SR4']), tx: range(-4.6, 4, 'H3C 400G SR4'), rx: range(-6.4, 4, 'H3C 400G SR4') },
+  { match: (r) => isSpeed(r, 400) && hasAny(r, ['VR4']), tx: range(-4.6, 4, 'H3C 400G VR4'), rx: range(-6.3, 4, 'H3C 400G VR4') },
+  { match: (r) => isSpeed(r, 400) && hasAny(r, ['DR4']), tx: range(-2.9, 4, 'H3C 400G DR4'), rx: range(-5.9, 4, 'H3C 400G DR4') },
+  { match: (r) => isSpeed(r, 400) && hasAny(r, ['FR4']), tx: range(-3.2, 4.4, 'H3C 400G FR4'), rx: range(-7.3, 4.4, 'H3C 400G FR4') },
+  { match: (r) => isSpeed(r, 400) && hasAny(r, ['LR4']), tx: range(-2.7, 5.1, 'H3C 400G LR4'), rx: range(-9, 5.1, 'H3C 400G LR4') },
+  { match: (r) => isSpeed(r, 400) && hasAny(r, ['LR8']), tx: range(-2.8, 5.3, 'H3C 400G LR8'), rx: range(-9.1, 5.3, 'H3C 400G LR8') },
+
+  // 200G，来源：H3C 200G 系列光模块接口指标表
+  { match: (r) => isSpeed(r, 200) && hasAny(r, ['SR4']), tx: range(-6.5, 4, 'H3C 200G SR4'), rx: range(-8.4, 4, 'H3C 200G SR4') },
+  { match: (r) => isSpeed(r, 200) && hasAny(r, ['FR4']), tx: range(-4.2, 4.7, 'H3C 200G FR4'), rx: range(-8.2, 4.7, 'H3C 200G FR4') },
+
+  // 100G/50G，来源：H3C 100G/50G 系列光模块接口指标表，按常见型号精确匹配
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['ZR4']), tx: range(2, 6.5, 'H3C 100G ZR4'), rx: range(-28, -7, 'H3C 100G ZR4') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['ER4L']), tx: range(0.5, 4.5, 'H3C 100G ER4L'), rx: range(-20.5, -1.9, 'H3C 100G ER4L') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['ER4']), tx: range(-2.9, 2.9, 'H3C 100G ER4'), rx: range(-20.9, -3.5, 'H3C 100G ER4') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['LR4L', 'CWDM4']), tx: range(-6.5, 2.5, 'H3C 100G LR4L/CWDM4'), rx: range(-11.5, 2.5, 'H3C 100G LR4L/CWDM4') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['LR4']), tx: range(-4.3, 4.5, 'H3C 100G LR4'), rx: range(-10.6, 4.5, 'H3C 100G LR4') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['PSM4']), tx: range(-9.4, 2, 'H3C 100G PSM4'), rx: range(-12.66, 2, 'H3C 100G PSM4') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['DR1']), tx: range(-2.9, 4, 'H3C 100G DR1'), rx: range(-5.9, 4, 'H3C 100G DR1') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['FR1']), tx: range(-3.1, 4, 'H3C 100G FR1'), rx: range(-7.1, 4, 'H3C 100G FR1') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['LR1']), tx: range(-1.9, 4.8, 'H3C 100G LR1'), rx: range(-8.2, 4.8, 'H3C 100G LR1') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['BIDI']), tx: range(-6.4, 4, 'H3C 100G BIDI'), rx: range(-8.2, 4, 'H3C 100G BIDI') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['SWDM4']), tx: range(-7.5, 2.4, 'H3C 100G SWDM4'), rx: range(-9.5, 3.4, 'H3C 100G SWDM4') },
+  { match: (r) => isSpeed(r, 100) && hasAny(r, ['SR4', 'ESR4', 'ESR']), tx: range(-8.4, 2.4, 'H3C 100G SR4/eSR4'), rx: range(-10.3, 2.4, 'H3C 100G SR4/eSR4') },
+  { match: (r) => isSpeed(r, 50) && hasAny(r, ['ER']), tx: range(0.4, 6.6, 'H3C 50G ER'), rx: range(-17.6, -3.4, 'H3C 50G ER') },
+  { match: (r) => isSpeed(r, 50), tx: range(-4.5, 4.2, 'H3C 50G LR'), rx: range(-10.8, 4.2, 'H3C 50G LR') },
+
+  // 25G，来源：H3C 25G 系列光模块接口指标表
+  { match: (r) => isSpeed(r, 25) && hasAny(r, ['CSR']), tx: range(-6.4, 2.4, 'H3C 25G CSR'), rx: range(-10.3, 2.4, 'H3C 25G CSR') },
+  { match: (r) => isSpeed(r, 25) && hasAny(r, ['LR']), tx: range(-7, 2, 'H3C 25G LR'), rx: range(-13.3, 2, 'H3C 25G LR') },
+  { match: (r) => isSpeed(r, 25) && hasAny(r, ['SR']), tx: range(-8.4, 2.4, 'H3C 25G SR'), rx: range(-10.3, 2.4, 'H3C 25G SR') },
+]
+
+const isPowerAbnormal = (value: number | null, targetRange?: MetricRange) =>
+  value !== null && Boolean(targetRange) && (value < targetRange!.min || value > targetRange!.max)
+const isMetricAbnormal = (value: number | null, targetRange?: MetricRange) =>
+  value !== null && Boolean(targetRange) && (value < targetRange!.min || value > targetRange!.max)
+
+const MetricText = ({ value, unit, danger, targetRange }: { value: number | null; unit: string; danger: boolean; targetRange?: MetricRange }) => {
   if (value === null) return <Text type="secondary">-</Text>
   return (
-    <Tooltip title={danger ? '超过常用安全范围，请结合模块规格确认阈值' : undefined}>
+    <Tooltip title={targetRange ? `${targetRange.source} 正常范围：${targetRange.min}～${targetRange.max} ${unit}` : undefined}>
       <Text type={danger ? 'danger' : undefined} strong={danger}>
         {value.toFixed(unit === '℃' ? 1 : 2)} {unit}
       </Text>
@@ -98,6 +146,65 @@ const getInterfaceName = (record: any) => record.ifDesc || record.interfaceName 
 const getDeviceIp = (record: any) => record.deviceIp || record.ip || ''
 const getSourceLabel = (record: any) => record.source || SOURCE_LABELS[record.sourceType] || record.sourceType || '控制器API'
 const isInterfaceUp = (record: any) => Number(record?.ifOperStatus) === 1
+const opticalText = (record: any) =>
+  [
+    record?.transceiveType,
+    record?.model,
+    record?.vendorName,
+    record?.ifDesc,
+    record?.ifDescRaw,
+  ].map((item) => String(item || '').toUpperCase()).join(' ')
+
+const getSpeedGbps = (record: any) => {
+  const raw = formatNumber(record?.transceiverSpeed)
+  if (raw !== null && raw > 0) {
+    if (raw >= 1000) return raw / 1024
+    return raw
+  }
+  const text = opticalText(record)
+  const matched = text.match(/(\d+)\s*G/)
+  return matched ? Number(matched[1]) : null
+}
+
+function isSpeed(record: any, speed: number) {
+  const actual = getSpeedGbps(record)
+  if (actual === null) return false
+  return Math.abs(actual - speed) < Math.max(2, speed * 0.08)
+}
+
+function hasAny(record: any, keywords: string[]) {
+  const text = opticalText(record)
+  return keywords.some((keyword) => text.includes(keyword.toUpperCase()))
+}
+
+const getH3cPowerThresholds = (record: any) => {
+  const matched = H3C_OPTICAL_RANGES.find((item) => item.match(record))
+  if (matched) return { rxPower: matched.rx, txPower: matched.tx }
+  if (isSpeed(record, 400)) return { txPower: range(-6.5, 5.3, 'H3C 400G 通用范围'), rxPower: range(-9.1, 5.3, 'H3C 400G 通用范围') }
+  if (isSpeed(record, 200)) return { txPower: range(-6.5, 4.7, 'H3C 200G 通用范围'), rxPower: range(-8.4, 4.7, 'H3C 200G 通用范围') }
+  if (isSpeed(record, 100)) return { txPower: range(-9.4, 6.5, 'H3C 100G 通用范围'), rxPower: range(-28, 4.8, 'H3C 100G 通用范围') }
+  if (isSpeed(record, 50)) return { txPower: range(-4.5, 6.6, 'H3C 50G 通用范围'), rxPower: range(-17.6, 4.2, 'H3C 50G 通用范围') }
+  if (isSpeed(record, 25)) return { txPower: range(-8.4, 2.4, 'H3C 25G 通用范围'), rxPower: range(-13.3, 2.4, 'H3C 25G 通用范围') }
+  return {}
+}
+
+const getTemperatureThreshold = (record: any): MetricRange => {
+  if (isSpeed(record, 200)) return range(0, 75, 'H3C 200G 适宜工作温度')
+  return range(0, 70, 'H3C 25G/100G/400G 适宜工作温度')
+}
+
+const getVoltageThreshold = (record: any): MetricRange => {
+  const lo = normalizeVoltage(record?.vccLoAlarm)
+  const hi = normalizeVoltage(record?.vccHiAlarm)
+  if (lo !== null && hi !== null && lo < hi) return range(lo, hi, '控制器模块 VCC 告警阈值')
+  return range(2.97, 3.63, '3.3V 光模块常用 VCC 范围')
+}
+
+const getOpticalThresholds = (record: any): OpticalThresholds => ({
+  ...getH3cPowerThresholds(record),
+  temperature: getTemperatureThreshold(record),
+  voltage: getVoltageThreshold(record),
+})
 
 const ModuleInfoQuery = () => {
   const [controllers, setControllers] = useState<ControllerOption[]>([])
@@ -292,10 +399,54 @@ const ModuleInfoQuery = () => {
     { title: '序列号', key: 'serialNumber', dataIndex: 'serialNumber', width: 180, ellipsis: true, sorter: (a: any, b: any) => compareNatural(a.serialNumber, b.serialNumber), render: (value: string) => value || '-' },
     { title: '类型', key: 'transceiveType', dataIndex: 'transceiveType', width: 160, ellipsis: true, sorter: (a: any, b: any) => compareNatural(a.transceiveType, b.transceiveType), render: (value: string) => value || '-' },
     { title: '速率', key: 'transceiverSpeed', dataIndex: 'transceiverSpeed', width: 120, sorter: (a: any, b: any) => compareNatural(a.transceiverSpeed, b.transceiverSpeed), render: (value: string) => value || '-' },
-    { title: '收光', key: 'curRxPower', dataIndex: 'curRxPower', width: 120, sorter: (a: any, b: any) => (normalizePower(a.curRxPower) ?? -999) - (normalizePower(b.curRxPower) ?? -999), render: (value: any, record: any) => <MetricText value={normalizePower(value)} unit="dBm" danger={isInterfaceUp(record) && isPowerAbnormal(normalizePower(value))} /> },
-    { title: '发光', key: 'curTxPower', dataIndex: 'curTxPower', width: 120, sorter: (a: any, b: any) => (normalizePower(a.curTxPower) ?? -999) - (normalizePower(b.curTxPower) ?? -999), render: (value: any, record: any) => <MetricText value={normalizePower(value)} unit="dBm" danger={isInterfaceUp(record) && isPowerAbnormal(normalizePower(value))} /> },
-    { title: '温度', key: 'curTemperature', dataIndex: 'curTemperature', width: 110, sorter: (a: any, b: any) => (normalizeTemperature(a.curTemperature) ?? -999) - (normalizeTemperature(b.curTemperature) ?? -999), render: (value: any) => <MetricText value={normalizeTemperature(value)} unit="℃" danger={isTemperatureAbnormal(normalizeTemperature(value))} /> },
-    { title: '电压', key: 'curVoltage', dataIndex: 'curVoltage', width: 110, sorter: (a: any, b: any) => (normalizeVoltage(a.curVoltage) ?? -999) - (normalizeVoltage(b.curVoltage) ?? -999), render: (value: any) => <MetricText value={normalizeVoltage(value)} unit="V" danger={isVoltageAbnormal(normalizeVoltage(value))} /> },
+    {
+      title: '收光',
+      key: 'curRxPower',
+      dataIndex: 'curRxPower',
+      width: 120,
+      sorter: (a: any, b: any) => (normalizePower(a.curRxPower) ?? -999) - (normalizePower(b.curRxPower) ?? -999),
+      render: (value: any, record: any) => {
+        const thresholds = getOpticalThresholds(record)
+        const normalized = normalizePower(value)
+        return <MetricText value={normalized} unit="dBm" targetRange={thresholds.rxPower} danger={isInterfaceUp(record) && isPowerAbnormal(normalized, thresholds.rxPower)} />
+      },
+    },
+    {
+      title: '发光',
+      key: 'curTxPower',
+      dataIndex: 'curTxPower',
+      width: 120,
+      sorter: (a: any, b: any) => (normalizePower(a.curTxPower) ?? -999) - (normalizePower(b.curTxPower) ?? -999),
+      render: (value: any, record: any) => {
+        const thresholds = getOpticalThresholds(record)
+        const normalized = normalizePower(value)
+        return <MetricText value={normalized} unit="dBm" targetRange={thresholds.txPower} danger={isInterfaceUp(record) && isPowerAbnormal(normalized, thresholds.txPower)} />
+      },
+    },
+    {
+      title: '温度',
+      key: 'curTemperature',
+      dataIndex: 'curTemperature',
+      width: 110,
+      sorter: (a: any, b: any) => (normalizeTemperature(a.curTemperature) ?? -999) - (normalizeTemperature(b.curTemperature) ?? -999),
+      render: (value: any, record: any) => {
+        const thresholds = getOpticalThresholds(record)
+        const normalized = normalizeTemperature(value)
+        return <MetricText value={normalized} unit="℃" targetRange={thresholds.temperature} danger={isMetricAbnormal(normalized, thresholds.temperature)} />
+      },
+    },
+    {
+      title: '电压',
+      key: 'curVoltage',
+      dataIndex: 'curVoltage',
+      width: 110,
+      sorter: (a: any, b: any) => (normalizeVoltage(a.curVoltage) ?? -999) - (normalizeVoltage(b.curVoltage) ?? -999),
+      render: (value: any, record: any) => {
+        const thresholds = getOpticalThresholds(record)
+        const normalized = normalizeVoltage(value)
+        return <MetricText value={normalized} unit="V" targetRange={thresholds.voltage} danger={isMetricAbnormal(normalized, thresholds.voltage)} />
+      },
+    },
     { title: '生产日期', key: 'mfgDate', dataIndex: 'mfgDate', width: 130, sorter: (a: any, b: any) => compareNatural(a.mfgDate, b.mfgDate), render: (value: string) => value || '-' },
     { title: '采集时间', key: 'time', dataIndex: 'time', width: 170, sorter: (a: any, b: any) => Number(a.time || 0) - Number(b.time || 0), render: (value: any) => value ? new Date(Number(value)).toLocaleString() : '-' },
   ]
