@@ -27,6 +27,7 @@ import {
   type DeviceProtocolSummary,
   type ProtocolNeighbor,
 } from '../../api/metrics'
+import { updateDevice } from '../../api/devices'
 
 const { Text } = Typography
 
@@ -332,6 +333,7 @@ const DeviceOverview = () => {
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailDevice, setDetailDevice] = useState<DeviceOverviewItem | null>(null)
   const [neighbors, setNeighbors] = useState<{ bgp: ProtocolNeighbor[]; ospf: ProtocolNeighbor[] }>({ bgp: [], ospf: [] })
+  const [syncingField, setSyncingField] = useState<string | null>(null)
   const filtersReadyRef = useRef(false)
   const [draggingColumnKey, setDraggingColumnKey] = useState<string | null>(null)
   const [dragOverColumnKey, setDragOverColumnKey] = useState<string | null>(null)
@@ -556,6 +558,43 @@ const DeviceOverview = () => {
     }
   }
 
+  const handleSyncDeviceField = async (
+    item: DeviceOverviewItem,
+    field: 'name' | 'model',
+    value?: string | null
+  ) => {
+    const nextValue = String(value || '').trim()
+    if (!nextValue) {
+      message.warning('采集值为空，不能同步')
+      return
+    }
+    const syncKey = `${item.device.id}:${field}`
+    setSyncingField(syncKey)
+    try {
+      await updateDevice(item.device.id, { [field]: nextValue })
+      setItems((current) =>
+        current.map((row) =>
+          row.device.id === item.device.id
+            ? {
+                ...row,
+                device: {
+                  ...row.device,
+                  [field]: nextValue,
+                },
+              }
+            : row
+        )
+      )
+      const label = field === 'name' ? '设备名称' : '型号'
+      message.success(`已将${label}同步为采集值：${nextValue}`)
+      loadData()
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '同步采集值失败')
+    } finally {
+      setSyncingField(null)
+    }
+  }
+
   const neighborColumns = [
     {
       title: '邻居',
@@ -609,9 +648,19 @@ const DeviceOverview = () => {
             <Text strong type={mismatch ? 'danger' : undefined}>{enteredName}</Text>
             <Text type="secondary">{record.device.ip_address}</Text>
             {mismatch ? (
-              <Tooltip title={`录入：${enteredName}；采集：${sysName}`}>
-                <Tag color="red">采集名称：{sysName}</Tag>
-              </Tooltip>
+              <Space size={6} wrap>
+                <Tooltip title={`录入：${enteredName}；采集：${sysName}`}>
+                  <Tag color="red">采集名称：{sysName}</Tag>
+                </Tooltip>
+                <Button
+                  size="small"
+                  type="link"
+                  loading={syncingField === `${record.device.id}:name`}
+                  onClick={() => handleSyncDeviceField(record, 'name', sysName)}
+                >
+                  同步为采集名称
+                </Button>
+              </Space>
             ) : null}
           </Space>
         )
@@ -631,9 +680,19 @@ const DeviceOverview = () => {
             <Text>{record.device.vendor || '-'}</Text>
             <Text type={mismatch ? 'danger' : 'secondary'}>{enteredModel}</Text>
             {mismatch ? (
-              <Tooltip title={`录入型号：${enteredModel}；采集型号：${snmpModel}`}>
-                <Tag color="red">采集型号：{snmpModel}</Tag>
-              </Tooltip>
+              <Space size={6} wrap>
+                <Tooltip title={`录入型号：${enteredModel}；采集型号：${snmpModel}`}>
+                  <Tag color="red">采集型号：{snmpModel}</Tag>
+                </Tooltip>
+                <Button
+                  size="small"
+                  type="link"
+                  loading={syncingField === `${record.device.id}:model`}
+                  onClick={() => handleSyncDeviceField(record, 'model', snmpModel)}
+                >
+                  同步为采集型号
+                </Button>
+              </Space>
             ) : null}
           </Space>
         )

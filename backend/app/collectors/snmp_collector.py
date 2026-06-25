@@ -13,6 +13,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from app.config import settings
 from app.utils import influx_client, redis_client
+from app.utils.snmp_system_info import extract_snmp_model
 from app.core import LoggerMixin
 
 
@@ -1580,9 +1581,7 @@ class SNMPCollector(LoggerMixin):
                 software_version = f"Software Version {version_match.group(1).strip()}"
                 if version_match.group(2):
                     software_version = f"{software_version}, {version_match.group(2).strip()}"
-            model_match = re.search(r"^\s*Densivelo\s+([A-Za-z0-9._/-]+)", sys_descr_text, re.IGNORECASE | re.MULTILINE)
-            if model_match:
-                snmp_model = model_match.group(1).strip()
+            snmp_model = extract_snmp_model(sys_descr_text)
         return {
             "sys_descr": sys_descr_text,
             "sys_name": sys_name_text,

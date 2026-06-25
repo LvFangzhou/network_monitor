@@ -27,6 +27,7 @@ from app.core import get_logger
 from app.config import settings
 from app.collectors import snmp_collector
 from app.services.flow_listener import flow_listener
+from app.utils.snmp_system_info import extract_snmp_model
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -832,13 +833,27 @@ def _latest_snmp_system_info(device_id: int) -> Dict[str, Any]:
         uptime = _latest_numeric(device_id, "snmp_metrics", ["seconds"])
         return {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "uptime_seconds": uptime}
     row = rows[0]
+    sys_descr = row.get("sys_descr")
+    snmp_model = row.get("snmp_model") or extract_snmp_model(sys_descr)
     return {
         "sys_name": row.get("sys_name"),
-        "sys_descr": row.get("sys_descr"),
+        "sys_descr": sys_descr,
         "software_version": row.get("software_version"),
-        "snmp_model": row.get("snmp_model"),
+        "snmp_model": snmp_model,
         "uptime_seconds": _safe_float(row.get("value")),
     }
+
+
+def _ensure_snmp_system_info_model(item: Dict[str, Any]) -> None:
+    """缓存里缺少 snmp_model 时，从 sys_descr 兜底补齐。"""
+    system_info = item.get("system_info")
+    if not isinstance(system_info, dict):
+        return
+    if system_info.get("snmp_model"):
+        return
+    snmp_model = extract_snmp_model(system_info.get("sys_descr"))
+    if snmp_model:
+        system_info["snmp_model"] = snmp_model
 
 
 def _hardware_summary(device_id: int) -> Dict[str, Any]:
@@ -2047,6 +2062,7 @@ async def get_monitor_devices_overview(
                     json.dumps(overview),
                 )
                 item.update(overview)
+        _ensure_snmp_system_info_model(item)
         item["collected_at"] = item.get("collected_at") or datetime.now(timezone.utc).isoformat()
         if not connectivity or item["connectivity"]["status"] == connectivity:
             items.append(item)
