@@ -166,6 +166,16 @@ const ControllerIntegrationPanel = () => {
     }
   }
 
+  const handleAddController = () => {
+    const currentControllers = form.getFieldValue('controllers') || []
+    form.setFieldsValue({
+      controllers: [
+        ...currentControllers,
+        buildDefaultController(currentControllers.length + 1),
+      ],
+    })
+  }
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <Alert
@@ -182,6 +192,9 @@ const ControllerIntegrationPanel = () => {
             <Button icon={<ReloadOutlined />} onClick={loadSettings}>
               刷新
             </Button>
+            <Button type="dashed" icon={<PlusOutlined />} onClick={handleAddController}>
+              添加控制器
+            </Button>
             <Button type="primary" onClick={handleSave} loading={saving}>
               保存配置
             </Button>
@@ -196,17 +209,8 @@ const ControllerIntegrationPanel = () => {
           }}
         >
           <Form.List name="controllers">
-            {(fields, { add, remove }) => (
+            {(fields, { remove }) => (
               <Space direction="vertical" size={16} style={{ width: '100%' }}>
-                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                  <Button
-                    type="dashed"
-                    icon={<PlusOutlined />}
-                    onClick={() => add(buildDefaultController(fields.length + 1))}
-                  >
-                    添加控制器
-                  </Button>
-                </div>
                 {fields.map((field, index) => {
                   const controller = controllers[index]
                   return (
