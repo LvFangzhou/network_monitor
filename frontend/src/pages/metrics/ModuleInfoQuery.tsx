@@ -97,6 +97,7 @@ const compareNatural = (left?: string | number | null, right?: string | number |
 const getInterfaceName = (record: any) => record.ifDesc || record.interfaceName || record.ifName || ''
 const getDeviceIp = (record: any) => record.deviceIp || record.ip || ''
 const getSourceLabel = (record: any) => record.source || SOURCE_LABELS[record.sourceType] || record.sourceType || '控制器API'
+const isInterfaceUp = (record: any) => Number(record?.ifOperStatus) === 1
 
 const ModuleInfoQuery = () => {
   const [controllers, setControllers] = useState<ControllerOption[]>([])
@@ -285,14 +286,14 @@ const ModuleInfoQuery = () => {
     },
     { title: '机房', key: 'datacenterName', dataIndex: 'datacenterName', width: 170, sorter: (a: any, b: any) => compareNatural(a.datacenterName, b.datacenterName), render: (value: string) => value || '-' },
     { title: '信息来源', key: 'source', width: 130, sorter: (a: any, b: any) => compareNatural(getSourceLabel(a), getSourceLabel(b)), render: (_: any, record: any) => <Tag color="blue">{getSourceLabel(record)}</Tag> },
-    { title: '运行状态', key: 'ifOperStatus', dataIndex: 'ifOperStatus', width: 110, sorter: (a: any, b: any) => Number(a.ifOperStatus || 0) - Number(b.ifOperStatus || 0), render: (value: any) => Number(value) === 1 ? <Tag color="green">UP</Tag> : <Tag>DOWN</Tag> },
+    { title: '运行状态', key: 'ifOperStatus', dataIndex: 'ifOperStatus', width: 110, sorter: (a: any, b: any) => Number(a.ifOperStatus || 0) - Number(b.ifOperStatus || 0), render: (value: any) => Number(value) === 1 ? <Tag color="green">UP</Tag> : <Tag color="red">DOWN</Tag> },
     { title: '管理状态', key: 'adminStatus', dataIndex: 'adminStatus', width: 110, sorter: (a: any, b: any) => Number(a.adminStatus || 0) - Number(b.adminStatus || 0), render: (value: any) => Number(value) === 1 ? <Tag color="green">UP</Tag> : <Tag>DOWN</Tag> },
     { title: '厂商', key: 'vendorName', dataIndex: 'vendorName', width: 150, ellipsis: true, sorter: (a: any, b: any) => compareNatural(a.vendorName, b.vendorName), render: (value: string) => value || '-' },
     { title: '序列号', key: 'serialNumber', dataIndex: 'serialNumber', width: 180, ellipsis: true, sorter: (a: any, b: any) => compareNatural(a.serialNumber, b.serialNumber), render: (value: string) => value || '-' },
     { title: '类型', key: 'transceiveType', dataIndex: 'transceiveType', width: 160, ellipsis: true, sorter: (a: any, b: any) => compareNatural(a.transceiveType, b.transceiveType), render: (value: string) => value || '-' },
     { title: '速率', key: 'transceiverSpeed', dataIndex: 'transceiverSpeed', width: 120, sorter: (a: any, b: any) => compareNatural(a.transceiverSpeed, b.transceiverSpeed), render: (value: string) => value || '-' },
-    { title: '收光', key: 'curRxPower', dataIndex: 'curRxPower', width: 120, sorter: (a: any, b: any) => (normalizePower(a.curRxPower) ?? -999) - (normalizePower(b.curRxPower) ?? -999), render: (value: any) => <MetricText value={normalizePower(value)} unit="dBm" danger={isPowerAbnormal(normalizePower(value))} /> },
-    { title: '发光', key: 'curTxPower', dataIndex: 'curTxPower', width: 120, sorter: (a: any, b: any) => (normalizePower(a.curTxPower) ?? -999) - (normalizePower(b.curTxPower) ?? -999), render: (value: any) => <MetricText value={normalizePower(value)} unit="dBm" danger={isPowerAbnormal(normalizePower(value))} /> },
+    { title: '收光', key: 'curRxPower', dataIndex: 'curRxPower', width: 120, sorter: (a: any, b: any) => (normalizePower(a.curRxPower) ?? -999) - (normalizePower(b.curRxPower) ?? -999), render: (value: any, record: any) => <MetricText value={normalizePower(value)} unit="dBm" danger={isInterfaceUp(record) && isPowerAbnormal(normalizePower(value))} /> },
+    { title: '发光', key: 'curTxPower', dataIndex: 'curTxPower', width: 120, sorter: (a: any, b: any) => (normalizePower(a.curTxPower) ?? -999) - (normalizePower(b.curTxPower) ?? -999), render: (value: any, record: any) => <MetricText value={normalizePower(value)} unit="dBm" danger={isInterfaceUp(record) && isPowerAbnormal(normalizePower(value))} /> },
     { title: '温度', key: 'curTemperature', dataIndex: 'curTemperature', width: 110, sorter: (a: any, b: any) => (normalizeTemperature(a.curTemperature) ?? -999) - (normalizeTemperature(b.curTemperature) ?? -999), render: (value: any) => <MetricText value={normalizeTemperature(value)} unit="℃" danger={isTemperatureAbnormal(normalizeTemperature(value))} /> },
     { title: '电压', key: 'curVoltage', dataIndex: 'curVoltage', width: 110, sorter: (a: any, b: any) => (normalizeVoltage(a.curVoltage) ?? -999) - (normalizeVoltage(b.curVoltage) ?? -999), render: (value: any) => <MetricText value={normalizeVoltage(value)} unit="V" danger={isVoltageAbnormal(normalizeVoltage(value))} /> },
     { title: '生产日期', key: 'mfgDate', dataIndex: 'mfgDate', width: 130, sorter: (a: any, b: any) => compareNatural(a.mfgDate, b.mfgDate), render: (value: string) => value || '-' },
