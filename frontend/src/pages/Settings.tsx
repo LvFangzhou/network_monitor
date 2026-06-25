@@ -198,6 +198,15 @@ const ControllerIntegrationPanel = () => {
           <Form.List name="controllers">
             {(fields, { add, remove }) => (
               <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                  <Button
+                    type="dashed"
+                    icon={<PlusOutlined />}
+                    onClick={() => add(buildDefaultController(fields.length + 1))}
+                  >
+                    添加控制器
+                  </Button>
+                </div>
                 {fields.map((field, index) => {
                   const controller = controllers[index]
                   return (
@@ -205,6 +214,10 @@ const ControllerIntegrationPanel = () => {
                       key={field.key}
                       size="small"
                       type="inner"
+                      styles={{
+                        header: { minHeight: 42, padding: '0 12px' },
+                        body: { padding: 12 },
+                      }}
                       title={
                         <Space>
                           <Form.Item noStyle name={[field.name, 'enabled']} valuePropName="checked">
@@ -241,32 +254,60 @@ const ControllerIntegrationPanel = () => {
                       <Form.Item name={[field.name, 'id']} hidden>
                         <Input />
                       </Form.Item>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(180px, 1fr))', gap: 16 }}>
-                        <Form.Item name={[field.name, 'name']} label="控制器名称" rules={[{ required: true, message: '请输入控制器名称' }]}>
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: '1.2fr 2fr 1fr 1fr 0.7fr 0.9fr 0.8fr 0.7fr 0.7fr 0.9fr',
+                          columnGap: 10,
+                          rowGap: 4,
+                          alignItems: 'end',
+                        }}
+                      >
+                        <Form.Item
+                          name={[field.name, 'name']}
+                          label="控制器名称"
+                          rules={[{ required: true, message: '请输入控制器名称' }]}
+                          style={{ marginBottom: 8 }}
+                        >
                           <Input placeholder="例如：湖北宜昌控制器" />
                         </Form.Item>
-                        <Form.Item name={[field.name, 'base_url']} label="北向 API 地址" rules={[{ required: true, message: '请输入控制器 API 地址' }]}>
+                        <Form.Item
+                          name={[field.name, 'base_url']}
+                          label="北向 API 地址"
+                          rules={[{ required: true, message: '请输入控制器 API 地址' }]}
+                          style={{ marginBottom: 8 }}
+                        >
                           <Input placeholder="http://10.239.16.1:30000" />
                         </Form.Item>
-                        <Form.Item name={[field.name, 'username']} label="用户名" rules={[{ required: true, message: '请输入用户名' }]}>
+                        <Form.Item
+                          name={[field.name, 'username']}
+                          label="用户名"
+                          rules={[{ required: true, message: '请输入用户名' }]}
+                          style={{ marginBottom: 8 }}
+                        >
                           <Input placeholder="admin" />
                         </Form.Item>
-                        <Form.Item name={[field.name, 'password']} label="密码" rules={[{ required: true, message: '请输入密码' }]}>
+                        <Form.Item
+                          name={[field.name, 'password']}
+                          label="密码"
+                          rules={[{ required: true, message: '请输入密码' }]}
+                          style={{ marginBottom: 8 }}
+                        >
                           <Input.Password visibilityToggle={false} placeholder="保存后再次打开会隐藏" />
                         </Form.Item>
-                        <Form.Item name={[field.name, 'user_id']} label="认证 ID">
+                        <Form.Item name={[field.name, 'user_id']} label="认证 ID" style={{ marginBottom: 8 }}>
                           <Input placeholder="1" />
                         </Form.Item>
-                        <Form.Item name={[field.name, 'region_id']} label="Region ID">
+                        <Form.Item name={[field.name, 'region_id']} label="Region ID" style={{ marginBottom: 8 }}>
                           <Input placeholder="可为空" />
                         </Form.Item>
-                        <Form.Item name={[field.name, 'effective_time']} label="Token 有效期/秒">
+                        <Form.Item name={[field.name, 'effective_time']} label="Token 秒" style={{ marginBottom: 8 }}>
                           <Input type="number" />
                         </Form.Item>
-                        <Form.Item name={[field.name, 'timeout']} label="请求超时/秒">
+                        <Form.Item name={[field.name, 'timeout']} label="超时秒" style={{ marginBottom: 8 }}>
                           <Input type="number" />
                         </Form.Item>
-                        <Form.Item name={[field.name, 'area_type']} label="区域类型">
+                        <Form.Item name={[field.name, 'area_type']} label="区域" style={{ marginBottom: 8 }}>
                           <Select
                             options={[
                               { value: 0, label: '0' },
@@ -275,21 +316,13 @@ const ControllerIntegrationPanel = () => {
                             ]}
                           />
                         </Form.Item>
-                        <Form.Item name={[field.name, 'insecure']} label="HTTPS 证书校验" valuePropName="checked">
+                        <Form.Item name={[field.name, 'insecure']} label="HTTPS 证书" valuePropName="checked" style={{ marginBottom: 8 }}>
                           <Switch checkedChildren="忽略" unCheckedChildren="校验" />
                         </Form.Item>
                       </div>
                     </Card>
                   )
                 })}
-                <Button
-                  type="dashed"
-                  icon={<PlusOutlined />}
-                  onClick={() => add(buildDefaultController(fields.length + 1))}
-                  block
-                >
-                  添加控制器
-                </Button>
               </Space>
             )}
           </Form.List>
