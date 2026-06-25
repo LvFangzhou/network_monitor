@@ -59,7 +59,14 @@ const isInvalidOpticalRawValue = (value: number | null) => {
 const normalizePower = (value?: number | string | null) => {
   const numeric = formatNumber(value)
   if (numeric === null || isInvalidOpticalRawValue(numeric)) return null
-  return numeric * 0.01
+  // 控制器/H3C 设备诊断接口常以 0.1uW 为原始单位返回光功率，
+  // 例如 31622 => 10*log10(31622/10000)=5.00dBm。
+  // 其他采集来源如果已经是 dBm，通常会落在 -60～30 范围内，直接保留。
+  if (numeric > 100 || numeric < -100) {
+    if (numeric <= 0) return null
+    return 10 * Math.log10(numeric / 10000)
+  }
+  return numeric
 }
 
 const normalizeTemperature = (value?: number | string | null) => {
@@ -106,6 +113,12 @@ const H3C_OPTICAL_RANGES: Array<{ match: (record: any) => boolean; rx: MetricRan
   { match: (r) => isSpeed(r, 100) && hasAny(r, ['SR4', 'ESR4', 'ESR']), tx: range(-8.4, 2.4, 'H3C 100G SR4/eSR4'), rx: range(-10.3, 2.4, 'H3C 100G SR4/eSR4') },
   { match: (r) => isSpeed(r, 50) && hasAny(r, ['ER']), tx: range(0.4, 6.6, 'H3C 50G ER'), rx: range(-17.6, -3.4, 'H3C 50G ER') },
   { match: (r) => isSpeed(r, 50), tx: range(-4.5, 4.2, 'H3C 50G LR'), rx: range(-10.8, 4.2, 'H3C 50G LR') },
+
+  // 10G 常见 H3C 光模块兜底；如果控制器返回了模块自身阈值，会优先使用控制器阈值。
+  { match: (r) => isSpeed(r, 10) && hasAny(r, ['ZR']), tx: range(0, 4, 'H3C 10G ZR 常用范围'), rx: range(-24, -7, 'H3C 10G ZR 常用范围') },
+  { match: (r) => isSpeed(r, 10) && hasAny(r, ['ER']), tx: range(-1, 4, 'H3C 10G ER 常用范围'), rx: range(-15.8, -1, 'H3C 10G ER 常用范围') },
+  { match: (r) => isSpeed(r, 10) && hasAny(r, ['LR', 'LXM']), tx: range(-8.2, 0.5, 'H3C 10G LR 常用范围'), rx: range(-14.4, 0.5, 'H3C 10G LR 常用范围') },
+  { match: (r) => isSpeed(r, 10) && hasAny(r, ['SR', '850']), tx: range(-7.3, -1, 'H3C 10G SR 常用范围'), rx: range(-9.9, -1, 'H3C 10G SR 常用范围') },
 
   // 25G，来源：H3C 25G 系列光模块接口指标表
   { match: (r) => isSpeed(r, 25) && hasAny(r, ['CSR']), tx: range(-6.4, 2.4, 'H3C 25G CSR'), rx: range(-10.3, 2.4, 'H3C 25G CSR') },
@@ -191,6 +204,8 @@ function hasAny(record: any, keywords: string[]) {
 }
 
 const getH3cPowerThresholds = (record: any) => {
+  const controllerThresholds = getControllerPowerThresholds(record)
+  if (controllerThresholds.rxPower && controllerThresholds.txPower) return controllerThresholds
   const matched = H3C_OPTICAL_RANGES.find((item) => item.match(record))
   if (matched) return { rxPower: matched.rx, txPower: matched.tx }
   if (isSpeed(record, 400)) return { txPower: range(-6.5, 5.3, 'H3C 400G 通用范围'), rxPower: range(-9.1, 5.3, 'H3C 400G 通用范围') }
@@ -198,7 +213,19 @@ const getH3cPowerThresholds = (record: any) => {
   if (isSpeed(record, 100)) return { txPower: range(-9.4, 6.5, 'H3C 100G 通用范围'), rxPower: range(-28, 4.8, 'H3C 100G 通用范围') }
   if (isSpeed(record, 50)) return { txPower: range(-4.5, 6.6, 'H3C 50G 通用范围'), rxPower: range(-17.6, 4.2, 'H3C 50G 通用范围') }
   if (isSpeed(record, 25)) return { txPower: range(-8.4, 2.4, 'H3C 25G 通用范围'), rxPower: range(-13.3, 2.4, 'H3C 25G 通用范围') }
+  if (isSpeed(record, 10)) return { txPower: range(-8.2, 4, 'H3C 10G 通用范围'), rxPower: range(-24, 0.5, 'H3C 10G 通用范围') }
   return {}
+}
+
+const getControllerPowerThresholds = (record: any) => {
+  const rxLo = normalizePower(record?.rcvPwrLoAlarm)
+  const rxHi = normalizePower(record?.rcvPwrHiAlarm)
+  const txLo = normalizePower(record?.pwrOutLoAlarm)
+  const txHi = normalizePower(record?.pwrOutHiAlarm)
+  return {
+    rxPower: rxLo !== null && rxHi !== null && rxLo < rxHi ? range(rxLo, rxHi, '控制器模块 RX 告警阈值') : undefined,
+    txPower: txLo !== null && txHi !== null && txLo < txHi ? range(txLo, txHi, '控制器模块 TX 告警阈值') : undefined,
+  }
 }
 
 const getTemperatureThreshold = (record: any): MetricRange => {
