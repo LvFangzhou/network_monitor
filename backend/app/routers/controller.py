@@ -11,6 +11,7 @@ from app.models import User
 from app.routers.auth import get_current_active_user
 from app.utils.controller_client import ControllerClient
 from app.utils.controller_settings import (
+    find_controller_settings,
     load_controller_settings,
     merge_runtime_settings,
     save_controller_settings,
@@ -24,10 +25,11 @@ def _require_admin(user: User) -> None:
         raise HTTPException(status_code=403, detail="仅管理员可修改控制器集成配置")
 
 
-def _client_from_saved() -> ControllerClient:
-    settings = load_controller_settings(mask_secret=False)
-    if not settings.get("enabled"):
-        raise HTTPException(status_code=400, detail="控制器集成尚未启用")
+def _client_from_saved(controller_id: Optional[str] = None) -> ControllerClient:
+    try:
+        settings = find_controller_settings(controller_id=controller_id, require_enabled=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ControllerClient(settings)
 
 
@@ -52,7 +54,10 @@ async def test_controller_connectivity(
     current_user: User = Depends(get_current_active_user),
 ):
     _require_admin(current_user)
-    settings = merge_runtime_settings(payload or {})
+    try:
+        settings = merge_runtime_settings(payload or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     client = ControllerClient(settings)
     return await client.check()
 
@@ -63,8 +68,9 @@ async def list_controller_assets(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     search: Optional[str] = Query(None),
+    controller_id: Optional[str] = Query(None),
 ):
-    client = _client_from_saved()
+    client = _client_from_saved(controller_id=controller_id)
     return await client.list_assets(page_num=page, page_size=page_size, filter_text=search)
 
 
@@ -76,6 +82,7 @@ async def list_controller_opticals(
     search: Optional[str] = Query(None),
     device_ip: Optional[str] = Query(None),
     hours: int = Query(3, ge=1, le=168),
+    controller_id: Optional[str] = Query(None),
 ):
-    client = _client_from_saved()
+    client = _client_from_saved(controller_id=controller_id)
     return await client.list_opticals(page=page, page_size=page_size, search=search, device_ip=device_ip, hours=hours)

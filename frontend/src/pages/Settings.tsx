@@ -37,6 +37,7 @@ import {
   updateControllerSettings,
   type ControllerCheck,
   type ControllerSettings,
+  type ControllerSettingsPayload,
 } from '../api/controller'
 import { useAuthStore } from '../store/auth'
 
@@ -48,10 +49,11 @@ const tablePagination = {
 }
 
 const ControllerIntegrationPanel = () => {
-  const [form] = Form.useForm<ControllerSettings>()
+  const [form] = Form.useForm<ControllerSettingsPayload>()
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [testing, setTesting] = useState(false)
+  const [testingId, setTestingId] = useState<string | null>(null)
+  const [testTarget, setTestTarget] = useState('')
   const [checks, setChecks] = useState<ControllerCheck[]>([])
   const [assetsLoading, setAssetsLoading] = useState(false)
   const [opticalsLoading, setOpticalsLoading] = useState(false)
@@ -59,12 +61,38 @@ const ControllerIntegrationPanel = () => {
   const [opticals, setOpticals] = useState<any[]>([])
   const [assetTotal, setAssetTotal] = useState(0)
   const [opticalTotal, setOpticalTotal] = useState(0)
+  const [selectedControllerId, setSelectedControllerId] = useState<string | undefined>()
+
+  const buildDefaultController = (index: number): ControllerSettings => ({
+    id: `controller-${Date.now()}-${index}`,
+    name: `控制器${index}`,
+    enabled: true,
+    base_url: index === 1 ? 'http://10.239.16.1:30000' : '',
+    username: index === 1 ? 'admin' : '',
+    password: '',
+    user_id: '1',
+    region_id: '',
+    effective_time: 7200,
+    timeout: 5,
+    area_type: 1,
+    insecure: false,
+  })
+
+  const controllers = Form.useWatch('controllers', form) || []
+  const enabledControllerOptions = controllers
+    .filter((item) => item?.id && item.enabled)
+    .map((item) => ({
+      value: item.id,
+      label: `${item.name || item.base_url || item.id}（${item.base_url || '未填写地址'}）`,
+    }))
 
   const loadSettings = async () => {
     setLoading(true)
     try {
       const settings = await getControllerSettings()
       form.setFieldsValue(settings)
+      const firstEnabled = settings.controllers?.find((item) => item.enabled) || settings.controllers?.[0]
+      setSelectedControllerId(firstEnabled?.id)
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取控制器配置失败')
     } finally {
@@ -82,6 +110,8 @@ const ControllerIntegrationPanel = () => {
       setSaving(true)
       const saved = await updateControllerSettings(values)
       form.setFieldsValue(saved)
+      const firstEnabled = saved.controllers?.find((item) => item.enabled) || saved.controllers?.[0]
+      setSelectedControllerId((current) => current && saved.controllers?.some((item) => item.id === current) ? current : firstEnabled?.id)
       message.success('控制器配置已保存')
     } catch (error: any) {
       if (!error?.errorFields) {
@@ -92,28 +122,28 @@ const ControllerIntegrationPanel = () => {
     }
   }
 
-  const handleTest = async () => {
+  const handleTest = async (controller: ControllerSettings) => {
     try {
-      const values = await form.validateFields()
-      setTesting(true)
-      const result = await testController(values)
+      setTestingId(controller.id)
+      setTestTarget(controller.name || controller.base_url || controller.id)
+      const result = await testController(controller)
       setChecks(result.checks || [])
       if (result.ok) {
-        message.success('控制器连通性测试通过')
+        message.success(`${controller.name || '控制器'}连通性测试通过`)
       } else {
-        message.warning('控制器部分接口测试失败，请查看明细')
+        message.warning(`${controller.name || '控制器'}部分接口测试失败，请查看明细`)
       }
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '测试控制器失败')
     } finally {
-      setTesting(false)
+      setTestingId(null)
     }
   }
 
   const loadAssetSample = async () => {
     setAssetsLoading(true)
     try {
-      const result = await getControllerAssets({ page: 1, page_size: 10 })
+      const result = await getControllerAssets({ page: 1, page_size: 10, controller_id: selectedControllerId })
       setAssets(result.items || [])
       setAssetTotal(result.total || 0)
     } catch (error: any) {
@@ -126,7 +156,7 @@ const ControllerIntegrationPanel = () => {
   const loadOpticalSample = async () => {
     setOpticalsLoading(true)
     try {
-      const result = await getControllerOpticals({ page: 1, page_size: 10, hours: 3 })
+      const result = await getControllerOpticals({ page: 1, page_size: 10, hours: 3, controller_id: selectedControllerId })
       setOpticals(result.items || [])
       setOpticalTotal(result.total || 0)
     } catch (error: any) {
@@ -141,8 +171,8 @@ const ControllerIntegrationPanel = () => {
       <Alert
         type="info"
         showIcon
-        message="控制器集成先用于验证北向 API 能力"
-        description="当前不会替换现有 SNMP/SSH 采集，只提供配置、连通性测试和样例数据读取；确认稳定后再接入光模块信息查询和高精度无损菜单。"
+        message="控制器集成支持维护多台控制器"
+        description="每台控制器独立保存地址、账号、区域类型和认证参数；样例读取默认使用选中的控制器，后续正式菜单也会按控制器维度筛选数据。"
       />
       <Card
         title="控制器 API 配置"
@@ -151,9 +181,6 @@ const ControllerIntegrationPanel = () => {
           <Space>
             <Button icon={<ReloadOutlined />} onClick={loadSettings}>
               刷新
-            </Button>
-            <Button onClick={handleTest} loading={testing}>
-              测试连通性
             </Button>
             <Button type="primary" onClick={handleSave} loading={saving}>
               保存配置
@@ -165,58 +192,111 @@ const ControllerIntegrationPanel = () => {
           form={form}
           layout="vertical"
           initialValues={{
-            enabled: true,
-            base_url: 'http://10.239.16.1:30000',
-            username: 'admin',
-            user_id: '1',
-            effective_time: 7200,
-            timeout: 5,
-            area_type: 1,
-            insecure: false,
+            controllers: [buildDefaultController(1)],
           }}
         >
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(180px, 1fr))', gap: 16 }}>
-            <Form.Item name="enabled" label="启用控制器集成" valuePropName="checked">
-              <Switch checkedChildren="启用" unCheckedChildren="停用" />
-            </Form.Item>
-            <Form.Item name="base_url" label="北向 API 地址" rules={[{ required: true, message: '请输入控制器 API 地址' }]}>
-              <Input placeholder="http://10.239.16.1:30000" />
-            </Form.Item>
-            <Form.Item name="username" label="用户名" rules={[{ required: true, message: '请输入用户名' }]}>
-              <Input placeholder="admin" />
-            </Form.Item>
-            <Form.Item name="password" label="密码" rules={[{ required: true, message: '请输入密码' }]}>
-              <Input.Password visibilityToggle={false} placeholder="保存后再次打开会隐藏" />
-            </Form.Item>
-            <Form.Item name="user_id" label="认证 ID">
-              <Input placeholder="1" />
-            </Form.Item>
-            <Form.Item name="region_id" label="Region ID">
-              <Input placeholder="可为空" />
-            </Form.Item>
-            <Form.Item name="effective_time" label="Token 有效期/秒">
-              <Input type="number" />
-            </Form.Item>
-            <Form.Item name="timeout" label="请求超时/秒">
-              <Input type="number" />
-            </Form.Item>
-            <Form.Item name="area_type" label="区域类型">
-              <Select
-                options={[
-                  { value: 0, label: '0' },
-                  { value: 1, label: '1' },
-                  { value: 2, label: '2' },
-                ]}
-              />
-            </Form.Item>
-            <Form.Item name="insecure" label="HTTPS 证书校验" valuePropName="checked">
-              <Switch checkedChildren="忽略" unCheckedChildren="校验" />
-            </Form.Item>
-          </div>
+          <Form.List name="controllers">
+            {(fields, { add, remove }) => (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                {fields.map((field, index) => {
+                  const controller = controllers[index]
+                  return (
+                    <Card
+                      key={field.key}
+                      size="small"
+                      type="inner"
+                      title={
+                        <Space>
+                          <Form.Item noStyle name={[field.name, 'enabled']} valuePropName="checked">
+                            <Switch checkedChildren="启用" unCheckedChildren="停用" />
+                          </Form.Item>
+                          <Typography.Text>{controller?.name || `控制器${index + 1}`}</Typography.Text>
+                          {controller?.base_url ? <Tag color="blue">{controller.base_url}</Tag> : <Tag>未填写地址</Tag>}
+                        </Space>
+                      }
+                      extra={
+                        <Space>
+                          <Button
+                            onClick={() => handleTest(controller)}
+                            loading={testingId === controller?.id}
+                            disabled={!controller}
+                          >
+                            测试
+                          </Button>
+                          <Popconfirm
+                            title="确认删除这台控制器配置吗？"
+                            onConfirm={() => {
+                              remove(field.name)
+                              setChecks([])
+                            }}
+                            disabled={fields.length <= 1}
+                          >
+                            <Button danger disabled={fields.length <= 1}>
+                              删除
+                            </Button>
+                          </Popconfirm>
+                        </Space>
+                      }
+                    >
+                      <Form.Item name={[field.name, 'id']} hidden>
+                        <Input />
+                      </Form.Item>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(180px, 1fr))', gap: 16 }}>
+                        <Form.Item name={[field.name, 'name']} label="控制器名称" rules={[{ required: true, message: '请输入控制器名称' }]}>
+                          <Input placeholder="例如：湖北宜昌控制器" />
+                        </Form.Item>
+                        <Form.Item name={[field.name, 'base_url']} label="北向 API 地址" rules={[{ required: true, message: '请输入控制器 API 地址' }]}>
+                          <Input placeholder="http://10.239.16.1:30000" />
+                        </Form.Item>
+                        <Form.Item name={[field.name, 'username']} label="用户名" rules={[{ required: true, message: '请输入用户名' }]}>
+                          <Input placeholder="admin" />
+                        </Form.Item>
+                        <Form.Item name={[field.name, 'password']} label="密码" rules={[{ required: true, message: '请输入密码' }]}>
+                          <Input.Password visibilityToggle={false} placeholder="保存后再次打开会隐藏" />
+                        </Form.Item>
+                        <Form.Item name={[field.name, 'user_id']} label="认证 ID">
+                          <Input placeholder="1" />
+                        </Form.Item>
+                        <Form.Item name={[field.name, 'region_id']} label="Region ID">
+                          <Input placeholder="可为空" />
+                        </Form.Item>
+                        <Form.Item name={[field.name, 'effective_time']} label="Token 有效期/秒">
+                          <Input type="number" />
+                        </Form.Item>
+                        <Form.Item name={[field.name, 'timeout']} label="请求超时/秒">
+                          <Input type="number" />
+                        </Form.Item>
+                        <Form.Item name={[field.name, 'area_type']} label="区域类型">
+                          <Select
+                            options={[
+                              { value: 0, label: '0' },
+                              { value: 1, label: '1' },
+                              { value: 2, label: '2' },
+                            ]}
+                          />
+                        </Form.Item>
+                        <Form.Item name={[field.name, 'insecure']} label="HTTPS 证书校验" valuePropName="checked">
+                          <Switch checkedChildren="忽略" unCheckedChildren="校验" />
+                        </Form.Item>
+                      </div>
+                    </Card>
+                  )
+                })}
+                <Button
+                  type="dashed"
+                  icon={<PlusOutlined />}
+                  onClick={() => add(buildDefaultController(fields.length + 1))}
+                  block
+                >
+                  添加控制器
+                </Button>
+              </Space>
+            )}
+          </Form.List>
         </Form>
       </Card>
 
-      <Card title="连通性测试结果">
+      <Card title={`连通性测试结果${testTarget ? `：${testTarget}` : ''}`}>
         <Table<ControllerCheck>
           rowKey="name"
           size="small"
@@ -236,6 +316,26 @@ const ControllerIntegrationPanel = () => {
             { title: '响应预览', dataIndex: 'preview', ellipsis: true, render: (value?: string) => value || '-' },
           ]}
         />
+      </Card>
+
+      <Card>
+        <Space wrap>
+          <Typography.Text>样例数据读取控制器：</Typography.Text>
+          <Select
+            style={{ minWidth: 360 }}
+            placeholder="选择控制器"
+            value={selectedControllerId}
+            options={enabledControllerOptions}
+            onChange={(value) => {
+              setSelectedControllerId(value)
+              setAssets([])
+              setOpticals([])
+              setAssetTotal(0)
+              setOpticalTotal(0)
+            }}
+          />
+          <Typography.Text type="secondary">仅展示样例数据，正式菜单会提供完整分页和筛选。</Typography.Text>
+        </Space>
       </Card>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 16 }}>

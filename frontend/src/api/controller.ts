@@ -1,6 +1,8 @@
 import request from './request'
 
 export interface ControllerSettings {
+  id: string
+  name: string
   enabled: boolean
   base_url: string
   username: string
@@ -11,6 +13,10 @@ export interface ControllerSettings {
   timeout: number
   area_type: number
   insecure: boolean
+}
+
+export interface ControllerSettingsPayload {
+  controllers: ControllerSettings[]
 }
 
 export interface ControllerCheck {
@@ -27,16 +33,16 @@ export interface ControllerTestResult {
   checks: ControllerCheck[]
 }
 
-export const getControllerSettings = () => request.get<ControllerSettings, ControllerSettings>('/controller/settings')
+export const getControllerSettings = () => request.get<ControllerSettingsPayload, ControllerSettingsPayload>('/controller/settings')
 
-export const updateControllerSettings = (payload: Partial<ControllerSettings>) =>
-  request.put<ControllerSettings, ControllerSettings>('/controller/settings', payload)
+export const updateControllerSettings = (payload: ControllerSettingsPayload) =>
+  request.put<ControllerSettingsPayload, ControllerSettingsPayload>('/controller/settings', payload)
 
 export const testController = (payload?: Partial<ControllerSettings>) =>
   request.post<ControllerTestResult, ControllerTestResult>('/controller/test', payload || {})
 
-export const getControllerAssets = (params?: { page?: number; page_size?: number; search?: string }) =>
+export const getControllerAssets = (params?: { page?: number; page_size?: number; search?: string; controller_id?: string }) =>
   request.get<any, { total: number; items: any[] }>('/controller/assets', { params })
 
-export const getControllerOpticals = (params?: { page?: number; page_size?: number; search?: string; device_ip?: string; hours?: number }) =>
+export const getControllerOpticals = (params?: { page?: number; page_size?: number; search?: string; device_ip?: string; hours?: number; controller_id?: string }) =>
   request.get<any, { total: number; items: any[] }>('/controller/opticals', { params })
