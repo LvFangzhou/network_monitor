@@ -17,7 +17,7 @@ import {
   Typography,
   message,
 } from 'antd'
-import { EyeOutlined, ReloadOutlined } from '@ant-design/icons'
+import { EyeOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import {
   getDeviceOverview,
@@ -93,6 +93,9 @@ const compareIpAddress = (left?: string, right?: string) => {
   if (leftValue !== rightValue) return leftValue - rightValue
   return String(left || '').localeCompare(String(right || ''), undefined, { numeric: true, sensitivity: 'base' })
 }
+
+const compareText = (left?: string | number | null, right?: string | number | null) =>
+  String(left ?? '').localeCompare(String(right ?? ''), 'zh-CN', { numeric: true, sensitivity: 'base' })
 
 const normalizePercent = (value?: number | null) => {
   if (value === undefined || value === null) return null
@@ -256,6 +259,42 @@ const formatDuration = (seconds?: number | null, fallback?: string | null) => {
   if (hours > 0) return `${hours}小时${minutes}分钟`
   return `${minutes}分钟`
 }
+
+const neighborColumnSearch = (
+  getValue: (record: ProtocolNeighbor) => string | number | null | undefined,
+  placeholder: string
+) => ({
+  filterDropdown: ({ setSelectedKeys, selectedKeys, confirm, clearFilters }: any) => (
+    <div style={{ padding: 8, width: 220 }} onKeyDown={(event) => event.stopPropagation()}>
+      <Input
+        autoFocus
+        allowClear
+        placeholder={placeholder}
+        value={selectedKeys[0]}
+        onChange={(event) => setSelectedKeys(event.target.value ? [event.target.value] : [])}
+        onPressEnter={() => confirm()}
+        style={{ marginBottom: 8, display: 'block' }}
+      />
+      <Space>
+        <Button type="primary" size="small" icon={<SearchOutlined />} onClick={() => confirm()}>
+          搜索
+        </Button>
+        <Button
+          size="small"
+          onClick={() => {
+            clearFilters?.()
+            confirm()
+          }}
+        >
+          重置
+        </Button>
+      </Space>
+    </div>
+  ),
+  filterIcon: (filtered: boolean) => <SearchOutlined style={{ color: filtered ? '#1677ff' : undefined }} />,
+  onFilter: (value: any, record: ProtocolNeighbor) =>
+    String(getValue(record) ?? '').toLowerCase().includes(String(value ?? '').toLowerCase()),
+})
 
 const formatSoftwareVersion = (value?: string | null) => {
   const text = String(value || '').trim()
@@ -614,11 +653,15 @@ const DeviceOverview = () => {
       dataIndex: 'peer',
       key: 'peer',
       width: 160,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareIpAddress(a.peer, b.peer),
+      ...neighborColumnSearch((record) => record.peer, '搜索邻居'),
     },
     {
       title: '状态',
       key: 'status',
       width: 120,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(a.state || a.status, b.state || b.status),
+      ...neighborColumnSearch((record) => record.state || record.status, '搜索状态'),
       render: (_: any, record: ProtocolNeighbor) => (
         <Tag color={record.status === 'up' ? 'green' : 'red'}>{record.state || record.status}</Tag>
       ),
@@ -628,6 +671,8 @@ const DeviceOverview = () => {
       dataIndex: 'interface',
       key: 'interface',
       width: 180,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(a.interface, b.interface),
+      ...neighborColumnSearch((record) => record.interface, '搜索接口'),
       render: (value: string | null) => value || '-',
     },
     {
@@ -635,12 +680,16 @@ const DeviceOverview = () => {
       dataIndex: 'remote_as',
       key: 'remote_as',
       width: 120,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(a.remote_as, b.remote_as),
+      ...neighborColumnSearch((record) => record.remote_as, '搜索 Remote AS'),
       render: (value: string | number | null) => value || '-',
     },
     {
       title: '持续时间',
       key: 'duration',
       width: 150,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => Number(a.duration_seconds || 0) - Number(b.duration_seconds || 0),
+      ...neighborColumnSearch((record) => formatDuration(record.duration_seconds, record.duration_text), '搜索持续时间'),
       render: (_: any, record: ProtocolNeighbor) => formatDuration(record.duration_seconds, record.duration_text),
     },
   ]
