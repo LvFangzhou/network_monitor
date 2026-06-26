@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   createAlertSilence,
   deleteAlertSilence,
+  getAlertSilenceMatchCounts,
   getAlertSilenceMatches,
   getAlertSilences,
   updateAlertSilence,
@@ -140,6 +141,7 @@ const AlertSilences = () => {
   const [selectedSilence, setSelectedSilence] = useState<AlertSilence | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const matchesRequestSeqRef = useRef(0)
+  const countRequestSeqRef = useRef(0)
   const [form] = Form.useForm()
   const currentUser = useAuthStore((state) => state.user)
   const navigate = useNavigate()
@@ -154,7 +156,13 @@ const AlertSilences = () => {
         include_match_counts: false,
         include_total_match_counts: false,
       })
-      setItems(result.items)
+      const nextItems = result.items.map((item) => ({
+        ...item,
+        matched_active_alerts: item.matched_active_alerts ?? null,
+        matched_total_alerts: item.matched_total_alerts ?? null,
+      }))
+      setItems(nextItems)
+      void loadMatchCounts(nextItems)
     } catch {
       message.error('获取告警屏蔽失败')
     } finally {
@@ -166,7 +174,42 @@ const AlertSilences = () => {
 
   useEffect(() => {
     fetchData()
+    return () => {
+      countRequestSeqRef.current += 1
+    }
   }, [])
+
+  const loadMatchCounts = async (silences: AlertSilence[]) => {
+    const requestSeq = countRequestSeqRef.current + 1
+    countRequestSeqRef.current = requestSeq
+    const targets = silences.filter((item) => item.id)
+    for (const silence of targets) {
+      if (requestSeq !== countRequestSeqRef.current) return
+      try {
+        const result = await getAlertSilenceMatchCounts(silence.id)
+        if (requestSeq !== countRequestSeqRef.current) return
+        if (!result.pending) {
+          setItems((prev) => prev.map((item) => (
+            item.id === silence.id
+              ? {
+                  ...item,
+                  matched_active_alerts: result.active.count ?? 0,
+                  matched_total_alerts: result.total.count ?? 0,
+                }
+              : item
+          )))
+        }
+      } catch {
+        if (requestSeq !== countRequestSeqRef.current) return
+        setItems((prev) => prev.map((item) => (
+          item.id === silence.id
+            ? { ...item, matched_active_alerts: 0, matched_total_alerts: 0 }
+            : item
+        )))
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 350))
+    }
+  }
 
   const openCreate = () => {
     setEditingItem(null)
@@ -347,8 +390,8 @@ const AlertSilences = () => {
               if (countsLoading) {
                 return (
                   <Space size={6}>
-                    <Tag color="default">点详情统计</Tag>
-                    <Tooltip title="点击后只统计这一条屏蔽规则，避免进入页面时批量扫库拖慢系统">
+                    <Tag color="processing">统计中</Tag>
+                    <Tooltip title="正在按顺序逐条统计；也可以点击查看当前规则命中明细">
                       <Button
                         type="text"
                         size="small"

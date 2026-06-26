@@ -4,6 +4,7 @@
 import hashlib
 import json
 import re
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
@@ -52,6 +53,8 @@ ALERT_HISTORY_SUMMARY_CACHE_PREFIX = "alerts:history_summary"
 ALERT_HISTORY_SUMMARY_CACHE_TTL_SECONDS = 120
 SILENCE_MATCH_CACHE_PREFIX = "alerts:silence_matches"
 SILENCE_MATCH_CACHE_TTL_SECONDS = 60
+SILENCE_MATCH_COUNT_LOCK_TTL_SECONDS = 120
+RULE_STATUS_MAX_RUNTIME_SECONDS = 6.0
 
 SEVERITY_NORMALIZATION = {
     "critical": "P0",
@@ -296,6 +299,39 @@ def _count_silence_matches_cached(db: Session, silence: AlertSilence, *, active_
     count = len(_get_silence_matched_alerts(db, silence, active_only=active_only))
     redis_client.setex(cache_key, SILENCE_MATCH_CACHE_TTL_SECONDS, str(count))
     return count
+
+
+def _silence_match_count_lock_key(silence_id: int, active_only: bool) -> str:
+    return f"{SILENCE_MATCH_CACHE_PREFIX}:lock:{silence_id}:{int(bool(active_only))}"
+
+
+def _count_silence_matches_with_lock(db: Session, silence: AlertSilence, *, active_only: bool) -> Dict[str, Any]:
+    cache_key = _silence_match_count_cache_key(silence, active_only)
+    cached = redis_client.get(cache_key)
+    if cached is not None:
+        try:
+            return {"count": int(cached), "cached": True, "pending": False}
+        except (TypeError, ValueError):
+            pass
+
+    lock_key = _silence_match_count_lock_key(silence.id, active_only)
+    lock_token = str(time.time())
+    if not redis_client.set(lock_key, lock_token, ex=SILENCE_MATCH_COUNT_LOCK_TTL_SECONDS, nx=True):
+        return {"count": None, "cached": False, "pending": True}
+
+    try:
+        count = len(_get_silence_matched_alerts(db, silence, active_only=active_only))
+        redis_client.setex(cache_key, SILENCE_MATCH_CACHE_TTL_SECONDS * 10, str(count))
+        return {"count": count, "cached": False, "pending": False}
+    finally:
+        try:
+            current = redis_client.get(lock_key)
+            if isinstance(current, bytes):
+                current = current.decode()
+            if current == lock_token:
+                redis_client.delete(lock_key)
+        except Exception:
+            pass
 
 
 def _clear_silence_match_cache() -> None:
@@ -597,6 +633,7 @@ def get_alert_rule_status(
     status: Optional[str] = Query(None, description="normal / alert / no_data"),
     limit: int = Query(500, ge=1, le=2000),
     refresh: bool = Query(False, description="是否绕过缓存重新评估"),
+    max_runtime_seconds: float = Query(RULE_STATUS_MAX_RUNTIME_SECONDS, ge=1, le=30, description="单次实时评估最大耗时预算"),
 ):
     """实时评估某条告警规则，展示正常、异常和无数据对象。"""
     rule = db.query(AlertRule).filter(AlertRule.id == rule_id).first()
@@ -630,7 +667,12 @@ def get_alert_rule_status(
 
     items = []
     summary = {"total": 0, "normal": 0, "alert": 0, "no_data": 0}
+    started_at = time.monotonic()
+    partial = False
     for device in devices:
+        if time.monotonic() - started_at > max_runtime_seconds:
+            partial = True
+            break
         try:
             targets = _get_metric_targets(db, device, rule.metric_type, rule.extra_config or {})
         except Exception as exc:
@@ -660,6 +702,9 @@ def get_alert_rule_status(
             continue
 
         for target in targets:
+            if time.monotonic() - started_at > max_runtime_seconds:
+                partial = True
+                break
             value = target.get("value")
             current_status = "no_data"
             is_alert = False
@@ -690,13 +735,16 @@ def get_alert_rule_status(
                 "message": "触发告警" if is_alert else "正常",
             }
             items.append(row)
+        if partial:
+            break
 
     payload = {
         "rule": _serialize_rule(rule),
         "summary": summary,
         "items": items,
         "limit": limit,
-        "truncated": len(items) >= limit and summary["total"] > limit,
+        "truncated": partial or (len(items) >= limit and summary["total"] > limit),
+        "partial": partial,
         "evaluated_at": _utc_now(),
         "cached": False,
         "cache_ttl_seconds": RULE_STATUS_CACHE_TTL_SECONDS,
@@ -710,6 +758,29 @@ def get_alert_rule_status(
     except Exception as exc:
         logger.warning("写入规则状态缓存失败", rule_id=rule.id, error=str(exc))
     return payload
+
+
+@router.get("/silences/{silence_id}/match-counts", response_model=dict)
+async def get_alert_silence_match_counts(
+    silence_id: int,
+    db: Session = Depends(get_db),
+):
+    """计算单条告警屏蔽命中数量。
+
+    前端会低并发逐条调用，避免进入列表时并发扫全量告警历史。
+    """
+    silence = db.query(AlertSilence).filter(AlertSilence.id == silence_id).first()
+    if not silence:
+        raise HTTPException(status_code=404, detail="告警屏蔽不存在")
+
+    active = _count_silence_matches_with_lock(db, silence, active_only=True)
+    total = _count_silence_matches_with_lock(db, silence, active_only=False)
+    return {
+        "silence_id": silence.id,
+        "active": active,
+        "total": total,
+        "pending": bool(active.get("pending") or total.get("pending")),
+    }
 
 
 @router.post("/rules", response_model=dict, status_code=status.HTTP_201_CREATED)

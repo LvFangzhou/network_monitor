@@ -193,7 +193,7 @@ const AlertRules = () => {
       const result = await getAlertRuleStatus(rule.id, {
         search: nextSearch.trim() || undefined,
         status: nextStatus,
-        limit: 1000,
+        limit: 200,
         refresh: forceRefresh || undefined,
       })
       ruleStatusCacheRef.current.set(cacheKey, { data: result, cachedAt: Date.now() })
@@ -575,7 +575,7 @@ const AlertRules = () => {
             <Tag color="green">{`正常 ${ruleStatus?.summary.normal ?? 0}`}</Tag>
             <Tag color="red">{`异常 ${ruleStatus?.summary.alert ?? 0}`}</Tag>
             <Tag>{`无数据 ${ruleStatus?.summary.no_data ?? 0}`}</Tag>
-            {ruleStatus?.truncated ? <Tag color="gold">结果已截断</Tag> : null}
+            {ruleStatus?.partial || ruleStatus?.truncated ? <Tag color="gold">已优先加载首屏，结果可能为部分数据</Tag> : null}
             {ruleStatus?.cached ? <Tag color="cyan">缓存</Tag> : null}
           </Space>
           <Space wrap>

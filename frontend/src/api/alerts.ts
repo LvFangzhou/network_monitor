@@ -158,6 +158,7 @@ export interface AlertRuleStatusResponse {
   items: AlertRuleStatusItem[]
   limit: number
   truncated: boolean
+  partial?: boolean
   evaluated_at: string
   cached?: boolean
   cache_ttl_seconds?: number
@@ -303,6 +304,22 @@ export const getAlertSilenceMatches = async (
     total_exact?: boolean
     items: AlertHistory[]
     rule_filters?: Array<{ text: string; value: string }>
+  }
+}
+
+export const getAlertSilenceMatchCounts = async (
+  id: number
+): Promise<{
+  silence_id: number
+  active: { count: number | null; cached: boolean; pending: boolean }
+  total: { count: number | null; cached: boolean; pending: boolean }
+  pending: boolean
+}> => {
+  return await request.get(`/alerts/silences/${id}/match-counts`) as {
+    silence_id: number
+    active: { count: number | null; cached: boolean; pending: boolean }
+    total: { count: number | null; cached: boolean; pending: boolean }
+    pending: boolean
   }
 }
 
