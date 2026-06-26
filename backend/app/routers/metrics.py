@@ -1234,16 +1234,17 @@ def _get_snmp_protocol_neighbors(device_id: int) -> Dict[str, List[Dict[str, Any
       |> sort(columns: ["_time"], desc: true)
     '''
     rows = influx_client.query(flux)
-    grouped: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    grouped: Dict[tuple[str, str, str], List[Dict[str, Any]]] = {}
     for row in rows:
         protocol = str(row.get("protocol") or "").lower()
         if protocol not in {"bgp", "ospf"}:
             continue
         peer = str(row.get("peer") or "")
-        grouped.setdefault((protocol, peer), []).append(row)
+        instance = str(row.get("instance") or "")
+        grouped.setdefault((protocol, peer, instance), []).append(row)
 
     result: Dict[str, List[Dict[str, Any]]] = {"bgp": [], "ospf": []}
-    for (protocol, peer), protocol_rows in grouped.items():
+    for (protocol, peer, instance), protocol_rows in grouped.items():
         latest = protocol_rows[0]
         latest_state = str(latest.get("state_text") or "")
         latest_value = _safe_float(latest.get("value"))
@@ -1261,6 +1262,7 @@ def _get_snmp_protocol_neighbors(device_id: int) -> Dict[str, List[Dict[str, Any
             "neighbor": peer,
             "remote_as": None,
             "interface": None,
+            "instance": instance or None,
             "state": latest_state or "-",
             "status": "up" if is_up else "down",
             "duration_seconds": _duration_from_time(duration_anchor),

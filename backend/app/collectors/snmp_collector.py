@@ -173,6 +173,9 @@ class SNMPCollector(LoggerMixin):
         "bgp_state_oids": [
             "1.3.6.1.2.1.15.3.1.2",
         ],
+        "bgp_contexts": [
+            "bgp-underlay",
+        ],
         "entity_class_oid": "1.3.6.1.2.1.47.1.1.1.1.5",
         "entity_name_oid": "1.3.6.1.2.1.47.1.1.1.1.7",
     }
@@ -295,7 +298,7 @@ class SNMPCollector(LoggerMixin):
             return self.snmp_get(device, f"{oid}.0")
         return None
 
-    def _build_snmp_command(self, tool: str, device: Any, oid: str) -> List[str]:
+    def _build_snmp_command(self, tool: str, device: Any, oid: str, context_name: Optional[str] = None) -> List[str]:
         version = (device.snmp_version or "v2c").lower()
         port = str(device.snmp_port or settings.SNMP_DEFAULT_PORT)
         agent = f"{device.ip_address}:{port}"
@@ -322,6 +325,9 @@ class SNMPCollector(LoggerMixin):
         else:
             community = device.snmp_community or "para@2026"
             base_command.extend(["-c", community])
+
+        if context_name:
+            base_command.extend(["-n", context_name])
 
         base_command.extend([agent, oid])
         return base_command
@@ -361,7 +367,7 @@ class SNMPCollector(LoggerMixin):
 
         return normalized
 
-    def _run_snmp_command(self, command: List[str], device: Any) -> Optional[str]:
+    def _run_snmp_command(self, command: List[str], device: Any, quiet_no_such: bool = False) -> Optional[str]:
         try:
             result = subprocess.run(
                 command,
@@ -382,6 +388,14 @@ class SNMPCollector(LoggerMixin):
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
             if stderr:
+                harmless_markers = [
+                    "No Such Instance",
+                    "No Such Object",
+                    "No more variables left",
+                    "No Such Instance currently exists",
+                ]
+                if quiet_no_such and any(marker in stderr for marker in harmless_markers):
+                    return ""
                 self.logger.warning(f"SNMP命令失败: {stderr}", device=device.ip_address, command=command[0])
             return ""
 
@@ -391,7 +405,7 @@ class SNMPCollector(LoggerMixin):
         """使用 net-snmp 获取完整文本值，保留多行 sysDescr。"""
         command = [part for part in self._build_snmp_command("snmpget", device, oid) if part != "-On"]
         command.insert(1, "-Oqv")
-        output = self._run_snmp_command(command, device)
+        output = self._run_snmp_command(command, device, quiet_no_such=True)
         if output is None:
             value = self.snmp_get(device, oid)
             return str(value).strip() if value is not None else None
@@ -443,9 +457,9 @@ class SNMPCollector(LoggerMixin):
         
         return target, auth_data
     
-    def snmp_get(self, device: Any, oid: str) -> Optional[Any]:
+    def snmp_get(self, device: Any, oid: str, context_name: Optional[str] = None) -> Optional[Any]:
         """执行SNMP GET操作"""
-        command = self._build_snmp_command("snmpget", device, oid)
+        command = self._build_snmp_command("snmpget", device, oid, context_name=context_name)
         output = self._run_snmp_command(command, device)
         if output is not None:
             if not output.strip():
@@ -464,7 +478,7 @@ class SNMPCollector(LoggerMixin):
                 SnmpEngine(),
                 auth,
                 target,
-                ContextData(),
+                ContextData(contextName=context_name or ""),
                 ObjectType(ObjectIdentity(oid))
             )
             
@@ -486,10 +500,10 @@ class SNMPCollector(LoggerMixin):
             self.logger.error(f"SNMP GET异常: {e}", device=device.ip_address)
             return None
     
-    def snmp_walk(self, device: Any, oid: str) -> List[Tuple[str, Any]]:
+    def snmp_walk(self, device: Any, oid: str, context_name: Optional[str] = None) -> List[Tuple[str, Any]]:
         """执行SNMP WALK操作"""
         results = []
-        command = self._build_snmp_command("snmpbulkwalk", device, oid)
+        command = self._build_snmp_command("snmpbulkwalk", device, oid, context_name=context_name)
         output = self._run_snmp_command(command, device)
         if output is not None:
             if not output.strip():
@@ -508,7 +522,7 @@ class SNMPCollector(LoggerMixin):
                 SnmpEngine(),
                 auth,
                 target,
-                ContextData(),
+                ContextData(contextName=context_name or ""),
                 ObjectType(ObjectIdentity(oid)),
                 lexicographicMode=False
             ):
@@ -528,9 +542,9 @@ class SNMPCollector(LoggerMixin):
             self.logger.error(f"SNMP WALK异常: {e}", device=device.ip_address)
             return []
 
-    def _walk_indexed_map(self, device: Any, oid: str, cast=None) -> Dict[str, Any]:
+    def _walk_indexed_map(self, device: Any, oid: str, cast=None, context_name: Optional[str] = None) -> Dict[str, Any]:
         results = {}
-        for item_oid, value in self.snmp_walk(device, oid):
+        for item_oid, value in self.snmp_walk(device, oid, context_name=context_name):
             if item_oid == oid or item_oid.lstrip(".") == oid.lstrip("."):
                 continue
             normalized_oid = item_oid.lstrip(".")
@@ -753,6 +767,17 @@ class SNMPCollector(LoggerMixin):
             bgp_state_oids = [bgp_state_oids]
         for oid in bgp_state_oids:
             bgp_state_map.update(self._walk_indexed_map(device, str(oid), int))
+        bgp_context_maps: Dict[Tuple[str, str], int] = {}
+        bgp_contexts = private_oids.get("bgp_contexts") or []
+        if isinstance(bgp_contexts, str):
+            bgp_contexts = [bgp_contexts]
+        for context_name in bgp_contexts:
+            context = str(context_name or "").strip()
+            if not context:
+                continue
+            for oid in bgp_state_oids:
+                for index, state in self._walk_indexed_map(device, str(oid), int, context_name=context).items():
+                    bgp_context_maps[(context, index)] = state
         bgp_state_text = {
             1: "idle",
             2: "connect",
@@ -770,6 +795,24 @@ class SNMPCollector(LoggerMixin):
                     "device_name": device.name,
                     "protocol": "bgp",
                     "peer": peer,
+                    "state_text": bgp_state_text.get(state, str(state)),
+                },
+                "fields": {
+                    "state_value": float(state),
+                    "state_up": 1.0 if state == 6 else 0.0,
+                },
+                "timestamp": now,
+            })
+        for (context_name, index), state in bgp_context_maps.items():
+            peer = self._extract_peer_from_index(index)
+            points.append({
+                "measurement": "protocol_status",
+                "tags": {
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                    "protocol": "bgp",
+                    "peer": peer,
+                    "instance": context_name,
                     "state_text": bgp_state_text.get(state, str(state)),
                 },
                 "fields": {
