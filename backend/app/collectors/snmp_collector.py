@@ -165,11 +165,15 @@ class SNMPCollector(LoggerMixin):
 
     DENSIVELO_PRIVATE_OIDS = {
         # S9867/DensiveloOS exposes a Yillion private tree under 1.3.6.1.4.1.64812.
-        # The currently available H3C 9867 documents only cover standard MIBs
-        # (IF-MIB/BGP4-MIB/ENTITY-MIB, etc.), so do not reuse legacy H3C 25506
-        # CPU/memory/environment OIDs here. Device-specific 64812 resource OIDs
-        # can be added through custom_fields.snmp_private_oids when the private
-        # MIB object names are available.
+        # The 03-设备管理 MIB bundle documents several legacy hh3cyldc objects under
+        # 1.3.6.1.4.1.2550664812, but field checks on S9867-128DH show that tree is
+        # not exposed by the current agent view. Keep resource collection on
+        # verified standard OIDs until a matching 64812 resource MIB is available.
+        #
+        # S9867 ports expose 64-bit IF-MIB HC counters. In high-frequency interface
+        # sampling, avoid the extra 32-bit ifInOctets/ifOutOctets walks unless a
+        # device-specific override disables this flag.
+        "skip_32bit_interface_counters": True,
         "bgp_state_oids": [
             "1.3.6.1.2.1.15.3.1.2",
         ],
@@ -944,13 +948,13 @@ class SNMPCollector(LoggerMixin):
     ) -> Dict[str, Any]:
         """批量采集接口历史监控数据，并基于上一次快照计算速率"""
         suppress_rate_interface_names = suppress_rate_interface_names or set()
+        private_oids = self._get_private_oid_config(device)
+        skip_32bit_counters = bool(private_oids.get("skip_32bit_interface_counters"))
         walk_jobs = {
             "if_name_map": ("1.3.6.1.2.1.31.1.1.1.1", str),
             "if_descr_map": ("1.3.6.1.2.1.2.2.1.2", str),
             "in_octets_64_map": ("1.3.6.1.2.1.31.1.1.1.6", int),
             "out_octets_64_map": ("1.3.6.1.2.1.31.1.1.1.10", int),
-            "in_octets_32_map": ("1.3.6.1.2.1.2.2.1.10", int),
-            "out_octets_32_map": ("1.3.6.1.2.1.2.2.1.16", int),
             "high_speed_map": ("1.3.6.1.2.1.31.1.1.1.15", int),
             "speed_map": ("1.3.6.1.2.1.2.2.1.5", int),
             "admin_status_map": ("1.3.6.1.2.1.2.2.1.7", int),
@@ -963,6 +967,11 @@ class SNMPCollector(LoggerMixin):
             "in_broadcast_map": ("1.3.6.1.2.1.31.1.1.1.3", int),
             "out_broadcast_map": ("1.3.6.1.2.1.31.1.1.1.5", int),
         }
+        if not skip_32bit_counters:
+            walk_jobs.update({
+                "in_octets_32_map": ("1.3.6.1.2.1.2.2.1.10", int),
+                "out_octets_32_map": ("1.3.6.1.2.1.2.2.1.16", int),
+            })
 
         with ThreadPoolExecutor(max_workers=len(walk_jobs)) as executor:
             futures = {
@@ -988,15 +997,17 @@ class SNMPCollector(LoggerMixin):
         now_ts = time.time()
         points = []
         monitored_count = 0
+        in_octets_32_map = walk_results.get("in_octets_32_map", {})
+        out_octets_32_map = walk_results.get("out_octets_32_map", {})
 
         for index in indexes:
             name = walk_results["if_name_map"].get(index) or walk_results["if_descr_map"].get(index) or f"if{index}"
             current_in = walk_results["in_octets_64_map"].get(index)
             current_out = walk_results["out_octets_64_map"].get(index)
             if current_in is None:
-                current_in = walk_results["in_octets_32_map"].get(index)
+                current_in = in_octets_32_map.get(index)
             if current_out is None:
-                current_out = walk_results["out_octets_32_map"].get(index)
+                current_out = out_octets_32_map.get(index)
 
             high_speed = walk_results["high_speed_map"].get(index)
             speed = walk_results["speed_map"].get(index)
