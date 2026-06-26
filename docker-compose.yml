@@ -161,13 +161,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
-      - SNMP_MAX_DEVICES_PER_TICK=200
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - ASTERNOS_MAX_DEVICES_PER_TICK=100
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=30
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=40
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_MAX_DEVICES_PER_TICK=20
       - LOG_LEVEL=INFO
       - LOG_FORMAT=json
     volumes:
@@ -221,13 +221,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
-      - SNMP_MAX_DEVICES_PER_TICK=200
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - ASTERNOS_MAX_DEVICES_PER_TICK=100
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=30
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=40
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_MAX_DEVICES_PER_TICK=20
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -270,13 +270,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
-      - SNMP_MAX_DEVICES_PER_TICK=200
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - ASTERNOS_MAX_DEVICES_PER_TICK=100
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=30
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=40
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_MAX_DEVICES_PER_TICK=20
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -335,13 +335,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
-      - SNMP_MAX_DEVICES_PER_TICK=200
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - ASTERNOS_MAX_DEVICES_PER_TICK=100
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=30
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=40
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_MAX_DEVICES_PER_TICK=20
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -365,7 +365,7 @@ services:
   celery-worker-asternos-realtime:
     build: ./backend
     container_name: nm-celery-worker-asternos-realtime
-    command: celery -A app.tasks worker -l info -Q asternos_realtime -n worker-asternos-realtime@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q asternos_realtime -n worker-asternos-realtime@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -389,13 +389,13 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
-      - SNMP_MAX_DEVICES_PER_TICK=200
-      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=5
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - ASTERNOS_MAX_DEVICES_PER_TICK=100
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=30
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=40
+      - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_MAX_DEVICES_PER_TICK=20
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -419,7 +419,7 @@ services:
   celery-worker-snmp:
     build: ./backend
     container_name: nm-celery-worker-snmp
-    command: celery -A app.tasks worker -l info -Q snmp_realtime -n worker-snmp@%h --pool=threads -c 32 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q snmp_realtime -n worker-snmp@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -443,9 +443,9 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=200
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=30
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_MAX_DEVICES_PER_TICK=40
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -469,7 +469,7 @@ services:
   celery-worker-snmp-circuit:
     build: ./backend
     container_name: nm-celery-worker-snmp-circuit
-    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
+    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -493,10 +493,10 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=guest
       - RABBITMQ_PASSWORD=guest
-      - SNMP_SCHEDULER_INTERVAL_SECONDS=5
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=60
-      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=15
-      - SNMP_MAX_DEVICES_PER_TICK=200
+      - SNMP_SCHEDULER_INTERVAL_SECONDS=30
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - SNMP_MAX_DEVICES_PER_TICK=40
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app

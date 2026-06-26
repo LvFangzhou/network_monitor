@@ -13,7 +13,7 @@ ASTERNOS_TASK_EXPIRES_SECONDS = max(1.0, ASTERNOS_SCHEDULER_INTERVAL_SECONDS - 1
 # 定时任务配置
 beat_schedule = {
     # SNMP全量采集调度 - 按配置分桶调度，避免 Beat 间隔和分桶间隔不一致导致部分桶永远扫不到。
-    'collect-snmp-every-10s': {
+    'collect-snmp-every-30s': {
         'task': 'app.tasks.snmp_tasks.collect_all_snmp',
         'schedule': SNMP_SCHEDULER_INTERVAL_SECONDS,
         'options': {
@@ -21,7 +21,7 @@ beat_schedule = {
         }
     },
     # SNMP接口高频采集 - 端口出入流量独立高频轮询，不受15分钟全量资源采集影响
-    'collect-snmp-interface-realtime-every-10s': {
+    'collect-snmp-interface-realtime-every-30s': {
         'task': 'app.tasks.snmp_tasks.collect_all_snmp_interface_realtime',
         'schedule': SNMP_SCHEDULER_INTERVAL_SECONDS,
         'options': {
@@ -29,21 +29,21 @@ beat_schedule = {
         }
     },
     # 线路绑定端口轻量采集 - 重点公网/专线端口保持10秒级曲线
-    'collect-circuit-interface-realtime-every-10s': {
+    'collect-circuit-interface-realtime-every-30s': {
         'task': 'app.tasks.snmp_tasks.collect_circuit_interface_realtime',
         'schedule': SNMP_SCHEDULER_INTERVAL_SECONDS,
         'options': {
             'expires': SNMP_TASK_EXPIRES_SECONDS,
         }
     },
-    'collect-asternos-interface-realtime-every-10s': {
+    'collect-asternos-interface-realtime-every-30s': {
         'task': 'app.tasks.snmp_tasks.collect_all_asternos_interface_realtime',
         'schedule': ASTERNOS_SCHEDULER_INTERVAL_SECONDS,
         'options': {
             'expires': ASTERNOS_TASK_EXPIRES_SECONDS,
         }
     },
-    'collect-asternos-exporter-every-10s': {
+    'collect-asternos-exporter-every-30s': {
         'task': 'app.tasks.snmp_tasks.collect_all_asternos_exporter',
         'schedule': ASTERNOS_SCHEDULER_INTERVAL_SECONDS,
         'options': {
@@ -83,30 +83,30 @@ beat_schedule = {
         }
     },
     
-    # 关键接口告警检查 - 每10秒执行一次，保障端口类告警10-30秒内触达
-    'check-fast-alerts-every-10s': {
+    # 关键接口告警检查 - 每30秒执行一次，避免采集/告警检查重叠导致页面卡顿
+    'check-fast-alerts-every-30s': {
         'task': 'app.tasks.alert_tasks.check_fast_alerts',
-        'schedule': 10.0,
+        'schedule': 30.0,
         'options': {
-            'expires': 8.0,
+            'expires': 25.0,
         }
     },
 
-    # 协议邻居告警检查 - 每30秒执行一次，不被慢速Exporter规则拖住
-    'check-protocol-alerts-every-30s': {
+    # 协议邻居告警检查 - 每60秒执行一次，不被慢速Exporter规则拖住
+    'check-protocol-alerts-every-60s': {
         'task': 'app.tasks.alert_tasks.check_protocol_alerts',
-        'schedule': 30.0,
+        'schedule': 60.0,
         'options': {
-            'expires': 25.0,
+            'expires': 50.0,
         }
     },
 
-    # 设备基础健康告警检查 - 每30秒执行一次，避免CPU/内存/温度恢复被全量慢规则拖住
-    'check-device-health-alerts-every-30s': {
+    # 设备基础健康告警检查 - 每60秒执行一次，避免CPU/内存/温度恢复被全量慢规则拖住
+    'check-device-health-alerts-every-60s': {
         'task': 'app.tasks.alert_tasks.check_device_health_alerts',
-        'schedule': 30.0,
+        'schedule': 60.0,
         'options': {
-            'expires': 25.0,
+            'expires': 50.0,
         }
     },
 
