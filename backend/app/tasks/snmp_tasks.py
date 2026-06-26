@@ -721,6 +721,50 @@ def _get_device_status(device_id: int) -> str:
     return redis_client.get(_device_status_key(device_id)) or SNMP_STATUS_UNKNOWN
 
 
+def _write_snmp_reachability(device: Device, reachable: bool, failures: int = 0) -> None:
+    if not device or not device.id or not device.ip_address:
+        return
+    try:
+        influx_client.write_point(
+            measurement="snmp_reachability",
+            tags={
+                "device_id": str(device.id),
+                "device_name": device.name,
+                "device_ip": device.ip_address,
+            },
+            fields={
+                "reachable": 1.0 if reachable else 0.0,
+                "failures": float(failures or 0),
+            },
+            timestamp=datetime.utcnow(),
+            sync=False,
+        )
+    except Exception as exc:
+        logger.warning("写入SNMP可达性指标失败", device_id=getattr(device, "id", None), error=str(exc))
+
+
+def _write_exporter_reachability(device: Optional[Device], reachable: bool, error: Optional[str] = None) -> None:
+    if not device or not device.id or not device.ip_address:
+        return
+    fields: Dict[str, Any] = {"reachable": 1.0 if reachable else 0.0}
+    if error:
+        fields["error"] = str(error)[:500]
+    try:
+        influx_client.write_point(
+            measurement="exporter_reachability",
+            tags={
+                "device_id": str(device.id),
+                "device_name": device.name,
+                "device_ip": device.ip_address,
+            },
+            fields=fields,
+            timestamp=datetime.utcnow(),
+            sync=False,
+        )
+    except Exception as exc:
+        logger.warning("写入Exporter可达性指标失败", device_id=getattr(device, "id", None), error=str(exc))
+
+
 def _mark_device_reachable(device_id: int) -> None:
     redis_client.set(_device_status_key(device_id), SNMP_STATUS_REACHABLE)
     redis_client.delete(_device_failure_key(device_id))
@@ -738,6 +782,20 @@ def _record_device_failure(device_id: int) -> int:
 
 def _clear_device_failure_state(device_id: int) -> None:
     _mark_device_reachable(device_id)
+
+
+def _clear_device_failure_state_for_device(device: Device) -> None:
+    _mark_device_reachable(device.id)
+    _write_snmp_reachability(device, True, 0)
+
+
+def _record_device_failure_for_device(device: Device) -> int:
+    failures = _record_device_failure(device.id)
+    if failures >= SNMP_FAILURE_THRESHOLD:
+        _write_snmp_reachability(device, False, failures)
+    else:
+        _write_snmp_reachability(device, True, failures)
+    return failures
 
 
 def _snmp_is_reachable(device: Device) -> bool:
@@ -891,6 +949,7 @@ def collect_snmp_for_device(self, device_id: int):
         device_id: 设备ID
     """
     db = SessionLocal()
+    device: Optional[Device] = None
     try:
         if not redis_client.exists(_device_lock_key(device_id)):
             _try_lock_device(device_id)
@@ -947,7 +1006,7 @@ def collect_snmp_for_device(self, device_id: int):
             + int(optical_result.get("points_written") or 0)
         )
         if total_points_written == 0 and not _snmp_is_reachable(device):
-            failures = _record_device_failure(device_id)
+            failures = _record_device_failure_for_device(device)
             logger.warning(
                 "SNMP采集无数据且连通性验证失败",
                 device_id=device_id,
@@ -968,7 +1027,7 @@ def collect_snmp_for_device(self, device_id: int):
                 "optical_points_written": 0,
             }
 
-        _clear_device_failure_state(device_id)
+        _clear_device_failure_state_for_device(device)
 
         memory = result.get("memory") or {}
         sessions = result.get("sessions") or {}
@@ -1027,7 +1086,12 @@ def collect_snmp_for_device(self, device_id: int):
         
     except Exception as exc:
         logger.error("SNMP采集失败", device_id=device_id, error=str(exc))
-        failures = _record_device_failure(device_id)
+        if device is None:
+            try:
+                device = db.query(Device).filter(Device.id == device_id).first()
+            except Exception:
+                device = None
+        failures = _record_device_failure_for_device(device) if device else _record_device_failure(device_id)
         return {
             "device_id": device_id,
             "success": False,
@@ -1209,6 +1273,7 @@ def collect_all_snmp_interface_realtime():
 def collect_asternos_for_device(self, device_id: int):
     """采集单台 AsterNOS Exporter 设备，并缓存总览/端口/邻居快照。"""
     db = SessionLocal()
+    device: Optional[Device] = None
     try:
         if not redis_client.exists(_asternos_lock_key(device_id)):
             _try_lock_asternos_device(device_id)
@@ -1268,6 +1333,7 @@ def collect_asternos_for_device(self, device_id: int):
         _set_monitor_cache("overview", device.id, overview)
         _set_monitor_cache("protocol_neighbors", device.id, {"neighbors": neighbors, "collected_at": collected_at})
         redis_client.set(f"asternos_collect:status:{device.id}", "reachable")
+        _write_exporter_reachability(device, True)
 
         return {
             "device_id": device.id,
@@ -1278,6 +1344,12 @@ def collect_asternos_for_device(self, device_id: int):
     except Exception as exc:
         logger.error("AsterNOS Exporter采集失败", device_id=device_id, error=str(exc))
         redis_client.set(f"asternos_collect:status:{device_id}", "unreachable")
+        if device is None:
+            try:
+                device = db.query(Device).filter(Device.id == device_id).first()
+            except Exception:
+                device = None
+        _write_exporter_reachability(device, False, str(exc))
         cache_key = _monitor_cache_key("overview", device_id)
         cached_raw = redis_client.get(cache_key)
         cached_overview = None
@@ -1609,10 +1681,10 @@ def verify_snmp_reachability(self, device_id: int):
 
         reachable = _snmp_is_reachable(device)
         if reachable:
-            _mark_device_reachable(device_id)
+            _clear_device_failure_state_for_device(device)
             return {"device_id": device_id, "verified": True, "reachable": True}
 
-        failures = _record_device_failure(device_id)
+        failures = _record_device_failure_for_device(device)
         return {
             "device_id": device_id,
             "verified": True,

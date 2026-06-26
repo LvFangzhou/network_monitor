@@ -340,11 +340,11 @@ def _format_snooze_until(value: datetime) -> str:
 
 
 def _validate_rule_logic(metric_type: Optional[str], condition: Optional[str], threshold: Optional[float]) -> None:
-    if metric_type != "device_reachability":
+    if metric_type not in DEVICE_REACHABILITY_METRIC_TYPES:
         return
     if condition is None or threshold is None:
         return
-    # device_reachability: 1 = reachable, 0 = unreachable
+    # reachability metrics: 1 = reachable, 0 = unreachable
     # Unreachable alarms should use < 1 / <= 0 / == 0 to avoid impossible matches.
     if condition in {">", ">="} and float(threshold) >= 1:
         raise HTTPException(
@@ -412,10 +412,35 @@ def _get_rule_applicable_devices(db: Session, rule: AlertRule) -> List[Device]:
     else:
         devices = db.query(Device).all()
 
-    if rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
+    if rule.metric_type == "device_reachability":
         return [
             device for device in devices
             if device.is_monitored and device.status in {"active", "online"} and device.ip_address
+        ]
+    if rule.metric_type == "snmp_reachability":
+        return [
+            device for device in devices
+            if device.is_monitored
+            and device.status in {"active", "online"}
+            and device.ip_address
+            and device.snmp_version
+            and (device.monitor_source == "snmp" or device.monitor_source is None)
+        ]
+    if rule.metric_type == "exporter_reachability":
+        return [
+            device for device in devices
+            if device.is_monitored
+            and device.status in {"active", "online"}
+            and device.ip_address
+            and _get_effective_monitor_source(device) == "asternos_exporter"
+        ]
+    if rule.metric_type == "telemetry_reachability":
+        return [
+            device for device in devices
+            if device.is_monitored
+            and device.status in {"active", "online"}
+            and device.ip_address
+            and int(device.gnmi_enabled or 0) == 1
         ]
     if rule.metric_type in INTERFACE_METRIC_TYPES or rule.metric_type in CIRCUIT_METRIC_TYPES:
         return [

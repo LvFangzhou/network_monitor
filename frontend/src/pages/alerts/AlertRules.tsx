@@ -49,7 +49,10 @@ const metricOptions = [
   { value: 'snmp_dnat_server_status', label: 'DNAT 服务器状态' },
   { value: 'snmp_slb_virtual_server_status', label: 'SLB 虚拟服务状态' },
   { value: 'device_status', label: '设备状态' },
-  { value: 'device_reachability', label: '设备可达状态（30秒 ICMP / 5 包）' },
+  { value: 'device_reachability', label: 'Ping 可达状态（30秒 ICMP / 5 包）' },
+  { value: 'snmp_reachability', label: 'SNMP 可达状态' },
+  { value: 'exporter_reachability', label: 'Exporter 可达状态' },
+  { value: 'telemetry_reachability', label: 'Telemetry 可达状态' },
   { value: 'interface_oper_status', label: '接口 up/down 状态' },
   { value: 'interface_admin_up_oper_down', label: '接口 admin up 但物理 down' },
   { value: 'interface_in_errors_delta', label: '接口入错包增量' },
@@ -402,7 +405,7 @@ const AlertRules = () => {
   }
 
   const applyMetricDefaults = (metricType?: string) => {
-    if (metricType === 'device_reachability') {
+    if (['device_reachability', 'snmp_reachability', 'exporter_reachability', 'telemetry_reachability'].includes(metricType || '')) {
       form.setFieldsValue({
         condition: '<',
         threshold: 1,
@@ -683,7 +686,7 @@ const AlertRules = () => {
           <Form.Item
             name="metric_type"
             label="监控指标"
-            extra={form.getFieldValue('metric_type') === 'device_reachability' ? '设备可达状态：1=可达，0=不可达。推荐条件填写为 “< 1”。' : undefined}
+            extra={['device_reachability', 'snmp_reachability', 'exporter_reachability', 'telemetry_reachability'].includes(form.getFieldValue('metric_type')) ? '可达状态：1=可达，0=不可达。推荐条件填写为 “< 1”。' : undefined}
             rules={[{ required: true, message: '请选择指标' }]}
           >
             <Select options={metricOptions} />

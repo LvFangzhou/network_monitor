@@ -118,6 +118,9 @@ CIRCUIT_METRIC_TYPES = {
 
 DEVICE_REACHABILITY_METRIC_TYPES = {
     "device_reachability",
+    "snmp_reachability",
+    "exporter_reachability",
+    "telemetry_reachability",
 }
 
 PROTOCOL_METRIC_TYPES = {
@@ -1190,10 +1193,35 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
         # 应用到所有设备
         devices = db.query(Device).all()
 
-    if rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
+    if rule.metric_type == "device_reachability":
         devices = [
             device for device in devices
             if device.is_monitored and device.status in {"active", "online"} and device.ip_address
+        ]
+    elif rule.metric_type == "snmp_reachability":
+        devices = [
+            device for device in devices
+            if device.is_monitored
+            and device.status in {"active", "online"}
+            and device.ip_address
+            and device.snmp_version
+            and (device.monitor_source == "snmp" or device.monitor_source is None)
+        ]
+    elif rule.metric_type == "exporter_reachability":
+        devices = [
+            device for device in devices
+            if device.is_monitored
+            and device.status in {"active", "online"}
+            and device.ip_address
+            and _get_effective_monitor_source(device) == "asternos_exporter"
+        ]
+    elif rule.metric_type == "telemetry_reachability":
+        devices = [
+            device for device in devices
+            if device.is_monitored
+            and device.status in {"active", "online"}
+            and device.ip_address
+            and int(device.gnmi_enabled or 0) == 1
         ]
     elif rule.metric_type in INTERFACE_METRIC_TYPES or rule.metric_type in CIRCUIT_METRIC_TYPES:
         devices = [
@@ -2421,6 +2449,9 @@ def _get_metric_value(db: Session, device_id: int, metric_type: str, extra_confi
             "snmp_session_queue_full_drop_delta": ("snmp_system", None, "pending_session_queue_full_drop"),
             "device_status": ("device_status", None, "status"),
             "device_reachability": ("device_reachability", None, "reachable"),
+            "snmp_reachability": ("snmp_reachability", None, "reachable"),
+            "exporter_reachability": ("exporter_reachability", None, "reachable"),
+            "telemetry_reachability": ("telemetry_reachability", None, "reachable"),
             "interface_oper_status": ("interface_monitoring", None, "oper_status"),
             "interface_admin_up_oper_down": ("interface_monitoring", None, "admin_up_oper_down"),
             "interface_in_errors_delta": ("interface_monitoring", None, "in_errors_delta"),
@@ -2691,7 +2722,10 @@ def _build_alert_message(rule: AlertRule, device: Device, value: float, target: 
         target_parts.append(f"关键字 {extra_config['keyword']}")
     target_text = f"（{' / '.join(target_parts)}）" if target_parts else ""
     metric_label = {
-        "device_reachability": "设备可达状态",
+        "device_reachability": "Ping可达状态",
+        "snmp_reachability": "SNMP可达状态",
+        "exporter_reachability": "Exporter可达状态",
+        "telemetry_reachability": "Telemetry可达状态",
         "exporter_metric": str(extra_config.get("metric_label") or extra_config.get("metric_base") or "Exporter 指标"),
         "device_temperature": "设备温度",
         "snmp_session_usage": "会话使用率",

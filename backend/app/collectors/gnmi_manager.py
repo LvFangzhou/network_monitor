@@ -5,9 +5,11 @@ gNMI连接池管理器
 import asyncio
 from typing import Dict, Optional, List, Any
 from dataclasses import dataclass
+from datetime import datetime
 
 from app.collectors.gnmi_collector import GNMICollector, GNMIConfig
 from app.core import LoggerMixin, get_logger
+from app.utils import influx_client
 
 logger = get_logger(__name__)
 
@@ -160,6 +162,26 @@ class GNMIManager(LoggerMixin):
             1 for c in self._collectors.values()
             if c.connected
         )
+
+    def _write_telemetry_reachability(self, device_id: int, collector: GNMICollector) -> None:
+        """将gNMI连接状态写入时序库，供Telemetry不可达告警使用。"""
+        try:
+            influx_client.write_point(
+                measurement="telemetry_reachability",
+                tags={
+                    "device_id": str(device_id),
+                    "device_ip": collector.config.target,
+                },
+                fields={
+                    "reachable": 1.0 if collector.connected else 0.0,
+                    "running": 1.0 if collector.running else 0.0,
+                    "errors": float((collector.get_stats() or {}).get("errors") or 0),
+                },
+                timestamp=datetime.utcnow(),
+                sync=False,
+            )
+        except Exception as exc:
+            self.logger.warning("写入Telemetry可达性指标失败", device_id=device_id, error=str(exc))
     
     async def _monitor_loop(self):
         """监控循环 - 定期检查连接状态"""
@@ -169,6 +191,8 @@ class GNMIManager(LoggerMixin):
                 
                 async with self._lock:
                     for device_id, collector in self._collectors.items():
+                        self._write_telemetry_reachability(device_id, collector)
+
                         if not collector.connected and collector.running:
                             self.logger.warning(
                                 "gNMI连接断开",
