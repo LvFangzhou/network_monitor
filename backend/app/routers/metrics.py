@@ -42,6 +42,7 @@ MONITOR_CACHE_STALE_SECONDS = 7 * 24 * 60 * 60
 MAX_INTERFACE_HISTORY_SECONDS = 7 * 24 * 60 * 60
 RATE_FALLBACK_MAX_SECONDS = 5 * 60
 HISTORY_REQUEST_CACHE_SECONDS = 8
+DASHBOARD_STATS_CACHE_SECONDS = 15
 FRESH_INTERFACE_SAMPLE_LOCK_SECONDS = 8
 FRESH_INTERFACE_SAMPLE_MAX_RANGE_SECONDS = 60 * 60
 INTERFACE_RATE_CAP_MULTIPLIER = 1.03
@@ -2403,6 +2404,14 @@ async def get_latest_metrics(
 @router.get("/dashboard/stats")
 async def get_dashboard_stats(db: Session = Depends(get_db)):
     """获取Dashboard统计数据"""
+    cache_key = "dashboard:stats:v2"
+    try:
+        cached = redis_client.get(cache_key)
+        if cached:
+            return json.loads(cached)
+    except Exception as e:
+        logger.warning("读取Dashboard缓存失败", error=str(e))
+
     try:
         # 设备统计
         total_devices = db.query(Device).count()
@@ -2471,49 +2480,15 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
             .all()
         )
         
-        # 获取最近告警
-        recent_alerts = db.query(AlertHistory).join(Device).filter(
-            AlertHistory.status == "firing"
-        ).order_by(AlertHistory.started_at.desc()).limit(5).all()
-        
+        # 前端仪表盘已不展示“最近告警”，这里不再查询大表，避免切换仪表盘时被告警历史拖慢。
         recent_alerts_data = []
-        for alert in recent_alerts:
-            recent_alerts_data.append({
-                "id": alert.id,
-                "device_name": alert.device.name if alert.device else "Unknown",
-                "device_ip": alert.device.ip_address if alert.device else "Unknown",
-                "message": alert.message,
-                "severity": alert.rule.severity if alert.rule else "warning",
-                "started_at": alert.started_at.isoformat() if alert.started_at else None
-            })
-        
-        # 指标数量统计（从InfluxDB获取）
+
+        # 指标数量统计曾经从 InfluxDB 做 count()，在高基数时会让仪表盘首屏等待十几秒。
+        # 当前前端不展示这两个数字，保留字段但不做重查询。
         snmp_count = 0
         gnmi_count = 0
-        try:
-            flux = f'''
-            from(bucket: "{influx_client.bucket}")
-              |> range(start: -1h)
-              |> filter(fn: (r) => r._measurement == "snmp_metrics")
-              |> count()
-            '''
-            result = influx_client.query(flux)
-            if result:
-                snmp_count = result[0].get('value', 0)
-            
-            flux = f'''
-            from(bucket: "{influx_client.bucket}")
-              |> range(start: -1h)
-              |> filter(fn: (r) => r._measurement == "gnmi_telemetry")
-              |> count()
-            '''
-            result = influx_client.query(flux)
-            if result:
-                gnmi_count = result[0].get('value', 0)
-        except Exception as e:
-            logger.warning("获取指标数量失败", error=str(e))
-        
-        return {
+
+        payload = {
             "total_devices": total_devices,
             "online_devices": online_devices,
             "offline_devices": offline_devices,
@@ -2530,6 +2505,11 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
             "gnmi_metrics_count": gnmi_count,
             "recent_alerts": recent_alerts_data
         }
+        try:
+            redis_client.setex(cache_key, DASHBOARD_STATS_CACHE_SECONDS, json.dumps(payload, ensure_ascii=False))
+        except Exception as e:
+            logger.warning("写入Dashboard缓存失败", error=str(e))
+        return payload
     except Exception as e:
         logger.error("获取Dashboard统计失败", error=str(e))
         raise HTTPException(status_code=500, detail=f"获取统计失败: {str(e)}")

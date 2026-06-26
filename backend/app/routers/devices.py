@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import re
 
 from app.database import get_db
-from app.models import Device, DeviceGroup, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
+from app.models import AlertHistory, Device, DeviceGroup, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
 from app.collectors.snmp_collector import SNMPCollector
 from app.schemas import (
     DeviceCreate, DeviceUpdate, DeviceResponse,
@@ -26,6 +26,37 @@ from app.core import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+
+ACTIVE_ALERT_STATUSES = ("firing", "acknowledged", "ignored", "snoozed")
+
+
+def resolve_active_alerts_for_unmonitored_devices(db: Session, device_ids: list[int]) -> int:
+    """设备退出监控后，自动恢复其仍在触发中的监控告警，避免告警历史继续误导。"""
+    normalized_ids = [int(device_id) for device_id in dict.fromkeys(device_ids or []) if device_id]
+    if not normalized_ids:
+        return 0
+
+    alerts = (
+        db.query(AlertHistory)
+        .filter(
+            AlertHistory.device_id.in_(normalized_ids),
+            AlertHistory.status.in_(ACTIVE_ALERT_STATUSES),
+        )
+        .all()
+    )
+    if not alerts:
+        return 0
+
+    now = datetime.now()
+    for alert in alerts:
+        alert.status = "resolved"
+        alert.resolved_at = now
+        alert.resolved_by = "system"
+        alert.resolution_note = "设备已设置为未监控，系统自动恢复活动告警"
+        alert.updated_at = now
+    logger.info("未监控设备活动告警已自动恢复", device_count=len(normalized_ids), alert_count=len(alerts))
+    return len(alerts)
 
 
 def normalize_monitoring_config(
@@ -878,6 +909,7 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
     db_device = db.query(Device).filter(Device.id == device_id).first()
     if not db_device:
         raise HTTPException(status_code=404, detail="设备不存在")
+    was_monitored = bool(db_device.is_monitored)
     
     # 更新基本字段
     update_data = device.model_dump(exclude_unset=True)
@@ -990,10 +1022,13 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
             setattr(db_device, key, value)
     
     db_device.updated_at = datetime.now()
+    resolved_alerts = 0
+    if "is_monitored" in update_data and was_monitored and not bool(db_device.is_monitored):
+        resolved_alerts = resolve_active_alerts_for_unmonitored_devices(db, [db_device.id])
     db.commit()
     db.refresh(db_device)
     
-    logger.info("设备更新成功", device_id=device_id)
+    logger.info("设备更新成功", device_id=device_id, auto_resolved_alerts=resolved_alerts)
     return db_device.to_dict()
 
 
@@ -1098,12 +1133,23 @@ async def batch_update_devices(payload: DeviceBatchUpdateRequest, db: Session = 
             setattr(device, key, value)
         device.updated_at = datetime.now()
 
+    resolved_alerts = 0
+    if payload.field == "is_monitored" and update_kwargs.get("is_monitored") is False:
+        resolved_alerts = resolve_active_alerts_for_unmonitored_devices(db, [device.id for device in devices])
+
     db.commit()
 
-    logger.info("设备批量更新成功", updated_count=len(devices), field=payload.field, missing_count=len(missing_ids))
+    logger.info(
+        "设备批量更新成功",
+        updated_count=len(devices),
+        field=payload.field,
+        missing_count=len(missing_ids),
+        auto_resolved_alerts=resolved_alerts,
+    )
     return {
         "updated": len(devices),
         "missing_ids": missing_ids,
+        "resolved_alerts": resolved_alerts,
     }
 
 

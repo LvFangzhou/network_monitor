@@ -313,8 +313,11 @@ const AlertRules = () => {
     setRuleStatus(null)
     setRuleStatusSearch('')
     setRuleStatusFilter(undefined)
+    setLoadingRuleStatus(true)
     setStatusModalOpen(true)
-    fetchRuleStatus(rule, '', undefined)
+    window.setTimeout(() => {
+      fetchRuleStatus(rule, '', undefined)
+    }, 0)
   }
 
   const handleSubmit = async () => {
