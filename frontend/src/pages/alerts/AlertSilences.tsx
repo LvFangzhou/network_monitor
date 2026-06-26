@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button, Card, DatePicker, Form, Input, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Tooltip, Typography, message } from 'antd'
 import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
@@ -97,6 +97,7 @@ const AlertSilences = () => {
   const [matchesPage, setMatchesPage] = useState(1)
   const [matchesPageSize, setMatchesPageSize] = useState(10)
   const [selectedSilence, setSelectedSilence] = useState<AlertSilence | null>(null)
+  const matchesRequestSeqRef = useRef(0)
   const [form] = Form.useForm()
   const currentUser = useAuthStore((state) => state.user)
   const navigate = useNavigate()
@@ -202,6 +203,8 @@ const AlertSilences = () => {
   }
 
   const fetchMatches = async (silence: AlertSilence, nextPage = 1, nextPageSize = matchesPageSize) => {
+    const requestSeq = matchesRequestSeqRef.current + 1
+    matchesRequestSeqRef.current = requestSeq
     setMatchesLoading(true)
     try {
       const result = await getAlertSilenceMatches(silence.id, {
@@ -209,22 +212,35 @@ const AlertSilences = () => {
         limit: nextPageSize,
         active_only: false,
       })
+      if (requestSeq !== matchesRequestSeqRef.current) return
       setMatches(result.items)
       setMatchesTotal(result.total)
       setMatchesPage(nextPage)
       setMatchesPageSize(nextPageSize)
+      setItems((prev) => prev.map((item) => (
+        item.id === silence.id
+          ? { ...item, matched_total_alerts: result.total }
+          : item
+      )))
     } catch (error: any) {
-      message.error(error?.response?.data?.detail || '获取命中告警失败')
+      if (requestSeq === matchesRequestSeqRef.current) {
+        message.error(error?.response?.data?.detail || '获取命中告警失败')
+      }
     } finally {
-      setMatchesLoading(false)
+      if (requestSeq === matchesRequestSeqRef.current) {
+        setMatchesLoading(false)
+      }
     }
   }
 
-  const openMatches = async (record: AlertSilence) => {
+  const openMatches = (record: AlertSilence) => {
     setSelectedSilence(record)
     setMatchesTitle(record.name)
+    setMatches([])
+    setMatchesTotal(0)
+    setMatchesPage(1)
     setMatchesOpen(true)
-    await fetchMatches(record, 1, matchesPageSize)
+    void fetchMatches(record, 1, matchesPageSize)
   }
 
   return (
@@ -284,14 +300,15 @@ const AlertSilences = () => {
               if (countsLoading) {
                 return (
                   <Space size={6}>
-                    <Tag color="default">按需查看</Tag>
-                    <Tooltip title="查看命中告警，点开后再统计，避免进入菜单时卡顿">
+                    <Tooltip title="打开后自动加载命中告警，不影响当前页面操作">
                       <Button
-                        type="text"
+                        type="link"
                         size="small"
                         icon={<EyeOutlined />}
                         onClick={() => openMatches(record)}
-                      />
+                      >
+                        查看命中
+                      </Button>
                     </Tooltip>
                   </Space>
                 )
@@ -309,7 +326,6 @@ const AlertSilences = () => {
                       type="text"
                       size="small"
                       icon={<EyeOutlined />}
-                      disabled={totalCount === 0}
                       onClick={() => openMatches(record)}
                     />
                   </Tooltip>
@@ -499,18 +515,34 @@ const AlertSilences = () => {
       </Modal>
 
       <Modal
-        title={`${matchesTitle || '告警屏蔽'} - 命中告警明细`}
+        title={(
+          <Space size={8}>
+            <span>{`${matchesTitle || '告警屏蔽'} - 命中告警明细`}</span>
+            {matchesLoading ? (
+              <Tag color="processing">正在加载</Tag>
+            ) : (
+              <Tag color={matchesTotal > 0 ? 'blue' : 'default'}>{`命中 ${matchesTotal} 条`}</Tag>
+            )}
+          </Space>
+        )}
         width={1080}
         open={matchesOpen}
         footer={null}
         onCancel={() => {
+          matchesRequestSeqRef.current += 1
           setMatchesOpen(false)
           setSelectedSilence(null)
           setMatches([])
           setMatchesTotal(0)
+          setMatchesLoading(false)
         }}
         destroyOnClose
       >
+        {matchesLoading && matches.length === 0 ? (
+          <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+            正在统计并加载命中告警，加载完成后会显示命中总数。
+          </Typography.Text>
+        ) : null}
         <Table
           rowKey="id"
           loading={matchesLoading}
