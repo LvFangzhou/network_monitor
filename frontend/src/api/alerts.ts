@@ -29,6 +29,7 @@ export interface AlertHistory {
   id: number
   alarm_id?: string | null
   rule_id: number
+  rule_name?: string | null
   device_id: number
   device_name?: string | null
   device_ip?: string | null

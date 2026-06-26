@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Button, Card, DatePicker, Form, Input, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Tooltip, Typography, message } from 'antd'
-import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined } from '@ant-design/icons'
+import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -83,6 +83,45 @@ const statusLabels: Record<string, string> = {
   snoozed: '暂停复查',
   resolved: '已解决',
 }
+
+const compareText = (left?: string | number | null, right?: string | number | null) =>
+  String(left ?? '').localeCompare(String(right ?? ''), 'zh-CN', { numeric: true, sensitivity: 'base' })
+
+const alertColumnSearch = (
+  getValue: (record: AlertHistoryItem) => string | number | null | undefined,
+  placeholder: string
+) => ({
+  filterDropdown: ({ setSelectedKeys, selectedKeys, confirm, clearFilters }: any) => (
+    <div style={{ padding: 8, width: 240 }} onKeyDown={(event) => event.stopPropagation()}>
+      <Input
+        autoFocus
+        allowClear
+        placeholder={placeholder}
+        value={selectedKeys[0]}
+        onChange={(event) => setSelectedKeys(event.target.value ? [event.target.value] : [])}
+        onPressEnter={() => confirm()}
+        style={{ marginBottom: 8, display: 'block' }}
+      />
+      <Space>
+        <Button type="primary" size="small" icon={<SearchOutlined />} onClick={() => confirm()}>
+          搜索
+        </Button>
+        <Button
+          size="small"
+          onClick={() => {
+            clearFilters?.()
+            confirm()
+          }}
+        >
+          重置
+        </Button>
+      </Space>
+    </div>
+  ),
+  filterIcon: (filtered: boolean) => <SearchOutlined style={{ color: filtered ? '#1677ff' : undefined }} />,
+  onFilter: (value: any, record: AlertHistoryItem) =>
+    String(getValue(record) ?? '').toLowerCase().includes(String(value ?? '').toLowerCase()),
+})
 
 const AlertSilences = () => {
   const [items, setItems] = useState<AlertSilence[]>([])
@@ -568,7 +607,7 @@ const AlertSilences = () => {
             )}
           </Space>
         )}
-        width={1080}
+        width="88vw"
         open={matchesOpen}
         footer={null}
         onCancel={() => {
@@ -586,11 +625,12 @@ const AlertSilences = () => {
             正在统计并加载命中告警，加载完成后会显示命中总数。
           </Typography.Text>
         ) : null}
-        <Table
+        <Table<AlertHistoryItem>
           rowKey="id"
           loading={matchesLoading}
           dataSource={matches}
           size="small"
+          scroll={{ x: 1500, y: 'calc(100vh - 330px)' }}
           pagination={{
             current: matchesPage,
             pageSize: matchesPageSize,
@@ -609,6 +649,9 @@ const AlertSilences = () => {
               title: 'Alarm ID',
               dataIndex: 'alarm_id',
               width: 150,
+              fixed: 'left',
+              sorter: (a: AlertHistoryItem, b: AlertHistoryItem) => compareText(a.alarm_id || a.id, b.alarm_id || b.id),
+              ...alertColumnSearch((record) => record.alarm_id || record.id, '搜索 Alarm ID'),
               render: (value: string | null | undefined, record: AlertHistoryItem) => (
                 <a onClick={() => navigate(`/alerts/history?alert_id=${record.id}`)}>
                   {value || record.id}
@@ -616,8 +659,18 @@ const AlertSilences = () => {
               ),
             },
             {
+              title: '告警规则',
+              dataIndex: 'rule_name',
+              width: 200,
+              sorter: (a: AlertHistoryItem, b: AlertHistoryItem) => compareText(a.rule_name || a.rule_id, b.rule_name || b.rule_id),
+              ...alertColumnSearch((record) => record.rule_name || record.rule_id, '搜索告警规则'),
+              render: (value?: string | null, record?: AlertHistoryItem) => value || (record?.rule_id ? `规则 ${record.rule_id}` : '-'),
+            },
+            {
               title: '设备',
-              width: 220,
+              width: 260,
+              sorter: (a: AlertHistoryItem, b: AlertHistoryItem) => compareText(a.device_name || a.device_ip, b.device_name || b.device_ip),
+              ...alertColumnSearch((record) => `${record.device_name || ''} ${record.device_ip || ''}`, '搜索设备/IP'),
               render: (_: unknown, record: AlertHistoryItem) => (
                 <Space direction="vertical" size={0}>
                   <span>{record.device_name || '-'}</span>
@@ -627,25 +680,38 @@ const AlertSilences = () => {
             },
             {
               title: '对象',
-              width: 180,
+              width: 220,
+              sorter: (a: AlertHistoryItem, b: AlertHistoryItem) => compareText(a.alert_target_name || a.alert_target_key, b.alert_target_name || b.alert_target_key),
+              ...alertColumnSearch((record) => record.alert_target_name || record.alert_target_key, '搜索对象'),
               render: (_: unknown, record: AlertHistoryItem) => record.alert_target_name || record.alert_target_key || '-',
             },
             {
               title: '消息',
               dataIndex: 'message',
+              width: 420,
               ellipsis: true,
-              render: (value?: string | null) => value || '-',
+              sorter: (a: AlertHistoryItem, b: AlertHistoryItem) => compareText(a.message, b.message),
+              ...alertColumnSearch((record) => record.message, '搜索消息'),
+              render: (value?: string | null) => (
+                <Tooltip mouseEnterDelay={0.15} title={<span style={{ whiteSpace: 'pre-wrap' }}>{value || '-'}</span>}>
+                  <span>{value || '-'}</span>
+                </Tooltip>
+              ),
             },
             {
               title: '状态',
               dataIndex: 'status',
               width: 90,
+              sorter: (a: AlertHistoryItem, b: AlertHistoryItem) => compareText(statusLabels[a.status] || a.status, statusLabels[b.status] || b.status),
+              ...alertColumnSearch((record) => statusLabels[record.status] || record.status, '搜索状态'),
               render: (value: string) => <Tag color={statusColors[value] || 'default'}>{statusLabels[value] || value}</Tag>,
             },
             {
               title: '开始时间',
               dataIndex: 'started_at',
               width: 170,
+              sorter: (a: AlertHistoryItem, b: AlertHistoryItem) => dayjs(a.started_at || 0).valueOf() - dayjs(b.started_at || 0).valueOf(),
+              ...alertColumnSearch((record) => record.started_at ? new Date(record.started_at).toLocaleString() : '-', '搜索开始时间'),
               render: (value?: string | null) => value ? new Date(value).toLocaleString() : '-',
             },
           ]}

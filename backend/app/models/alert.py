@@ -139,6 +139,7 @@ class AlertHistory(Base):
             "alarm_id": _short_alarm_id(self.id, self.started_at),
             "raw_alarm_id": self.alarm_id,
             "rule_id": self.rule_id,
+            "rule_name": self.rule.name if self.rule else None,
             "device_id": self.device_id,
             "device_name": self.device.name if self.device else None,
             "device_ip": self.device.ip_address if self.device else None,
