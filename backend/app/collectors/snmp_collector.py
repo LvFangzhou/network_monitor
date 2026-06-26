@@ -164,11 +164,19 @@ class SNMPCollector(LoggerMixin):
     }
 
     DENSIVELO_PRIVATE_OIDS = {
-        # S9867/DensiveloOS exposes a Yillion private tree under 1.3.6.1.4.1.64812.
-        # The 03-设备管理 MIB bundle documents several legacy hh3cyldc objects under
-        # 1.3.6.1.4.1.2550664812, but field checks on S9867-128DH show that tree is
-        # not exposed by the current agent view. Keep resource collection on
-        # verified standard OIDs until a matching 64812 resource MIB is available.
+        # S9867/DensiveloOS exposes Yillion device-management objects under:
+        #   1.3.6.1.4.1.64812.8.35.18
+        # Source: 03-设备管理 / YLDC-LSW-DEV-ADM-MIB.
+        "cpu_usage_oid": "1.3.6.1.4.1.64812.8.35.18.1.3.0",
+        "memory_usage_oid": "1.3.6.1.4.1.64812.8.35.18.1.16.0",
+        "system_version_oid": "1.3.6.1.4.1.64812.8.35.18.1.4.0",
+        "system_release_oid": "1.3.6.1.4.1.64812.8.35.18.1.24.0",
+        "system_model_oid": "1.3.6.1.4.1.64812.8.35.18.1.23.0",
+        "system_serial_oid": "1.3.6.1.4.1.64812.8.35.18.1.21.0",
+        # The documented yldcLswSysTemperature (.1.17.0) returns No Such Object
+        # on tested S9867-128DH devices; yldcLswSlotTemperature is documented as
+        # unsupported. Do not collect temperature here until a valid current-value
+        # OID is confirmed.
         #
         # S9867 ports expose 64-bit IF-MIB HC counters. In high-frequency interface
         # sampling, avoid the extra 32-bit ifInOctets/ifOutOctets walks unless a
@@ -1623,8 +1631,10 @@ class SNMPCollector(LoggerMixin):
         """采集标准 SNMP system 信息"""
         sys_descr_text = self._snmp_get_text_value(device, "1.3.6.1.2.1.1.1.0")
         sys_name_text = self._snmp_get_text_value(device, "1.3.6.1.2.1.1.5.0")
+        private_oids = self._get_private_oid_config(device)
         software_version = None
         snmp_model = None
+        serial_number = None
         if sys_descr_text:
             version_match = re.search(
                 r"Software\s+Version\s+([^,\r\n]+)(?:,\s*(Release\s+[^\r\n,]+))?",
@@ -1636,11 +1646,46 @@ class SNMPCollector(LoggerMixin):
                 if version_match.group(2):
                     software_version = f"{software_version}, {version_match.group(2).strip()}"
             snmp_model = extract_snmp_model(sys_descr_text)
+
+        private_version = (
+            self._snmp_get_text_value(device, str(private_oids["system_version_oid"]))
+            if private_oids.get("system_version_oid")
+            else None
+        )
+        private_release = (
+            self._snmp_get_text_value(device, str(private_oids["system_release_oid"]))
+            if private_oids.get("system_release_oid")
+            else None
+        )
+        if private_version:
+            software_version = f"Software Version {private_version.strip()}"
+            if private_release:
+                release_text = private_release.strip()
+                if release_text.upper().startswith("R") and release_text[1:].isdigit():
+                    release_text = f"Release {release_text[1:]}"
+                elif not release_text.lower().startswith("release"):
+                    release_text = f"Release {release_text}"
+                software_version = f"{software_version}, {release_text}"
+
+        private_model = (
+            self._snmp_get_text_value(device, str(private_oids["system_model_oid"]))
+            if private_oids.get("system_model_oid")
+            else None
+        )
+        if private_model:
+            snmp_model = extract_snmp_model(private_model) or private_model.strip()
+
+        serial_number = (
+            self._snmp_get_text_value(device, str(private_oids["system_serial_oid"]))
+            if private_oids.get("system_serial_oid")
+            else None
+        )
         return {
             "sys_descr": sys_descr_text,
             "sys_name": sys_name_text,
             "software_version": software_version,
             "snmp_model": snmp_model,
+            "serial_number": serial_number,
         }
     
     def collect_device(self, device: Any) -> Dict[str, Any]:
@@ -1879,6 +1924,7 @@ class SNMPCollector(LoggerMixin):
                     "sys_descr": system_info.get("sys_descr"),
                     "software_version": system_info.get("software_version"),
                     "snmp_model": system_info.get("snmp_model"),
+                    "serial_number": system_info.get("serial_number"),
                 },
                 "fields": {"uptime_seconds": float(uptime or 0)},
                 "timestamp": timestamp

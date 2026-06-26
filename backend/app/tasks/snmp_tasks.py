@@ -1065,6 +1065,7 @@ def collect_snmp_for_device(self, device_id: int):
                 "sys_descr": None,
                 "software_version": None,
                 "snmp_model": None,
+                "serial_number": None,
                 "uptime_seconds": result.get("uptime"),
             },
             "collected_at": datetime.now(timezone.utc).isoformat(),
@@ -1372,7 +1373,7 @@ def collect_asternos_for_device(self, device_id: int):
                 "sessions": {"current": None, "total": None, "usage_percent": None},
                 "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
                 "protocols": {"bgp": {"total": 0, "up": 0, "down": 0}, "ospf": {"total": 0, "up": 0, "down": 0}},
-                "system_info": {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "uptime_seconds": None},
+                "system_info": {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "serial_number": None, "uptime_seconds": None},
                 "collected_at": datetime.now(timezone.utc).isoformat(),
             })
         return {"device_id": device_id, "success": False, "error": str(exc)}

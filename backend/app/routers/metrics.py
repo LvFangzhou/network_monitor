@@ -831,10 +831,10 @@ def _latest_snmp_system_info(device_id: int) -> Dict[str, Any]:
         rows = influx_client.query(flux)
     except Exception as exc:
         logger.warning("读取SNMP系统信息失败", device_id=device_id, error=str(exc))
-        return {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "uptime_seconds": None}
+        return {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "serial_number": None, "uptime_seconds": None}
     if not rows:
         uptime = _latest_numeric(device_id, "snmp_metrics", ["seconds"])
-        return {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "uptime_seconds": uptime}
+        return {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "serial_number": None, "uptime_seconds": uptime}
     row = rows[0]
     sys_descr = row.get("sys_descr")
     snmp_model = row.get("snmp_model") or extract_snmp_model(sys_descr)
@@ -843,6 +843,7 @@ def _latest_snmp_system_info(device_id: int) -> Dict[str, Any]:
         "sys_descr": sys_descr,
         "software_version": row.get("software_version"),
         "snmp_model": snmp_model,
+        "serial_number": row.get("serial_number"),
         "uptime_seconds": _safe_float(row.get("value")),
     }
 
@@ -1398,7 +1399,7 @@ def _device_base_overview(device: Device) -> Dict[str, Any]:
             "power_status_known": True,
         },
         "protocols": _empty_protocol_summary(),
-        "system_info": {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "uptime_seconds": None},
+        "system_info": {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "serial_number": None, "uptime_seconds": None},
         "data_sources": {"resources": {}, "protocols": {}, "system_info": {}},
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
