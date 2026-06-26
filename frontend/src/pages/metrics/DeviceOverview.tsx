@@ -194,9 +194,11 @@ const ProtocolCell = ({ data, source }: { data: DeviceProtocolSummary; source?: 
   const color = data.down > 0 ? 'red' : 'green'
   const label = sourceLabel(source)
   return (
-    <Space size={4}>
-      <Tag color={color}>{data.up}/{data.total}</Tag>
-      {label ? <Tag color="blue">{label}</Tag> : null}
+    <Space direction="vertical" size={2} style={{ lineHeight: 1.2 }}>
+      <Space size={4} wrap={false}>
+        <Tag color={color}>{data.up}/{data.total}</Tag>
+        {label ? <Tag color="blue">{label}</Tag> : null}
+      </Space>
       {data.down > 0 ? <Text type="danger">异常 {data.down}</Text> : null}
     </Space>
   )
@@ -814,14 +816,14 @@ const DeviceOverview = () => {
     {
       title: 'BGP',
       key: 'bgp',
-      width: 120,
+      width: 130,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => a.protocols.bgp.down - b.protocols.bgp.down,
       render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.bgp} source={record.data_sources?.protocols?.bgp} />,
     },
     {
       title: 'OSPF',
       key: 'ospf',
-      width: 120,
+      width: 130,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => a.protocols.ospf.down - b.protocols.ospf.down,
       render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.ospf} source={record.data_sources?.protocols?.ospf} />,
     },
