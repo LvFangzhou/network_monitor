@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Card, DatePicker, Form, Input, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Tooltip, Typography, message } from 'antd'
 import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
@@ -325,6 +325,17 @@ const AlertSilences = () => {
     setMatchesOpen(true)
     void fetchMatches(record, 1, matchesPageSize)
   }
+
+  const matchRuleFilters = useMemo(() => {
+    const options = new Map<string, string>()
+    matches.forEach((item) => {
+      const label = item.rule_name || (item.rule_id ? `规则 ${item.rule_id}` : '-')
+      options.set(label, label)
+    })
+    return Array.from(options.values())
+      .sort((left, right) => compareText(left, right))
+      .map((value) => ({ text: value, value }))
+  }, [matches])
 
   return (
     <Card
@@ -663,7 +674,12 @@ const AlertSilences = () => {
               dataIndex: 'rule_name',
               width: 200,
               sorter: (a: AlertHistoryItem, b: AlertHistoryItem) => compareText(a.rule_name || a.rule_id, b.rule_name || b.rule_id),
-              ...alertColumnSearch((record) => record.rule_name || record.rule_id, '搜索告警规则'),
+              filters: matchRuleFilters,
+              filterSearch: true,
+              onFilter: (value: any, record: AlertHistoryItem) => {
+                const label = record.rule_name || (record.rule_id ? `规则 ${record.rule_id}` : '-')
+                return label === value
+              },
               render: (value?: string | null, record?: AlertHistoryItem) => value || (record?.rule_id ? `规则 ${record.rule_id}` : '-'),
             },
             {
