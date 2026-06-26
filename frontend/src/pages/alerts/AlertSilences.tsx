@@ -98,6 +98,7 @@ const AlertSilences = () => {
   const [matchesPageSize, setMatchesPageSize] = useState(10)
   const [selectedSilence, setSelectedSilence] = useState<AlertSilence | null>(null)
   const matchesRequestSeqRef = useRef(0)
+  const countRequestSeqRef = useRef(0)
   const [form] = Form.useForm()
   const currentUser = useAuthStore((state) => state.user)
   const navigate = useNavigate()
@@ -113,6 +114,7 @@ const AlertSilences = () => {
         include_total_match_counts: false,
       })
       setItems(result.items)
+      void loadMatchCounts(result.items)
     } catch {
       message.error('获取告警屏蔽失败')
     } finally {
@@ -125,6 +127,46 @@ const AlertSilences = () => {
   useEffect(() => {
     fetchData()
   }, [])
+
+  const loadMatchCounts = async (silences: AlertSilence[]) => {
+    const requestSeq = countRequestSeqRef.current + 1
+    countRequestSeqRef.current = requestSeq
+    const targets = silences.filter((item) => item.id)
+    const concurrency = 2
+    let cursor = 0
+
+    const worker = async () => {
+      while (cursor < targets.length && requestSeq === countRequestSeqRef.current) {
+        const silence = targets[cursor]
+        cursor += 1
+        try {
+          const [activeResult, totalResult] = await Promise.all([
+            getAlertSilenceMatches(silence.id, { skip: 0, limit: 1, active_only: true }),
+            getAlertSilenceMatches(silence.id, { skip: 0, limit: 1, active_only: false }),
+          ])
+          if (requestSeq !== countRequestSeqRef.current) return
+          setItems((prev) => prev.map((item) => (
+            item.id === silence.id
+              ? {
+                  ...item,
+                  matched_active_alerts: activeResult.total,
+                  matched_total_alerts: totalResult.total,
+                }
+              : item
+          )))
+        } catch {
+          if (requestSeq !== countRequestSeqRef.current) return
+          setItems((prev) => prev.map((item) => (
+            item.id === silence.id
+              ? { ...item, matched_active_alerts: 0, matched_total_alerts: 0 }
+              : item
+          )))
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, () => worker()))
+  }
 
   const openCreate = () => {
     setEditingItem(null)
@@ -177,18 +219,20 @@ const AlertSilences = () => {
           item.id === savedItem.id
             ? {
                 ...savedItem,
-                matched_active_alerts: item.matched_active_alerts,
-                matched_total_alerts: item.matched_total_alerts,
+                matched_active_alerts: null,
+                matched_total_alerts: null,
               }
             : item
         )))
+        void loadMatchCounts([savedItem])
         message.success('告警屏蔽已更新')
       } else {
         savedItem = await createAlertSilence(payload)
         setItems((prev) => [
-          { ...savedItem, matched_active_alerts: 0, matched_total_alerts: 0 },
+          { ...savedItem, matched_active_alerts: null, matched_total_alerts: null },
           ...prev,
         ])
+        void loadMatchCounts([savedItem])
         message.success('告警屏蔽已创建')
       }
       setModalOpen(false)
@@ -300,15 +344,14 @@ const AlertSilences = () => {
               if (countsLoading) {
                 return (
                   <Space size={6}>
-                    <Tooltip title="打开后自动加载命中告警，不影响当前页面操作">
+                    <Tag color="processing">统计中</Tag>
+                    <Tooltip title="查看具体命中的告警明细">
                       <Button
-                        type="link"
+                        type="text"
                         size="small"
                         icon={<EyeOutlined />}
                         onClick={() => openMatches(record)}
-                      >
-                        查看命中
-                      </Button>
+                      />
                     </Tooltip>
                   </Space>
                 )
