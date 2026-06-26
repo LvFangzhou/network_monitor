@@ -77,8 +77,9 @@ const SORT_OPTIONS = [
 
 const REFRESH_OPTIONS = [
   { value: 0, label: '手动刷新' },
-  { value: 30, label: '每30秒刷新' },
-  { value: 60, label: '每60秒刷新' },
+  { value: 300, label: '每5分钟刷新' },
+  { value: 600, label: '每10分钟刷新' },
+  { value: 900, label: '每15分钟刷新' },
 ]
 
 const ipToNumber = (ip?: string) => {
@@ -379,7 +380,7 @@ const DeviceOverview = () => {
   const [model, setModel] = useState('')
   const [connectivity, setConnectivity] = useState('')
   const [sortKey, setSortKey] = useState('ip_asc')
-  const [refreshIntervalSeconds, setRefreshIntervalSeconds] = useState(30)
+  const [refreshIntervalSeconds, setRefreshIntervalSeconds] = useState(300)
   const [tablePageSize, setTablePageSize] = useState(20)
   const [detailOpen, setDetailOpen] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -460,54 +461,50 @@ const DeviceOverview = () => {
     })
   }
 
-  const loadData = async (
-    nextSearch = search,
-    nextVendor = vendor,
-    nextModel = model,
-    nextConnectivity = connectivity
-  ) => {
-    setLoading(true)
+  const loadData = async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent)
+    if (!silent || items.length === 0) {
+      setLoading(true)
+    }
     try {
       const result = await getDeviceOverview({
-        search: nextSearch.trim() || undefined,
-        vendor: nextVendor || undefined,
-        model: nextModel.trim() || undefined,
-        connectivity: nextConnectivity || undefined,
         monitored_only: true,
         include_storage: visibleColumnKeys.includes('storage'),
         include_hardware: visibleColumnKeys.includes('fan') || visibleColumnKeys.includes('power'),
         include_sessions: false,
-        limit: 500,
+        limit: 1000,
       })
       const nextItems = result.items || []
       setItems(nextItems)
-      if (!nextSearch.trim() && !nextVendor && !nextModel.trim() && !nextConnectivity) {
-        const payload: DeviceOverviewCachePayload = {
-          items: nextItems,
-          savedAt: new Date().toISOString(),
-        }
-        window.localStorage.setItem(OVERVIEW_CACHE_KEY, JSON.stringify(payload))
+      const payload: DeviceOverviewCachePayload = {
+        items: nextItems,
+        savedAt: new Date().toISOString(),
       }
+      window.localStorage.setItem(OVERVIEW_CACHE_KEY, JSON.stringify(payload))
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取设备总览失败')
     } finally {
-      setLoading(false)
+      if (!silent || items.length === 0) {
+        setLoading(false)
+      }
     }
   }
 
   useEffect(() => {
+    let hasCachedOverview = false
     try {
       const raw = window.localStorage.getItem(OVERVIEW_CACHE_KEY)
       if (raw) {
         const payload = JSON.parse(raw) as DeviceOverviewCachePayload
         if (Array.isArray(payload.items) && payload.items.length > 0) {
           setItems(payload.items)
+          hasCachedOverview = true
         }
       }
     } catch {
       window.localStorage.removeItem(OVERVIEW_CACHE_KEY)
     }
-    loadData('', '', '', '')
+    loadData({ silent: hasCachedOverview })
   }, [])
 
   useEffect(() => {
@@ -516,18 +513,18 @@ const DeviceOverview = () => {
       return
     }
     const timer = window.setTimeout(() => {
-      loadData(search, vendor, model, connectivity)
+      loadData({ silent: items.length > 0 })
     }, 300)
     return () => window.clearTimeout(timer)
-  }, [search, vendor, model, connectivity, visibleColumnKeys])
+  }, [visibleColumnKeys])
 
   useEffect(() => {
     if (!refreshIntervalSeconds) return undefined
     const timer = window.setInterval(() => {
-      loadData(search, vendor, model, connectivity)
+      loadData({ silent: true })
     }, refreshIntervalSeconds * 1000)
     return () => window.clearInterval(timer)
-  }, [refreshIntervalSeconds, search, vendor, model, connectivity, visibleColumnKeys])
+  }, [refreshIntervalSeconds, visibleColumnKeys, items.length])
 
   const datacenterOptions = useMemo(() => {
     const unique = new Map<string, string>()
@@ -546,11 +543,41 @@ const DeviceOverview = () => {
   }, [items])
 
   const filteredItems = useMemo(() => {
-    if (datacenter === DATACENTER_ALL_VALUE) {
-      return items
-    }
-    return items.filter((item) => (item.device.datacenter?.name || '') === datacenter)
-  }, [datacenter, items])
+    const keyword = search.trim().toLowerCase()
+    const modelKeyword = model.trim().toLowerCase()
+    return items.filter((item) => {
+      if (datacenter !== DATACENTER_ALL_VALUE && (item.device.datacenter?.name || '') !== datacenter) {
+        return false
+      }
+      if (vendor && !String(item.device.vendor || '').toLowerCase().includes(vendor.toLowerCase())) {
+        return false
+      }
+      if (modelKeyword && !String(item.device.model || '').toLowerCase().includes(modelKeyword)) {
+        return false
+      }
+      if (connectivity && item.connectivity.status !== connectivity) {
+        return false
+      }
+      if (!keyword) {
+        return true
+      }
+      const haystack = [
+        item.device.name,
+        item.device.ip_address,
+        item.device.vendor,
+        item.device.model,
+        item.device.datacenter?.name,
+        item.system_info?.sys_name,
+        item.system_info?.snmp_model,
+        item.system_info?.software_version,
+        item.system_info?.serial_number,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+      return haystack.includes(keyword)
+    })
+  }, [connectivity, datacenter, items, model, search, vendor])
 
   const sortedItems = useMemo(() => {
     const protocolDownCount = (item: DeviceOverviewItem) => item.protocols.bgp.down + item.protocols.ospf.down

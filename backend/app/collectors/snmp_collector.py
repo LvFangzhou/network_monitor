@@ -188,6 +188,10 @@ class SNMPCollector(LoggerMixin):
         "bgp_contexts": [
             "bgp-underlay",
         ],
+        # S9867 underlay BGP is exposed in the bgp-underlay SNMP context. Reading
+        # both the default context and bgp-underlay can produce duplicate peers in
+        # overview/detail pages, so prefer the context result when it is present.
+        "prefer_bgp_contexts": True,
         "entity_class_oid": "1.3.6.1.2.1.47.1.1.1.1.5",
         "entity_name_oid": "1.3.6.1.2.1.47.1.1.1.1.7",
     }
@@ -798,23 +802,25 @@ class SNMPCollector(LoggerMixin):
             5: "openconfirm",
             6: "established",
         }
-        for index, state in bgp_state_map.items():
-            peer = self._extract_peer_from_index(index)
-            points.append({
-                "measurement": "protocol_status",
-                "tags": {
-                    "device_id": str(device.id),
-                    "device_name": device.name,
-                    "protocol": "bgp",
-                    "peer": peer,
-                    "state_text": bgp_state_text.get(state, str(state)),
-                },
-                "fields": {
-                    "state_value": float(state),
-                    "state_up": 1.0 if state == 6 else 0.0,
-                },
-                "timestamp": now,
-            })
+        emit_default_bgp = not (private_oids.get("prefer_bgp_contexts") and bgp_context_maps)
+        if emit_default_bgp:
+            for index, state in bgp_state_map.items():
+                peer = self._extract_peer_from_index(index)
+                points.append({
+                    "measurement": "protocol_status",
+                    "tags": {
+                        "device_id": str(device.id),
+                        "device_name": device.name,
+                        "protocol": "bgp",
+                        "peer": peer,
+                        "state_text": bgp_state_text.get(state, str(state)),
+                    },
+                    "fields": {
+                        "state_value": float(state),
+                        "state_up": 1.0 if state == 6 else 0.0,
+                    },
+                    "timestamp": now,
+                })
         for (context_name, index), state in bgp_context_maps.items():
             peer = self._extract_peer_from_index(index)
             points.append({

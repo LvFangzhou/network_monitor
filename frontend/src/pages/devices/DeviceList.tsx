@@ -217,6 +217,7 @@ const DeviceList = () => {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const searchTimerRef = useRef<number | null>(null)
   const resizeStateRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null)
+  const fetchSeqRef = useRef(0)
 
   const getColumnFilterParams = (filters: Partial<Record<ColumnFilterKey, string>>) => ({
     name_text: filters.name || undefined,
@@ -230,6 +231,8 @@ const DeviceList = () => {
   })
 
   const fetchDevices = async (params?: any) => {
+    const fetchSeq = fetchSeqRef.current + 1
+    fetchSeqRef.current = fetchSeq
     const silent = Boolean(params?.silent)
     if (!silent) {
       setLoading(true)
@@ -258,6 +261,9 @@ const DeviceList = () => {
         sort_order: effectiveSortOrder,
         ...requestOverrides,
       })
+      if (fetchSeq !== fetchSeqRef.current) {
+        return
+      }
       const nextItems = effectiveSortField === 'ip_address'
         ? [...result.items].sort((left, right) => {
           const order = compareIpAddress(left.ip_address, right.ip_address)
@@ -269,7 +275,7 @@ const DeviceList = () => {
     } catch (error) {
       console.error('获取设备列表失败:', error)
     } finally {
-      if (!silent) {
+      if (!silent && fetchSeq === fetchSeqRef.current) {
         setLoading(false)
       }
     }
