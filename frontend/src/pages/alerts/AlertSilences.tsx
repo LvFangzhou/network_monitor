@@ -137,6 +137,7 @@ const AlertSilences = () => {
   const [matchesPageSize, setMatchesPageSize] = useState(10)
   const [matchRuleFilters, setMatchRuleFilters] = useState<Array<{ text: string; value: string }>>([])
   const [selectedSilence, setSelectedSilence] = useState<AlertSilence | null>(null)
+  const [submitting, setSubmitting] = useState(false)
   const matchesRequestSeqRef = useRef(0)
   const countRequestSeqRef = useRef(0)
   const [form] = Form.useForm()
@@ -232,6 +233,8 @@ const AlertSilences = () => {
   }
 
   const handleSubmit = async () => {
+    if (submitting) return
+    setSubmitting(true)
     try {
       const values = await form.validateFields()
       const payload: AlertSilencePayload = {
@@ -264,7 +267,9 @@ const AlertSilences = () => {
               }
             : item
         )))
-        void loadMatchCounts([savedItem])
+        window.setTimeout(() => {
+          void loadMatchCounts([savedItem])
+        }, 800)
         message.success('告警屏蔽已更新')
       } else {
         savedItem = await createAlertSilence(payload)
@@ -272,17 +277,18 @@ const AlertSilences = () => {
           { ...savedItem, matched_active_alerts: null, matched_total_alerts: null },
           ...prev,
         ])
-        void loadMatchCounts([savedItem])
+        window.setTimeout(() => {
+          void loadMatchCounts([savedItem])
+        }, 800)
         message.success('告警屏蔽已创建')
       }
       setModalOpen(false)
-      window.setTimeout(() => {
-        void fetchData({ silent: true })
-      }, 300)
     } catch (error: any) {
       if (!error?.errorFields) {
         message.error(error?.response?.data?.detail || '保存失败')
       }
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -453,12 +459,13 @@ const AlertSilences = () => {
         afterClose={() => {
           setEditingItem(null)
           form.resetFields()
+          setSubmitting(false)
         }}
         footer={[
-          <Button key="reset" onClick={() => form.resetFields()}>
+          <Button key="reset" onClick={() => form.resetFields()} disabled={submitting}>
             重置
           </Button>,
-          <Button key="submit" type="primary" onClick={handleSubmit}>
+          <Button key="submit" type="primary" onClick={handleSubmit} loading={submitting}>
             提交
           </Button>,
         ]}

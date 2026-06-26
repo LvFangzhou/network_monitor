@@ -43,6 +43,7 @@ MAX_INTERFACE_HISTORY_SECONDS = 7 * 24 * 60 * 60
 RATE_FALLBACK_MAX_SECONDS = 5 * 60
 HISTORY_REQUEST_CACHE_SECONDS = 8
 DASHBOARD_STATS_CACHE_SECONDS = 15
+DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS = 60
 FRESH_INTERFACE_SAMPLE_LOCK_SECONDS = 8
 FRESH_INTERFACE_SAMPLE_MAX_RANGE_SECONDS = 60 * 60
 INTERFACE_RATE_CAP_MULTIPLIER = 1.03
@@ -2124,6 +2125,25 @@ async def get_monitor_devices_overview(
     db: Session = Depends(get_db),
 ):
     """设备总览：汇总设备资源、监控连通性和路由协议状态。"""
+    overview_cache_key = ":".join([
+        "monitor:cache:overview_response",
+        str(search or ""),
+        str(vendor or ""),
+        str(model or ""),
+        str(connectivity or ""),
+        str(int(monitored_only)),
+        str(int(include_storage)),
+        str(int(include_hardware)),
+        str(int(include_sessions)),
+        str(limit),
+    ])
+    cached_response = redis_client.get(overview_cache_key)
+    if cached_response:
+        try:
+            return json.loads(cached_response)
+        except Exception:
+            redis_client.delete(overview_cache_key)
+
     query = db.query(Device).filter(Device.status.in_(["active", "online"]))
     if monitored_only:
         query = query.filter(Device.is_monitored == True)
@@ -2208,7 +2228,13 @@ async def get_monitor_devices_overview(
         if not connectivity or item["connectivity"]["status"] == connectivity:
             items.append(item)
 
-    return {"items": items, "total": len(items)}
+    payload = {"items": items, "total": len(items)}
+    redis_client.setex(
+        overview_cache_key,
+        DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS,
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
+    return payload
 
 
 @router.post("/monitoring/devices/refresh")

@@ -105,6 +105,8 @@ const ConfigBackups = () => {
   const [jobResultsLoading, setJobResultsLoading] = useState(false)
   const [jobResults, setJobResults] = useState<ConfigBackupResult[]>([])
   const [latestResults, setLatestResults] = useState<ConfigBackupResult[]>([])
+  const [latestResultsJobId, setLatestResultsJobId] = useState<number | null>(null)
+  const [latestResultsLoading, setLatestResultsLoading] = useState(false)
   const [resultFilterText, setResultFilterText] = useState('')
   const [resultDatacenterFilter, setResultDatacenterFilter] = useState<string>()
   const [resultVendorFilter, setResultVendorFilter] = useState<string>()
@@ -172,13 +174,22 @@ const ConfigBackups = () => {
   const loadLatestResults = async (jobId?: number | null, clearOnEmpty = true) => {
     if (!jobId) {
       if (clearOnEmpty) setLatestResults([])
+      setLatestResultsJobId(null)
       return
     }
+    if (latestResultsJobId === jobId && latestResults.length > 0) {
+      return
+    }
+    setLatestResultsLoading(true)
     try {
       const detail = await getConfigBackupJob(jobId)
       setLatestResults(detail.results || [])
+      setLatestResultsJobId(jobId)
     } catch {
       if (clearOnEmpty) setLatestResults([])
+      setLatestResultsJobId(null)
+    } finally {
+      setLatestResultsLoading(false)
     }
   }
 
@@ -208,8 +219,10 @@ const ConfigBackups = () => {
     setLatestJob(latest.job)
     setJobs(result.items)
     setJobsTotal(result.total)
-    if (latest.job?.id) {
-      await loadLatestResults(latest.job.id, false)
+    if (latest.job?.id && latest.job.id !== latestResultsJobId && !['pending', 'running'].includes(latest.job.status)) {
+      window.setTimeout(() => {
+        void loadLatestResults(latest.job?.id, false)
+      }, 400)
     }
   }
 
@@ -232,9 +245,6 @@ const ConfigBackups = () => {
 
   useEffect(() => {
     loadPageMeta()
-    getLatestConfigBackupJob()
-      .then((latest) => loadLatestResults(latest.job?.id))
-      .catch(() => undefined)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -246,6 +256,17 @@ const ConfigBackups = () => {
     return () => window.clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobsPage, jobsPageSize, latestJob?.status])
+
+  useEffect(() => {
+    if (!latestJob?.id || ['pending', 'running'].includes(latestJob.status)) {
+      return undefined
+    }
+    const timer = window.setTimeout(() => {
+      void loadLatestResults(latestJob.id, false)
+    }, 700)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latestJob?.id, latestJob?.status])
 
   const handleTrigger = async () => {
     setTriggering(true)
@@ -633,8 +654,10 @@ const ConfigBackups = () => {
             <Table
               size="small"
               rowKey="id"
+              loading={latestResultsLoading}
               dataSource={filteredLatestResults}
               pagination={false}
+              virtual
               scroll={{ x: 720, y: 470 }}
               columns={[
                 { title: resizableTitle('设备', 'device', latestColumnWidths, setLatestColumnWidths, 160), width: latestColumnWidths.device, sorter: (a, b) => ipToNumber(a.device_ip) - ipToNumber(b.device_ip), render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text strong>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
@@ -714,7 +737,8 @@ const ConfigBackups = () => {
           loading={jobResultsLoading}
           dataSource={jobResults}
           pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total) => `共 ${total} 台` }}
-          scroll={{ y: '70vh' }}
+          virtual
+          scroll={{ x: 1300, y: 620 }}
           columns={[
             { title: '设备', width: 260, sorter: (a, b) => ipToNumber(a.device_ip) - ipToNumber(b.device_ip), render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
             { title: '机房', dataIndex: 'datacenter_name', width: 150, filters: jobResultOptions.datacenters, onFilter: (value, record) => record.datacenter_name === value, sorter: (a, b) => String(a.datacenter_name || '').localeCompare(String(b.datacenter_name || '')), render: (value?: string) => value || '-' },
