@@ -48,6 +48,8 @@ router = APIRouter()
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 RULE_STATUS_CACHE_PREFIX = "alerts:rule_status"
 RULE_STATUS_CACHE_TTL_SECONDS = 900
+ALERT_HISTORY_SUMMARY_CACHE_PREFIX = "alerts:history_summary"
+ALERT_HISTORY_SUMMARY_CACHE_TTL_SECONDS = 120
 SILENCE_MATCH_CACHE_PREFIX = "alerts:silence_matches"
 SILENCE_MATCH_CACHE_TTL_SECONDS = 60
 
@@ -879,6 +881,30 @@ async def get_alert_history_summary(
     limit: int = Query(10, ge=1, le=50),
 ):
     """按当前筛选条件聚合告警历史。"""
+    cache_payload = {
+        "view": view,
+        "status": status,
+        "device_id": device_id,
+        "rule_id": rule_id,
+        "alert_id": alert_id,
+        "alarm_id": alarm_id,
+        "severity": severity,
+        "datacenter": datacenter,
+        "search": search,
+        "older_than_days": older_than_days,
+        "limit": limit,
+    }
+    cache_key = (
+        f"{ALERT_HISTORY_SUMMARY_CACHE_PREFIX}:"
+        f"{hashlib.sha1(json.dumps(cache_payload, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()}"
+    )
+    try:
+        cached = redis_client.get(cache_key)
+        if cached:
+            return json.loads(cached)
+    except Exception as exc:
+        logger.warning("读取告警历史统计缓存失败", error=str(exc))
+
     base_query = _build_alert_history_query(
         db,
         view=view,
@@ -954,7 +980,7 @@ async def get_alert_history_summary(
         key = _normalize_severity(str(severity_value))
         severities[key] = severities.get(key, 0) + int(count or 0)
 
-    return {
+    payload = {
         "total": total,
         "protected_total": int(protected_total or 0),
         "deletable_total": int((total or 0) - (protected_total or 0)),
@@ -964,6 +990,15 @@ async def get_alert_history_summary(
         "statuses": statuses,
         "severities": severities,
     }
+    try:
+        redis_client.setex(
+            cache_key,
+            ALERT_HISTORY_SUMMARY_CACHE_TTL_SECONDS,
+            json.dumps(payload, ensure_ascii=False, default=str),
+        )
+    except Exception as exc:
+        logger.warning("写入告警历史统计缓存失败", error=str(exc))
+    return payload
 
 
 @router.post("/history/clear", response_model=dict)

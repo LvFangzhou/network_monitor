@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,7 @@ from app.models import ConfigBackupJob, ConfigBackupResult, Datacenter, Device, 
 from app.routers.auth import get_current_active_user
 from app.tasks.config_backup_tasks import run_config_backup
 from app.utils import notification_manager
+from app.utils import redis_client
 from app.utils.config_backup_settings import (
     detect_webhook_type,
     load_config_backup_settings,
@@ -24,6 +26,8 @@ from app.utils.config_backup_settings import (
 )
 
 router = APIRouter()
+CONFIG_BACKUP_FILTERS_CACHE_KEY = "config_backups:filters:v1"
+CONFIG_BACKUP_FILTERS_CACHE_SECONDS = 300
 
 
 def _job_to_dict(job: ConfigBackupJob, include_results: bool = False) -> Dict[str, Any]:
@@ -282,6 +286,12 @@ async def search_config_backups(
 
 @router.get("/filters", response_model=dict)
 async def get_config_backup_filters(db: Session = Depends(get_db)):
+    cached = redis_client.get(CONFIG_BACKUP_FILTERS_CACHE_KEY)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            redis_client.delete(CONFIG_BACKUP_FILTERS_CACHE_KEY)
     datacenters = [
         {"name": name}
         for (name,) in (
@@ -292,7 +302,9 @@ async def get_config_backup_filters(db: Session = Depends(get_db)):
             .all()
         )
     ]
-    return {"datacenters": datacenters}
+    payload = {"datacenters": datacenters}
+    redis_client.setex(CONFIG_BACKUP_FILTERS_CACHE_KEY, CONFIG_BACKUP_FILTERS_CACHE_SECONDS, json.dumps(payload, ensure_ascii=False))
+    return payload
 
 
 @router.get("/settings", response_model=dict)
