@@ -297,8 +297,12 @@ export const getAlertSilences = async (params?: {
 export const getAlertSilenceMatches = async (
   id: number,
   params?: { skip?: number; limit?: number; active_only?: boolean }
-): Promise<{ total: number; items: AlertHistory[] }> => {
-  return await request.get(`/alerts/silences/${id}/matches`, { params }) as { total: number; items: AlertHistory[] }
+): Promise<{ total: number; items: AlertHistory[]; rule_filters?: Array<{ text: string; value: string }> }> => {
+  return await request.get(`/alerts/silences/${id}/matches`, { params }) as {
+    total: number
+    items: AlertHistory[]
+    rule_filters?: Array<{ text: string; value: string }>
+  }
 }
 
 export const createAlertSilence = async (data: AlertSilencePayload): Promise<AlertSilence> => {

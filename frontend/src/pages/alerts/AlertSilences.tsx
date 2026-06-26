@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button, Card, DatePicker, Form, Input, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Tooltip, Typography, message } from 'antd'
 import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
@@ -135,6 +135,7 @@ const AlertSilences = () => {
   const [matchesTotal, setMatchesTotal] = useState(0)
   const [matchesPage, setMatchesPage] = useState(1)
   const [matchesPageSize, setMatchesPageSize] = useState(10)
+  const [matchRuleFilters, setMatchRuleFilters] = useState<Array<{ text: string; value: string }>>([])
   const [selectedSilence, setSelectedSilence] = useState<AlertSilence | null>(null)
   const matchesRequestSeqRef = useRef(0)
   const countRequestSeqRef = useRef(0)
@@ -298,6 +299,7 @@ const AlertSilences = () => {
       if (requestSeq !== matchesRequestSeqRef.current) return
       setMatches(result.items)
       setMatchesTotal(result.total)
+      setMatchRuleFilters(result.rule_filters || [])
       setMatchesPage(nextPage)
       setMatchesPageSize(nextPageSize)
       setItems((prev) => prev.map((item) => (
@@ -321,21 +323,11 @@ const AlertSilences = () => {
     setMatchesTitle(record.name)
     setMatches([])
     setMatchesTotal(0)
+    setMatchRuleFilters([])
     setMatchesPage(1)
     setMatchesOpen(true)
     void fetchMatches(record, 1, matchesPageSize)
   }
-
-  const matchRuleFilters = useMemo(() => {
-    const options = new Map<string, string>()
-    matches.forEach((item) => {
-      const label = item.rule_name || (item.rule_id ? `规则 ${item.rule_id}` : '-')
-      options.set(label, label)
-    })
-    return Array.from(options.values())
-      .sort((left, right) => compareText(left, right))
-      .map((value) => ({ text: value, value }))
-  }, [matches])
 
   return (
     <Card
@@ -627,6 +619,7 @@ const AlertSilences = () => {
           setSelectedSilence(null)
           setMatches([])
           setMatchesTotal(0)
+          setMatchRuleFilters([])
           setMatchesLoading(false)
         }}
         destroyOnClose
@@ -677,8 +670,8 @@ const AlertSilences = () => {
               filters: matchRuleFilters,
               filterSearch: true,
               onFilter: (value: any, record: AlertHistoryItem) => {
-                const label = record.rule_name || (record.rule_id ? `规则 ${record.rule_id}` : '-')
-                return label === value
+                const key = record.rule_id ? String(record.rule_id) : (record.rule_name || '-')
+                return key === value
               },
               render: (value?: string | null, record?: AlertHistoryItem) => value || (record?.rule_id ? `规则 ${record.rule_id}` : '-'),
             },

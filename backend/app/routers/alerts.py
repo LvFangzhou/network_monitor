@@ -1193,9 +1193,18 @@ async def list_alert_silence_matches(
     if not silence:
         raise HTTPException(status_code=404, detail="告警屏蔽不存在")
     matched_alerts = _get_silence_matched_alerts(db, silence, active_only=active_only)
+    rule_filters = {}
+    for alert in matched_alerts:
+        label = alert.rule.name if alert.rule else (f"规则 {alert.rule_id}" if alert.rule_id else "-")
+        value = str(alert.rule_id) if alert.rule_id else label
+        rule_filters[value] = label
     return {
         "total": len(matched_alerts),
         "items": [alert.to_dict() for alert in matched_alerts[skip: skip + limit]],
+        "rule_filters": [
+            {"text": label, "value": value}
+            for value, label in sorted(rule_filters.items(), key=lambda item: item[1])
+        ],
     }
 
 
