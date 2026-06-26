@@ -163,4 +163,20 @@ beat_schedule = {
             'expires': 50.0,
         },
     },
+
+    # 菜单首屏缓存预热 - 系统 24 小时运行时后台保持常用页面缓存，用户登录/切菜单优先读缓存
+    'prewarm-fast-menu-caches-every-60s': {
+        'task': 'app.tasks.menu_cache_tasks.prewarm_fast_menu_caches',
+        'schedule': 60.0,
+        'options': {
+            'expires': 50.0,
+        },
+    },
+    'prewarm-device-overview-cache-every-5m': {
+        'task': 'app.tasks.menu_cache_tasks.prewarm_device_overview_cache',
+        'schedule': 300.0,
+        'options': {
+            'expires': 240.0,
+        },
+    },
 }

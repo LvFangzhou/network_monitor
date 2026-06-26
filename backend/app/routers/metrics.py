@@ -44,6 +44,7 @@ RATE_FALLBACK_MAX_SECONDS = 5 * 60
 HISTORY_REQUEST_CACHE_SECONDS = 8
 DASHBOARD_STATS_CACHE_SECONDS = 300
 DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS = 15 * 60
+DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX = "monitor:cache:overview_snapshot"
 FRESH_INTERFACE_SAMPLE_LOCK_SECONDS = 8
 FRESH_INTERFACE_SAMPLE_MAX_RANGE_SECONDS = 60 * 60
 INTERFACE_RATE_CAP_MULTIPLIER = 1.03
@@ -2125,40 +2126,62 @@ async def get_monitor_devices_overview(
     db: Session = Depends(get_db),
 ):
     """设备总览：汇总设备资源、监控连通性和路由协议状态。"""
-    overview_cache_key = ":".join([
-        "monitor:cache:overview_response",
-        str(search or ""),
-        str(vendor or ""),
-        str(model or ""),
-        str(connectivity or ""),
+    # 设备总览是高频入口页。这里缓存“全量首屏快照”，再在内存中过滤搜索条件，
+    # 避免用户第一次进入、搜索或取消搜索时反复触发重聚合。
+    snapshot_cache_key = ":".join([
+        DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX,
         str(int(monitored_only)),
         str(int(include_storage)),
         str(int(include_hardware)),
         str(int(include_sessions)),
         str(limit),
     ])
-    cached_response = redis_client.get(overview_cache_key)
-    if cached_response:
+    cached_snapshot = redis_client.get(snapshot_cache_key)
+    if cached_snapshot:
         try:
-            return json.loads(cached_response)
+            payload = json.loads(cached_snapshot)
+            items = payload.get("items", []) if isinstance(payload, dict) else []
+            keyword = (search or "").strip().lower()
+            vendor_keyword = (vendor or "").strip().lower()
+            model_keyword = (model or "").strip().lower()
+            filtered_items = []
+            for item in items:
+                device = item.get("device") or {}
+                if connectivity and (item.get("connectivity") or {}).get("status") != connectivity:
+                    continue
+                if vendor_keyword and vendor_keyword not in str(device.get("vendor") or "").lower():
+                    continue
+                if model_keyword and model_keyword not in str(device.get("model") or "").lower():
+                    continue
+                if keyword:
+                    system_info = item.get("system_info") or {}
+                    datacenter = device.get("datacenter") or {}
+                    haystack = " ".join(
+                        str(value)
+                        for value in [
+                            device.get("name"),
+                            device.get("hostname"),
+                            device.get("ip_address"),
+                            device.get("vendor"),
+                            device.get("model"),
+                            datacenter.get("name") if isinstance(datacenter, dict) else None,
+                            system_info.get("sys_name"),
+                            system_info.get("snmp_model"),
+                            system_info.get("software_version"),
+                            system_info.get("serial_number"),
+                        ]
+                        if value
+                    ).lower()
+                    if keyword not in haystack:
+                        continue
+                filtered_items.append(item)
+            return {"items": filtered_items, "total": len(filtered_items), "cached": True}
         except Exception:
-            redis_client.delete(overview_cache_key)
+            redis_client.delete(snapshot_cache_key)
 
     query = db.query(Device).filter(Device.status.in_(["active", "online"]))
     if monitored_only:
         query = query.filter(Device.is_monitored == True)
-    if search:
-        keyword = f"%{search.strip()}%"
-        query = query.filter(
-            (Device.name.ilike(keyword)) |
-            (Device.ip_address.ilike(keyword)) |
-            (Device.vendor.ilike(keyword)) |
-            (Device.model.ilike(keyword))
-        )
-    if vendor:
-        query = query.filter(Device.vendor.ilike(f"%{vendor.strip()}%"))
-    if model:
-        query = query.filter(Device.model.ilike(f"%{model.strip()}%"))
 
     devices = query.order_by(Device.ip_address.asc()).limit(limit).all()
     items: List[Dict[str, Any]] = []
@@ -2225,15 +2248,53 @@ async def get_monitor_devices_overview(
         _ensure_snmp_system_info_model(item)
         _apply_controller_overview_fallback(item, controller_data)
         item["collected_at"] = item.get("collected_at") or datetime.now(timezone.utc).isoformat()
-        if not connectivity or item["connectivity"]["status"] == connectivity:
-            items.append(item)
+        items.append(item)
 
     payload = {"items": items, "total": len(items)}
     redis_client.setex(
-        overview_cache_key,
+        snapshot_cache_key,
         DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS,
         json.dumps(payload, ensure_ascii=False, default=str),
     )
+
+    # 复用同一份快照过滤本次请求，避免首次带搜索条件访问时漏掉过滤逻辑。
+    keyword = (search or "").strip().lower()
+    vendor_keyword = (vendor or "").strip().lower()
+    model_keyword = (model or "").strip().lower()
+    if keyword or vendor_keyword or model_keyword or connectivity:
+        filtered_items = []
+        for item in items:
+            device = item.get("device") or {}
+            if connectivity and (item.get("connectivity") or {}).get("status") != connectivity:
+                continue
+            if vendor_keyword and vendor_keyword not in str(device.get("vendor") or "").lower():
+                continue
+            if model_keyword and model_keyword not in str(device.get("model") or "").lower():
+                continue
+            if keyword:
+                system_info = item.get("system_info") or {}
+                datacenter = device.get("datacenter") or {}
+                haystack = " ".join(
+                    str(value)
+                    for value in [
+                        device.get("name"),
+                        device.get("hostname"),
+                        device.get("ip_address"),
+                        device.get("vendor"),
+                        device.get("model"),
+                        datacenter.get("name") if isinstance(datacenter, dict) else None,
+                        system_info.get("sys_name"),
+                        system_info.get("snmp_model"),
+                        system_info.get("software_version"),
+                        system_info.get("serial_number"),
+                    ]
+                    if value
+                ).lower()
+                if keyword not in haystack:
+                    continue
+            filtered_items.append(item)
+        return {"items": filtered_items, "total": len(filtered_items), "cached": False}
+
     return payload
 
 
