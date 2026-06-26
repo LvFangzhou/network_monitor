@@ -406,7 +406,6 @@ const DeviceList = () => {
         search: value || undefined,
         search_mode: value ? getSearchMode(value) : 'fuzzy',
         skip: 0,
-        silent: true,
       })
     }, 120)
   }
@@ -423,31 +422,31 @@ const DeviceList = () => {
   const handleStatusChange = (value: string | undefined) => {
     setStatusFilter(value)
     setCurrentPage(1)
-    fetchDevices({ status: value, skip: 0, silent: true })
+    fetchDevices({ status: value, skip: 0 })
   }
 
   const handleDatacenterChange = (value: number | undefined) => {
     setDatacenterFilter(value)
     setCurrentPage(1)
-    fetchDevices({ datacenter_id: value, skip: 0, silent: true })
+    fetchDevices({ datacenter_id: value, skip: 0 })
   }
 
   const handleRoleChange = (value: string | undefined) => {
     setRoleFilter(value)
     setCurrentPage(1)
-    fetchDevices({ device_role: value, skip: 0, silent: true })
+    fetchDevices({ device_role: value, skip: 0 })
   }
 
   const handleDeviceTypeChange = (value: number | undefined) => {
     setDeviceTypeFilter(value)
     setCurrentPage(1)
-    fetchDevices({ device_type_id: value, skip: 0, silent: true })
+    fetchDevices({ device_type_id: value, skip: 0 })
   }
 
   const handleVendorChange = (value: string | undefined) => {
     setVendorFilter(value)
     setCurrentPage(1)
-    fetchDevices({ vendor: value, skip: 0, silent: true })
+    fetchDevices({ vendor: value, skip: 0 })
   }
 
   const handleMonitoredChange = (value: string | undefined) => {
@@ -456,7 +455,6 @@ const DeviceList = () => {
     fetchDevices({
       is_monitored: value === undefined ? undefined : value === 'true',
       skip: 0,
-      silent: true,
     })
   }
 

@@ -270,12 +270,19 @@ const ConfigBackups = () => {
 
   const handleTrigger = async () => {
     setTriggering(true)
+    const hideLoading = message.loading('正在提交配置备份任务，请稍候...', 0)
     try {
       const result = await triggerConfigBackup()
+      hideLoading()
       message.success(result.message || '已提交配置备份任务')
+      if (result.job) {
+        setLatestJob(result.job)
+        setJobs((prev) => [result.job, ...prev.filter((item) => item.id !== result.job.id)].slice(0, jobsPageSize))
+      }
       await loadJobs(1, jobsPageSize)
       setJobsPage(1)
     } catch (error: any) {
+      hideLoading()
       message.error(error?.response?.data?.detail || '触发配置备份失败')
     } finally {
       setTriggering(false)
@@ -731,14 +738,21 @@ const ConfigBackups = () => {
         </Spin>
       </Drawer>
 
-      <Drawer title="任务设备明细" open={jobResultsOpen} onClose={() => setJobResultsOpen(false)} width="96vw">
+      <Drawer
+        title="任务设备明细"
+        open={jobResultsOpen}
+        onClose={() => setJobResultsOpen(false)}
+        width="96vw"
+        bodyStyle={{ padding: 16, height: 'calc(100vh - 55px)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
+      >
         <Table
           rowKey="id"
           loading={jobResultsLoading}
           dataSource={jobResults}
           pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total) => `共 ${total} 台` }}
           virtual
-          scroll={{ x: 1300, y: 620 }}
+          scroll={{ x: 1300, y: Math.max(520, window.innerHeight - 205) }}
+          style={{ flex: 1, minHeight: 0 }}
           columns={[
             { title: '设备', width: 260, sorter: (a, b) => ipToNumber(a.device_ip) - ipToNumber(b.device_ip), render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
             { title: '机房', dataIndex: 'datacenter_name', width: 150, filters: jobResultOptions.datacenters, onFilter: (value, record) => record.datacenter_name === value, sorter: (a, b) => String(a.datacenter_name || '').localeCompare(String(b.datacenter_name || '')), render: (value?: string) => value || '-' },
@@ -756,7 +770,7 @@ const ConfigBackups = () => {
             },
           ]}
         />
-        <Text type="secondary" style={{ display: 'block', marginTop: 12 }}>失败设备通常是 SSH 账号、密码、ACL、登录超时或厂商分页命令不兼容导致。</Text>
+        <Text type="secondary" style={{ display: 'block', marginTop: 8, flexShrink: 0 }}>失败设备通常是 SSH 账号、密码、ACL、登录超时或厂商分页命令不兼容导致。</Text>
       </Drawer>
     </div>
   )

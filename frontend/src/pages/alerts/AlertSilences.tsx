@@ -133,13 +133,13 @@ const AlertSilences = () => {
   const [matchesTitle, setMatchesTitle] = useState('')
   const [matches, setMatches] = useState<AlertHistoryItem[]>([])
   const [matchesTotal, setMatchesTotal] = useState(0)
+  const [matchesTotalExact, setMatchesTotalExact] = useState(true)
   const [matchesPage, setMatchesPage] = useState(1)
   const [matchesPageSize, setMatchesPageSize] = useState(10)
   const [matchRuleFilters, setMatchRuleFilters] = useState<Array<{ text: string; value: string }>>([])
   const [selectedSilence, setSelectedSilence] = useState<AlertSilence | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const matchesRequestSeqRef = useRef(0)
-  const countRequestSeqRef = useRef(0)
   const [form] = Form.useForm()
   const currentUser = useAuthStore((state) => state.user)
   const navigate = useNavigate()
@@ -155,7 +155,6 @@ const AlertSilences = () => {
         include_total_match_counts: false,
       })
       setItems(result.items)
-      void loadMatchCounts(result.items)
     } catch {
       message.error('获取告警屏蔽失败')
     } finally {
@@ -168,46 +167,6 @@ const AlertSilences = () => {
   useEffect(() => {
     fetchData()
   }, [])
-
-  const loadMatchCounts = async (silences: AlertSilence[]) => {
-    const requestSeq = countRequestSeqRef.current + 1
-    countRequestSeqRef.current = requestSeq
-    const targets = silences.filter((item) => item.id)
-    const concurrency = 2
-    let cursor = 0
-
-    const worker = async () => {
-      while (cursor < targets.length && requestSeq === countRequestSeqRef.current) {
-        const silence = targets[cursor]
-        cursor += 1
-        try {
-          const [activeResult, totalResult] = await Promise.all([
-            getAlertSilenceMatches(silence.id, { skip: 0, limit: 1, active_only: true }),
-            getAlertSilenceMatches(silence.id, { skip: 0, limit: 1, active_only: false }),
-          ])
-          if (requestSeq !== countRequestSeqRef.current) return
-          setItems((prev) => prev.map((item) => (
-            item.id === silence.id
-              ? {
-                  ...item,
-                  matched_active_alerts: activeResult.total,
-                  matched_total_alerts: totalResult.total,
-                }
-              : item
-          )))
-        } catch {
-          if (requestSeq !== countRequestSeqRef.current) return
-          setItems((prev) => prev.map((item) => (
-            item.id === silence.id
-              ? { ...item, matched_active_alerts: 0, matched_total_alerts: 0 }
-              : item
-          )))
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, () => worker()))
-  }
 
   const openCreate = () => {
     setEditingItem(null)
@@ -267,9 +226,6 @@ const AlertSilences = () => {
               }
             : item
         )))
-        window.setTimeout(() => {
-          void loadMatchCounts([savedItem])
-        }, 800)
         message.success('告警屏蔽已更新')
       } else {
         savedItem = await createAlertSilence(payload)
@@ -277,9 +233,6 @@ const AlertSilences = () => {
           { ...savedItem, matched_active_alerts: null, matched_total_alerts: null },
           ...prev,
         ])
-        window.setTimeout(() => {
-          void loadMatchCounts([savedItem])
-        }, 800)
         message.success('告警屏蔽已创建')
       }
       setModalOpen(false)
@@ -305,6 +258,7 @@ const AlertSilences = () => {
       if (requestSeq !== matchesRequestSeqRef.current) return
       setMatches(result.items)
       setMatchesTotal(result.total)
+      setMatchesTotalExact(result.total_exact !== false)
       setMatchRuleFilters(result.rule_filters || [])
       setMatchesPage(nextPage)
       setMatchesPageSize(nextPageSize)
@@ -329,6 +283,7 @@ const AlertSilences = () => {
     setMatchesTitle(record.name)
     setMatches([])
     setMatchesTotal(0)
+    setMatchesTotalExact(true)
     setMatchRuleFilters([])
     setMatchesPage(1)
     setMatchesOpen(true)
@@ -392,8 +347,8 @@ const AlertSilences = () => {
               if (countsLoading) {
                 return (
                   <Space size={6}>
-                    <Tag color="processing">统计中</Tag>
-                    <Tooltip title="查看具体命中的告警明细">
+                    <Tag color="default">点详情统计</Tag>
+                    <Tooltip title="点击后只统计这一条屏蔽规则，避免进入页面时批量扫库拖慢系统">
                       <Button
                         type="text"
                         size="small"
@@ -613,7 +568,9 @@ const AlertSilences = () => {
             {matchesLoading ? (
               <Tag color="processing">正在加载</Tag>
             ) : (
-              <Tag color={matchesTotal > 0 ? 'blue' : 'default'}>{`命中 ${matchesTotal} 条`}</Tag>
+              <Tag color={matchesTotal > 0 ? 'blue' : 'default'}>
+                {matchesTotalExact ? `命中 ${matchesTotal} 条` : `已加载 ${matchesTotal}+ 条`}
+              </Tag>
             )}
           </Space>
         )}
@@ -626,6 +583,7 @@ const AlertSilences = () => {
           setSelectedSilence(null)
           setMatches([])
           setMatchesTotal(0)
+          setMatchesTotalExact(true)
           setMatchRuleFilters([])
           setMatchesLoading(false)
         }}
@@ -648,7 +606,7 @@ const AlertSilences = () => {
             total: matchesTotal,
             showSizeChanger: true,
             pageSizeOptions: [10, 20, 50, 100],
-            showTotal: (total, range) => `第 ${range[0]}-${range[1]} 条 / 共 ${total} 条`,
+            showTotal: (total, range) => `第 ${range[0]}-${range[1]} 条 / ${matchesTotalExact ? `共 ${total} 条` : `已加载 ${total}+ 条`}`,
             onChange: (nextPage, nextPageSize) => {
               if (selectedSilence) {
                 fetchMatches(selectedSilence, nextPage, nextPageSize)

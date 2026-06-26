@@ -98,6 +98,41 @@ def _get_silence_matched_alerts(
     return matched
 
 
+def _get_silence_matched_alerts_page(
+    db: Session,
+    silence: AlertSilence,
+    *,
+    active_only: bool,
+    skip: int,
+    limit: int,
+) -> tuple[List[AlertHistory], int, bool]:
+    """Return one matched page without forcing a full history scan.
+
+    Some silence rules match thousands of alerts. The old detail API loaded and
+    matched every candidate just to return page one, which made the page appear
+    as a network error under load. This helper stops once the requested page is
+    filled. The returned count is exact only when the scan naturally reaches the
+    end; otherwise it is a lower bound for UI pagination.
+    """
+    alerts_query = _build_silence_candidate_query(db, silence, active_only=active_only)
+    matched_page: List[AlertHistory] = []
+    matched_seen = 0
+    exhausted = True
+    target_count = skip + limit
+
+    for alert in alerts_query.order_by(AlertHistory.started_at.desc()).yield_per(200):
+        if not _alert_matches_silence(silence, alert):
+            continue
+        matched_seen += 1
+        if matched_seen > skip and len(matched_page) < limit:
+            matched_page.append(alert)
+        if matched_seen >= target_count and len(matched_page) >= limit:
+            exhausted = False
+            break
+
+    return matched_page, matched_seen, exhausted
+
+
 def _alert_matches_silence(silence: AlertSilence, alert: AlertHistory) -> bool:
     if not alert.rule or not alert.device:
         return False
@@ -1192,8 +1227,8 @@ async def list_alert_silences(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=200),
     enabled: Optional[bool] = None,
-    include_match_counts: bool = Query(True, description="是否同步计算命中告警数量"),
-    include_total_match_counts: bool = Query(True, description="是否同步计算历史命中告警数量"),
+    include_match_counts: bool = Query(False, description="是否返回已缓存的命中告警数量；不会在列表页同步扫库计算"),
+    include_total_match_counts: bool = Query(False, description="是否返回已缓存的历史命中告警数量；不会在列表页同步扫库计算"),
 ):
     query = db.query(AlertSilence)
     if enabled is not None:
@@ -1204,9 +1239,11 @@ async def list_alert_silences(
     for item in items:
         data = item.to_dict()
         if include_match_counts:
-            data["matched_active_alerts"] = _count_silence_matches_cached(db, item, active_only=True)
+            cached_active = redis_client.get(_silence_match_count_cache_key(item, True))
+            data["matched_active_alerts"] = int(cached_active) if cached_active is not None else None
             if include_total_match_counts:
-                data["matched_total_alerts"] = _count_silence_matches_cached(db, item, active_only=False)
+                cached_total = redis_client.get(_silence_match_count_cache_key(item, False))
+                data["matched_total_alerts"] = int(cached_total) if cached_total is not None else None
             else:
                 data["matched_total_alerts"] = None
         else:
@@ -1227,15 +1264,45 @@ async def list_alert_silence_matches(
     silence = db.query(AlertSilence).filter(AlertSilence.id == silence_id).first()
     if not silence:
         raise HTTPException(status_code=404, detail="告警屏蔽不存在")
-    matched_alerts = _get_silence_matched_alerts(db, silence, active_only=active_only)
+    matched_alerts, matched_seen, exhausted = _get_silence_matched_alerts_page(
+        db,
+        silence,
+        active_only=active_only,
+        skip=skip,
+        limit=limit,
+    )
+    count_cache_key = _silence_match_count_cache_key(silence, active_only)
+    cached_count = redis_client.get(count_cache_key)
+    total = None
+    if cached_count is not None:
+        try:
+            total = int(cached_count)
+        except (TypeError, ValueError):
+            total = None
+    if exhausted:
+        total = matched_seen
+        redis_client.setex(count_cache_key, SILENCE_MATCH_CACHE_TTL_SECONDS, str(total))
+    if total is None:
+        total = max(skip + len(matched_alerts), matched_seen)
     rule_filters = {}
+    for rule_id, rule_name in (
+        _build_silence_candidate_query(db, silence, active_only=active_only)
+        .with_entities(AlertRule.id, AlertRule.name)
+        .distinct()
+        .order_by(AlertRule.name.asc())
+        .limit(200)
+        .all()
+    ):
+        if rule_id:
+            rule_filters[str(rule_id)] = rule_name or f"规则 {rule_id}"
     for alert in matched_alerts:
         label = alert.rule.name if alert.rule else (f"规则 {alert.rule_id}" if alert.rule_id else "-")
         value = str(alert.rule_id) if alert.rule_id else label
         rule_filters[value] = label
     return {
-        "total": len(matched_alerts),
-        "items": [alert.to_dict() for alert in matched_alerts[skip: skip + limit]],
+        "total": total,
+        "total_exact": exhausted or cached_count is not None,
+        "items": [alert.to_dict() for alert in matched_alerts],
         "rule_filters": [
             {"text": label, "value": value}
             for value, label in sorted(rule_filters.items(), key=lambda item: item[1])

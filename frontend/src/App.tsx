@@ -59,25 +59,8 @@ const preloadRouteModules = () => {
   void Promise.allSettled([
     loadDashboard(),
     loadDeviceList(),
-    loadDeviceDictionaryManager(),
-    loadDatacenterList(),
-    loadCustomerList(),
-    loadVendorList(),
-    loadPublicCircuitList(),
-    loadPrivateCircuitList(),
-    loadIPDBList(),
-    loadAlertRules(),
     loadAlertHistory(),
-    loadAlertAudit(),
-    loadAlertSilences(),
     loadMetrics(),
-    loadDeviceOverview(),
-    loadIPFlowQuery(),
-    loadModuleInfoQuery(),
-    loadLosslessInfoQuery(),
-    loadSettings(),
-    loadTacacsManager(),
-    loadConfigBackups(),
   ])
 }
 
