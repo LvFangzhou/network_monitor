@@ -120,11 +120,16 @@ beat_schedule = {
     },
 
     # 告警规则详情缓存预热 - 用户首次点击“查看状态”时优先命中Redis缓存
-    'prewarm-alert-rule-status-cache-every-60s': {
+    'prewarm-alert-rule-status-cache-every-3m': {
         'task': 'app.tasks.alert_tasks.prewarm_alert_rule_status_cache',
-        'schedule': 60.0,
+        'schedule': 180.0,
+        'kwargs': {
+            'limit': 100,
+            'batch_size': 2,
+            'max_runtime_seconds': 4,
+        },
         'options': {
-            'expires': 50.0,
+            'expires': 120.0,
         }
     },
     

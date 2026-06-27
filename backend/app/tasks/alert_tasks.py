@@ -38,7 +38,7 @@ PENDING_ALERT_TTL_SECONDS = 7200
 _EXPORTER_SCRAPE_CACHE: Dict[int, Dict[str, Any]] = {}
 _EXPORTER_SCRAPE_CACHE_LOCK = threading.Lock()
 EXPORTER_DELTA_CACHE_TTL_SECONDS = 86400
-RULE_STATUS_PREWARM_URL = "http://api:8000/api/v1/alerts/rules/{rule_id}/status?limit=500"
+RULE_STATUS_PREWARM_URL = "http://api:8000/api/v1/alerts/rules/{rule_id}/status?limit={limit}&max_runtime_seconds={max_runtime_seconds}"
 RULE_STATUS_PREWARM_LOCK_KEY = "alerts:rule_status_prewarm:lock"
 RULE_STATUS_PREWARM_CURSOR_KEY = "alerts:rule_status_prewarm:cursor"
 NOTIFICATION_QUEUE = "notification"
@@ -1101,7 +1101,7 @@ def check_alerts():
 
 
 @shared_task
-def prewarm_alert_rule_status_cache(limit: int = 500, batch_size: int = 8):
+def prewarm_alert_rule_status_cache(limit: int = 100, batch_size: int = 2, max_runtime_seconds: int = 4):
     """分批预热告警规则详情缓存，减少首次点击等待且避免打满后台。"""
     lock_value = f"{time.time()}:{uuid.uuid4()}"
     lock_acquired = bool(
@@ -1138,11 +1138,13 @@ def prewarm_alert_rule_status_cache(limit: int = 500, batch_size: int = 8):
         ]
 
         for rule_id in selected_rule_ids:
-            url = RULE_STATUS_PREWARM_URL.format(rule_id=rule_id)
-            if limit != 500:
-                url = f"http://api:8000/api/v1/alerts/rules/{rule_id}/status?limit={int(limit)}"
+            url = RULE_STATUS_PREWARM_URL.format(
+                rule_id=rule_id,
+                limit=int(limit),
+                max_runtime_seconds=int(max_runtime_seconds),
+            )
             try:
-                with urllib.request.urlopen(url, timeout=6) as response:
+                with urllib.request.urlopen(url, timeout=max(int(max_runtime_seconds) + 1, 3)) as response:
                     response.read(256)
                 warmed += 1
             except Exception as exc:

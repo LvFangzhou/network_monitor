@@ -201,7 +201,13 @@ export const deleteAlertRule = async (id: number): Promise<void> => {
 
 export const getAlertRuleStatus = async (
   id: number,
-  params?: { search?: string; status?: 'normal' | 'alert' | 'no_data'; limit?: number; refresh?: boolean }
+  params?: {
+    search?: string
+    status?: 'normal' | 'alert' | 'no_data'
+    limit?: number
+    refresh?: boolean
+    max_runtime_seconds?: number
+  }
 ): Promise<AlertRuleStatusResponse> => {
   return await request.get(`/alerts/rules/${id}/status`, { params }) as AlertRuleStatusResponse
 }

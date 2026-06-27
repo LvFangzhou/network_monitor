@@ -2136,7 +2136,19 @@ async def get_monitor_devices_overview(
         str(int(include_sessions)),
         str(limit),
     ])
+    last_success_cache_key = ":".join([
+        "monitor:cache:last_success_overview_snapshot",
+        str(int(monitored_only)),
+        str(int(include_storage)),
+        str(int(include_hardware)),
+        str(int(include_sessions)),
+        str(limit),
+    ])
     cached_snapshot = redis_client.get(snapshot_cache_key)
+    stale_snapshot = False
+    if not cached_snapshot:
+        cached_snapshot = redis_client.get(last_success_cache_key)
+        stale_snapshot = bool(cached_snapshot)
     if cached_snapshot:
         try:
             payload = json.loads(cached_snapshot)
@@ -2175,7 +2187,7 @@ async def get_monitor_devices_overview(
                     if keyword not in haystack:
                         continue
                 filtered_items.append(item)
-            return {"items": filtered_items, "total": len(filtered_items), "cached": True}
+            return {"items": filtered_items, "total": len(filtered_items), "cached": True, "stale": stale_snapshot}
         except Exception:
             redis_client.delete(snapshot_cache_key)
 
@@ -2254,6 +2266,11 @@ async def get_monitor_devices_overview(
     redis_client.setex(
         snapshot_cache_key,
         DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS,
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
+    redis_client.setex(
+        last_success_cache_key,
+        24 * 60 * 60,
         json.dumps(payload, ensure_ascii=False, default=str),
     )
 

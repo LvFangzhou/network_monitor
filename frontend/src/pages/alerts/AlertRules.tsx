@@ -194,11 +194,22 @@ const AlertRules = () => {
         search: nextSearch.trim() || undefined,
         status: nextStatus,
         limit: 200,
+        max_runtime_seconds: 6,
         refresh: forceRefresh || undefined,
       })
       ruleStatusCacheRef.current.set(cacheKey, { data: result, cachedAt: Date.now() })
       setRuleStatus(result)
     } catch (error) {
+      setRuleStatus({
+        rule,
+        summary: { total: 0, normal: 0, alert: 0, no_data: 0 },
+        items: [],
+        limit: 200,
+        truncated: false,
+        partial: true,
+        evaluated_at: new Date().toISOString(),
+        cached: false,
+      })
       message.error('获取规则当前状态失败')
     } finally {
       setLoadingRuleStatus(false)
