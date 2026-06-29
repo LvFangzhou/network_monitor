@@ -1174,6 +1174,30 @@ def prewarm_alert_rule_status_cache(limit: int = 100, batch_size: int = 2, max_r
             redis_client.delete(RULE_STATUS_PREWARM_LOCK_KEY)
 
 
+@shared_task(name="app.tasks.alert_tasks.prewarm_alert_silence_match_counts", time_limit=240, soft_time_limit=210)
+def prewarm_alert_silence_match_counts(silence_id: int):
+    """后台计算告警屏蔽命中数量，避免列表页同步扫库拖慢 API。"""
+    db = SessionLocal()
+    try:
+        silence = db.query(AlertSilence).filter(AlertSilence.id == silence_id).first()
+        if not silence:
+            return {"silence_id": silence_id, "missing": True}
+
+        # Runtime import avoids making alert route imports part of Celery module
+        # initialization. The route module owns the exact matching/cache helpers,
+        # so the list count and detail count remain consistent.
+        from app.routers.alerts import _count_silence_matches_with_lock
+
+        active = _count_silence_matches_with_lock(db, silence, active_only=True)
+        total = _count_silence_matches_with_lock(db, silence, active_only=False)
+        return {"silence_id": silence_id, "active": active, "total": total}
+    except Exception as exc:
+        logger.warning("告警屏蔽命中数量后台统计失败", silence_id=silence_id, error=str(exc))
+        return {"silence_id": silence_id, "error": str(exc)}
+    finally:
+        db.close()
+
+
 def _check_single_rule(db: Session, rule: AlertRule) -> bool:
     """
     检查单个告警规则

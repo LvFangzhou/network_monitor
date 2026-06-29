@@ -35,6 +35,7 @@ from app.tasks.alert_tasks import (
     _is_targeted_metric,
     _silence_matches,
 )
+from app.tasks import celery_app
 from app.utils import notification_manager, redis_client
 from app.utils.ip_match import is_exact_ip_address
 from app.schemas import (
@@ -54,6 +55,7 @@ ALERT_HISTORY_SUMMARY_CACHE_TTL_SECONDS = 120
 SILENCE_MATCH_CACHE_PREFIX = "alerts:silence_matches"
 SILENCE_MATCH_CACHE_TTL_SECONDS = 60
 SILENCE_MATCH_COUNT_LOCK_TTL_SECONDS = 120
+SILENCE_MATCH_QUEUE_LOCK_TTL_SECONDS = 30
 RULE_STATUS_MAX_RUNTIME_SECONDS = 6.0
 
 SEVERITY_NORMALIZATION = {
@@ -303,6 +305,42 @@ def _count_silence_matches_cached(db: Session, silence: AlertSilence, *, active_
 
 def _silence_match_count_lock_key(silence_id: int, active_only: bool) -> str:
     return f"{SILENCE_MATCH_CACHE_PREFIX}:lock:{silence_id}:{int(bool(active_only))}"
+
+
+def _silence_match_count_queue_lock_key(silence_id: int) -> str:
+    return f"{SILENCE_MATCH_CACHE_PREFIX}:queue:{silence_id}"
+
+
+def _get_silence_match_count_cached(silence: AlertSilence, *, active_only: bool) -> Dict[str, Any]:
+    cache_key = _silence_match_count_cache_key(silence, active_only)
+    cached = redis_client.get(cache_key)
+    if cached is not None:
+        try:
+            return {"count": int(cached), "cached": True, "pending": False}
+        except (TypeError, ValueError):
+            pass
+    return {"count": None, "cached": False, "pending": True}
+
+
+def _queue_silence_match_count_prewarm(silence_id: int) -> None:
+    queue_lock_key = _silence_match_count_queue_lock_key(silence_id)
+    queued = redis_client.set(
+        queue_lock_key,
+        str(time.time()),
+        ex=SILENCE_MATCH_QUEUE_LOCK_TTL_SECONDS,
+        nx=True,
+    )
+    if not queued:
+        return
+    try:
+        celery_app.send_task(
+            "app.tasks.alert_tasks.prewarm_alert_silence_match_counts",
+            args=[silence_id],
+            queue="alerts_prewarm",
+        )
+    except Exception as exc:
+        redis_client.delete(queue_lock_key)
+        logger.warning("告警屏蔽命中统计后台任务入队失败", silence_id=silence_id, error=str(exc))
 
 
 def _count_silence_matches_with_lock(db: Session, silence: AlertSilence, *, active_only: bool) -> Dict[str, Any]:
@@ -767,14 +805,17 @@ async def get_alert_silence_match_counts(
 ):
     """计算单条告警屏蔽命中数量。
 
-    前端会低并发逐条调用，避免进入列表时并发扫全量告警历史。
+    列表页只读缓存；未命中时丢到低优先 Celery 队列后台计算，
+    避免慢规则同步扫库拖垮 API。
     """
     silence = db.query(AlertSilence).filter(AlertSilence.id == silence_id).first()
     if not silence:
         raise HTTPException(status_code=404, detail="告警屏蔽不存在")
 
-    active = _count_silence_matches_with_lock(db, silence, active_only=True)
-    total = _count_silence_matches_with_lock(db, silence, active_only=False)
+    active = _get_silence_match_count_cached(silence, active_only=True)
+    total = _get_silence_match_count_cached(silence, active_only=False)
+    if active.get("pending") or total.get("pending"):
+        _queue_silence_match_count_prewarm(silence.id)
     return {
         "silence_id": silence.id,
         "active": active,

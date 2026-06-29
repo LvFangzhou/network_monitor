@@ -183,7 +183,7 @@ const AlertSilences = () => {
     const requestSeq = countRequestSeqRef.current + 1
     countRequestSeqRef.current = requestSeq
     let targets = silences.filter((item) => item.id)
-    const maxRounds = 8
+    const maxRounds = 60
     for (let round = 0; round < maxRounds && targets.length > 0; round += 1) {
       const pendingTargets: AlertSilence[] = []
       for (const silence of targets) {
@@ -389,23 +389,34 @@ const AlertSilences = () => {
             title: '命中告警',
             render: (_: unknown, record: AlertSilence) => {
               const countsLoading = record.matched_active_alerts === null || record.matched_total_alerts === null
-              const activeLoading = record.matched_active_alerts === null
-              const totalLoading = record.matched_total_alerts === null
               const activeCount = record.matched_active_alerts ?? 0
               const totalCount = record.matched_total_alerts ?? 0
+              if (countsLoading) {
+                return (
+                  <Space size={6}>
+                    <Tag color="processing">
+                      <Space size={4}><Spin size="small" />加载命中数</Space>
+                    </Tag>
+                    <Tooltip title="命中数量正在后台统计；可先查看已加载明细">
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<EyeOutlined />}
+                        onClick={() => openMatches(record)}
+                      />
+                    </Tooltip>
+                  </Space>
+                )
+              }
               return (
                 <Space size={6}>
                   <Tooltip title="当前仍处于触发、确认、忽略或暂缓状态的命中告警">
-                    <Tag color={activeLoading ? 'processing' : activeCount > 0 ? 'red' : 'default'}>
-                      {activeLoading ? <Space size={4}><Spin size="small" />当前</Space> : `当前 ${activeCount} 条`}
-                    </Tag>
+                    <Tag color={activeCount > 0 ? 'red' : 'default'}>当前 {activeCount} 条</Tag>
                   </Tooltip>
                   <Tooltip title="历史上匹配过这条屏蔽规则的告警">
-                    <Tag color={totalLoading ? 'processing' : totalCount > 0 ? 'blue' : 'default'}>
-                      {totalLoading ? <Space size={4}><Spin size="small" />历史</Space> : `历史 ${totalCount} 条`}
-                    </Tag>
+                    <Tag color={totalCount > 0 ? 'blue' : 'default'}>历史 {totalCount} 条</Tag>
                   </Tooltip>
-                  <Tooltip title={countsLoading ? '命中数量正在后台统计；可先查看已加载明细' : '查看历史命中告警'}>
+                  <Tooltip title="查看历史命中告警">
                     <Button
                       type="text"
                       size="small"

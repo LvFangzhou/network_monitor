@@ -3,12 +3,16 @@ H3C 控制器/分析器北向 API 客户端。
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 import re
 
 import httpx
+
+from app.utils.redis_client import redis_client
 
 
 @dataclass
@@ -390,16 +394,37 @@ class ControllerClient:
         total = int((result or {}).get("totalSize") or 0)
 
         if has_local_filter:
-            all_records = list(records)
-            total_pages = max(1, (total + fetch_page_size - 1) // fetch_page_size)
-            for next_page in range(2, min(total_pages, 60) + 1):
-                next_params = {**params, "currentPage": next_page}
-                next_data = await self.get(path, params=next_params)
-                next_result = next_data.get("result") if isinstance(next_data, dict) else {}
-                next_records = (next_result or {}).get("recordList") or []
-                if not next_records:
-                    break
-                all_records.extend(next_records)
+            cache_key = f"controller:opticals:full:{self.base_url}"
+            cached_records = redis_client.get(cache_key)
+            if cached_records:
+                try:
+                    all_records = json.loads(cached_records)
+                    if not isinstance(all_records, list):
+                        all_records = []
+                except (TypeError, ValueError):
+                    all_records = []
+            else:
+                all_records = list(records)
+                total_pages = max(1, (total + fetch_page_size - 1) // fetch_page_size)
+                max_pages = min(total_pages, 60)
+
+                async def _fetch_optical_page(page_number: int) -> list[Dict[str, Any]]:
+                    page_data = await self.get(path, params={**params, "currentPage": page_number})
+                    page_result = page_data.get("result") if isinstance(page_data, dict) else {}
+                    page_records = (page_result or {}).get("recordList") or []
+                    return page_records if isinstance(page_records, list) else []
+
+                for start_page in range(2, max_pages + 1, 5):
+                    page_numbers = list(range(start_page, min(start_page + 5, max_pages + 1)))
+                    page_results = await asyncio.gather(
+                        *[_fetch_optical_page(page_number) for page_number in page_numbers],
+                        return_exceptions=True,
+                    )
+                    for page_records in page_results:
+                        if isinstance(page_records, Exception):
+                            continue
+                        all_records.extend(page_records)
+                redis_client.setex(cache_key, 600, json.dumps(all_records, ensure_ascii=False, default=str))
             records = _filter_optical_records(
                 all_records,
                 search=search,

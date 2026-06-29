@@ -42,6 +42,7 @@ celery_app.conf.update(
         "app.tasks.alert_tasks.check_device_health_alerts": {"queue": "alerts_health"},
         "app.tasks.alert_tasks.check_alerts": {"queue": "alerts_general"},
         "app.tasks.alert_tasks.prewarm_alert_rule_status_cache": {"queue": "alerts_prewarm"},
+        "app.tasks.alert_tasks.prewarm_alert_silence_match_counts": {"queue": "alerts_prewarm"},
         "app.tasks.alert_tasks.resolve_stale_alerts": {"queue": "alerts_general"},
         "app.tasks.alert_tasks._send_alert_notification": {"queue": "notification"},
         "app.tasks.alert_tasks._send_alert_event_notification": {"queue": "notification"},
