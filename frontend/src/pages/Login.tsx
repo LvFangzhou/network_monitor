@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { Form, Input, Button, Card, message, Typography, Space } from 'antd'
 import {
   UserOutlined,
@@ -11,11 +11,19 @@ import { useAuthStore } from '../store/auth'
 import { initAuth } from '../api/auth'
 
 const { Title, Text } = Typography
+const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
+
+const getSafeRedirectPath = (value?: unknown) => {
+  if (typeof value !== 'string') return ''
+  if (!value.startsWith('/') || value.startsWith('//') || value.startsWith('/login')) return ''
+  return value
+}
 
 const Login = () => {
   const [loading, setLoading] = useState(false)
   const [initLoading, setInitLoading] = useState(false)
   const navigate = useNavigate()
+  const location = useLocation()
   const { login } = useAuthStore()
 
   const handleSubmit = async (values: { username: string; password: string }) => {
@@ -23,7 +31,12 @@ const Login = () => {
     try {
       await login(values.username, values.password)
       message.success('登录成功')
-      navigate('/')
+      const stateRedirect = getSafeRedirectPath((location.state as { from?: string } | null)?.from)
+      const queryRedirect = getSafeRedirectPath(new URLSearchParams(location.search).get('redirect'))
+      const storedRedirect = getSafeRedirectPath(sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY))
+      const redirectTo = stateRedirect || queryRedirect || storedRedirect || '/'
+      sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY)
+      navigate(redirectTo, { replace: true })
     } catch (error) {
       const axiosError = error as AxiosError<{ detail?: string }>
       const detail = axiosError.response?.data?.detail

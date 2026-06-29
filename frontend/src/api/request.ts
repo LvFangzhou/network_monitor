@@ -2,6 +2,8 @@ import axios, { AxiosError, AxiosInstance } from 'axios'
 import { message } from 'antd'
 import { useAuthStore } from '../store/auth'
 
+const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
+
 // 创建 axios 实例
 const request: AxiosInstance = axios.create({
   baseURL: '/api/v1',
@@ -59,7 +61,11 @@ request.interceptors.response.use(
       if (status === 401 && !isLoginRequest) {
         message.error('登录已过期，请重新登录')
         useAuthStore.getState().logout()
-        window.location.href = '/login'
+        const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`
+        if (currentPath && currentPath !== '/login' && !currentPath.startsWith('/login?')) {
+          sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, currentPath)
+        }
+        window.location.href = `/login${currentPath && currentPath !== '/login' ? `?redirect=${encodeURIComponent(currentPath)}` : ''}`
       }
       // 422 错误让调用方处理，不在这里显示
     } else {
