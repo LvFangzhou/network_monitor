@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Button, Card, DatePicker, Form, Input, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Tooltip, Typography, message } from 'antd'
+import { Button, Card, DatePicker, Form, Input, Modal, Popconfirm, Select, Space, Spin, Switch, Table, Tag, Tooltip, Typography, message } from 'antd'
 import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { useNavigate } from 'react-router-dom'
@@ -182,32 +182,36 @@ const AlertSilences = () => {
   const loadMatchCounts = async (silences: AlertSilence[]) => {
     const requestSeq = countRequestSeqRef.current + 1
     countRequestSeqRef.current = requestSeq
-    const targets = silences.filter((item) => item.id)
-    for (const silence of targets) {
+    let targets = silences.filter((item) => item.id)
+    const maxRounds = 8
+    for (let round = 0; round < maxRounds && targets.length > 0; round += 1) {
+      const pendingTargets: AlertSilence[] = []
+      for (const silence of targets) {
       if (requestSeq !== countRequestSeqRef.current) return
       try {
         const result = await getAlertSilenceMatchCounts(silence.id)
         if (requestSeq !== countRequestSeqRef.current) return
-        if (!result.pending) {
-          setItems((prev) => prev.map((item) => (
-            item.id === silence.id
-              ? {
-                  ...item,
-                  matched_active_alerts: result.active.count ?? 0,
-                  matched_total_alerts: result.total.count ?? 0,
-                }
-              : item
-          )))
+        setItems((prev) => prev.map((item) => {
+          if (item.id !== silence.id) return item
+          return {
+            ...item,
+            matched_active_alerts: result.active.count ?? item.matched_active_alerts ?? null,
+            matched_total_alerts: result.total.count ?? item.matched_total_alerts ?? null,
+          }
+        }))
+        if (result.pending || result.active.count === null || result.total.count === null) {
+          pendingTargets.push(silence)
         }
       } catch {
         if (requestSeq !== countRequestSeqRef.current) return
-        setItems((prev) => prev.map((item) => (
-          item.id === silence.id
-            ? { ...item, matched_active_alerts: 0, matched_total_alerts: 0 }
-            : item
-        )))
+        pendingTargets.push(silence)
       }
       await new Promise((resolve) => window.setTimeout(resolve, 350))
+      }
+      targets = pendingTargets
+      if (targets.length > 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, Math.min(1500 + round * 500, 5000)))
+      }
     }
   }
 
@@ -385,32 +389,23 @@ const AlertSilences = () => {
             title: '命中告警',
             render: (_: unknown, record: AlertSilence) => {
               const countsLoading = record.matched_active_alerts === null || record.matched_total_alerts === null
-              const activeCount = record.matched_active_alerts || 0
-              const totalCount = record.matched_total_alerts || 0
-              if (countsLoading) {
-                return (
-                  <Space size={6}>
-                    <Tag color="processing">统计中</Tag>
-                    <Tooltip title="正在按顺序逐条统计；也可以点击查看当前规则命中明细">
-                      <Button
-                        type="text"
-                        size="small"
-                        icon={<EyeOutlined />}
-                        onClick={() => openMatches(record)}
-                      />
-                    </Tooltip>
-                  </Space>
-                )
-              }
+              const activeLoading = record.matched_active_alerts === null
+              const totalLoading = record.matched_total_alerts === null
+              const activeCount = record.matched_active_alerts ?? 0
+              const totalCount = record.matched_total_alerts ?? 0
               return (
                 <Space size={6}>
                   <Tooltip title="当前仍处于触发、确认、忽略或暂缓状态的命中告警">
-                    <Tag color={activeCount > 0 ? 'red' : 'default'}>当前 {activeCount} 条</Tag>
+                    <Tag color={activeLoading ? 'processing' : activeCount > 0 ? 'red' : 'default'}>
+                      {activeLoading ? <Space size={4}><Spin size="small" />当前</Space> : `当前 ${activeCount} 条`}
+                    </Tag>
                   </Tooltip>
                   <Tooltip title="历史上匹配过这条屏蔽规则的告警">
-                    <Tag color={totalCount > 0 ? 'blue' : 'default'}>历史 {totalCount} 条</Tag>
+                    <Tag color={totalLoading ? 'processing' : totalCount > 0 ? 'blue' : 'default'}>
+                      {totalLoading ? <Space size={4}><Spin size="small" />历史</Space> : `历史 ${totalCount} 条`}
+                    </Tag>
                   </Tooltip>
-                  <Tooltip title="查看历史命中告警">
+                  <Tooltip title={countsLoading ? '命中数量正在后台统计；可先查看已加载明细' : '查看历史命中告警'}>
                     <Button
                       type="text"
                       size="small"
