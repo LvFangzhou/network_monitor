@@ -312,6 +312,7 @@ services:
     <<: *celery-worker-base
     container_name: nm-celery-worker-config-backup
     command: celery -A app.tasks worker -l info -Q config_backup -n worker-config-backup@%h --pool=prefork -c 1 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=10 --max-memory-per-child=900000
+    cpu_shares: 512
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -341,7 +342,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '4'
+          cpus: '2'
           memory: 2G
 
   # 告警全量规则独立队列：慢规则不再拖住协议/健康告警
@@ -349,10 +350,11 @@ services:
     <<: *celery-worker-base
     container_name: nm-celery-worker-alerts-general
     command: celery -A app.tasks worker -l info -Q alerts_general -n worker-alerts-general@%h --pool=prefork -c 2 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=600000
+    cpu_shares: 768
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: '1.5'
           memory: 2G
 
   # 协议邻居告警独立队列：BGP/OSPF 状态异常不被全量规则阻塞
@@ -360,10 +362,11 @@ services:
     <<: *celery-worker-base
     container_name: nm-celery-worker-alerts-protocol
     command: celery -A app.tasks worker -l info -Q alerts_protocol -n worker-alerts-protocol@%h --pool=prefork -c 2 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=600000
+    cpu_shares: 1024
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: '1.5'
           memory: 2G
 
   # 设备健康告警独立队列：Ping/SNMP/Exporter/基础健康告警优先保障
@@ -371,10 +374,11 @@ services:
     <<: *celery-worker-base
     container_name: nm-celery-worker-alerts-health
     command: celery -A app.tasks worker -l info -Q alerts_health -n worker-alerts-health@%h --pool=prefork -c 2 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=600000
+    cpu_shares: 1024
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: '1.5'
           memory: 2G
 
   # 告警详情缓存预热独立低优先队列，不再影响实时告警检查
@@ -415,6 +419,7 @@ services:
     build: ./backend
     container_name: nm-celery-worker-asternos
     command: celery -A app.tasks worker -l info -Q asternos -n worker-asternos@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
+    cpu_shares: 2048
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -461,7 +466,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: '3'
           memory: 1G
 
   # Celery Worker Asteros 高频实时采集，与全量 Exporter 采集分离，减少互相抢占
@@ -469,6 +474,7 @@ services:
     build: ./backend
     container_name: nm-celery-worker-asternos-realtime
     command: celery -A app.tasks worker -l info -Q asternos_realtime -n worker-asternos-realtime@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
+    cpu_shares: 2048
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -523,6 +529,7 @@ services:
     build: ./backend
     container_name: nm-celery-worker-snmp
     command: celery -A app.tasks worker -l info -Q snmp_realtime -n worker-snmp@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
+    cpu_shares: 3072
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -565,7 +572,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '3'
+          cpus: '4'
           memory: 2G
 
   # Celery Worker 线路绑定端口 10 秒级采集
@@ -573,6 +580,7 @@ services:
     build: ./backend
     container_name: nm-celery-worker-snmp-circuit
     command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
+    cpu_shares: 2048
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -616,7 +624,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
+          cpus: '2'
           memory: 1G
 
   # 前端 Web 应用
