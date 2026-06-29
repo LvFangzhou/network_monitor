@@ -72,19 +72,22 @@ def _looks_like_byte_pager(text: str) -> bool:
     return bool(re.search(r"(?:^|\n)\s*byte\s+\d+\s*$", text, re.IGNORECASE))
 
 
-def _expects_config_end(device: Device, command: str) -> bool:
+def _expected_config_end_marker(device: Device, command: str) -> Optional[str]:
     vendor = _vendor_text(device)
-    return (
-        command.strip().lower() == "show running-config"
-        and any(marker in vendor for marker in ["asteros", "asternos", "asterfusion", "星融元", "ruijie", "锐捷", "cisco", "nexus", "ios", "nx-os"])
-    )
+    normalized_command = command.strip().lower()
+    if normalized_command in {"dis current-configuration", "display current-configuration"} and any(marker in vendor for marker in ["h3c", "华三"]):
+        return "return"
+    if normalized_command == "show running-config" and any(marker in vendor for marker in ["asteros", "asternos", "asterfusion", "星融元", "ruijie", "锐捷", "cisco", "nexus", "ios", "nx-os"]):
+        return "end"
+    return None
 
 
-def _has_config_end(config: str) -> bool:
+def _has_config_end(config: str, marker: str) -> bool:
     lines = [line.strip().lower() for line in (config or "").splitlines() if line.strip()]
     if not lines:
         return False
-    return "end" in lines[-20:]
+    normalized_marker = marker.strip().lower()
+    return normalized_marker in lines[-20:]
 
 
 def _validate_config_content(device: Device, command: str, config: str) -> None:
@@ -110,9 +113,10 @@ def _validate_config_content(device: Device, command: str, config: str) -> None:
         preview = " / ".join(line.strip() for line in lines[:3])[:160]
         raise RuntimeError(f"备份内容过短：仅 {len(lines)} 行，疑似未完整输出配置。预览：{preview}")
 
-    if _expects_config_end(device, command) and not _has_config_end(text):
+    expected_end_marker = _expected_config_end_marker(device, command)
+    if expected_end_marker and not _has_config_end(text, expected_end_marker):
         preview = " / ".join(line.strip() for line in lines[-5:])[:220]
-        raise RuntimeError(f"备份内容未读取到配置结束标记 end，疑似分页或输出截断。尾部预览：{preview}")
+        raise RuntimeError(f"备份内容未读取到配置结束标记 {expected_end_marker}，疑似分页或输出截断。尾部预览：{preview}")
 
 
 def _screen_disable_commands(device: Device) -> List[str]:

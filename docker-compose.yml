@@ -246,7 +246,7 @@ services:
     build: ./backend
     image: network_monitor-celery-worker
     container_name: nm-celery-worker
-    command: celery -A app.tasks worker -l info -Q celery,default,alerts,tacacs,resource,system -n worker-background@%h --pool=prefork -c 6 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=450000
+    command: celery -A app.tasks worker -l info -Q celery,default,tacacs -n worker-background@%h --pool=prefork -c 3 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=450000
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -305,6 +305,109 @@ services:
       resources:
         limits:
           cpus: '1'
+          memory: 1G
+
+  # 配置备份独立队列：SSH/Netmiko/Paramiko 长耗时任务不再挤占告警和页面缓存
+  celery-worker-config-backup:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-config-backup
+    command: celery -A app.tasks worker -l info -Q config_backup -n worker-config-backup@%h --pool=prefork -c 1 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=10 --max-memory-per-child=900000
+    environment:
+      - DEBUG=false
+      - SECRET_KEY=your-secret-key-change-in-production
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=network_monitor
+      - POSTGRES_PASSWORD=network_monitor
+      - POSTGRES_DB=network_monitor
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_ORG=network-monitor
+      - INFLUXDB_BUCKET=network_metrics
+      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_DATA_PATH=/host-data/influxdb
+      - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
+      - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
+      - SYSTEM_ALERT_WEBHOOK_URL=${SYSTEM_ALERT_WEBHOOK_URL:-}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASSWORD=guest
+      - CONFIG_BACKUP_CONCURRENCY=40
+      - CONFIG_BACKUP_WAIT_TIMEOUT_SECONDS=1
+      - LOG_LEVEL=INFO
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 2G
+
+  # 告警全量规则独立队列：慢规则不再拖住协议/健康告警
+  celery-worker-alerts-general:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-alerts-general
+    command: celery -A app.tasks worker -l info -Q alerts_general -n worker-alerts-general@%h --pool=prefork -c 2 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=600000
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  # 协议邻居告警独立队列：BGP/OSPF 状态异常不被全量规则阻塞
+  celery-worker-alerts-protocol:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-alerts-protocol
+    command: celery -A app.tasks worker -l info -Q alerts_protocol -n worker-alerts-protocol@%h --pool=prefork -c 2 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=600000
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  # 设备健康告警独立队列：Ping/SNMP/Exporter/基础健康告警优先保障
+  celery-worker-alerts-health:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-alerts-health
+    command: celery -A app.tasks worker -l info -Q alerts_health -n worker-alerts-health@%h --pool=prefork -c 2 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=600000
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  # 告警详情缓存预热独立低优先队列，不再影响实时告警检查
+  celery-worker-alerts-prewarm:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-alerts-prewarm
+    command: celery -A app.tasks worker -l info -Q alerts_prewarm -n worker-alerts-prewarm@%h --pool=threads -c 2 --prefetch-multiplier=1 -Ofair
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  # 系统缓存/菜单预热独立队列，避免慢预热任务占用普通后台 worker
+  celery-worker-system:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-system
+    command: celery -A app.tasks worker -l info -Q system -n worker-system@%h --pool=threads -c 4 --prefetch-multiplier=1 -Ofair
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+
+  # 资源统计独立队列：线路/资源类定时任务与配置备份分离
+  celery-worker-resource:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-resource
+    command: celery -A app.tasks worker -l info -Q resource -n worker-resource@%h --pool=threads -c 3 --prefetch-multiplier=1 -Ofair
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
           memory: 1G
 
   # Celery Worker Asteros Exporter 独立采集，避免与告警/Tacacs/资源任务互相挤占
