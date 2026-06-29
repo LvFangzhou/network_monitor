@@ -411,6 +411,10 @@ const ConfigBackups = () => {
     return Math.round(((latestJob.success_count + latestJob.failed_count) / latestJob.total_devices) * 100)
   }, [latestJob])
   const hasRunningJob = Boolean(latestJob && ['pending', 'running'].includes(latestJob.status))
+  const isCancelledJob = latestJob?.status === 'cancelled'
+  const isFinishedJob = Boolean(latestJob && ['success', 'partial_failed', 'failed', 'cancelled'].includes(latestJob.status))
+  const completedCount = (latestJob?.success_count || 0) + (latestJob?.failed_count || 0)
+  const unfinishedCount = Math.max((latestJob?.total_devices || 0) - completedCount, 0)
 
   const filteredLatestResults = useMemo(() => {
     const text = resultFilterText.trim().toLowerCase()
@@ -512,7 +516,18 @@ const ConfigBackups = () => {
         </Col>
         <Col span={6}>
           <Card>
-            <Statistic title="总进度" value={progressPercent} suffix="%" />
+            {hasRunningJob ? (
+              <Statistic title="总进度" value={progressPercent} suffix="%" />
+            ) : (
+              <Statistic
+                title="任务结果"
+                value={latestJob ? (statusLabel[latestJob.status] || latestJob.status) : '暂无'}
+                valueStyle={{
+                  color: latestJob?.status === 'success' ? '#16a34a' : latestJob?.status === 'partial_failed' ? '#d97706' : isCancelledJob ? '#64748b' : latestJob?.status === 'failed' ? '#f5222d' : undefined,
+                  fontWeight: 800,
+                }}
+              />
+            )}
           </Card>
         </Col>
       </Row>
@@ -535,14 +550,36 @@ const ConfigBackups = () => {
                   手动触发备份
                 </Button>
               )}
-              {latestJob ? (
+              {latestJob && hasRunningJob ? (
                 <div>
                   <Progress
                     percent={progressPercent}
-                    status={latestJob.status === 'failed' ? 'exception' : latestJob.status === 'success' ? 'success' : 'active'}
+                    status="active"
                   />
                   <Text type="secondary">
-                    已完成 {(latestJob.success_count || 0) + (latestJob.failed_count || 0)} / {latestJob.total_devices || 0}，成功 {latestJob.success_count || 0}，失败 {latestJob.failed_count || 0}
+                    已完成 {completedCount} / {latestJob.total_devices || 0}，成功 {latestJob.success_count || 0}，失败 {latestJob.failed_count || 0}
+                  </Text>
+                </div>
+              ) : latestJob && isFinishedJob ? (
+                <div style={{ padding: 12, borderRadius: 12, background: colorFillQuaternary }}>
+                  <Space direction="vertical" size={4}>
+                    <Text strong>{statusLabel[latestJob.status] || latestJob.status}</Text>
+                    <Text type="secondary">
+                      成功 {latestJob.success_count || 0}，失败 {latestJob.failed_count || 0}
+                      {isCancelledJob ? `，未执行 ${unfinishedCount}` : ''}
+                    </Text>
+                    {isCancelledJob ? (
+                      <Text type="secondary">任务已停止，未继续备份，不再显示进行中进度。</Text>
+                    ) : null}
+                    {latestJob.finished_at ? (
+                      <Text type="secondary">结束时间：{formatTime(latestJob.finished_at)}</Text>
+                    ) : null}
+                  </Space>
+                </div>
+              ) : latestJob ? (
+                <div>
+                  <Text type="secondary">
+                    成功 {latestJob.success_count || 0}，失败 {latestJob.failed_count || 0}
                   </Text>
                 </div>
               ) : null}
