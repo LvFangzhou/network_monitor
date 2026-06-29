@@ -421,7 +421,8 @@ def _apply_windowed_octet_rates(rows: List[Dict[str, Any]], window_seconds: int)
             cutoff = row_time.timestamp() - window_seconds
             candidates = [(time_value, value) for time_value, value in candidates if time_value.timestamp() >= cutoff]
             previous = candidates[0] if candidates else last_seen
-            if previous:
+            existing_rate = _safe_float(row.get(bps_key))
+            if previous and existing_rate is None:
                 previous_time, previous_value = previous
                 elapsed = (row_time - previous_time).total_seconds()
                 delta = current_value - previous_value
@@ -433,6 +434,13 @@ def _apply_windowed_octet_rates(rows: List[Dict[str, Any]], window_seconds: int)
 
 
 def _apply_windowed_bps_average(rows: List[Dict[str, Any]], window_seconds: int, interval_seconds: int, range_seconds: int) -> None:
+    # 端口流量图用于压测/故障定位时必须保留真实阶跃和低谷。
+    # 采集侧已经按相邻两次 counter 差值写入 *_bps，这里再做移动平均会导致：
+    # - 停止打流后 2~4 分钟才回落；
+    # - 6 小时视图里 1~2Mbps 底噪被抬到几百 Mbps；
+    # - 几分钟峰值被摊平。
+    return
+
     if interval_seconds >= window_seconds:
         return
 
@@ -507,7 +515,7 @@ def _history_rate_window_seconds(interval_seconds: int) -> int:
     if interval_seconds <= 30:
         return 60
     if interval_seconds <= 60:
-        return 120
+        return 60
     return min(5 * 60, max(interval_seconds * 2, 120))
 
 
@@ -1629,7 +1637,7 @@ async def get_monitor_device_interface_history(
         traffic_start_time = start_time.timestamp() - rate_window_seconds
         traffic_range_clause = f'start: {_flux_time(datetime.fromtimestamp(traffic_start_time, timezone.utc))}, stop: {_flux_time(end_time)}'
         normalized_group = (group or "traffic").strip() or "traffic"
-        cache_suffix = f":v9:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}:{rate_window_seconds}"
+        cache_suffix = f":v10:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}:{rate_window_seconds}"
         logger.info(
             "端口历史绝对时间查询",
             device_id=device_id,
@@ -1644,7 +1652,7 @@ async def get_monitor_device_interface_history(
         normalized_group = (group or "traffic").strip() or "traffic"
         range_clause = f"start: {range}"
         traffic_range_clause = f"start: -{traffic_start}"
-        cache_suffix = f":v9:{interface_index}:{normalized_group}:{range}:{interval}:{rate_window_seconds}"
+        cache_suffix = f":v10:{interface_index}:{normalized_group}:{range}:{interval}:{rate_window_seconds}"
     is_traffic_only = normalized_group == "traffic"
     fresh_sample_written = False
     if not is_traffic_only:
@@ -1693,7 +1701,7 @@ async def get_monitor_device_interface_history(
         r._field == "in_bps" or
         r._field == "out_bps"
       )
-      |> aggregateWindow(every: {interval}, fn: mean, createEmpty: false)
+      |> aggregateWindow(every: {interval}, fn: max, createEmpty: false)
 
     octets = from(bucket: "{influx_client.bucket}")
       |> range({traffic_range_clause})
