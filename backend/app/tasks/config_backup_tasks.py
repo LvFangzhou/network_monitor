@@ -48,6 +48,12 @@ def _is_asteros(device: Device) -> bool:
     return any(marker in _vendor_text(device) for marker in ["asteros", "asternos", "asterfusion", "星融元"])
 
 
+def _prefer_paramiko_shell(device: Device) -> bool:
+    """已知用交互 shell 更稳定的设备，避免 Netmiko 先空等超时再回退。"""
+    vendor = _vendor_text(device)
+    return any(marker in vendor for marker in ["h3c", "华三", "asteros", "asternos", "asterfusion", "星融元"])
+
+
 def _looks_like_interactive_prompt(text: str) -> bool:
     normalized = text.lower()
     prompt_markers = [
@@ -189,7 +195,7 @@ def _collect_config_netmiko(device: Device) -> Tuple[str, str]:
         output = connection.send_command(
             command,
             expect_string=None,
-            read_timeout=120,
+            read_timeout=45,
             strip_prompt=True,
             strip_command=True,
         )
@@ -297,7 +303,7 @@ def _run_shell_config_command(shell: Any, device: Device, command: str) -> str:
         output = _read_shell_output(
             shell,
             idle_seconds=4.0 if _is_asteros(device) else 1.2,
-            timeout_seconds=180 if _is_asteros(device) else 90,
+            timeout_seconds=150 if _is_asteros(device) else 60,
         )
         if re.search(r"press\s+(return|enter)", output, re.IGNORECASE):
             shell.send("\n")
@@ -326,14 +332,14 @@ def _run_shell_config_command(shell: Any, device: Device, command: str) -> str:
 
 def _collect_config(device: Device) -> Tuple[str, str]:
     netmiko_error: Optional[Exception] = None
-    if not _is_asteros(device):
+    if not _prefer_paramiko_shell(device):
         try:
             return _collect_config_netmiko(device)
         except Exception as exc:
             netmiko_error = exc
             logger.info("Netmiko配置备份失败，回退Paramiko", device_id=device.id, ip=device.ip_address, error=str(exc))
     else:
-        logger.info("Asteros设备使用Paramiko交互模式备份配置", device_id=device.id, ip=device.ip_address)
+        logger.info("设备使用Paramiko交互模式备份配置", device_id=device.id, ip=device.ip_address, vendor=getattr(device, "vendor", None), model=getattr(device, "model", None))
 
     try:
         import paramiko
