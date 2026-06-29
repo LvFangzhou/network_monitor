@@ -225,12 +225,13 @@ export const getMonitorInterfaceStats = async (
 export const getMonitorInterfaceHistory = async (
   deviceId: number,
   interfaceIndex: number,
-  params: { range: string; interval: string; group?: string; start?: string; end?: string; start_ts?: number; end_ts?: number }
+  params: { range: string; interval: string; rate_window?: string; group?: string; start?: string; end?: string; start_ts?: number; end_ts?: number }
 ): Promise<{
   device: MonitorDevice
   interface_index: number
   range: string
   interval: string
+  rate_window?: string
   data: MonitorHistoryPoint[]
   total: number
 }> => {
@@ -241,6 +242,7 @@ export const getMonitorInterfaceHistory = async (
     interface_index: number
     range: string
     interval: string
+    rate_window?: string
     data: MonitorHistoryPoint[]
     total: number
   }

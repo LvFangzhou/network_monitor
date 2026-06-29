@@ -165,7 +165,8 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=40
+      - SNMP_MAX_DEVICES_PER_TICK=160
+      - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
       - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
       - ASTERNOS_MAX_DEVICES_PER_TICK=20
@@ -226,7 +227,8 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=40
+      - SNMP_MAX_DEVICES_PER_TICK=160
+      - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
       - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
       - ASTERNOS_MAX_DEVICES_PER_TICK=20
@@ -275,7 +277,8 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=40
+      - SNMP_MAX_DEVICES_PER_TICK=160
+      - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
       - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
       - ASTERNOS_MAX_DEVICES_PER_TICK=20
@@ -585,8 +588,8 @@ services:
     build: ./backend
     image: network_monitor-backend:latest
     container_name: nm-celery-worker-snmp-circuit
-    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
-    cpu_shares: 2048
+    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
+    cpu_shares: 4096
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -613,7 +616,8 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
-      - SNMP_MAX_DEVICES_PER_TICK=40
+      - SNMP_MAX_DEVICES_PER_TICK=160
+      - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -630,8 +634,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2'
-          memory: 1G
+          cpus: '6'
+          memory: 2G
 
   # 前端 Web 应用
   frontend:

@@ -500,7 +500,15 @@ def _history_interval_seconds(interval: str) -> int:
 
 
 def _history_rate_window_seconds(interval_seconds: int) -> int:
-    return 5 * 60
+    # 端口查询的短时间视图用于压测/故障定位，不能用 5 分钟窗口把突增流量抹成缓慢爬坡。
+    # SNMP 接口实时采集通常 30~60 秒一轮，窗口保持在 1~2 个采样周期即可兼顾准确和抗抖。
+    if interval_seconds <= 10:
+        return 60
+    if interval_seconds <= 30:
+        return 60
+    if interval_seconds <= 60:
+        return 120
+    return min(5 * 60, max(interval_seconds * 2, 120))
 
 
 def _mark_stale_rate_samples(rows: List[Dict[str, Any]], interval_seconds: int, max_sample_seconds: int = 75) -> None:
@@ -1586,6 +1594,7 @@ async def get_monitor_device_interface_history(
     range: str = Query("-10m", description="历史时间范围"),
     interval: str = Query("30s", description="聚合间隔"),
     group: str = Query("traffic", description="监控项分组"),
+    rate_window: Optional[str] = Query(None, description="速率计算窗口，例如 60s/2m；短窗口更贴近实时流量"),
     start: Optional[str] = Query(None, description="绝对开始时间"),
     end: Optional[str] = Query(None, description="绝对结束时间"),
     start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
@@ -1608,14 +1617,19 @@ async def get_monitor_device_interface_history(
         MAX_INTERFACE_HISTORY_SECONDS,
     )
     interval_seconds = _history_interval_seconds(interval)
-    rate_window_seconds = _history_rate_window_seconds(interval_seconds)
+    requested_rate_window_seconds = _parse_flux_duration_seconds(rate_window, 0) if rate_window else 0
+    rate_window_seconds = (
+        max(interval_seconds, min(requested_rate_window_seconds, 5 * 60))
+        if requested_rate_window_seconds > 0
+        else _history_rate_window_seconds(interval_seconds)
+    )
     traffic_start = _flux_duration(range_seconds + rate_window_seconds)
     if use_absolute_range and start_time:
         range_clause = f'start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}'
         traffic_start_time = start_time.timestamp() - rate_window_seconds
         traffic_range_clause = f'start: {_flux_time(datetime.fromtimestamp(traffic_start_time, timezone.utc))}, stop: {_flux_time(end_time)}'
         normalized_group = (group or "traffic").strip() or "traffic"
-        cache_suffix = f":v8:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}"
+        cache_suffix = f":v9:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}:{rate_window_seconds}"
         logger.info(
             "端口历史绝对时间查询",
             device_id=device_id,
@@ -1630,7 +1644,7 @@ async def get_monitor_device_interface_history(
         normalized_group = (group or "traffic").strip() or "traffic"
         range_clause = f"start: {range}"
         traffic_range_clause = f"start: -{traffic_start}"
-        cache_suffix = f":v8:{interface_index}:{normalized_group}:{range}:{interval}"
+        cache_suffix = f":v9:{interface_index}:{normalized_group}:{range}:{interval}:{rate_window_seconds}"
     is_traffic_only = normalized_group == "traffic"
     fresh_sample_written = False
     if not is_traffic_only:

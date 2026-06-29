@@ -455,9 +455,9 @@ const getAdaptiveInterval = (rangeValue: string) => {
 
 const getAdaptiveRateWindow = (rangeValue: string) => {
   const rateWindowMap: Record<string, string> = {
-    '-10m': '5m',
-    '-30m': '5m',
-    '-1h': '5m',
+    '-10m': '60s',
+    '-30m': '60s',
+    '-1h': '2m',
     '-6h': '5m',
     '-12h': '5m',
     '-24h': '5m',
@@ -943,6 +943,7 @@ const Metrics = () => {
     }
     const rangeConfig = RANGE_OPTIONS.find((item) => item.value === nextRange) || RANGE_OPTIONS[0]
     const interval = getAdaptiveInterval(rangeConfig.value)
+    const rateWindow = getAdaptiveRateWindow(rangeConfig.value)
     const now = Date.now()
     const cacheEntries = targets.map((target) => ({
       target,
@@ -978,6 +979,7 @@ const Metrics = () => {
             : getMonitorInterfaceHistory(target.device.id, target.interface.index, {
                 range: rangeConfig.value,
                 interval,
+                rate_window: rateWindow,
                 group: selectedMonitorKey,
               }).then((history) => [cacheKey, fallbackKey, history.data.map(toChartPoint)] as const)
 
@@ -1136,12 +1138,14 @@ const Metrics = () => {
       const end = Math.max(current.start, current.end)
       const zoomRangeValue = getRangeValueForWindowMs(end - start)
       const zoomInterval = getAdaptiveInterval(zoomRangeValue)
+      const zoomRateWindow = getAdaptiveRateWindow(zoomRangeValue)
       const target = selectedTargets.find((item) => item.key === targetKeyValue)
       if (target && !isQueueDetailGroup(selectedMonitorKey)) {
         const cacheKey = zoomHistoryCacheKey(target.key, start, end, zoomInterval, selectedMonitorKey)
         void getMonitorInterfaceHistory(target.device.id, target.interface.index, {
           range: zoomRangeValue,
           interval: zoomInterval,
+          rate_window: zoomRateWindow,
           group: selectedMonitorKey,
           start_ts: start,
           end_ts: end,
@@ -1219,7 +1223,7 @@ const Metrics = () => {
   useEffect(() => {
     if (!selectedTargets.length) return
     const timer = window.setInterval(() => {
-      loadHistoryForTargets(selectedTargets, rangeValue, { silent: true })
+      loadHistoryForTargets(selectedTargets, rangeValue, { silent: true, force: true })
     }, refreshValue * 1000)
     return () => window.clearInterval(timer)
   }, [selectedTargets, refreshValue, rangeValue, selectedMonitorKey])

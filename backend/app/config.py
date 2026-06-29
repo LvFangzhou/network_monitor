@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     # 这里保持约 60 秒内完整轮一遍所有 SNMP 设备端口基础流量数据。
     SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS: int = 60
     SNMP_MAX_DEVICES_PER_TICK: int = 40
+    SNMP_INTERFACE_REALTIME_MAX_WORKERS: int = 4
     # Asteros Exporter 全量资源/协议/队列指标也按批次分摊，避免和端口流量采集抢队列。
     ASTERNOS_SCHEDULER_INTERVAL_SECONDS: int = 30
     ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS: int = 120
