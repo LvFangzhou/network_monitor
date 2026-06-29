@@ -959,6 +959,7 @@ class SNMPCollector(LoggerMixin):
         self,
         device: Any,
         suppress_rate_interface_names: Optional[set[str]] = None,
+        realtime: bool = False,
     ) -> Dict[str, Any]:
         """批量采集接口历史监控数据，并基于上一次快照计算速率"""
         suppress_rate_interface_names = suppress_rate_interface_names or set()
@@ -973,26 +974,46 @@ class SNMPCollector(LoggerMixin):
             "speed_map": ("1.3.6.1.2.1.2.2.1.5", int),
             "admin_status_map": ("1.3.6.1.2.1.2.2.1.7", int),
             "oper_status_map": ("1.3.6.1.2.1.2.2.1.8", int),
-            "in_discards_map": ("1.3.6.1.2.1.2.2.1.13", int),
-            "out_discards_map": ("1.3.6.1.2.1.2.2.1.19", int),
-            "in_errors_map": ("1.3.6.1.2.1.2.2.1.14", int),
-            "out_errors_map": ("1.3.6.1.2.1.2.2.1.20", int),
-            "queue_length_map": ("1.3.6.1.2.1.2.2.1.21", int),
-            "in_broadcast_map": ("1.3.6.1.2.1.31.1.1.1.3", int),
-            "out_broadcast_map": ("1.3.6.1.2.1.31.1.1.1.5", int),
         }
-        if not skip_32bit_counters:
+        if not realtime:
+            # 这些 OID 对“端口实时速率”不是必需项，而且部分高端口设备在并发 walk
+            # 这些表时会偶发超时，拖慢整轮 60 秒采集。实时队列只保留带宽/状态
+            # 必需 OID，错误包/丢弃/广播/队列长度由低频全量采集补齐。
+            walk_jobs.update({
+                "in_discards_map": ("1.3.6.1.2.1.2.2.1.13", int),
+                "out_discards_map": ("1.3.6.1.2.1.2.2.1.19", int),
+                "in_errors_map": ("1.3.6.1.2.1.2.2.1.14", int),
+                "out_errors_map": ("1.3.6.1.2.1.2.2.1.20", int),
+                "queue_length_map": ("1.3.6.1.2.1.2.2.1.21", int),
+                "in_broadcast_map": ("1.3.6.1.2.1.31.1.1.1.3", int),
+                "out_broadcast_map": ("1.3.6.1.2.1.31.1.1.1.5", int),
+            })
+
+        if not realtime and not skip_32bit_counters:
             walk_jobs.update({
                 "in_octets_32_map": ("1.3.6.1.2.1.2.2.1.10", int),
                 "out_octets_32_map": ("1.3.6.1.2.1.2.2.1.16", int),
             })
 
-        with ThreadPoolExecutor(max_workers=len(walk_jobs)) as executor:
+        max_walk_workers = min(len(walk_jobs), 6 if realtime else len(walk_jobs))
+        with ThreadPoolExecutor(max_workers=max_walk_workers) as executor:
             futures = {
                 name: executor.submit(self._walk_indexed_map, device, oid, cast)
                 for name, (oid, cast) in walk_jobs.items()
             }
             walk_results = {name: future.result() for name, future in futures.items()}
+        for optional_name in (
+            "in_discards_map",
+            "out_discards_map",
+            "in_errors_map",
+            "out_errors_map",
+            "queue_length_map",
+            "in_broadcast_map",
+            "out_broadcast_map",
+            "in_octets_32_map",
+            "out_octets_32_map",
+        ):
+            walk_results.setdefault(optional_name, {})
 
         indexes = sorted(
             set(walk_results["if_name_map"]) | set(walk_results["if_descr_map"]),

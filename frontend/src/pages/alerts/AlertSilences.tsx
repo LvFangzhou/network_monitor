@@ -394,10 +394,10 @@ const AlertSilences = () => {
               if (countsLoading) {
                 return (
                   <Space size={6}>
-                    <Tag color="processing">
-                      <Space size={4}><Spin size="small" />加载命中数</Space>
-                    </Tag>
-                    <Tooltip title="命中数量正在后台统计；可先查看已加载明细">
+                    <Tooltip title="命中数量正在后台统计，完成后会显示当前/历史命中数">
+                      <Spin size="small" />
+                    </Tooltip>
+                    <Tooltip title="查看历史命中告警">
                       <Button
                         type="text"
                         size="small"

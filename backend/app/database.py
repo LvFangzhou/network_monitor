@@ -240,6 +240,11 @@ def ensure_compatible_schema() -> None:
                 connection.execute(text("ALTER TABLE devices ADD COLUMN prometheus_job VARCHAR(100)"))
             if "prometheus_instance" not in device_columns:
                 connection.execute(text("ALTER TABLE devices ADD COLUMN prometheus_instance VARCHAR(255)"))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_devices_ip_inet_valid "
+                "ON devices ((ip_address::inet)) "
+                "WHERE ip_address ~ '^((25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$'"
+            ))
 
         if "alert_histories" in table_names:
             connection.execute(text(
@@ -257,6 +262,14 @@ def ensure_compatible_schema() -> None:
             connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_alert_histories_rule_device_status "
                 "ON alert_histories (rule_id, device_id, status)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_alert_histories_device_started "
+                "ON alert_histories (device_id, started_at DESC)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_alert_histories_started_desc "
+                "ON alert_histories (started_at DESC)"
             ))
 
         if "alert_silences" in table_names:

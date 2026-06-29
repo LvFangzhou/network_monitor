@@ -1211,6 +1211,7 @@ def collect_all_snmp_interface_realtime():
                 return snmp_collector.collect_interface_monitoring(
                     device,
                     suppress_rate_interface_names=_circuit_port_names_for_device(db, device.id),
+                    realtime=True,
                 )
             finally:
                 _release_device_lock(device.id)

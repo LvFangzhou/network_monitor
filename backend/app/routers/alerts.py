@@ -2,12 +2,14 @@
 告警管理路由
 """
 import hashlib
+import ipaddress
 import json
 import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
+from sqlalchemy import and_, cast, func, literal, or_
+from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.orm import Session
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
@@ -56,6 +58,9 @@ SILENCE_MATCH_CACHE_PREFIX = "alerts:silence_matches"
 SILENCE_MATCH_CACHE_TTL_SECONDS = 60
 SILENCE_MATCH_COUNT_LOCK_TTL_SECONDS = 120
 SILENCE_MATCH_QUEUE_LOCK_TTL_SECONDS = 30
+SILENCE_MATCH_EXACT_SCAN_LIMIT = 12000
+SILENCE_MATCH_EXACT_SCAN_SECONDS = 8.0
+SILENCE_MATCH_CANDIDATE_FALLBACK_LIMIT = 50000
 RULE_STATUS_MAX_RUNTIME_SECONDS = 6.0
 
 SEVERITY_NORMALIZATION = {
@@ -122,16 +127,25 @@ def _get_silence_matched_alerts_page(
     alerts_query = _build_silence_candidate_query(db, silence, active_only=active_only)
     matched_page: List[AlertHistory] = []
     matched_seen = 0
+    scanned = 0
+    started = time.monotonic()
     exhausted = True
     target_count = skip + limit
 
     for alert in alerts_query.order_by(AlertHistory.started_at.desc()).yield_per(200):
+        scanned += 1
         if not _alert_matches_silence(silence, alert):
+            if scanned >= SILENCE_MATCH_EXACT_SCAN_LIMIT or time.monotonic() - started > SILENCE_MATCH_EXACT_SCAN_SECONDS:
+                exhausted = False
+                break
             continue
         matched_seen += 1
         if matched_seen > skip and len(matched_page) < limit:
             matched_page.append(alert)
         if matched_seen >= target_count and len(matched_page) >= limit:
+            exhausted = False
+            break
+        if scanned >= SILENCE_MATCH_EXACT_SCAN_LIMIT or time.monotonic() - started > SILENCE_MATCH_EXACT_SCAN_SECONDS:
             exhausted = False
             break
 
@@ -153,6 +167,79 @@ def _alert_matches_silence(silence: AlertSilence, alert: AlertHistory) -> bool:
 
 def _split_silence_values(value: Optional[str]) -> List[str]:
     return [item.strip() for item in re.split(r"[,，;；\n\r]+", value or "") if item.strip()]
+
+
+def _ipv4_range_expression(value: str):
+    if "-" not in value:
+        return None
+    start_text, end_text = [part.strip() for part in value.split("-", 1)]
+    try:
+        start_ip = ipaddress.ip_address(start_text)
+        end_ip = ipaddress.ip_address(end_text)
+    except ValueError:
+        return None
+    if start_ip.version != 4 or end_ip.version != 4:
+        return None
+    if int(start_ip) > int(end_ip):
+        start_ip, end_ip = end_ip, start_ip
+    device_ip = cast(Device.ip_address, INET)
+    return and_(
+        Device.ip_address.op("~")(r"^((25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$"),
+        device_ip >= cast(literal(str(start_ip)), INET),
+        device_ip <= cast(literal(str(end_ip)), INET),
+    )
+
+
+def _ip_filter_expression(value: str):
+    value = (value or "").strip()
+    if not value:
+        return None
+    range_expr = _ipv4_range_expression(value)
+    if range_expr is not None:
+        return range_expr
+    try:
+        if "/" in value:
+            network = ipaddress.ip_network(value, strict=False)
+            if network.version == 4:
+                return and_(
+                    Device.ip_address.op("~")(r"^((25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$"),
+                    cast(Device.ip_address, INET).op("<<=")(cast(literal(str(network)), INET)),
+                )
+        ip_value = ipaddress.ip_address(value)
+        return Device.ip_address == str(ip_value)
+    except ValueError:
+        return None
+
+
+def _silence_is_sql_exact_ip_only(silence: AlertSilence) -> bool:
+    conditions = silence.conditions or []
+    if not conditions:
+        return False
+    for condition in conditions:
+        field_name = str((condition or {}).get("field") or "").strip()
+        operator = str((condition or {}).get("operator") or "contains").strip()
+        values = _split_silence_values(str((condition or {}).get("value") or ""))
+        if field_name not in {"ip", "device_ip"} or operator not in {"contains", "equals"} or not values:
+            return False
+        if not any(_ip_filter_expression(value) is not None for value in values):
+            return False
+    return True
+
+
+def _get_silence_ip_device_ids(db: Session, silence: AlertSilence) -> List[int]:
+    query = db.query(Device.id)
+    for condition in silence.conditions or []:
+        field_name = str((condition or {}).get("field") or "").strip()
+        operator = str((condition or {}).get("operator") or "contains").strip()
+        values = _split_silence_values(str((condition or {}).get("value") or ""))
+        if field_name not in {"ip", "device_ip"} or operator not in {"contains", "equals"} or not values:
+            return []
+        ip_expressions = [_ip_filter_expression(value) for value in values]
+        ip_expressions = [expr for expr in ip_expressions if expr is not None]
+        if not ip_expressions:
+            return []
+        query = query.filter(or_(*ip_expressions))
+    return [int(row[0]) for row in query.limit(10000).all()]
 
 
 def _build_alert_history_query(
@@ -249,11 +336,11 @@ def _build_silence_candidate_query(
         if not values or operator in {"not_contains", "not_equals", "not_regex", "regex"}:
             continue
         if field_name in {"ip", "device_ip"}:
-            # Range and CIDR values cannot be compared to the varchar IP column
-            # with equality. Keep those candidates and let _silence_matches apply
-            # the complete IP matcher; exact-only lists can still use the fast SQL
-            # prefilter.
-            if all(is_exact_ip_address(value) for value in values):
+            ip_expressions = [_ip_filter_expression(value) for value in values]
+            ip_expressions = [expr for expr in ip_expressions if expr is not None]
+            if ip_expressions:
+                alerts_query = alerts_query.filter(or_(*ip_expressions))
+            elif all(is_exact_ip_address(value) for value in values):
                 alerts_query = alerts_query.filter(or_(*[Device.ip_address == value for value in values]))
         elif field_name in {"interface"}:
             if operator in {"contains", "equals"}:
@@ -275,11 +362,45 @@ def _build_silence_candidate_query(
                 alerts_query = alerts_query.filter(
                     or_(*[AlertHistory.alarm_id.ilike(f"%{value}%") for value in values])
                 )
+        elif field_name == "message":
+            if operator in {"contains", "equals"}:
+                alerts_query = alerts_query.filter(
+                    or_(*[AlertHistory.message.ilike(f"%{value}%") for value in values])
+                )
     return alerts_query
 
 
 def _count_silence_matches(db: Session, silence: AlertSilence) -> int:
     return len(_get_silence_matched_alerts(db, silence))
+
+
+def _count_silence_matches_bounded(db: Session, silence: AlertSilence, *, active_only: bool) -> Dict[str, Any]:
+    """Return a match count without allowing one silence rule to monopolize API/worker.
+
+    Some broad silence rules can match tens of thousands of historical alerts.
+    Exact Python-side matching for every candidate used to run for tens of
+    minutes. For very large candidate sets we return the SQL prefiltered
+    candidate count as a safe operational fallback. The UI needs a quick
+    magnitude to show whether the rule is effective; detailed rows remain
+    paginated.
+    """
+    alerts_query = _build_silence_candidate_query(db, silence, active_only=active_only)
+    candidate_count = alerts_query.count()
+    if _silence_is_sql_exact_ip_only(silence):
+        return {"count": int(candidate_count), "exact": True, "candidate_count": int(candidate_count)}
+    if candidate_count > SILENCE_MATCH_CANDIDATE_FALLBACK_LIMIT:
+        return {"count": int(candidate_count), "exact": False, "candidate_count": int(candidate_count)}
+
+    started = time.monotonic()
+    scanned = 0
+    matched = 0
+    for alert in alerts_query.order_by(AlertHistory.started_at.desc()).yield_per(300):
+        scanned += 1
+        if _alert_matches_silence(silence, alert):
+            matched += 1
+        if scanned >= SILENCE_MATCH_EXACT_SCAN_LIMIT or time.monotonic() - started > SILENCE_MATCH_EXACT_SCAN_SECONDS:
+            return {"count": int(candidate_count), "exact": False, "candidate_count": int(candidate_count)}
+    return {"count": int(matched), "exact": True, "candidate_count": int(candidate_count)}
 
 
 def _silence_match_count_cache_key(silence: AlertSilence, active_only: bool) -> str:
@@ -316,10 +437,28 @@ def _get_silence_match_count_cached(silence: AlertSilence, *, active_only: bool)
     cached = redis_client.get(cache_key)
     if cached is not None:
         try:
-            return {"count": int(cached), "cached": True, "pending": False}
+            exact_raw = redis_client.get(f"{cache_key}:exact")
+            if isinstance(exact_raw, bytes):
+                exact_raw = exact_raw.decode()
+            return {"count": int(cached), "cached": True, "pending": False, "exact": exact_raw != "0"}
         except (TypeError, ValueError):
             pass
-    return {"count": None, "cached": False, "pending": True}
+    return {"count": None, "cached": False, "pending": True, "exact": False}
+
+
+def _get_silence_cached_count_and_exact(silence: AlertSilence, *, active_only: bool) -> tuple[Optional[int], bool]:
+    cache_key = _silence_match_count_cache_key(silence, active_only)
+    cached_count = redis_client.get(cache_key)
+    if cached_count is None:
+        return None, False
+    try:
+        count = int(cached_count)
+    except (TypeError, ValueError):
+        return None, False
+    exact_raw = redis_client.get(f"{cache_key}:exact")
+    if isinstance(exact_raw, bytes):
+        exact_raw = exact_raw.decode()
+    return count, exact_raw != "0"
 
 
 def _queue_silence_match_count_prewarm(silence_id: int) -> None:
@@ -358,9 +497,11 @@ def _count_silence_matches_with_lock(db: Session, silence: AlertSilence, *, acti
         return {"count": None, "cached": False, "pending": True}
 
     try:
-        count = len(_get_silence_matched_alerts(db, silence, active_only=active_only))
+        result = _count_silence_matches_bounded(db, silence, active_only=active_only)
+        count = int(result.get("count") or 0)
         redis_client.setex(cache_key, SILENCE_MATCH_CACHE_TTL_SECONDS * 10, str(count))
-        return {"count": count, "cached": False, "pending": False}
+        redis_client.setex(f"{cache_key}:exact", SILENCE_MATCH_CACHE_TTL_SECONDS * 10, "1" if result.get("exact") else "0")
+        return {"count": count, "cached": False, "pending": False, "exact": bool(result.get("exact"))}
     finally:
         try:
             current = redis_client.get(lock_key)
@@ -1376,44 +1517,62 @@ async def list_alert_silence_matches(
     silence = db.query(AlertSilence).filter(AlertSilence.id == silence_id).first()
     if not silence:
         raise HTTPException(status_code=404, detail="告警屏蔽不存在")
-    matched_alerts, matched_seen, exhausted = _get_silence_matched_alerts_page(
-        db,
-        silence,
-        active_only=active_only,
-        skip=skip,
-        limit=limit,
-    )
-    count_cache_key = _silence_match_count_cache_key(silence, active_only)
-    cached_count = redis_client.get(count_cache_key)
-    total = None
-    if cached_count is not None:
-        try:
-            total = int(cached_count)
-        except (TypeError, ValueError):
-            total = None
+    sql_exact_ip_only = _silence_is_sql_exact_ip_only(silence)
+    if sql_exact_ip_only:
+        matched_device_ids = _get_silence_ip_device_ids(db, silence)
+        base_query = db.query(AlertHistory).filter(AlertHistory.device_id.in_(matched_device_ids or [-1]))
+        if active_only:
+            base_query = base_query.filter(AlertHistory.status.in_(SILENCE_ACTIVE_STATUSES))
+        matched_alerts = (
+            base_query
+            .order_by(AlertHistory.started_at.desc())
+            .offset(skip)
+            .limit(limit)
+            .all()
+        )
+        matched_seen = skip + len(matched_alerts)
+        exhausted = len(matched_alerts) < limit
+    else:
+        matched_alerts, matched_seen, exhausted = _get_silence_matched_alerts_page(
+            db,
+            silence,
+            active_only=active_only,
+            skip=skip,
+            limit=limit,
+        )
+    total, cached_total_exact = _get_silence_cached_count_and_exact(silence, active_only=active_only)
+    if sql_exact_ip_only:
+        if total is None:
+            _queue_silence_match_count_prewarm(silence.id)
+        else:
+            cached_total_exact = True
     if exhausted:
         total = matched_seen
+        cached_total_exact = True
+        count_cache_key = _silence_match_count_cache_key(silence, active_only)
         redis_client.setex(count_cache_key, SILENCE_MATCH_CACHE_TTL_SECONDS, str(total))
+        redis_client.setex(f"{count_cache_key}:exact", SILENCE_MATCH_CACHE_TTL_SECONDS, "1")
     if total is None:
         total = max(skip + len(matched_alerts), matched_seen)
     rule_filters = {}
-    for rule_id, rule_name in (
-        _build_silence_candidate_query(db, silence, active_only=active_only)
-        .with_entities(AlertRule.id, AlertRule.name)
-        .distinct()
-        .order_by(AlertRule.name.asc())
-        .limit(200)
-        .all()
-    ):
-        if rule_id:
-            rule_filters[str(rule_id)] = rule_name or f"规则 {rule_id}"
+    if cached_total_exact and total <= SILENCE_MATCH_CANDIDATE_FALLBACK_LIMIT:
+        for rule_id, rule_name in (
+            _build_silence_candidate_query(db, silence, active_only=active_only)
+            .with_entities(AlertRule.id, AlertRule.name)
+            .distinct()
+            .order_by(AlertRule.name.asc())
+            .limit(200)
+            .all()
+        ):
+            if rule_id:
+                rule_filters[str(rule_id)] = rule_name or f"规则 {rule_id}"
     for alert in matched_alerts:
         label = alert.rule.name if alert.rule else (f"规则 {alert.rule_id}" if alert.rule_id else "-")
         value = str(alert.rule_id) if alert.rule_id else label
         rule_filters[value] = label
     return {
         "total": total,
-        "total_exact": exhausted or cached_count is not None,
+        "total_exact": exhausted or cached_total_exact,
         "items": [alert.to_dict() for alert in matched_alerts],
         "rule_filters": [
             {"text": label, "value": value}
