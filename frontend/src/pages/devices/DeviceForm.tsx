@@ -294,8 +294,21 @@ const DeviceForm = () => {
       <Form
         form={form}
         layout="vertical"
-        style={{ maxWidth: 640 }}
+        style={{ maxWidth: 1180 }}
       >
+        <Form.Item name="custom_fields_text" hidden>
+          <Input.TextArea />
+        </Form.Item>
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))',
+            gap: 24,
+            alignItems: 'start',
+          }}
+        >
+          <Card size="small" title="基础信息" bordered={false} style={{ boxShadow: '0 8px 24px rgba(15, 23, 42, 0.06)' }}>
         <Form.Item
           name="name"
           label="设备名称"
@@ -416,7 +429,9 @@ const DeviceForm = () => {
           <Input placeholder="例如：SN123456789" />
         </Form.Item>
 
-        <Divider orientation="left">监控配置</Divider>
+          </Card>
+
+          <Card size="small" title="监控与备份" bordered={false} style={{ boxShadow: '0 8px 24px rgba(15, 23, 42, 0.06)' }}>
 
         <Form.Item
           name="is_monitored"
@@ -770,53 +785,10 @@ const DeviceForm = () => {
           }}
         </Form.Item>
 
-        <Form.Item
-          noStyle
-          shouldUpdate={(prev, next) =>
-            prev.is_monitored !== next.is_monitored ||
-            prev.monitor_source !== next.monitor_source ||
-            prev.vendor !== next.vendor
-          }
-        >
-          {({ getFieldValue }) => {
-            const vendor = getFieldValue('vendor')
-            if (isAsterNOSVendor(vendor)) {
-              return (
-                <Alert
-                  type="success"
-                  showIcon
-                  style={{ marginBottom: 24 }}
-                  message="AsterNOS 指标已内置适配"
-                  description="CPU、内存、系统状态、接口状态、端口流量、错包、丢包、光功率、BGP/OSPF/CRM 等指标会从 Exporter 文本自动解析，无需填写 JSON 扩展。"
-                />
-              )
-            }
+          </Card>
+        </div>
 
-            return (
-              <>
-                <Divider orientation="left">监控扩展(JSON)</Divider>
-
-                <Form.Item
-                  name="custom_fields_text"
-                  label="监控扩展配置"
-                  extra={'可填写 snmp_private_oids，例如 {"snmp_private_oids":{"bfd_session_state_oid":"1.3.6.x.x","optical_rx_oid":"1.3.6.x.x","optical_tx_oid":"1.3.6.x.x","optical_power_scale":0.1}}'}
-                  rules={[
-                    {
-                      validator: async (_, value) => {
-                        if (!value) return
-                        JSON.parse(value)
-                      },
-                    },
-                  ]}
-                >
-                  <Input.TextArea rows={6} placeholder='例如 {"snmp_private_oids":{"bfd_session_state_oid":"1.3.6.1.x.x","optical_rx_oid":"1.3.6.1.x.x","optical_tx_oid":"1.3.6.1.x.x","optical_power_scale":0.1}}' />
-                </Form.Item>
-              </>
-            )
-          }}
-        </Form.Item>
-
-        <Form.Item>
+        <Form.Item style={{ marginTop: 24 }}>
           <Space>
             <Button onClick={() => navigate('/devices')}>
               取消
