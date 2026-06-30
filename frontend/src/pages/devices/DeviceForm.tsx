@@ -442,7 +442,6 @@ const DeviceForm = () => {
                 <Form.Item
                   name="interface_scope_mode"
                   label="端口监控范围"
-                  initialValue="all"
                   extra="默认监控全部端口；如果某些端口接终端、经常重启，可以只监控核心链路端口。"
                 >
                   <Select>
