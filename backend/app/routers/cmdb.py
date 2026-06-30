@@ -26,6 +26,11 @@ DEVICE_CSV_HEADERS = [
     'interface_scope_mode', 'interface_scope_include', 'interface_scope_exclude',
     'ssh_port', 'ssh_username', 'ssh_password', 'ssh_key'
 ]
+DEVICE_EXPORT_CSV_HEADERS = [
+    'name', 'status', 'ip_address', 'device_role', 'device_type', 'vendor', 'model', 'serial_number',
+    'datacenter_name', 'datacenter_code', 'is_monitored',
+    'interface_scope_mode', 'interface_scope_include', 'interface_scope_exclude'
+]
 
 
 def decode_csv_content(content: bytes) -> str:
@@ -425,7 +430,7 @@ async def import_devices(
 def build_device_csv(devices: list[Device]) -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(DEVICE_CSV_HEADERS)
+    writer.writerow(DEVICE_EXPORT_CSV_HEADERS)
     for device in devices:
         interface_scope = get_device_interface_scope(device)
         writer.writerow([
@@ -443,10 +448,6 @@ def build_device_csv(devices: list[Device]) -> bytes:
             interface_scope["mode"],
             interface_scope["include"],
             interface_scope["exclude"],
-            device.ssh_port or 22,
-            device.ssh_username,
-            '',
-            '',
         ])
     return output.getvalue().encode('utf-8-sig')
 
