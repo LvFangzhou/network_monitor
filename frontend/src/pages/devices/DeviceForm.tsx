@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Form, Input, Select, Button, Card, message, Space, Divider, InputNumber, Switch, Alert } from 'antd'
-import { SaveOutlined, ArrowLeftOutlined } from '@ant-design/icons'
+import { Form, Input, Select, Button, Card, message, Space, Divider, InputNumber, Switch, Tooltip } from 'antd'
+import { SaveOutlined, ArrowLeftOutlined, QuestionCircleOutlined } from '@ant-design/icons'
 import {
   createDevice,
   updateDevice,
@@ -23,6 +23,29 @@ const statusOptions = [
 ]
 
 const interfaceScopeExamples = '例如：400G1/0/1-400G1/0/64，或 1/0/1-1/0/64，多个范围可用逗号、空格或换行分隔'
+
+const OptionalLabel = ({ children }: { children: string }) => (
+  <span>
+    {children}
+    <span style={{ color: '#94a3b8', fontWeight: 400 }}>（可选）</span>
+  </span>
+)
+
+const LabelWithTip = ({ label, tip }: { label: string; tip: string }) => (
+  <Space size={6}>
+    <span>{label}</span>
+    <Tooltip title={tip} mouseEnterDelay={0.15}>
+      <QuestionCircleOutlined style={{ color: '#3b82f6' }} />
+    </Tooltip>
+  </Space>
+)
+
+const compactCardStyle = {
+  height: '100%',
+  boxShadow: '0 8px 24px rgba(15, 23, 42, 0.06)',
+} as const
+
+const compactFormItemStyle = { marginBottom: 12 } as const
 
 const normalizeAsterNOSExporterUrl = (ipAddress?: string, value?: string) => {
   const raw = (value || '').trim()
@@ -294,7 +317,7 @@ const DeviceForm = () => {
       <Form
         form={form}
         layout="vertical"
-        style={{ maxWidth: 1180 }}
+        style={{ width: '100%' }}
       >
         <Form.Item name="custom_fields_text" hidden>
           <Input.TextArea />
@@ -303,15 +326,16 @@ const DeviceForm = () => {
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))',
-            gap: 24,
+            gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+            gap: 16,
             alignItems: 'start',
           }}
         >
-          <Card size="small" title="基础信息" bordered={false} style={{ boxShadow: '0 8px 24px rgba(15, 23, 42, 0.06)' }}>
+          <Card size="small" title="基础信息" bordered={false} style={compactCardStyle}>
         <Form.Item
           name="name"
           label="设备名称"
+          style={compactFormItemStyle}
           rules={[{ required: true, message: '请输入设备名称' }]}
         >
           <Input placeholder="例如：核心交换机-01" />
@@ -320,6 +344,7 @@ const DeviceForm = () => {
         <Form.Item
           name="status"
           label="运行状态"
+          style={compactFormItemStyle}
           rules={[{ required: true, message: '请选择运行状态' }]}
         >
           <Select placeholder="选择运行状态">
@@ -334,6 +359,7 @@ const DeviceForm = () => {
         <Form.Item
           name="ip_address"
           label="IP地址"
+          style={compactFormItemStyle}
           rules={[
             { required: true, message: '请输入IP地址' },
             { pattern: /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/, message: '请输入有效的IP地址' },
@@ -344,7 +370,8 @@ const DeviceForm = () => {
 
         <Form.Item
           name="datacenter_id"
-          label="所属机房"
+          label={<OptionalLabel>所属机房</OptionalLabel>}
+          style={compactFormItemStyle}
         >
           <Select placeholder="选择机房" allowClear showSearch optionFilterProp="label">
             {datacenters.filter((item) => item.is_active).map((item) => (
@@ -362,6 +389,7 @@ const DeviceForm = () => {
         <Form.Item
           name="device_type"
           label="设备类型"
+          style={compactFormItemStyle}
           rules={[{ required: true, message: '请选择设备类型' }]}
         >
           <Select
@@ -385,7 +413,8 @@ const DeviceForm = () => {
 
         <Form.Item
           name="device_role"
-          label="设备角色"
+          label={<OptionalLabel>设备角色</OptionalLabel>}
+          style={compactFormItemStyle}
         >
           <Select placeholder="选择设备角色" allowClear showSearch optionFilterProp="label">
             {deviceRoles.filter((item) => item.is_active).map((item) => (
@@ -398,7 +427,8 @@ const DeviceForm = () => {
 
         <Form.Item
           name="vendor"
-          label="厂商"
+          label={<OptionalLabel>厂商</OptionalLabel>}
+          style={compactFormItemStyle}
         >
           <Select
             placeholder="选择厂商"
@@ -417,26 +447,29 @@ const DeviceForm = () => {
 
         <Form.Item
           name="model"
-          label="型号"
+          label={<OptionalLabel>型号</OptionalLabel>}
+          style={compactFormItemStyle}
         >
           <Input placeholder="例如：Catalyst 9300" />
         </Form.Item>
 
         <Form.Item
           name="serial_number"
-          label="序列号"
+          label={<OptionalLabel>序列号</OptionalLabel>}
+          style={compactFormItemStyle}
         >
           <Input placeholder="例如：SN123456789" />
         </Form.Item>
 
           </Card>
 
-          <Card size="small" title="监控与备份" bordered={false} style={{ boxShadow: '0 8px 24px rgba(15, 23, 42, 0.06)' }}>
+          <Card size="small" title="监控配置" bordered={false} style={compactCardStyle}>
 
         <Form.Item
           name="is_monitored"
           label="是否加入监控"
           valuePropName="checked"
+          style={compactFormItemStyle}
         >
           <Switch checkedChildren="加入" unCheckedChildren="不加入" />
         </Form.Item>
@@ -456,8 +489,13 @@ const DeviceForm = () => {
               <>
                 <Form.Item
                   name="interface_scope_mode"
-                  label="端口监控范围"
-                  extra="默认监控全部端口；如果某些端口接终端、经常重启，可以只监控核心链路端口。"
+                  label={
+                    <LabelWithTip
+                      label="端口监控范围"
+                      tip="默认监控全部端口；如果某些端口接终端、经常重启，可以只监控核心链路端口。端口范围只影响接口/光模块类告警，不影响设备连通性、CPU、内存、BGP、OSPF 等设备级或协议级告警。保存后，范围外仍在触发的接口告警会自动恢复。"
+                    />
+                  }
+                  style={compactFormItemStyle}
                 >
                   <Select>
                     <Option value="all">全部端口（默认）</Option>
@@ -471,6 +509,7 @@ const DeviceForm = () => {
                     name="interface_scope_include"
                     label="只监控这些端口"
                     extra={interfaceScopeExamples}
+                    style={compactFormItemStyle}
                     rules={[{ required: true, message: '请输入需要监控的端口或端口范围' }]}
                   >
                     <Input.TextArea rows={3} placeholder={'400G1/0/1-400G1/0/64\n400G1/0/101, 400G1/0/103'} />
@@ -482,19 +521,12 @@ const DeviceForm = () => {
                     name="interface_scope_exclude"
                     label="不监控这些端口"
                     extra={interfaceScopeExamples}
+                    style={compactFormItemStyle}
                     rules={[{ required: true, message: '请输入需要排除的端口或端口范围' }]}
                   >
                     <Input.TextArea rows={3} placeholder={'400G1/0/65-400G1/0/128\n1/0/65-1/0/128'} />
                   </Form.Item>
                 )}
-
-                <Alert
-                  type="info"
-                  showIcon
-                  style={{ marginBottom: 24 }}
-                  message="端口范围只影响接口/光模块类告警"
-                  description="设备连通性、CPU、内存、BGP、OSPF 等设备级或协议级告警不受影响。保存后，范围外仍在触发的接口告警会自动恢复。"
-                />
               </>
             )
           }}
@@ -523,18 +555,16 @@ const DeviceForm = () => {
 
                 {monitorSource === 'asternos_exporter' ? (
                   <>
-                    <Alert
-                      type="info"
-                      showIcon
-                      message="AsterNOS 直连模式"
-                      description={`厂商识别为 AsterNOS/Asterfusion，Network_monitor 会按设备管理 IP 自动读取 ${getFieldValue('ip_address') ? `http://${getFieldValue('ip_address')}:8101/metrics` : 'http://设备管理IP:8101/metrics'}，不需要填写 SNMP Community 或 Telemetry 参数。`}
-                    />
+                    <div style={{ color: '#64748b', fontSize: 12, marginBottom: 12 }}>
+                      AsterNOS 直连模式：系统会按设备管理 IP 自动读取 {getFieldValue('ip_address') ? `http://${getFieldValue('ip_address')}:8101/metrics` : 'http://设备管理IP:8101/metrics'}。
+                    </div>
                   </>
                 ) : (
                   <>
                     <Form.Item
                       label="监控方式"
                       name="network_monitor_mode"
+                      style={compactFormItemStyle}
                       rules={[{ required: true, message: '请选择监控方式' }]}
                     >
                       <Select
@@ -552,12 +582,9 @@ const DeviceForm = () => {
                         <Option value="snmp_telemetry">SNMP 和 Telemetry</Option>
                       </Select>
                     </Form.Item>
-                    <Alert
-                      type="info"
-                      showIcon
-                      message="SNMP / Telemetry 监控模式"
-                      description="厂商识别为传统网络设备，请填写 SNMP Community；选择 SNMP 和 Telemetry 时继续填写 gNMI/Telemetry 参数。"
-                    />
+                    <div style={{ color: '#64748b', fontSize: 12, marginBottom: 12 }}>
+                      SNMP / Telemetry：传统网络设备请填写 SNMP Community；选择 SNMP 和 Telemetry 时继续填写 gNMI 参数。
+                    </div>
                   </>
                 )}
               </>
@@ -582,11 +609,12 @@ const DeviceForm = () => {
 
             return (
               <>
-                <Divider orientation="left">SNMP / Telemetry 配置</Divider>
+                <Divider orientation="left" style={{ margin: '10px 0 14px' }}>SNMP / Telemetry 配置</Divider>
 
                 <Form.Item
                   name={['snmp', 'version']}
                   label="SNMP版本"
+                  style={compactFormItemStyle}
                 >
                   <Select>
                     <Option value="v1">v1</Option>
@@ -597,7 +625,8 @@ const DeviceForm = () => {
 
                 <Form.Item
                   name={['snmp', 'port']}
-                  label="SNMP端口"
+                  label={<OptionalLabel>SNMP端口</OptionalLabel>}
+                  style={compactFormItemStyle}
                 >
                   <InputNumber min={1} max={65535} style={{ width: '100%' }} />
                 </Form.Item>
@@ -614,6 +643,7 @@ const DeviceForm = () => {
                           <Form.Item
                             name={['snmp', 'username']}
                             label="SNMP用户名"
+                            style={compactFormItemStyle}
                             rules={[{ required: true, message: '请输入 SNMPv3 用户名' }]}
                           >
                             <Input placeholder="SNMPv3 用户名" />
@@ -621,7 +651,8 @@ const DeviceForm = () => {
 
                           <Form.Item
                             name={['snmp', 'security_level']}
-                            label="安全级别"
+                            label={<OptionalLabel>安全级别</OptionalLabel>}
+                            style={compactFormItemStyle}
                           >
                             <Select allowClear placeholder="SNMPv3 安全级别">
                               <Option value="noAuthNoPriv">noAuthNoPriv</Option>
@@ -632,7 +663,8 @@ const DeviceForm = () => {
 
                           <Form.Item
                             name={['snmp', 'auth_protocol']}
-                            label="认证协议"
+                            label={<OptionalLabel>认证协议</OptionalLabel>}
+                            style={compactFormItemStyle}
                           >
                             <Select allowClear placeholder="SNMPv3 认证协议">
                               <Option value="MD5">MD5</Option>
@@ -642,14 +674,16 @@ const DeviceForm = () => {
 
                           <Form.Item
                             name={['snmp', 'auth_password']}
-                            label="认证密码"
+                            label={<OptionalLabel>认证密码</OptionalLabel>}
+                            style={compactFormItemStyle}
                           >
                             <Input.Password visibilityToggle={false} placeholder="SNMPv3 认证密码" />
                           </Form.Item>
 
                           <Form.Item
                             name={['snmp', 'priv_protocol']}
-                            label="加密协议"
+                            label={<OptionalLabel>加密协议</OptionalLabel>}
+                            style={compactFormItemStyle}
                           >
                             <Select allowClear placeholder="SNMPv3 加密协议">
                               <Option value="DES">DES</Option>
@@ -659,7 +693,8 @@ const DeviceForm = () => {
 
                           <Form.Item
                             name={['snmp', 'priv_password']}
-                            label="加密密码"
+                            label={<OptionalLabel>加密密码</OptionalLabel>}
+                            style={compactFormItemStyle}
                           >
                             <Input.Password visibilityToggle={false} placeholder="SNMPv3 加密密码" />
                           </Form.Item>
@@ -671,38 +706,13 @@ const DeviceForm = () => {
                       <Form.Item
                         name={['snmp', 'community']}
                         label="Community"
+                        style={compactFormItemStyle}
                         rules={[{ required: true, message: '请输入 SNMP Community' }]}
                       >
                         <Input.Password visibilityToggle={false} placeholder="v1/v2c 例如：para@2026" />
                       </Form.Item>
                     )
                   }}
-                </Form.Item>
-
-                <Divider orientation="left">SSH / 配置备份账号</Divider>
-
-                <Form.Item
-                  name={['ssh', 'port']}
-                  label="SSH端口"
-                  extra="配置备份会优先使用这里的 SSH 参数登录设备。"
-                >
-                  <InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder="默认 22" />
-                </Form.Item>
-
-                <Form.Item name={['ssh', 'username']} label="SSH用户名">
-                  <Input placeholder="例如：admin / backup" autoComplete="off" />
-                </Form.Item>
-
-                <Form.Item name={['ssh', 'password']} label="SSH密码">
-                  <Input.Password visibilityToggle={false} placeholder="用于配置备份，可留空改用私钥" autoComplete="new-password" />
-                </Form.Item>
-
-                <Form.Item
-                  name={['ssh', 'key']}
-                  label="SSH私钥"
-                  extra="可选。仅当设备支持密钥登录时填写，密码和私钥至少配置一种。"
-                >
-                  <Input.TextArea rows={4} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
                 </Form.Item>
 
                 <Form.Item
@@ -720,48 +730,52 @@ const DeviceForm = () => {
 
                     return (
                       <>
-                        <Divider orientation="left">Telemetry / gNMI 参数</Divider>
+                        <Divider orientation="left" style={{ margin: '10px 0 14px' }}>Telemetry / gNMI 参数</Divider>
 
                         <Form.Item
                           name={['gnmi', 'port']}
                           label="Telemetry 端口"
+                          style={compactFormItemStyle}
                           rules={[{ required: true, message: '请输入 Telemetry 端口' }]}
                         >
                           <InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder="默认 57400" />
                         </Form.Item>
 
-                        <Form.Item name={['gnmi', 'username']} label="Telemetry 用户名">
+                        <Form.Item name={['gnmi', 'username']} label={<OptionalLabel>Telemetry 用户名</OptionalLabel>} style={compactFormItemStyle}>
                           <Input placeholder="gNMI 用户名" />
                         </Form.Item>
 
-                        <Form.Item name={['gnmi', 'password']} label="Telemetry 密码">
+                        <Form.Item name={['gnmi', 'password']} label={<OptionalLabel>Telemetry 密码</OptionalLabel>} style={compactFormItemStyle}>
                           <Input.Password visibilityToggle={false} placeholder="gNMI 密码" />
                         </Form.Item>
 
                         <Form.Item
                           name={['gnmi', 'tls_enabled']}
-                          label="启用 TLS"
+                          label={<OptionalLabel>启用 TLS</OptionalLabel>}
                           valuePropName="checked"
+                          style={compactFormItemStyle}
                         >
                           <Switch checkedChildren="启用" unCheckedChildren="关闭" />
                         </Form.Item>
 
                         <Form.Item
                           name={['gnmi', 'skip_verify']}
-                          label="跳过证书校验"
+                          label={<OptionalLabel>跳过证书校验</OptionalLabel>}
                           valuePropName="checked"
+                          style={compactFormItemStyle}
                         >
                           <Switch checkedChildren="跳过" unCheckedChildren="校验" />
                         </Form.Item>
 
-                        <Form.Item name={['gnmi', 'tls_cert']} label="TLS 证书">
-                          <Input.TextArea rows={3} placeholder="可选，填写 PEM 证书内容" />
+                        <Form.Item name={['gnmi', 'tls_cert']} label={<OptionalLabel>TLS 证书</OptionalLabel>} style={compactFormItemStyle}>
+                          <Input.TextArea rows={2} placeholder="可选，填写 PEM 证书内容" />
                         </Form.Item>
 
                         <Form.Item
                           name="gnmi_subscriptions_text"
-                          label="Telemetry 订阅路径(JSON)"
+                          label={<OptionalLabel>Telemetry 订阅路径(JSON)</OptionalLabel>}
                           extra={'例如 [{"path":"/interfaces/interface/state/counters","mode":"sample","sample_interval":10000000000}]'}
+                          style={compactFormItemStyle}
                           rules={[
                             {
                               validator: async (_, value) => {
@@ -774,7 +788,7 @@ const DeviceForm = () => {
                             },
                           ]}
                         >
-                          <Input.TextArea rows={4} placeholder='例如 [{"path":"/interfaces/interface/state/counters","mode":"sample","sample_interval":10000000000}]' />
+                          <Input.TextArea rows={3} placeholder='例如 [{"path":"/interfaces/interface/state/counters","mode":"sample","sample_interval":10000000000}]' />
                         </Form.Item>
                       </>
                     )
@@ -784,6 +798,37 @@ const DeviceForm = () => {
             )
           }}
         </Form.Item>
+
+          </Card>
+
+          <Card size="small" title="SSH / 配置备份账号" bordered={false} style={compactCardStyle}>
+                <div style={{ color: '#64748b', fontSize: 12, marginBottom: 12 }}>
+                  配置备份优先使用这里的 SSH 参数登录设备；密码和私钥至少配置一种即可。
+                </div>
+
+                <Form.Item
+                  name={['ssh', 'port']}
+                  label={<OptionalLabel>SSH端口</OptionalLabel>}
+                  style={compactFormItemStyle}
+                >
+                  <InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder="默认 22" />
+                </Form.Item>
+
+                <Form.Item name={['ssh', 'username']} label={<OptionalLabel>SSH用户名</OptionalLabel>} style={compactFormItemStyle}>
+                  <Input placeholder="例如：admin / backup" autoComplete="off" />
+                </Form.Item>
+
+                <Form.Item name={['ssh', 'password']} label={<OptionalLabel>SSH密码</OptionalLabel>} style={compactFormItemStyle}>
+                  <Input.Password visibilityToggle={false} placeholder="用于配置备份，可留空改用私钥" autoComplete="new-password" />
+                </Form.Item>
+
+                <Form.Item
+                  name={['ssh', 'key']}
+                  label={<OptionalLabel>SSH私钥</OptionalLabel>}
+                  style={compactFormItemStyle}
+                >
+                  <Input.TextArea rows={8} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
+                </Form.Item>
 
           </Card>
         </div>
