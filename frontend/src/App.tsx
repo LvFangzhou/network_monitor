@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import React, { Suspense, lazy, useEffect } from 'react'
-import { Spin } from 'antd'
+import { Button, Result, Spin } from 'antd'
 import { useAuthStore } from './store/auth'
 import request from './api/request'
 import Layout from './components/Layout'
@@ -163,6 +163,33 @@ const RouteFallback = () => (
   </div>
 )
 
+class RouteErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
+  state = { hasError: false }
+
+  static getDerivedStateFromError() {
+    return { hasError: true }
+  }
+
+  componentDidCatch(error: unknown) {
+    console.error('页面加载失败:', error)
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <Result
+          status="warning"
+          title="页面资源加载失败"
+          subTitle="系统刚更新过前端资源，当前页面可能还引用了旧文件。请点击刷新重新加载最新页面。"
+          extra={<Button type="primary" onClick={() => window.location.reload()}>刷新页面</Button>}
+        />
+      )
+    }
+
+    return this.props.children
+  }
+}
+
 function App() {
   const { initAuth } = useAuthStore()
 
@@ -177,8 +204,9 @@ function App() {
   return (
     <BrowserRouter>
       <RouteAuditTracker />
-      <Suspense fallback={<RouteFallback />}>
-        <Routes>
+      <RouteErrorBoundary>
+        <Suspense fallback={<RouteFallback />}>
+          <Routes>
           <Route path="/login" element={<Login />} />
           <Route
             path="/"
@@ -218,8 +246,9 @@ function App() {
             <Route path="tacacs/config" element={<MenuRoute menuPath="/tacacs"><TacacsManager activeTab="config" /></MenuRoute>} />
             <Route path="tacacs/logs" element={<MenuRoute menuPath="/tacacs"><TacacsManager activeTab="logs" /></MenuRoute>} />
           </Route>
-        </Routes>
-      </Suspense>
+          </Routes>
+        </Suspense>
+      </RouteErrorBoundary>
     </BrowserRouter>
   )
 }
