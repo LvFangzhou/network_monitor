@@ -934,31 +934,34 @@ def _empty_protocol_summary() -> Dict[str, Dict[str, int]]:
 
 def _summarize_protocol_rows(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
     summary = _empty_protocol_summary()
+    protocol_peer_states: Dict[tuple[str, str], bool] = {}
     for row in rows:
         protocol = str(row.get("protocol") or "").lower()
         if protocol not in summary:
             continue
+        peer = str(row.get("peer") or "").strip()
+        if not peer:
+            continue
         value = _safe_float(row.get("value"))
         is_up = value is not None and value >= 1
+        key = (protocol, peer)
+        protocol_peer_states[key] = bool(protocol_peer_states.get(key, True) and is_up)
+
+    for (protocol, _peer), is_up in protocol_peer_states.items():
         summary[protocol]["total"] += 1
-        if is_up:
-            summary[protocol]["up"] += 1
-        else:
-            summary[protocol]["down"] += 1
+        summary[protocol]["up" if is_up else "down"] += 1
     return summary
 
 
 def _get_snmp_protocol_summary(device_id: int) -> Dict[str, Dict[str, int]]:
-    flux = f'''
-    from(bucket: "{influx_client.bucket}")
-      |> range(start: -1h)
-      |> filter(fn: (r) => r._measurement == "protocol_status")
-      |> filter(fn: (r) => r.device_id == "{device_id}")
-      |> filter(fn: (r) => r._field == "state_up")
-      |> group(columns: ["protocol", "peer"])
-      |> last()
-    '''
-    return _summarize_protocol_rows(influx_client.query(flux))
+    neighbors = _get_snmp_protocol_neighbors(device_id)
+    summary = _empty_protocol_summary()
+    for protocol in ("bgp", "ospf"):
+        for row in neighbors.get(protocol) or []:
+            summary[protocol]["total"] += 1
+            status = str(row.get("status") or "").lower()
+            summary[protocol]["up" if status == "up" else "down"] += 1
+    return summary
 
 
 def _snmp_overview_has_recent_data(

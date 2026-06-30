@@ -895,11 +895,22 @@ class SNMPCollector(LoggerMixin):
             "bgp": {"total": 0, "up": 0, "down": 0},
             "ospf": {"total": 0, "up": 0, "down": 0},
         }
+        protocol_peer_states: Dict[Tuple[str, str], bool] = {}
         for point in points:
             protocol = str(point.get("tags", {}).get("protocol") or "").lower()
             if protocol not in protocol_summary:
                 continue
+            peer = str(point.get("tags", {}).get("peer") or "").strip()
+            if not peer:
+                continue
             is_up = float(point.get("fields", {}).get("state_up") or 0) >= 1
+            key = (protocol, peer)
+            # 同一个 peer 可能因为不同 BGP OID / 地址族 / context 被采到多次。
+            # 总览要按真实邻居数统计，而不是按采样行数统计；如果同一 peer 有
+            # 任一 down 状态，以 down 优先，避免掩盖异常。
+            protocol_peer_states[key] = bool(protocol_peer_states.get(key, True) and is_up)
+
+        for (protocol, _peer), is_up in protocol_peer_states.items():
             protocol_summary[protocol]["total"] += 1
             protocol_summary[protocol]["up" if is_up else "down"] += 1
 
