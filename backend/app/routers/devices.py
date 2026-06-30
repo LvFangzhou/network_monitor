@@ -13,6 +13,7 @@ import re
 from app.database import get_db
 from app.models import AlertHistory, Device, DeviceGroup, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
 from app.collectors.snmp_collector import SNMPCollector
+from app.utils.interface_scope import alert_target_interface_is_monitored
 from app.schemas import (
     DeviceCreate, DeviceUpdate, DeviceResponse,
     DeviceGroupCreate, DeviceGroupUpdate, DeviceGroupResponse,
@@ -57,6 +58,44 @@ def resolve_active_alerts_for_unmonitored_devices(db: Session, device_ids: list[
         alert.updated_at = now
     logger.info("未监控设备活动告警已自动恢复", device_count=len(normalized_ids), alert_count=len(alerts))
     return len(alerts)
+
+
+def resolve_active_interface_alerts_outside_scope(db: Session, device: Device) -> int:
+    """端口监控范围收窄后，自动恢复范围外仍在触发中的接口类告警。"""
+    if not device or not device.id:
+        return 0
+
+    alerts = (
+        db.query(AlertHistory)
+        .filter(
+            AlertHistory.device_id == device.id,
+            AlertHistory.status.in_(ACTIVE_ALERT_STATUSES),
+            AlertHistory.alert_target_type == "interface",
+        )
+        .all()
+    )
+    if not alerts:
+        return 0
+
+    now = datetime.now()
+    resolved_count = 0
+    for alert in alerts:
+        target = {
+            "target_key": alert.alert_target_key,
+            "target_name": alert.alert_target_name,
+        }
+        if alert_target_interface_is_monitored(device, target):
+            continue
+        alert.status = "resolved"
+        alert.resolved_at = now
+        alert.resolved_by = "system"
+        alert.resolution_note = "端口已设置为不监控，系统自动恢复活动告警"
+        alert.updated_at = now
+        resolved_count += 1
+
+    if resolved_count:
+        logger.info("端口监控范围外活动告警已自动恢复", device_id=device.id, alert_count=resolved_count)
+    return resolved_count
 
 
 def normalize_monitoring_config(
@@ -1025,6 +1064,8 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
     resolved_alerts = 0
     if "is_monitored" in update_data and was_monitored and not bool(db_device.is_monitored):
         resolved_alerts = resolve_active_alerts_for_unmonitored_devices(db, [db_device.id])
+    elif bool(db_device.is_monitored) and "custom_fields" in update_data:
+        resolved_alerts = resolve_active_interface_alerts_outside_scope(db, db_device)
     db.commit()
     db.refresh(db_device)
     

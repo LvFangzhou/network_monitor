@@ -19,6 +19,7 @@ from app.database import SessionLocal
 from app.models import AlertRule, AlertHistory, AlertSilence, Circuit, Device, SyslogEvent
 from app.utils import influx_client, notification_manager, redis_client
 from app.utils.asternos_exporter_client import asternos_exporter_client
+from app.utils.interface_scope import is_interface_monitored
 from app.config import settings
 from app.core import get_logger
 
@@ -2300,6 +2301,8 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
                     continue
                 if interface_name and any(skip in interface_name.lower() for skip in ["loopback", "null", "vlanif"]) and not extra_config.get("include_logical_interfaces"):
                     continue
+                if not is_interface_monitored(device, interface_name, interface_index):
+                    continue
                 try:
                     stats = _get_exporter_interface_stats_cached(device, interface_name)
                 except Exception as exc:
@@ -2363,6 +2366,8 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
             if extra_config.get("interface_index") and str(interface_index) != str(extra_config.get("interface_index")):
                 continue
             if interface_name and any(skip in interface_name.lower() for skip in ["loopback", "null", "vlanif"]) and not extra_config.get("include_logical_interfaces"):
+                continue
+            if not is_interface_monitored(device, interface_name, interface_index):
                 continue
             value = item.get("value")
             if value is None:
@@ -2446,6 +2451,8 @@ def _get_metric_value(db: Session, device_id: int, metric_type: str, extra_confi
                         logger.error("Exporter接口索引解析失败", device_id=device_id, error=str(exc))
                         interface_name = None
                 if interface_name:
+                    if not is_interface_monitored(device, interface_name, extra_config.get("interface_index")):
+                        return None
                     try:
                         stats = _get_exporter_interface_stats_cached(device, str(interface_name))
                         metric_value_map = {
@@ -2521,6 +2528,12 @@ def _get_metric_value(db: Session, device_id: int, metric_type: str, extra_confi
                 tag_filters["interface_name"] = str(extra_config["interface_name"])
             elif extra_config.get("interface_index"):
                 tag_filters["interface_index"] = str(extra_config["interface_index"])
+            if device and not is_interface_monitored(
+                device,
+                extra_config.get("interface_name"),
+                extra_config.get("interface_index"),
+            ):
+                return None
         if metric_type in {"bgp_peer_state", "ospf_neighbor_state", "bfd_session_state"}:
             protocol_map = {
                 "bgp_peer_state": "bgp",
@@ -2535,6 +2548,12 @@ def _get_metric_value(db: Session, device_id: int, metric_type: str, extra_confi
                 tag_filters["interface_name"] = str(extra_config["interface_name"])
             elif extra_config.get("interface_index"):
                 tag_filters["interface_index"] = str(extra_config["interface_index"])
+            if device and not is_interface_monitored(
+                device,
+                extra_config.get("interface_name"),
+                extra_config.get("interface_index"),
+            ):
+                return None
 
         flux = _build_influx_last_value_query(
             measurement=measurement,

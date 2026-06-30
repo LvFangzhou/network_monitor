@@ -22,6 +22,8 @@ const statusOptions = [
   { value: 'deployed', label: '上架' },
 ]
 
+const interfaceScopeExamples = '例如：400G1/0/1-400G1/0/64，或 1/0/1-1/0/64，多个范围可用逗号、空格或换行分隔'
+
 const normalizeAsterNOSExporterUrl = (ipAddress?: string, value?: string) => {
   const raw = (value || '').trim()
   if (!raw) {
@@ -95,6 +97,9 @@ const DeviceForm = () => {
         ssh: {
           port: 22,
         },
+        interface_scope_mode: 'all',
+        interface_scope_include: '',
+        interface_scope_exclude: '',
       })
     }
   }, [id])
@@ -119,6 +124,7 @@ const DeviceForm = () => {
   const fetchDevice = async () => {
     try {
       const device = await getDevice(Number(id))
+      const interfaceScope = device.custom_fields?.monitoring?.interface_scope || {}
       form.setFieldsValue({
         name: device.name,
         status: device.status || 'in_stock',
@@ -163,6 +169,9 @@ const DeviceForm = () => {
           password: device.ssh?.password,
           key: device.ssh?.key,
         },
+        interface_scope_mode: interfaceScope.mode || 'all',
+        interface_scope_include: interfaceScope.include || interfaceScope.include_patterns || '',
+        interface_scope_exclude: interfaceScope.exclude || interfaceScope.exclude_patterns || '',
         custom_fields_text: device.custom_fields ? JSON.stringify(device.custom_fields, null, 2) : '',
       })
     } catch (error) {
@@ -184,6 +193,15 @@ const DeviceForm = () => {
         monitorSource === 'asternos_exporter'
           ? normalizeAsterNOSExporterUrl(values.ip_address)
           : undefined
+      const interfaceScopeMode = values.interface_scope_mode || 'all'
+      parsedCustomFields.monitoring = {
+        ...(parsedCustomFields.monitoring || {}),
+        interface_scope: {
+          mode: interfaceScopeMode,
+          include: interfaceScopeMode === 'include' ? (values.interface_scope_include || '') : '',
+          exclude: interfaceScopeMode === 'exclude' ? (values.interface_scope_exclude || '') : '',
+        },
+      }
       if (monitorSource === 'asternos_exporter') {
         parsedCustomFields.monitoring = {
           ...(parsedCustomFields.monitoring || {}),
@@ -406,6 +424,66 @@ const DeviceForm = () => {
           valuePropName="checked"
         >
           <Switch checkedChildren="加入" unCheckedChildren="不加入" />
+        </Form.Item>
+
+        <Form.Item
+          noStyle
+          shouldUpdate={(prev, next) =>
+            prev.is_monitored !== next.is_monitored ||
+            prev.interface_scope_mode !== next.interface_scope_mode
+          }
+        >
+          {({ getFieldValue }) => {
+            if (!getFieldValue('is_monitored')) return null
+            const mode = getFieldValue('interface_scope_mode') || 'all'
+
+            return (
+              <>
+                <Form.Item
+                  name="interface_scope_mode"
+                  label="端口监控范围"
+                  initialValue="all"
+                  extra="默认监控全部端口；如果某些端口接终端、经常重启，可以只监控核心链路端口。"
+                >
+                  <Select>
+                    <Option value="all">全部端口（默认）</Option>
+                    <Option value="include">只监控指定端口</Option>
+                    <Option value="exclude">排除指定端口</Option>
+                  </Select>
+                </Form.Item>
+
+                {mode === 'include' && (
+                  <Form.Item
+                    name="interface_scope_include"
+                    label="只监控这些端口"
+                    extra={interfaceScopeExamples}
+                    rules={[{ required: true, message: '请输入需要监控的端口或端口范围' }]}
+                  >
+                    <Input.TextArea rows={3} placeholder={'400G1/0/1-400G1/0/64\n400G1/0/101, 400G1/0/103'} />
+                  </Form.Item>
+                )}
+
+                {mode === 'exclude' && (
+                  <Form.Item
+                    name="interface_scope_exclude"
+                    label="不监控这些端口"
+                    extra={interfaceScopeExamples}
+                    rules={[{ required: true, message: '请输入需要排除的端口或端口范围' }]}
+                  >
+                    <Input.TextArea rows={3} placeholder={'400G1/0/65-400G1/0/128\n1/0/65-1/0/128'} />
+                  </Form.Item>
+                )}
+
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 24 }}
+                  message="端口范围只影响接口/光模块类告警"
+                  description="设备连通性、CPU、内存、BGP、OSPF 等设备级或协议级告警不受影响。保存后，范围外仍在触发的接口告警会自动恢复。"
+                />
+              </>
+            )
+          }}
         </Form.Item>
 
         <Form.Item
