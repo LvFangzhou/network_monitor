@@ -23,6 +23,7 @@ REQUIRED_IMPORT_HEADERS = {'name', 'ip_address'}
 DEVICE_CSV_HEADERS = [
     'name', 'status', 'ip_address', 'device_role', 'device_type', 'vendor', 'model', 'serial_number',
     'datacenter_name', 'datacenter_code', 'is_monitored',
+    'interface_scope_mode', 'interface_scope_include', 'interface_scope_exclude',
     'ssh_port', 'ssh_username', 'ssh_password', 'ssh_key'
 ]
 
@@ -96,6 +97,65 @@ def normalize_ssh_port(raw_value: Optional[str]) -> int:
     return port
 
 
+def normalize_interface_scope_mode(raw_value: Optional[str]) -> str:
+    value = (raw_value or "all").strip().lower()
+    aliases = {
+        "": "all",
+        "all": "all",
+        "全部": "all",
+        "全部端口": "all",
+        "include": "include",
+        "only": "include",
+        "只监控": "include",
+        "只监控指定端口": "include",
+        "exclude": "exclude",
+        "except": "exclude",
+        "排除": "exclude",
+        "排除指定端口": "exclude",
+    }
+    if value not in aliases:
+        raise ValueError("interface_scope_mode 仅支持 all/include/exclude")
+    return aliases[value]
+
+
+def apply_interface_scope_from_csv(device: Device, row: dict[str, str]) -> None:
+    if not any(key in row for key in ("interface_scope_mode", "interface_scope_include", "interface_scope_exclude")):
+        return
+
+    mode = normalize_interface_scope_mode(row.get("interface_scope_mode"))
+    include = csv_value(row, "interface_scope_include") or ""
+    exclude = csv_value(row, "interface_scope_exclude") or ""
+    if mode == "include" and not include:
+        raise ValueError("interface_scope_mode 为 include 时，interface_scope_include 不能为空")
+    if mode == "exclude" and not exclude:
+        raise ValueError("interface_scope_mode 为 exclude 时，interface_scope_exclude 不能为空")
+
+    custom_fields = dict(device.custom_fields or {})
+    monitoring = custom_fields.get("monitoring")
+    if not isinstance(monitoring, dict):
+        monitoring = {}
+    monitoring["interface_scope"] = {
+        "mode": mode,
+        "include": include if mode == "include" else "",
+        "exclude": exclude if mode == "exclude" else "",
+    }
+    custom_fields["monitoring"] = monitoring
+    device.custom_fields = custom_fields
+
+
+def get_device_interface_scope(device: Device) -> dict[str, str]:
+    custom_fields = device.custom_fields or {}
+    monitoring = custom_fields.get("monitoring") if isinstance(custom_fields, dict) else {}
+    scope = monitoring.get("interface_scope") if isinstance(monitoring, dict) else {}
+    if not isinstance(scope, dict):
+        scope = {}
+    return {
+        "mode": str(scope.get("mode") or "all"),
+        "include": str(scope.get("include") or scope.get("include_patterns") or ""),
+        "exclude": str(scope.get("exclude") or scope.get("exclude_patterns") or ""),
+    }
+
+
 def apply_device_import_row(device: Device, row: dict[str, str], db: Session, group_id: Optional[int] = None) -> None:
     """将 CSV 行应用到新建或已有设备；空字段不覆盖已有非空值。"""
     if csv_value(row, 'name'):
@@ -146,6 +206,8 @@ def apply_device_import_row(device: Device, row: dict[str, str], db: Session, gr
         device.ssh_password = csv_value(row, 'ssh_password')
     if 'ssh_key' in row and csv_value(row, 'ssh_key') is not None:
         device.ssh_key = csv_value(row, 'ssh_key')
+
+    apply_interface_scope_from_csv(device, row)
 
 
 def find_or_create_datacenter(
@@ -365,6 +427,7 @@ def build_device_csv(devices: list[Device]) -> bytes:
     writer = csv.writer(output)
     writer.writerow(DEVICE_CSV_HEADERS)
     for device in devices:
+        interface_scope = get_device_interface_scope(device)
         writer.writerow([
             device.name,
             normalize_inventory_status(device.status),
@@ -377,6 +440,9 @@ def build_device_csv(devices: list[Device]) -> bytes:
             device.datacenter_ref.name if device.datacenter_ref else None,
             device.datacenter_ref.code if device.datacenter_ref else None,
             '是' if device.is_monitored else '否',
+            interface_scope["mode"],
+            interface_scope["include"],
+            interface_scope["exclude"],
             device.ssh_port or 22,
             device.ssh_username,
             '',
@@ -392,7 +458,11 @@ async def export_device_template():
     content = io.StringIO()
     writer = csv.writer(content)
     writer.writerow(DEVICE_CSV_HEADERS)
-    writer.writerow(['示例交换机', 'in_stock', '192.0.2.10', '接入交换机', 'switch', 'H3C', '', '', '', '', '是', '22', 'backup', '', ''])
+    writer.writerow([
+        '示例交换机', 'in_stock', '192.0.2.10', '接入交换机', 'switch', 'H3C', '', '', '', '', '是',
+        'include', '400G1/0/1-400G1/0/64', '',
+        '22', 'backup', '', ''
+    ])
     return StreamingResponse(
         io.BytesIO(content.getvalue().encode('utf-8-sig')),
         media_type="text/csv; charset=utf-8",
