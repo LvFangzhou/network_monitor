@@ -118,8 +118,30 @@ def _interface_realtime_lock_key(kind: str = "asternos") -> str:
     return f"interface_realtime_collect:{kind}:lock"
 
 
+def _bucket_cursor_key(kind: str) -> str:
+    return f"collect:bucket_cursor:{kind}"
+
+
 def _icmp_reachability_lock_key() -> str:
     return "device_reachability_collect:lock"
+
+
+def _next_round_robin_bucket(kind: str, bucket_count: int) -> int:
+    """Return the next bucket using Redis state instead of wall-clock modulo.
+
+    Celery Beat can run with a stable phase (for example always around :15/:45).
+    If bucket selection is based on ``int(time.time() // interval) % N``, some
+    buckets may be skipped for a long time when task runtime and beat phase line
+    up badly. A Redis cursor guarantees every scheduler execution advances to
+    the next bucket.
+    """
+    if bucket_count <= 1:
+        return 0
+    try:
+        return (int(redis_client.incr(_bucket_cursor_key(kind))) - 1) % bucket_count
+    except Exception as exc:
+        logger.warning("采集分桶游标更新失败，回退到时间分桶", kind=kind, error=str(exc))
+        return int(time.time() // SNMP_SCHEDULER_INTERVAL_SECONDS) % bucket_count
 
 
 def _try_lock_asternos_device(device_id: int) -> bool:
@@ -1121,7 +1143,7 @@ def collect_all_snmp():
             or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
         ).order_by(Device.id.asc()).all()
 
-        current_bucket = int(time.time() // SNMP_SCHEDULER_INTERVAL_SECONDS) % SNMP_BATCH_COUNT
+        current_bucket = _next_round_robin_bucket("snmp_full", SNMP_BATCH_COUNT)
         devices_in_bucket = [
             device for device in devices
             if int(device.id or 0) % SNMP_BATCH_COUNT == current_bucket
@@ -1189,7 +1211,7 @@ def collect_all_snmp_interface_realtime():
             or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
         ).order_by(Device.id.asc()).all()
 
-        current_bucket = int(time.time() // SNMP_SCHEDULER_INTERVAL_SECONDS) % SNMP_INTERFACE_BATCH_COUNT
+        current_bucket = _next_round_robin_bucket("snmp_interface_realtime", SNMP_INTERFACE_BATCH_COUNT)
         devices_in_bucket = [
             device for device in devices
             if int(device.id or 0) % SNMP_INTERFACE_BATCH_COUNT == current_bucket
@@ -1402,7 +1424,7 @@ def collect_all_asternos_exporter():
             ):
                 devices.append(device)
 
-        current_bucket = int(time.time() // ASTERNOS_SCHEDULER_INTERVAL_SECONDS) % ASTERNOS_BATCH_COUNT
+        current_bucket = _next_round_robin_bucket("asternos_full", ASTERNOS_BATCH_COUNT)
         devices_in_bucket = [
             device for device in devices
             if int(device.id or 0) % ASTERNOS_BATCH_COUNT == current_bucket
