@@ -341,6 +341,7 @@ class Device(Base):
             "prometheus_url": f"http://{self.ip_address}:8101" if monitor_source == "asternos_exporter" else None,
             "prometheus_job": None,
             "prometheus_instance": None,
+            "custom_fields": self.custom_fields or {},
             "group_id": self.group_id,
             "tags": [tag.name for tag in self.tags] if self.tags else [],
             "created_at": self.created_at.isoformat() if self.created_at else None,
