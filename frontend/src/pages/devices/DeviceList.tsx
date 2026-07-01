@@ -250,6 +250,21 @@ const DeviceList = () => {
     serial_number_text: filters.serial_number || undefined,
   })
 
+  const getCurrentExportFilters = () => {
+    const effectiveSearch = searchKeyword || undefined
+    return {
+      search: effectiveSearch,
+      search_mode: effectiveSearch ? getSearchMode(effectiveSearch) : 'fuzzy',
+      status: statusFilter,
+      device_type_id: deviceTypeFilter,
+      device_role: roleFilter,
+      vendor: vendorFilter,
+      is_monitored: monitoredFilter === undefined ? undefined : monitoredFilter === 'true',
+      datacenter_id: datacenterFilter,
+      ...getColumnFilterParams(columnFilters),
+    }
+  }
+
   const fetchDevices = async (params?: any) => {
     const fetchSeq = fetchSeqRef.current + 1
     fetchSeqRef.current = fetchSeq
@@ -627,7 +642,7 @@ const DeviceList = () => {
 
     setExporting(true)
     try {
-      const blob = await exportDevices(fields)
+      const blob = await exportDevices(fields, getCurrentExportFilters())
       const url = window.URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
@@ -1286,7 +1301,7 @@ const DeviceList = () => {
       >
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Text type="secondary">
-            普通导出不包含 SSH 用户名、SSH 端口、密码、私钥、SNMP Community 等敏感参数。
+            会按照当前页面筛选条件导出；普通导出不包含 SSH 用户名、SSH 端口、密码、私钥、SNMP Community 等敏感参数。
           </Text>
           <Space>
             <Button size="small" onClick={() => setSelectedExportFields(DEFAULT_EXPORT_FIELDS)}>

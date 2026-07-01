@@ -318,9 +318,31 @@ export const importDevices = async (file: File): Promise<{ imported: number; fai
   }) as { imported: number; failed: number; errors: string[] }
 }
 
-export const exportDevices = async (fields?: string[]): Promise<Blob> => {
+export const exportDevices = async (fields?: string[], filters?: {
+  group_id?: number
+  status?: string
+  device_type?: string
+  device_type_id?: number
+  device_role?: string
+  vendor?: string
+  datacenter_id?: number
+  is_monitored?: boolean
+  search?: string
+  search_mode?: 'fuzzy' | 'regex'
+  name_text?: string
+  ip_address_text?: string
+  status_text?: string
+  monitored_text?: string
+  datacenter_text?: string
+  model_text?: string
+  device_type_text?: string
+  serial_number_text?: string
+}): Promise<Blob> => {
   return await request.get('/cmdb/devices/export', {
-    params: fields && fields.length > 0 ? { fields } : undefined,
+    params: {
+      ...(filters || {}),
+      ...(fields && fields.length > 0 ? { fields } : {}),
+    },
     paramsSerializer: {
       indexes: null,
     },

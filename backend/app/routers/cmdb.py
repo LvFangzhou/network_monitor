@@ -2,12 +2,13 @@
 CMDB 资产管理路由
 """
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 from typing import List, Optional
 import csv
 import io
+import re
 from copy import deepcopy
 from datetime import datetime
 from sqlalchemy.exc import SQLAlchemyError
@@ -561,6 +562,148 @@ def normalize_export_fields(fields: Optional[List[str]]) -> list[str]:
     return normalized
 
 
+def apply_device_export_filters(
+    query,
+    *,
+    group_id: Optional[int] = None,
+    status: Optional[str] = None,
+    device_type: Optional[str] = None,
+    device_type_id: Optional[int] = None,
+    device_role: Optional[str] = None,
+    vendor: Optional[str] = None,
+    datacenter_id: Optional[int] = None,
+    is_monitored: Optional[bool] = None,
+    search: Optional[str] = None,
+    search_mode: str = "fuzzy",
+    name_text: Optional[str] = None,
+    ip_address_text: Optional[str] = None,
+    status_text: Optional[str] = None,
+    monitored_text: Optional[str] = None,
+    datacenter_text: Optional[str] = None,
+    model_text: Optional[str] = None,
+    device_type_text: Optional[str] = None,
+    serial_number_text: Optional[str] = None,
+):
+    """导出接口复用网络设备列表的主要筛选语义，确保“所见即所导”。"""
+    if group_id:
+        query = query.filter(Device.group_id == group_id)
+    if status:
+        if status == "active":
+            query = query.filter(Device.status.in_(["active", "online"]))
+        elif status == "inactive":
+            query = query.filter(Device.status.in_(["inactive", "offline"]))
+        else:
+            query = query.filter(Device.status == status)
+    if device_type:
+        query = query.filter(Device.device_type == device_type)
+    if device_type_id:
+        query = query.filter(Device.device_type_id == device_type_id)
+    if device_role:
+        query = query.filter(Device.device_role.ilike(f"%{device_role}%"))
+    if vendor:
+        query = query.filter(Device.vendor.ilike(f"%{vendor}%"))
+    if datacenter_id:
+        query = query.filter(Device.datacenter_id == datacenter_id)
+    if is_monitored is not None:
+        query = query.filter(Device.is_monitored == is_monitored)
+
+    if name_text:
+        query = query.filter(Device.name.ilike(f"%{name_text.strip()}%"))
+    if ip_address_text:
+        query = query.filter(Device.ip_address.ilike(f"%{ip_address_text.strip()}%"))
+    if model_text:
+        query = query.filter(Device.model.ilike(f"%{model_text.strip()}%"))
+    if serial_number_text:
+        query = query.filter(Device.serial_number.ilike(f"%{serial_number_text.strip()}%"))
+    if datacenter_text:
+        value = datacenter_text.strip()
+        query = query.filter(Device.datacenter_ref.has(
+            Datacenter.name.ilike(f"%{value}%") |
+            Datacenter.code.ilike(f"%{value}%") |
+            Datacenter.location.ilike(f"%{value}%")
+        ))
+    if device_type_text:
+        value = device_type_text.strip()
+        query = query.filter(
+            Device.device_type.ilike(f"%{value}%") |
+            Device.device_type_ref.has(
+                DeviceType.name.ilike(f"%{value}%") |
+                DeviceType.display_name.ilike(f"%{value}%")
+            )
+        )
+    if status_text:
+        value = status_text.strip()
+        status_aliases = {
+            "active": "上线",
+            "online": "上线",
+            "inactive": "离线",
+            "offline": "离线",
+            "in_stock": "库存",
+            "deployed": "上架",
+        }
+        matched_statuses = [key for key, label in status_aliases.items() if value.lower() in key.lower() or value in label]
+        status_conditions = [Device.status.ilike(f"%{value}%")]
+        if matched_statuses:
+            status_conditions.append(Device.status.in_(matched_statuses))
+        query = query.filter(or_(*status_conditions))
+    if monitored_text:
+        value = monitored_text.strip().lower()
+        true_labels = ["监控", "监控中", "已监控", "是", "true", "yes", "1"]
+        false_labels = ["未监控", "否", "false", "no", "0"]
+        matches_true = any(value in label.lower() for label in true_labels)
+        matches_false = any(value in label.lower() for label in false_labels)
+        if matches_true and not matches_false:
+            query = query.filter(Device.is_monitored.is_(True))
+        elif matches_false and not matches_true:
+            query = query.filter(Device.is_monitored.is_(False))
+        elif value:
+            query = query.filter(Device.id == -1)
+
+    if search:
+        if search_mode == "regex":
+            try:
+                re.compile(search)
+            except re.error:
+                raise HTTPException(status_code=400, detail="正则表达式格式无效")
+            query = query.filter(
+                Device.name.op("~*")(search) |
+                Device.ip_address.op("~*")(search) |
+                Device.hostname.op("~*")(search) |
+                Device.serial_number.op("~*")(search) |
+                Device.model.op("~*")(search) |
+                Device.vendor.op("~*")(search) |
+                Device.device_role.op("~*")(search) |
+                Device.device_type.op("~*")(search) |
+                Device.description.op("~*")(search) |
+                Device.location.op("~*")(search) |
+                Device.datacenter_ref.has(
+                    Datacenter.name.op("~*")(search) |
+                    Datacenter.code.op("~*")(search) |
+                    Datacenter.location.op("~*")(search)
+                )
+            )
+        else:
+            query = query.filter(
+                Device.name.ilike(f"%{search}%") |
+                Device.ip_address.ilike(f"%{search}%") |
+                Device.hostname.ilike(f"%{search}%") |
+                Device.serial_number.ilike(f"%{search}%") |
+                Device.model.ilike(f"%{search}%") |
+                Device.vendor.ilike(f"%{search}%") |
+                Device.device_role.ilike(f"%{search}%") |
+                Device.device_type.ilike(f"%{search}%") |
+                Device.description.ilike(f"%{search}%") |
+                Device.location.ilike(f"%{search}%") |
+                Device.datacenter_ref.has(
+                    Datacenter.name.ilike(f"%{search}%") |
+                    Datacenter.code.ilike(f"%{search}%") |
+                    Datacenter.location.ilike(f"%{search}%")
+                )
+            )
+
+    return query
+
+
 def build_device_csv(devices: list[Device], fields: Optional[List[str]] = None) -> bytes:
     export_fields = normalize_export_fields(fields)
     output = io.StringIO()
@@ -598,16 +741,49 @@ async def export_device_template():
 async def export_devices(
     db: Session = Depends(get_db),
     group_id: Optional[int] = None,
+    status: Optional[str] = None,
     device_type: Optional[str] = None,
+    device_type_id: Optional[int] = None,
+    device_role: Optional[str] = None,
+    vendor: Optional[str] = None,
+    datacenter_id: Optional[int] = None,
+    is_monitored: Optional[bool] = None,
+    search: Optional[str] = None,
+    search_mode: str = Query("fuzzy", pattern="^(fuzzy|regex)$"),
+    name_text: Optional[str] = None,
+    ip_address_text: Optional[str] = None,
+    status_text: Optional[str] = None,
+    monitored_text: Optional[str] = None,
+    datacenter_text: Optional[str] = None,
+    model_text: Optional[str] = None,
+    device_type_text: Optional[str] = None,
+    serial_number_text: Optional[str] = None,
     fields: Optional[List[str]] = Query(None),
 ):
     """导出设备（CSV格式）"""
     query = db.query(Device)
 
-    if group_id:
-        query = query.filter(Device.group_id == group_id)
-    if device_type:
-        query = query.filter(Device.device_type == device_type)
+    query = apply_device_export_filters(
+        query,
+        group_id=group_id,
+        status=status,
+        device_type=device_type,
+        device_type_id=device_type_id,
+        device_role=device_role,
+        vendor=vendor,
+        datacenter_id=datacenter_id,
+        is_monitored=is_monitored,
+        search=search,
+        search_mode=search_mode,
+        name_text=name_text,
+        ip_address_text=ip_address_text,
+        status_text=status_text,
+        monitored_text=monitored_text,
+        datacenter_text=datacenter_text,
+        model_text=model_text,
+        device_type_text=device_type_text,
+        serial_number_text=serial_number_text,
+    )
     
     devices = query.all()
     
