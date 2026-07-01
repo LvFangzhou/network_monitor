@@ -428,8 +428,8 @@ def _silence_match_count_lock_key(silence_id: int, active_only: bool) -> str:
     return f"{SILENCE_MATCH_CACHE_PREFIX}:lock:{silence_id}:{int(bool(active_only))}"
 
 
-def _silence_match_count_queue_lock_key(silence_id: int) -> str:
-    return f"{SILENCE_MATCH_CACHE_PREFIX}:queue:{silence_id}"
+def _silence_match_count_queue_lock_key(silence_id: int, include_total: bool = False) -> str:
+    return f"{SILENCE_MATCH_CACHE_PREFIX}:queue:{silence_id}:{int(bool(include_total))}"
 
 
 def _get_silence_match_count_cached(silence: AlertSilence, *, active_only: bool) -> Dict[str, Any]:
@@ -461,8 +461,8 @@ def _get_silence_cached_count_and_exact(silence: AlertSilence, *, active_only: b
     return count, exact_raw != "0"
 
 
-def _queue_silence_match_count_prewarm(silence_id: int) -> None:
-    queue_lock_key = _silence_match_count_queue_lock_key(silence_id)
+def _queue_silence_match_count_prewarm(silence_id: int, *, include_total: bool = False) -> None:
+    queue_lock_key = _silence_match_count_queue_lock_key(silence_id, include_total)
     queued = redis_client.set(
         queue_lock_key,
         str(time.time()),
@@ -474,7 +474,7 @@ def _queue_silence_match_count_prewarm(silence_id: int) -> None:
     try:
         celery_app.send_task(
             "app.tasks.alert_tasks.prewarm_alert_silence_match_counts",
-            args=[silence_id],
+            args=[silence_id, include_total],
             queue="alerts_prewarm",
         )
     except Exception as exc:
@@ -943,6 +943,7 @@ def get_alert_rule_status(
 async def get_alert_silence_match_counts(
     silence_id: int,
     db: Session = Depends(get_db),
+    include_total: bool = Query(False, description="是否同时统计历史命中；默认只统计当前命中以降低系统压力"),
 ):
     """计算单条告警屏蔽命中数量。
 
@@ -954,14 +955,19 @@ async def get_alert_silence_match_counts(
         raise HTTPException(status_code=404, detail="告警屏蔽不存在")
 
     active = _get_silence_match_count_cached(silence, active_only=True)
-    total = _get_silence_match_count_cached(silence, active_only=False)
-    if active.get("pending") or total.get("pending"):
-        _queue_silence_match_count_prewarm(silence.id)
+    total = _get_silence_match_count_cached(silence, active_only=False) if include_total else {
+        "count": None,
+        "cached": False,
+        "pending": False,
+        "exact": False,
+    }
+    if active.get("pending") or (include_total and total.get("pending")):
+        _queue_silence_match_count_prewarm(silence.id, include_total=include_total)
     return {
         "silence_id": silence.id,
         "active": active,
         "total": total,
-        "pending": bool(active.get("pending") or total.get("pending")),
+        "pending": bool(active.get("pending") or (include_total and total.get("pending"))),
     }
 
 
@@ -1543,7 +1549,7 @@ async def list_alert_silence_matches(
     total, cached_total_exact = _get_silence_cached_count_and_exact(silence, active_only=active_only)
     if sql_exact_ip_only:
         if total is None:
-            _queue_silence_match_count_prewarm(silence.id)
+            _queue_silence_match_count_prewarm(silence.id, include_total=not active_only)
         else:
             cached_total_exact = True
     if exhausted:

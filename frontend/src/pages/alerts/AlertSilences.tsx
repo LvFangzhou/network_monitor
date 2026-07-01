@@ -135,6 +135,7 @@ const AlertSilences = () => {
   const [matches, setMatches] = useState<AlertHistoryItem[]>([])
   const [matchesTotal, setMatchesTotal] = useState(0)
   const [matchesTotalExact, setMatchesTotalExact] = useState(true)
+  const [matchesActiveOnly, setMatchesActiveOnly] = useState(true)
   const [matchesPage, setMatchesPage] = useState(1)
   const [matchesPageSize, setMatchesPageSize] = useState(10)
   const [matchRuleFilters, setMatchRuleFilters] = useState<Array<{ text: string; value: string }>>([])
@@ -196,10 +197,10 @@ const AlertSilences = () => {
           return {
             ...item,
             matched_active_alerts: result.active.count ?? item.matched_active_alerts ?? null,
-            matched_total_alerts: result.total.count ?? item.matched_total_alerts ?? null,
+            matched_total_alerts: item.matched_total_alerts ?? null,
           }
         }))
-        if (result.pending || result.active.count === null || result.total.count === null) {
+        if (result.pending || result.active.count === null) {
           pendingTargets.push(silence)
         }
       } catch {
@@ -292,15 +293,28 @@ const AlertSilences = () => {
     }
   }
 
-  const fetchMatches = async (silence: AlertSilence, nextPage = 1, nextPageSize = matchesPageSize) => {
+  const fetchMatches = async (
+    silence: AlertSilence,
+    nextPage = 1,
+    nextPageSize = matchesPageSize,
+    activeOnly = matchesActiveOnly
+  ) => {
     const requestSeq = matchesRequestSeqRef.current + 1
     matchesRequestSeqRef.current = requestSeq
+    const modeChanged = activeOnly !== matchesActiveOnly
+    setMatchesActiveOnly(activeOnly)
+    if (modeChanged) {
+      setMatches([])
+      setMatchesTotal(0)
+      setMatchesTotalExact(true)
+      setMatchRuleFilters([])
+    }
     setMatchesLoading(true)
     try {
       const result = await getAlertSilenceMatches(silence.id, {
         skip: (nextPage - 1) * nextPageSize,
         limit: nextPageSize,
-        active_only: false,
+        active_only: activeOnly,
       })
       if (requestSeq !== matchesRequestSeqRef.current) return
       setMatches(result.items)
@@ -311,7 +325,7 @@ const AlertSilences = () => {
       setMatchesPageSize(nextPageSize)
       setItems((prev) => prev.map((item) => (
         item.id === silence.id
-          ? { ...item, matched_total_alerts: result.total }
+          ? (activeOnly ? { ...item, matched_active_alerts: result.total } : { ...item, matched_total_alerts: result.total })
           : item
       )))
     } catch (error: any) {
@@ -331,10 +345,11 @@ const AlertSilences = () => {
     setMatches([])
     setMatchesTotal(0)
     setMatchesTotalExact(true)
+    setMatchesActiveOnly(true)
     setMatchRuleFilters([])
     setMatchesPage(1)
     setMatchesOpen(true)
-    void fetchMatches(record, 1, matchesPageSize)
+    void fetchMatches(record, 1, matchesPageSize, true)
   }
 
   return (
@@ -388,16 +403,15 @@ const AlertSilences = () => {
           {
             title: '命中告警',
             render: (_: unknown, record: AlertSilence) => {
-              const countsLoading = record.matched_active_alerts === null || record.matched_total_alerts === null
+              const countsLoading = record.matched_active_alerts === null
               const activeCount = record.matched_active_alerts ?? 0
-              const totalCount = record.matched_total_alerts ?? 0
               if (countsLoading) {
                 return (
                   <Space size={6}>
-                    <Tooltip title="命中数量正在后台统计，完成后会显示当前/历史命中数">
+                    <Tooltip title="当前命中数量正在后台统计">
                       <Spin size="small" />
                     </Tooltip>
-                    <Tooltip title="查看历史命中告警">
+                    <Tooltip title="查看当前命中告警">
                       <Button
                         type="text"
                         size="small"
@@ -413,10 +427,7 @@ const AlertSilences = () => {
                   <Tooltip title="当前仍处于触发、确认、忽略或暂缓状态的命中告警">
                     <Tag color={activeCount > 0 ? 'red' : 'default'}>当前 {activeCount} 条</Tag>
                   </Tooltip>
-                  <Tooltip title="历史上匹配过这条屏蔽规则的告警">
-                    <Tag color={totalCount > 0 ? 'blue' : 'default'}>历史 {totalCount} 条</Tag>
-                  </Tooltip>
-                  <Tooltip title="查看历史命中告警">
+                  <Tooltip title="查看当前命中告警；历史命中可在弹窗内手动切换">
                     <Button
                       type="text"
                       size="small"
@@ -613,12 +624,12 @@ const AlertSilences = () => {
       <Modal
         title={(
           <Space size={8}>
-            <span>{`${matchesTitle || '告警屏蔽'} - 命中告警明细`}</span>
+            <span>{`${matchesTitle || '告警屏蔽'} - ${matchesActiveOnly ? '当前命中告警' : '历史命中告警'}`}</span>
             {matchesLoading ? (
               <Tag color="processing">正在加载</Tag>
             ) : (
-              <Tag color={matchesTotal > 0 ? 'blue' : 'default'}>
-                {matchesTotalExact ? `命中 ${matchesTotal} 条` : `已加载 ${matchesTotal}+ 条`}
+              <Tag color={matchesActiveOnly && matchesTotal > 0 ? 'red' : matchesTotal > 0 ? 'blue' : 'default'}>
+                {matchesTotalExact ? `${matchesActiveOnly ? '当前' : '历史'} ${matchesTotal} 条` : `已加载 ${matchesTotal}+ 条`}
               </Tag>
             )}
           </Space>
@@ -633,14 +644,36 @@ const AlertSilences = () => {
           setMatches([])
           setMatchesTotal(0)
           setMatchesTotalExact(true)
+          setMatchesActiveOnly(true)
           setMatchRuleFilters([])
           setMatchesLoading(false)
         }}
         destroyOnClose
       >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+          <Space size={8}>
+            <Button
+              type={matchesActiveOnly ? 'primary' : 'default'}
+              onClick={() => selectedSilence && fetchMatches(selectedSilence, 1, matchesPageSize, true)}
+            >
+              当前命中
+            </Button>
+            <Tooltip title="历史命中数据量通常更大，只有需要追溯时再查询">
+              <Button
+                type={!matchesActiveOnly ? 'primary' : 'default'}
+                onClick={() => selectedSilence && fetchMatches(selectedSilence, 1, matchesPageSize, false)}
+              >
+                历史命中
+              </Button>
+            </Tooltip>
+          </Space>
+          <Typography.Text type="secondary">
+            默认只查询当前命中，减少历史扫描对系统的压力。
+          </Typography.Text>
+        </div>
         {matchesLoading && matches.length === 0 ? (
           <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-            正在统计并加载命中告警，加载完成后会显示命中总数。
+            正在加载{matchesActiveOnly ? '当前' : '历史'}命中告警，加载完成后会显示命中总数。
           </Typography.Text>
         ) : null}
         <Table<AlertHistoryItem>
@@ -658,7 +691,7 @@ const AlertSilences = () => {
             showTotal: (total, range) => `第 ${range[0]}-${range[1]} 条 / ${matchesTotalExact ? `共 ${total} 条` : `已加载 ${total}+ 条`}`,
             onChange: (nextPage, nextPageSize) => {
               if (selectedSilence) {
-                fetchMatches(selectedSilence, nextPage, nextPageSize)
+                fetchMatches(selectedSilence, nextPage, nextPageSize, matchesActiveOnly)
               }
             },
           }}

@@ -314,14 +314,15 @@ export const getAlertSilenceMatches = async (
 }
 
 export const getAlertSilenceMatchCounts = async (
-  id: number
+  id: number,
+  params?: { include_total?: boolean }
 ): Promise<{
   silence_id: number
   active: { count: number | null; cached: boolean; pending: boolean }
   total: { count: number | null; cached: boolean; pending: boolean }
   pending: boolean
 }> => {
-  return await request.get(`/alerts/silences/${id}/match-counts`) as {
+  return await request.get(`/alerts/silences/${id}/match-counts`, { params }) as {
     silence_id: number
     active: { count: number | null; cached: boolean; pending: boolean }
     total: { count: number | null; cached: boolean; pending: boolean }
