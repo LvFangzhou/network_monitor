@@ -24,21 +24,34 @@ def _interface_aliases(interface_name: Optional[str], interface_index: Optional[
         name_variants = {
             raw_name,
             raw_name.replace("fourhundredgige", "400g"),
+            raw_name.replace("twohundredgige", "200g"),
             raw_name.replace("hundredgige", "100g"),
             raw_name.replace("twenty-fivegige", "25g"),
+            raw_name.replace("twentyfivegige", "25g"),
             raw_name.replace("tengige", "10g"),
+            raw_name.replace("ten-gigabitethernet", "10g"),
+            raw_name.replace("gigabitethernet", "1g"),
         }
         for name_variant in name_variants:
             aliases.add(name_variant)
             # FourHundredGigE1/0/127 -> 1/0/127, 400G1/0/127 -> 1/0/127
-            slash_tail = re.search(r"(\d+(?:/\d+)+)$", name_variant)
-            if slash_tail:
-                aliases.add(slash_tail.group(1))
-                tail_parts = slash_tail.group(1).split("/")
+            # TwoHundredGigE1/0/42:2 -> 1/0/42:2 and base port 1/0/42.
+            slash_tail = re.search(r"(\d+(?:/\d+)+(?:[:.]\d+)?)$", name_variant)
+            if not slash_tail:
+                continue
+            port_with_channel = slash_tail.group(1)
+            aliases.add(port_with_channel)
+            base_port = re.sub(r"[:.]\d+$", "", port_with_channel)
+            aliases.add(base_port)
+            for candidate in {port_with_channel, base_port}:
+                tail_parts = candidate.split("/")
                 if len(tail_parts) >= 2:
                     aliases.add("/".join(tail_parts[-2:]))
                 aliases.add(tail_parts[-1])
-    if interface_index is not None and str(interface_index).strip():
+    if not raw_name and interface_index is not None and str(interface_index).strip():
+        # Only fall back to raw interface index when the interface name is unavailable.
+        # If a name exists, the index may be an SNMP ifIndex and can accidentally
+        # collide with port ranges such as 1/0/65-1/0/128.
         aliases.add(_normalize_text(interface_index))
     return {item for item in aliases if item}
 
