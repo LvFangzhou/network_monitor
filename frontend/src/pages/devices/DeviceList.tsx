@@ -67,6 +67,23 @@ const DEFAULT_COLUMN_WIDTHS = {
   action: 150,
 }
 const COLUMN_ORDER = ['name', 'ip_address', 'status', 'is_monitored', 'datacenter', 'device_role', 'model', 'device_type', 'vendor', 'serial_number', 'action']
+const DEVICE_EXPORT_FIELDS = [
+  { value: 'name', label: '设备名称' },
+  { value: 'status', label: '运行状态' },
+  { value: 'ip_address', label: '管理地址' },
+  { value: 'device_role', label: '设备角色' },
+  { value: 'device_type', label: '设备类型' },
+  { value: 'vendor', label: '厂商' },
+  { value: 'model', label: '设备型号' },
+  { value: 'serial_number', label: '序列号' },
+  { value: 'datacenter_name', label: '机房名称' },
+  { value: 'datacenter_code', label: '机房编号' },
+  { value: 'is_monitored', label: '是否加入监控' },
+  { value: 'interface_scope_mode', label: '端口监控模式' },
+  { value: 'interface_scope_include', label: '只监控端口' },
+  { value: 'interface_scope_exclude', label: '排除端口' },
+]
+const DEFAULT_EXPORT_FIELDS = DEVICE_EXPORT_FIELDS.map((field) => field.value)
 const TABLE_CELL_TEXT_STYLE: React.CSSProperties = {
   display: 'block',
   width: '100%',
@@ -198,6 +215,9 @@ const DeviceList = () => {
   const [batchEditVisible, setBatchEditVisible] = useState(false)
   const [batchUpdating, setBatchUpdating] = useState(false)
   const [importing, setImporting] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [exportModalVisible, setExportModalVisible] = useState(false)
+  const [selectedExportFields, setSelectedExportFields] = useState<string[]>(DEFAULT_EXPORT_FIELDS)
   const [filterOptions, setFilterOptions] = useState({
     datacenters: [] as Array<{ id: number; name: string; code?: string; location?: string; contact_person?: string }>,
     device_types: [] as Array<{ id: number; name: string; display_name?: string }>,
@@ -599,9 +619,15 @@ const DeviceList = () => {
     }
   }
 
-  const handleExport = async () => {
+  const downloadDeviceExport = async (fields: string[]) => {
+    if (fields.length === 0) {
+      message.warning('请至少选择一个导出字段')
+      return
+    }
+
+    setExporting(true)
     try {
-      const blob = await exportDevices()
+      const blob = await exportDevices(fields)
       const url = window.URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
@@ -609,9 +635,16 @@ const DeviceList = () => {
       link.click()
       window.URL.revokeObjectURL(url)
       message.success('导出成功')
+      setExportModalVisible(false)
     } catch (error) {
       message.error('导出失败')
+    } finally {
+      setExporting(false)
     }
+  }
+
+  const handleExport = () => {
+    setExportModalVisible(true)
   }
 
   const handleExportTemplate = async () => {
@@ -1162,7 +1195,7 @@ const DeviceList = () => {
             </Button>
           </Tooltip>
           <Tooltip title="导出">
-            <Button icon={<ExportOutlined />} onClick={handleExport}>
+            <Button icon={<ExportOutlined />} onClick={handleExport} loading={exporting}>
               导出
             </Button>
           </Tooltip>
@@ -1240,6 +1273,47 @@ const DeviceList = () => {
         scroll={{ x: 'max-content' }}
       />
       </div>
+
+      <Modal
+        title="选择导出字段"
+        open={exportModalVisible}
+        onCancel={() => setExportModalVisible(false)}
+        onOk={() => downloadDeviceExport(selectedExportFields)}
+        okText="确认导出"
+        cancelText="取消"
+        confirmLoading={exporting}
+        destroyOnClose
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Text type="secondary">
+            普通导出不包含 SSH 用户名、SSH 端口、密码、私钥、SNMP Community 等敏感参数。
+          </Text>
+          <Space>
+            <Button size="small" onClick={() => setSelectedExportFields(DEFAULT_EXPORT_FIELDS)}>
+              全选
+            </Button>
+            <Button size="small" onClick={() => setSelectedExportFields(['datacenter_name', 'ip_address', 'model'])}>
+              仅机房/管理地址/型号
+            </Button>
+            <Button size="small" onClick={() => setSelectedExportFields([])}>
+              清空
+            </Button>
+          </Space>
+          <Checkbox.Group
+            value={selectedExportFields}
+            onChange={(values) => setSelectedExportFields(values as string[])}
+            style={{ width: '100%' }}
+          >
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '10px 16px' }}>
+              {DEVICE_EXPORT_FIELDS.map((field) => (
+                <Checkbox key={field.value} value={field.value}>
+                  {field.label}
+                </Checkbox>
+              ))}
+            </div>
+          </Checkbox.Group>
+        </Space>
+      </Modal>
 
       <Modal
         title="批量修改设备"

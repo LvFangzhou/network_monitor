@@ -318,8 +318,12 @@ export const importDevices = async (file: File): Promise<{ imported: number; fai
   }) as { imported: number; failed: number; errors: string[] }
 }
 
-export const exportDevices = async (): Promise<Blob> => {
+export const exportDevices = async (fields?: string[]): Promise<Blob> => {
   return await request.get('/cmdb/devices/export', {
+    params: fields && fields.length > 0 ? { fields } : undefined,
+    paramsSerializer: {
+      indexes: null,
+    },
     responseType: 'blob',
   }) as Blob
 }

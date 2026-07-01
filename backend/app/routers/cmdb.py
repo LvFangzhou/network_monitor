@@ -69,6 +69,22 @@ DEVICE_EXPORT_CSV_HEADERS = [
     'datacenter_name', 'datacenter_code', 'is_monitored',
     'interface_scope_mode', 'interface_scope_include', 'interface_scope_exclude'
 ]
+DEVICE_EXPORT_FIELD_DEFINITIONS = {
+    'name': ('name', lambda device, scope: device.name),
+    'status': ('status', lambda device, scope: normalize_inventory_status(device.status)),
+    'ip_address': ('ip_address', lambda device, scope: device.ip_address),
+    'device_role': ('device_role', lambda device, scope: device.device_role),
+    'device_type': ('device_type', lambda device, scope: device.device_type),
+    'vendor': ('vendor', lambda device, scope: device.vendor),
+    'model': ('model', lambda device, scope: device.model),
+    'serial_number': ('serial_number', lambda device, scope: device.serial_number),
+    'datacenter_name': ('datacenter_name', lambda device, scope: device.datacenter_ref.name if device.datacenter_ref else None),
+    'datacenter_code': ('datacenter_code', lambda device, scope: device.datacenter_ref.code if device.datacenter_ref else None),
+    'is_monitored': ('is_monitored', lambda device, scope: '是' if device.is_monitored else '否'),
+    'interface_scope_mode': ('interface_scope_mode', lambda device, scope: scope["mode"]),
+    'interface_scope_include': ('interface_scope_include', lambda device, scope: scope["include"]),
+    'interface_scope_exclude': ('interface_scope_exclude', lambda device, scope: scope["exclude"]),
+}
 
 
 def decode_csv_content(content: bytes) -> str:
@@ -521,27 +537,40 @@ async def import_devices(
     }
 
 
-def build_device_csv(devices: list[Device]) -> bytes:
+def normalize_export_fields(fields: Optional[List[str]]) -> list[str]:
+    if not fields:
+        return DEVICE_EXPORT_CSV_HEADERS
+
+    normalized: list[str] = []
+    invalid_fields: list[str] = []
+    for raw_field in fields:
+        for field in str(raw_field or "").split(","):
+            field = field.strip()
+            if not field:
+                continue
+            if field not in DEVICE_EXPORT_FIELD_DEFINITIONS:
+                invalid_fields.append(field)
+                continue
+            if field not in normalized:
+                normalized.append(field)
+
+    if invalid_fields:
+        raise HTTPException(status_code=400, detail=f"不支持导出字段: {', '.join(invalid_fields)}")
+    if not normalized:
+        raise HTTPException(status_code=400, detail="至少选择一个导出字段")
+    return normalized
+
+
+def build_device_csv(devices: list[Device], fields: Optional[List[str]] = None) -> bytes:
+    export_fields = normalize_export_fields(fields)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(DEVICE_EXPORT_CSV_HEADERS)
+    writer.writerow([DEVICE_EXPORT_FIELD_DEFINITIONS[field][0] for field in export_fields])
     for device in devices:
         interface_scope = get_device_interface_scope(device)
         writer.writerow([
-            device.name,
-            normalize_inventory_status(device.status),
-            device.ip_address,
-            device.device_role,
-            device.device_type,
-            device.vendor,
-            device.model,
-            device.serial_number,
-            device.datacenter_ref.name if device.datacenter_ref else None,
-            device.datacenter_ref.code if device.datacenter_ref else None,
-            '是' if device.is_monitored else '否',
-            interface_scope["mode"],
-            interface_scope["include"],
-            interface_scope["exclude"],
+            DEVICE_EXPORT_FIELD_DEFINITIONS[field][1](device, interface_scope)
+            for field in export_fields
         ])
     return output.getvalue().encode('utf-8-sig')
 
@@ -569,7 +598,8 @@ async def export_device_template():
 async def export_devices(
     db: Session = Depends(get_db),
     group_id: Optional[int] = None,
-    device_type: Optional[str] = None
+    device_type: Optional[str] = None,
+    fields: Optional[List[str]] = Query(None),
 ):
     """导出设备（CSV格式）"""
     query = db.query(Device)
@@ -583,7 +613,7 @@ async def export_devices(
     
     from fastapi.responses import StreamingResponse
     return StreamingResponse(
-        io.BytesIO(build_device_csv(devices)),
+        io.BytesIO(build_device_csv(devices, fields)),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=devices.csv"}
     )
