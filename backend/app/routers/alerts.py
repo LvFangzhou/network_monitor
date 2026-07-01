@@ -115,6 +115,7 @@ def _get_silence_matched_alerts_page(
     active_only: bool,
     skip: int,
     limit: int,
+    rule_id: Optional[int] = None,
 ) -> tuple[List[AlertHistory], int, bool]:
     """Return one matched page without forcing a full history scan.
 
@@ -125,6 +126,8 @@ def _get_silence_matched_alerts_page(
     end; otherwise it is a lower bound for UI pagination.
     """
     alerts_query = _build_silence_candidate_query(db, silence, active_only=active_only)
+    if rule_id:
+        alerts_query = alerts_query.filter(AlertHistory.rule_id == rule_id)
     matched_page: List[AlertHistory] = []
     matched_seen = 0
     scanned = 0
@@ -150,6 +153,60 @@ def _get_silence_matched_alerts_page(
             break
 
     return matched_page, matched_seen, exhausted
+
+
+def _get_silence_match_rule_filters(
+    db: Session,
+    silence: AlertSilence,
+    *,
+    active_only: bool,
+) -> List[Dict[str, str]]:
+    """Build rule filter options from all matched alerts, not only current page."""
+    alerts_query = _build_silence_candidate_query(db, silence, active_only=active_only)
+    sql_exact_ip_only = _silence_is_sql_exact_ip_only(silence)
+    rule_map: Dict[str, str] = {}
+
+    if sql_exact_ip_only:
+        rows = (
+            alerts_query
+            .with_entities(AlertRule.id, AlertRule.name)
+            .distinct()
+            .order_by(AlertRule.name.asc())
+            .limit(300)
+            .all()
+        )
+        for rule_id, rule_name in rows:
+            if rule_id:
+                rule_map[str(rule_id)] = rule_name or f"规则 {rule_id}"
+        return [{"text": label, "value": value} for value, label in sorted(rule_map.items(), key=lambda item: item[1])]
+
+    started = time.monotonic()
+    scanned = 0
+    exhausted = True
+    for alert in alerts_query.order_by(AlertHistory.started_at.desc()).yield_per(300):
+        scanned += 1
+        if _alert_matches_silence(silence, alert):
+            label = alert.rule.name if alert.rule else (f"规则 {alert.rule_id}" if alert.rule_id else "-")
+            value = str(alert.rule_id) if alert.rule_id else label
+            rule_map[value] = label
+        if scanned >= SILENCE_MATCH_CANDIDATE_FALLBACK_LIMIT or time.monotonic() - started > SILENCE_MATCH_EXACT_SCAN_SECONDS:
+            exhausted = False
+            break
+
+    if not exhausted:
+        rows = (
+            alerts_query
+            .with_entities(AlertRule.id, AlertRule.name)
+            .distinct()
+            .order_by(AlertRule.name.asc())
+            .limit(300)
+            .all()
+        )
+        for rule_id, rule_name in rows:
+            if rule_id:
+                rule_map.setdefault(str(rule_id), rule_name or f"规则 {rule_id}")
+
+    return [{"text": label, "value": value} for value, label in sorted(rule_map.items(), key=lambda item: item[1])]
 
 
 def _alert_matches_silence(silence: AlertSilence, alert: AlertHistory) -> bool:
@@ -374,7 +431,13 @@ def _count_silence_matches(db: Session, silence: AlertSilence) -> int:
     return len(_get_silence_matched_alerts(db, silence))
 
 
-def _count_silence_matches_bounded(db: Session, silence: AlertSilence, *, active_only: bool) -> Dict[str, Any]:
+def _count_silence_matches_bounded(
+    db: Session,
+    silence: AlertSilence,
+    *,
+    active_only: bool,
+    rule_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """Return a match count without allowing one silence rule to monopolize API/worker.
 
     Some broad silence rules can match tens of thousands of historical alerts.
@@ -385,6 +448,8 @@ def _count_silence_matches_bounded(db: Session, silence: AlertSilence, *, active
     paginated.
     """
     alerts_query = _build_silence_candidate_query(db, silence, active_only=active_only)
+    if rule_id:
+        alerts_query = alerts_query.filter(AlertHistory.rule_id == rule_id)
     candidate_count = alerts_query.count()
     if _silence_is_sql_exact_ip_only(silence):
         return {"count": int(candidate_count), "exact": True, "candidate_count": int(candidate_count)}
@@ -1519,6 +1584,7 @@ async def list_alert_silence_matches(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=200),
     active_only: bool = Query(False, description="只查看当前触发中的命中告警"),
+    rule_id: Optional[int] = Query(None, description="按告警规则过滤命中告警"),
 ):
     silence = db.query(AlertSilence).filter(AlertSilence.id == silence_id).first()
     if not silence:
@@ -1529,6 +1595,8 @@ async def list_alert_silence_matches(
         base_query = db.query(AlertHistory).filter(AlertHistory.device_id.in_(matched_device_ids or [-1]))
         if active_only:
             base_query = base_query.filter(AlertHistory.status.in_(SILENCE_ACTIVE_STATUSES))
+        if rule_id:
+            base_query = base_query.filter(AlertHistory.rule_id == rule_id)
         matched_alerts = (
             base_query
             .order_by(AlertHistory.started_at.desc())
@@ -1545,10 +1613,16 @@ async def list_alert_silence_matches(
             active_only=active_only,
             skip=skip,
             limit=limit,
+            rule_id=rule_id,
         )
-    total, cached_total_exact = _get_silence_cached_count_and_exact(silence, active_only=active_only)
+    if rule_id:
+        count_result = _count_silence_matches_bounded(db, silence, active_only=active_only, rule_id=rule_id)
+        total = int(count_result.get("count") or max(skip + len(matched_alerts), matched_seen))
+        cached_total_exact = bool(count_result.get("exact"))
+    else:
+        total, cached_total_exact = _get_silence_cached_count_and_exact(silence, active_only=active_only)
     if sql_exact_ip_only:
-        if total is None:
+        if total is None and not rule_id:
             _queue_silence_match_count_prewarm(silence.id, include_total=not active_only)
         else:
             cached_total_exact = True
@@ -1560,30 +1634,12 @@ async def list_alert_silence_matches(
         redis_client.setex(f"{count_cache_key}:exact", SILENCE_MATCH_CACHE_TTL_SECONDS, "1")
     if total is None:
         total = max(skip + len(matched_alerts), matched_seen)
-    rule_filters = {}
-    if cached_total_exact and total <= SILENCE_MATCH_CANDIDATE_FALLBACK_LIMIT:
-        for rule_id, rule_name in (
-            _build_silence_candidate_query(db, silence, active_only=active_only)
-            .with_entities(AlertRule.id, AlertRule.name)
-            .distinct()
-            .order_by(AlertRule.name.asc())
-            .limit(200)
-            .all()
-        ):
-            if rule_id:
-                rule_filters[str(rule_id)] = rule_name or f"规则 {rule_id}"
-    for alert in matched_alerts:
-        label = alert.rule.name if alert.rule else (f"规则 {alert.rule_id}" if alert.rule_id else "-")
-        value = str(alert.rule_id) if alert.rule_id else label
-        rule_filters[value] = label
+    rule_filters = _get_silence_match_rule_filters(db, silence, active_only=active_only)
     return {
         "total": total,
         "total_exact": exhausted or cached_total_exact,
         "items": [alert.to_dict() for alert in matched_alerts],
-        "rule_filters": [
-            {"text": label, "value": value}
-            for value, label in sorted(rule_filters.items(), key=lambda item: item[1])
-        ],
+        "rule_filters": rule_filters,
     }
 
 

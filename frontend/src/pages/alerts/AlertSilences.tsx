@@ -139,6 +139,7 @@ const AlertSilences = () => {
   const [matchesPage, setMatchesPage] = useState(1)
   const [matchesPageSize, setMatchesPageSize] = useState(10)
   const [matchRuleFilters, setMatchRuleFilters] = useState<Array<{ text: string; value: string }>>([])
+  const [matchRuleFilterValue, setMatchRuleFilterValue] = useState<string | null>(null)
   const [selectedSilence, setSelectedSilence] = useState<AlertSilence | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const matchesRequestSeqRef = useRef(0)
@@ -297,7 +298,8 @@ const AlertSilences = () => {
     silence: AlertSilence,
     nextPage = 1,
     nextPageSize = matchesPageSize,
-    activeOnly = matchesActiveOnly
+    activeOnly = matchesActiveOnly,
+    nextRuleFilterValue = matchRuleFilterValue
   ) => {
     const requestSeq = matchesRequestSeqRef.current + 1
     matchesRequestSeqRef.current = requestSeq
@@ -308,13 +310,19 @@ const AlertSilences = () => {
       setMatchesTotal(0)
       setMatchesTotalExact(true)
       setMatchRuleFilters([])
+      setMatchRuleFilterValue(null)
+    }
+    if (!modeChanged) {
+      setMatchRuleFilterValue(nextRuleFilterValue)
     }
     setMatchesLoading(true)
     try {
+      const effectiveRuleFilter = modeChanged ? null : nextRuleFilterValue
       const result = await getAlertSilenceMatches(silence.id, {
         skip: (nextPage - 1) * nextPageSize,
         limit: nextPageSize,
         active_only: activeOnly,
+        rule_id: effectiveRuleFilter ? Number(effectiveRuleFilter) : undefined,
       })
       if (requestSeq !== matchesRequestSeqRef.current) return
       setMatches(result.items)
@@ -347,6 +355,7 @@ const AlertSilences = () => {
     setMatchesTotalExact(true)
     setMatchesActiveOnly(true)
     setMatchRuleFilters([])
+    setMatchRuleFilterValue(null)
     setMatchesPage(1)
     setMatchesOpen(true)
     void fetchMatches(record, 1, matchesPageSize, true)
@@ -695,6 +704,13 @@ const AlertSilences = () => {
               }
             },
           }}
+          onChange={(_pagination, filters, _sorter, extra) => {
+            if (extra.action !== 'filter' || !selectedSilence) return
+            const selectedRule = Array.isArray(filters.rule_id) && filters.rule_id.length > 0
+              ? String(filters.rule_id[0])
+              : null
+            void fetchMatches(selectedSilence, 1, matchesPageSize, matchesActiveOnly, selectedRule)
+          }}
           columns={[
             {
               title: 'Alarm ID',
@@ -711,15 +727,14 @@ const AlertSilences = () => {
             },
             {
               title: '告警规则',
+              key: 'rule_id',
               dataIndex: 'rule_name',
               width: 200,
               sorter: (a: AlertHistoryItem, b: AlertHistoryItem) => compareText(a.rule_name || a.rule_id, b.rule_name || b.rule_id),
               filters: matchRuleFilters,
+              filteredValue: matchRuleFilterValue ? [matchRuleFilterValue] : null,
+              filterMultiple: false,
               filterSearch: true,
-              onFilter: (value: any, record: AlertHistoryItem) => {
-                const key = record.rule_id ? String(record.rule_id) : (record.rule_name || '-')
-                return key === value
-              },
               render: (value?: string | null, record?: AlertHistoryItem) => value || (record?.rule_id ? `规则 ${record.rule_id}` : '-'),
             },
             {

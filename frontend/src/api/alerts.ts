@@ -303,7 +303,7 @@ export const getAlertSilences = async (params?: {
 
 export const getAlertSilenceMatches = async (
   id: number,
-  params?: { skip?: number; limit?: number; active_only?: boolean }
+  params?: { skip?: number; limit?: number; active_only?: boolean; rule_id?: number }
 ): Promise<{ total: number; total_exact?: boolean; items: AlertHistory[]; rule_filters?: Array<{ text: string; value: string }> }> => {
   return await request.get(`/alerts/silences/${id}/matches`, { params }) as {
     total: number
