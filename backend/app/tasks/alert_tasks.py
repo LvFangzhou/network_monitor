@@ -114,6 +114,13 @@ INTERFACE_METRIC_TYPES = {
     "optical_rx_power",
     "optical_tx_power",
 }
+DEFAULT_SKIPPED_INTERFACE_MARKERS = (
+    "loopback",
+    "null",
+    "vlanif",
+    "vlan-interface",
+    "vlan interface",
+)
 
 CIRCUIT_METRIC_TYPES = {
     "internet_circuit_traffic_floor",
@@ -1327,12 +1334,17 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
     
     for device in devices:
         targets = _get_metric_targets(db, device, rule.metric_type, rule.extra_config or {})
-        if rule.metric_type in PROTOCOL_METRIC_TYPES:
+        if rule.metric_type in PROTOCOL_METRIC_TYPES or rule.metric_type in INTERFACE_METRIC_TYPES:
             _resolve_disappeared_target_alerts(
                 db,
                 rule,
                 device,
-                {str(target.get("target_key")) for target in targets if target.get("target_key")},
+                {
+                    str(value)
+                    for target in targets
+                    for value in (target.get("target_key"), target.get("target_name"))
+                    if value
+                },
             )
         if not targets:
             continue
@@ -1512,8 +1524,8 @@ def _resolve_disappeared_target_alerts(
     active_target_keys: set[str],
 ) -> None:
     """
-    协议邻居配置被删除后，SNMP walk 不再返回该 peer。
-    这种场景不应继续保持“协议 Down”告警，而应认为监控目标已消失并自动恢复。
+    监控目标被删除/不再采集后，SNMP walk 不再返回该 target。
+    这种场景不应继续保持活动告警，而应认为监控目标已消失并自动恢复。
     """
     active_alerts = db.query(AlertHistory).filter(
         AlertHistory.rule_id == rule.id,
@@ -1528,16 +1540,21 @@ def _resolve_disappeared_target_alerts(
         alert.status = "resolved"
         alert.resolved_at = _utc_now()
         alert.resolved_by = "system"
-        alert.resolution_note = "协议邻居已不在当前采集结果中，自动恢复"
+        alert.resolution_note = "监控目标已不在当前采集结果中，自动恢复"
         db.commit()
         enqueue_alert_notification(alert.id, "auto_resolved", "system")
         logger.info(
-            "协议目标消失，自动恢复告警",
+            "监控目标消失，自动恢复告警",
             rule_id=rule.id,
             device_id=device.id,
             alert_id=alert.id,
             target_key=alert.alert_target_key,
         )
+
+
+def _is_default_skipped_interface(interface_name: Optional[str]) -> bool:
+    normalized = str(interface_name or "").strip().lower()
+    return bool(normalized and any(marker in normalized for marker in DEFAULT_SKIPPED_INTERFACE_MARKERS))
 
 
 def _resolve_active_interface_alert(
@@ -1648,6 +1665,16 @@ def resolve_interface_alerts_quick() -> Dict[str, Any]:
                     db,
                     alert,
                     "设备已设置为未监控，系统自动恢复接口告警",
+                    notify=not (alert.status == "ignored" and alert.ignored_by == "alert_silence"),
+                )
+                resolved_scope += 1
+                continue
+
+            if _is_default_skipped_interface(alert.alert_target_name):
+                _resolve_active_interface_alert(
+                    db,
+                    alert,
+                    "逻辑接口默认不参与接口物理状态监控，系统自动恢复活动告警",
                     notify=not (alert.status == "ignored" and alert.ignored_by == "alert_silence"),
                 )
                 resolved_scope += 1
@@ -2485,7 +2512,7 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
                     continue
                 if extra_config.get("interface_index") and str(interface_index) != str(extra_config.get("interface_index")):
                     continue
-                if interface_name and any(skip in interface_name.lower() for skip in ["loopback", "null", "vlanif"]) and not extra_config.get("include_logical_interfaces"):
+                if _is_default_skipped_interface(interface_name) and not extra_config.get("include_logical_interfaces"):
                     continue
                 if not is_interface_monitored(device, interface_name, interface_index):
                     continue
@@ -2551,7 +2578,7 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
                 continue
             if extra_config.get("interface_index") and str(interface_index) != str(extra_config.get("interface_index")):
                 continue
-            if interface_name and any(skip in interface_name.lower() for skip in ["loopback", "null", "vlanif"]) and not extra_config.get("include_logical_interfaces"):
+            if _is_default_skipped_interface(interface_name) and not extra_config.get("include_logical_interfaces"):
                 continue
             if not is_interface_monitored(device, interface_name, interface_index):
                 continue
