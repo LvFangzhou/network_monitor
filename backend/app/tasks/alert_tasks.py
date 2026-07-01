@@ -20,6 +20,7 @@ from app.models import AlertRule, AlertHistory, AlertSilence, Circuit, Device, S
 from app.utils import influx_client, notification_manager, redis_client
 from app.utils.asternos_exporter_client import asternos_exporter_client
 from app.utils.interface_scope import is_interface_monitored
+from app.utils.interface_scope import get_interface_scope
 from app.config import settings
 from app.core import get_logger
 
@@ -29,10 +30,12 @@ CHECK_ALERTS_LOCK_KEY = "alerts:check_alerts:lock"
 FAST_CHECK_ALERTS_LOCK_KEY = "alerts:check_fast_alerts:lock"
 PROTOCOL_CHECK_ALERTS_LOCK_KEY = "alerts:check_protocol_alerts:lock"
 DEVICE_HEALTH_CHECK_ALERTS_LOCK_KEY = "alerts:check_device_health_alerts:lock"
+INTERFACE_ALERT_RECOVERY_LOCK_KEY = "alerts:resolve_interface_alerts_quick:lock"
 CHECK_ALERTS_LOCK_TTL_SECONDS = 900
-FAST_CHECK_ALERTS_LOCK_TTL_SECONDS = 60
+FAST_CHECK_ALERTS_LOCK_TTL_SECONDS = 300
 PROTOCOL_CHECK_ALERTS_LOCK_TTL_SECONDS = 180
 DEVICE_HEALTH_CHECK_ALERTS_LOCK_TTL_SECONDS = 120
+INTERFACE_ALERT_RECOVERY_LOCK_TTL_SECONDS = 45
 EXPORTER_SCRAPE_CACHE_TTL_SECONDS = 5
 ROBOT_NOTIFICATION_INTERVAL_SECONDS = 2
 PENDING_ALERT_TTL_SECONDS = 7200
@@ -745,7 +748,12 @@ def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
         return True
 
     duration_seconds = max(int(rule.duration or 0), 0)
-    confirm_seconds = max(60, duration_seconds)
+    if rule.metric_type == "interface_admin_up_oper_down":
+        # 接口 AdminUp/物理Down 依赖高频接口采集。根因修复后如果再额外等待 60s，
+        # 实际恢复会变成“采集轮次 + 60s”，现场观感通常超过 1 分钟。
+        confirm_seconds = max(15, min(duration_seconds, 30) if duration_seconds else 15)
+    else:
+        confirm_seconds = max(60, duration_seconds)
     now = time.time()
     key = _pending_recovery_key(rule, device, target)
     pending_raw = redis_client.get(key)
@@ -1525,6 +1533,179 @@ def _resolve_disappeared_target_alerts(
             alert_id=alert.id,
             target_key=alert.alert_target_key,
         )
+
+
+def _resolve_active_interface_alert(
+    db: Session,
+    alert: AlertHistory,
+    reason: str,
+    value: Optional[float] = None,
+    notify: bool = True,
+) -> None:
+    """Resolve one active interface alert with a consistent audit trail."""
+    now = _utc_now()
+    if value is not None:
+        alert.alert_value = float(value)
+    alert.status = "resolved"
+    alert.resolved_at = now
+    alert.resolved_by = "system"
+    alert.resolution_note = reason
+    alert.updated_at = now
+    db.commit()
+    if notify:
+        enqueue_alert_notification(alert.id, "auto_resolved", "system")
+
+
+def _latest_interface_values_by_device(device_id: int, field: str, start: str = "-5m") -> Dict[str, float]:
+    """Return latest interface field values keyed by both interface index and name."""
+    flux = _build_influx_grouped_last_query(
+        measurement="interface_monitoring",
+        device_id=int(device_id),
+        field=field,
+        group_columns=["interface_index", "interface_name"],
+        start=start,
+    )
+    latest: Dict[str, float] = {}
+    try:
+        for row in influx_client.query(flux):
+            value = row.get("value")
+            if value is None:
+                continue
+            numeric_value = float(value)
+            for key in (row.get("interface_index"), row.get("interface_name")):
+                if key is not None and str(key).strip():
+                    latest[str(key)] = numeric_value
+    except Exception as exc:
+        logger.error("接口告警快速恢复读取最新指标失败", device_id=device_id, field=field, error=str(exc))
+    return latest
+
+
+@shared_task
+def resolve_interface_alerts_quick() -> Dict[str, Any]:
+    """
+    快速恢复接口类活动告警。
+
+    目的：
+    1. 端口被改为不监控/排除后，历史已触发的接口告警不再等待慢速全量规则扫描。
+    2. 设备退出监控后，接口类活动告警立即静默恢复。
+
+    注意：最新值恢复只处理配置了端口范围/未监控的候选设备，避免扫描全网 1 万+ 活动告警。
+    """
+    started_at = time.time()
+    lock_value = f"{started_at}:{uuid.uuid4()}"
+    lock_acquired = bool(
+        redis_client.set(
+            INTERFACE_ALERT_RECOVERY_LOCK_KEY,
+            lock_value,
+            ex=INTERFACE_ALERT_RECOVERY_LOCK_TTL_SECONDS,
+            nx=True,
+        )
+    )
+    if not lock_acquired:
+        return {"skipped": True, "reason": "interface alert recovery already running"}
+
+    db = SessionLocal()
+    checked = 0
+    resolved_scope = 0
+    resolved_value = 0
+    try:
+        candidate_devices = db.query(Device).filter(
+            or_(Device.is_monitored == False, Device.custom_fields.isnot(None))  # noqa: E712
+        ).all()
+        candidate_device_map = {}
+        for device in candidate_devices:
+            scope = get_interface_scope(device)
+            if (not device.is_monitored) or (scope.get("mode") != "all"):
+                candidate_device_map[int(device.id)] = device
+
+        if not candidate_device_map:
+            return {"checked": 0, "resolved_scope": 0, "elapsed_seconds": round(time.time() - started_at, 3)}
+
+        active_rows = (
+            db.query(AlertHistory, AlertRule)
+            .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+            .filter(
+                AlertHistory.device_id.in_(list(candidate_device_map.keys())),
+                AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+                AlertHistory.alert_target_type == "interface",
+            )
+            .all()
+        )
+
+        scoped_admin_alerts_by_device: Dict[int, List[tuple[AlertHistory, AlertRule, Device]]] = {}
+        for alert, rule in active_rows:
+            device = candidate_device_map.get(int(alert.device_id or 0))
+            if not device:
+                continue
+            checked += 1
+            if not device.is_monitored:
+                _resolve_active_interface_alert(
+                    db,
+                    alert,
+                    "设备已设置为未监控，系统自动恢复接口告警",
+                    notify=not (alert.status == "ignored" and alert.ignored_by == "alert_silence"),
+                )
+                resolved_scope += 1
+                continue
+
+            if not is_interface_monitored(device, alert.alert_target_name, alert.alert_target_key):
+                _resolve_active_interface_alert(
+                    db,
+                    alert,
+                    "端口已设置为不监控，系统自动恢复活动告警",
+                    notify=not (alert.status == "ignored" and alert.ignored_by == "alert_silence"),
+                )
+                resolved_scope += 1
+                continue
+
+            if rule.metric_type == "interface_admin_up_oper_down":
+                scoped_admin_alerts_by_device.setdefault(int(device.id), []).append((alert, rule, device))
+
+        for device_id, rows in scoped_admin_alerts_by_device.items():
+            latest_values = _latest_interface_values_by_device(device_id, "admin_up_oper_down", "-5m")
+            if not latest_values:
+                continue
+            for alert, rule, device in rows:
+                value = None
+                for key in (alert.alert_target_key, alert.alert_target_name):
+                    if key is not None and str(key) in latest_values:
+                        value = latest_values[str(key)]
+                        break
+                if value is None:
+                    continue
+                if not _evaluate_rule_condition(rule, float(value)):
+                    _clear_pending_recovery(rule, device, _target_from_alert_history(alert))
+                    _resolve_active_interface_alert(
+                        db,
+                        alert,
+                        "接口最新采集值已恢复，系统快速恢复活动告警",
+                        value=float(value),
+                        notify=not (alert.status == "ignored" and alert.ignored_by == "alert_silence"),
+                    )
+                    resolved_value += 1
+
+        elapsed_seconds = round(time.time() - started_at, 3)
+        if resolved_scope or resolved_value or elapsed_seconds >= 3:
+            logger.info(
+                "接口告警快速恢复完成",
+                checked=checked,
+                resolved_scope=resolved_scope,
+                resolved_value=resolved_value,
+                elapsed_seconds=elapsed_seconds,
+            )
+        return {
+            "checked": checked,
+            "resolved_scope": resolved_scope,
+            "resolved_value": resolved_value,
+            "elapsed_seconds": elapsed_seconds,
+        }
+    except Exception as exc:
+        logger.error("接口告警快速恢复失败", error=str(exc))
+        return {"error": str(exc)}
+    finally:
+        db.close()
+        if redis_client.get(INTERFACE_ALERT_RECOVERY_LOCK_KEY) == lock_value:
+            redis_client.delete(INTERFACE_ALERT_RECOVERY_LOCK_KEY)
 
 
 def _build_influx_last_value_query(

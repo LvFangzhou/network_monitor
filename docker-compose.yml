@@ -386,6 +386,18 @@ services:
           cpus: '1.5'
           memory: 2G
 
+  # 接口快速告警独立队列：接口 AdminUp/物理Down 不再占用 SNMP 采集 worker
+  celery-worker-alerts-fast:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-alerts-fast
+    command: celery -A app.tasks worker -l info -Q alerts_fast -n worker-alerts-fast@%h --pool=prefork -c 1 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=40 --max-memory-per-child=700000
+    cpu_shares: 1536
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
   # 告警详情缓存预热独立低优先队列，不再影响实时告警检查
   celery-worker-alerts-prewarm:
     <<: *celery-worker-base

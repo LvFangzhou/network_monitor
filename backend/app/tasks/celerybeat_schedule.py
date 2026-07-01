@@ -92,6 +92,15 @@ beat_schedule = {
         }
     },
 
+    # 接口告警快速恢复 - 只扫描当前活动接口告警，端口排除/AdminDown 后不等待全量规则慢扫
+    'resolve-interface-alerts-quick-every-30s': {
+        'task': 'app.tasks.alert_tasks.resolve_interface_alerts_quick',
+        'schedule': 30.0,
+        'options': {
+            'expires': 25.0,
+        }
+    },
+
     # 协议邻居告警检查 - 每60秒执行一次，不被慢速Exporter规则拖住
     'check-protocol-alerts-every-60s': {
         'task': 'app.tasks.alert_tasks.check_protocol_alerts',
