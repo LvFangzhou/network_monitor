@@ -4,22 +4,60 @@ CMDB 资产管理路由
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from typing import List, Optional
 import csv
 import io
+from copy import deepcopy
 from datetime import datetime
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import get_db
-from app.models import Device, DeviceGroup, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
+from app.models import AlertHistory, Device, DeviceGroup, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
 from app.schemas import DeviceCreate
 from app.core import get_logger
+from app.utils.interface_scope import alert_target_interface_is_monitored
 
 logger = get_logger(__name__)
 router = APIRouter()
 
 
 REQUIRED_IMPORT_HEADERS = {'name', 'ip_address'}
+ACTIVE_ALERT_STATUSES = ("firing", "acknowledged", "ignored", "snoozed")
+CSV_HEADER_ALIASES = {
+    '设备名称': 'name',
+    '名称': 'name',
+    '管理地址': 'ip_address',
+    'IP地址': 'ip_address',
+    'ip': 'ip_address',
+    '运行状态': 'status',
+    '设备角色': 'device_role',
+    '设备类型': 'device_type',
+    '厂商': 'vendor',
+    '型号': 'model',
+    '序列号': 'serial_number',
+    '机房名称': 'datacenter_name',
+    '机房': 'datacenter_name',
+    '机房编号': 'datacenter_code',
+    '是否加入监控': 'is_monitored',
+    '是否监控': 'is_monitored',
+    '端口监控模式': 'interface_scope_mode',
+    '端口监控范围': 'interface_scope_mode',
+    '监控端口模式': 'interface_scope_mode',
+    '只监控端口': 'interface_scope_include',
+    '只监控指定端口': 'interface_scope_include',
+    '监控指定端口': 'interface_scope_include',
+    '指定监控端口': 'interface_scope_include',
+    '排除端口': 'interface_scope_exclude',
+    '排除指定端口': 'interface_scope_exclude',
+    '不监控端口': 'interface_scope_exclude',
+    '不监控这些端口': 'interface_scope_exclude',
+    'SSH端口': 'ssh_port',
+    'SSH用户名': 'ssh_username',
+    'SSH账号': 'ssh_username',
+    'SSH密码': 'ssh_password',
+    'SSH私钥': 'ssh_key',
+}
 DEVICE_CSV_HEADERS = [
     'name', 'status', 'ip_address', 'device_role', 'device_type', 'vendor', 'model', 'serial_number',
     'datacenter_name', 'datacenter_code', 'is_monitored',
@@ -49,6 +87,7 @@ def normalize_csv_row(row: dict[str, Optional[str]]) -> dict[str, str]:
         normalized_key = (key or '').strip().lstrip('\ufeff')
         if not normalized_key:
             continue
+        normalized_key = CSV_HEADER_ALIASES.get(normalized_key, normalized_key)
         normalized[normalized_key] = (value or '').strip()
     return normalized
 
@@ -107,16 +146,25 @@ def normalize_interface_scope_mode(raw_value: Optional[str]) -> str:
     aliases = {
         "": "all",
         "all": "all",
+        "全部监控": "all",
         "全部": "all",
         "全部端口": "all",
+        "监控全部端口": "all",
         "include": "include",
         "only": "include",
         "只监控": "include",
+        "只监控端口": "include",
         "只监控指定端口": "include",
+        "监控指定端口": "include",
+        "指定监控端口": "include",
+        "指定端口": "include",
         "exclude": "exclude",
         "except": "exclude",
         "排除": "exclude",
         "排除指定端口": "exclude",
+        "排除端口": "exclude",
+        "不监控端口": "exclude",
+        "不监控这些端口": "exclude",
     }
     if value not in aliases:
         raise ValueError("interface_scope_mode 仅支持 all/include/exclude")
@@ -127,15 +175,22 @@ def apply_interface_scope_from_csv(device: Device, row: dict[str, str]) -> None:
     if not any(key in row for key in ("interface_scope_mode", "interface_scope_include", "interface_scope_exclude")):
         return
 
-    mode = normalize_interface_scope_mode(row.get("interface_scope_mode"))
+    raw_mode = row.get("interface_scope_mode")
     include = csv_value(row, "interface_scope_include") or ""
     exclude = csv_value(row, "interface_scope_exclude") or ""
+
+    # 运维导入时经常只填写“只监控端口”或“排除端口”其中一列；
+    # 未显式填写模式时，根据有内容的列自动推断，避免静默导成“全部端口”。
+    if raw_mode in {None, ""}:
+        raw_mode = "include" if include else "exclude" if exclude else "all"
+
+    mode = normalize_interface_scope_mode(raw_mode)
     if mode == "include" and not include:
         raise ValueError("interface_scope_mode 为 include 时，interface_scope_include 不能为空")
     if mode == "exclude" and not exclude:
         raise ValueError("interface_scope_mode 为 exclude 时，interface_scope_exclude 不能为空")
 
-    custom_fields = dict(device.custom_fields or {})
+    custom_fields = deepcopy(device.custom_fields or {})
     monitoring = custom_fields.get("monitoring")
     if not isinstance(monitoring, dict):
         monitoring = {}
@@ -146,6 +201,43 @@ def apply_interface_scope_from_csv(device: Device, row: dict[str, str]) -> None:
     }
     custom_fields["monitoring"] = monitoring
     device.custom_fields = custom_fields
+    flag_modified(device, "custom_fields")
+
+
+def resolve_active_interface_alerts_outside_scope(db: Session, device: Device) -> int:
+    """导入时端口监控范围变化后，自动恢复范围外仍在触发中的接口类告警。"""
+    if not device or not device.id:
+        return 0
+
+    alerts = (
+        db.query(AlertHistory)
+        .filter(
+            AlertHistory.device_id == device.id,
+            AlertHistory.status.in_(ACTIVE_ALERT_STATUSES),
+            AlertHistory.alert_target_type == "interface",
+        )
+        .all()
+    )
+    if not alerts:
+        return 0
+
+    now = datetime.now()
+    resolved_count = 0
+    for alert in alerts:
+        target = {
+            "target_key": alert.alert_target_key,
+            "target_name": alert.alert_target_name,
+        }
+        if alert_target_interface_is_monitored(device, target):
+            continue
+        alert.status = "resolved"
+        alert.resolved_at = now
+        alert.resolved_by = "system"
+        alert.resolution_note = "导入端口监控范围后，范围外接口系统自动恢复活动告警"
+        alert.updated_at = now
+        resolved_count += 1
+
+    return resolved_count
 
 
 def get_device_interface_scope(device: Device) -> dict[str, str]:
@@ -381,6 +473,8 @@ async def import_devices(
                     ssh_port=22,
                 )
                 apply_device_import_row(device, row, db, group_id)
+                db.flush()
+                resolve_active_interface_alerts_outside_scope(db, device)
 
                 # 处理标签
                 if row.get('tags'):
