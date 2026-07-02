@@ -657,16 +657,34 @@ services:
     container_name: nm-telemetry-receiver
     command: python -m app.services.telemetry_receiver --host 0.0.0.0 --port 50051
     environment:
+      - DEBUG=false
+      - SECRET_KEY=your-secret-key-change-in-production
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=network_monitor
+      - POSTGRES_PASSWORD=network_monitor
+      - POSTGRES_DB=network_monitor
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_ORG=network-monitor
+      - INFLUXDB_BUCKET=network_metrics
+      - INFLUXDB_RETENTION_DAYS=30
       - LOG_LEVEL=INFO
       - TELEMETRY_RECEIVER_PORT=50051
       - TELEMETRY_RECEIVER_SPOOL_DIR=/app/data/telemetry
       - TELEMETRY_RECEIVER_MAX_WORKERS=16
       - TELEMETRY_RECEIVER_LOG_EVERY=100
+      - TELEMETRY_RECEIVER_WRITE_INFLUX=true
     volumes:
       - ./backend/app:/app/app
       - ${DATA_ROOT:-./data}/telemetry:/app/data/telemetry
     ports:
       - "50051:50051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
     networks:
       - network-monitor
     restart: unless-stopped
