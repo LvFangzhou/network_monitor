@@ -1749,7 +1749,9 @@ async def get_monitor_device_interface_history(
     _mark_stale_rate_samples(
         history,
         interval_seconds,
-        max_sample_seconds=max(75, rate_window_seconds + interval_seconds),
+        # 当前 SNMP 端口高频采集在设备量较大时实际采样间隔可能落在 110~130 秒。
+        # 端口流量查询以展示真实已采集速率为最高优先级，不能把合法的 2 分钟样本误判为空。
+        max_sample_seconds=max(180, rate_window_seconds + interval_seconds + 60),
     )
     cutoff = (start_time.timestamp() if use_absolute_range and start_time else datetime.now(timezone.utc).timestamp() - range_seconds)
     stop_ts = end_time.timestamp() if use_absolute_range else None

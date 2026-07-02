@@ -1090,8 +1090,11 @@ class SNMPCollector(LoggerMixin):
 
                 admin_status = status_map.get(walk_results["admin_status_map"].get(index), "unknown")
                 oper_status = status_map.get(walk_results["oper_status_map"].get(index), "unknown")
-                in_bps = None if name in suppress_rate_interface_names else 0.0
-                out_bps = None if name in suppress_rate_interface_names else 0.0
+                # 接口流量图以原始端口速率为最高优先级。线路/专线统计如果需要去重，
+                # 应在上层聚合查询里处理，不能在底层接口历史中把端口速率写成空值，
+                # 否则端口查询会出现“有采集行但无流量值”。
+                in_bps = 0.0
+                out_bps = 0.0
                 monitored_count += 1
                 points.append({
                     "measurement": "interface_monitoring",
@@ -1181,14 +1184,10 @@ class SNMPCollector(LoggerMixin):
             out_broadcast_pps = round((out_broadcast_delta or 0.0) / elapsed, 2) if out_broadcast_delta is not None else None
 
             monitored_count += 1
-            rate_suppressed = name in suppress_rate_interface_names or walk_results["if_descr_map"].get(index) in suppress_rate_interface_names
-            if rate_suppressed:
-                in_bps = None
-                out_bps = None
-                sample_seconds = None
-            else:
-                sample_seconds = round(elapsed, 2)
-                in_bps, out_bps = self._sanitize_interface_rates(in_bps, out_bps, speed_bps)
+            # 不再压制线路关联端口的接口速率。接口历史是底层事实数据，必须完整保留；
+            # 是否参与线路汇总应由线路查询/聚合逻辑决定。
+            sample_seconds = round(elapsed, 2)
+            in_bps, out_bps = self._sanitize_interface_rates(in_bps, out_bps, speed_bps)
             in_utilization = round((in_bps / speed_bps) * 100, 2) if in_bps is not None and speed_bps else None
             out_utilization = round((out_bps / speed_bps) * 100, 2) if out_bps is not None and speed_bps else None
             admin_status_text = status_map.get(walk_results["admin_status_map"].get(index), "unknown")

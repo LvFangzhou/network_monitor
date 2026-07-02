@@ -647,6 +647,37 @@ const compactChartPoint = (point: ChartPoint): ChartPoint => (
 
 const targetKey = (deviceId: number, interfaceIndex: number) => `${deviceId}:${interfaceIndex}`
 
+const normalizeInterfaceSearchText = (value?: string | null) => {
+  let text = String(value || '').trim().toLowerCase()
+  if (!text) return ''
+  text = text
+    .replace(/fourhundredgigabitethernet|fourhundredgige/g, '400g')
+    .replace(/twohundredgigabitethernet|twohundredgige/g, '200g')
+    .replace(/hundredgigabitethernet|hundredgige/g, '100g')
+    .replace(/twentyfivegigabitethernet|twentyfivegige/g, '25g')
+    .replace(/tengigabitethernet|tengige|xgigabitethernet|xgige/g, '10g')
+    .replace(/gigabitethernet|gige/g, '1g')
+  return text.replace(/[\s_\-:]/g, '')
+}
+
+const interfaceMatchesKeyword = (item: MonitorInterface, keyword: string) => {
+  const normalizedKeyword = normalizeInterfaceSearchText(keyword)
+  if (!normalizedKeyword) return true
+  return [item.name, item.description, item.alias, String(item.index)]
+    .some((value) => normalizeInterfaceSearchText(value).includes(normalizedKeyword))
+}
+
+const findInterfaceByName = (interfaces: MonitorInterface[], portName: string) => {
+  const normalizedPortName = normalizeInterfaceSearchText(portName)
+  return interfaces.find((item) => item.name === portName) ||
+    interfaces.find((item) => item.description === portName) ||
+    interfaces.find((item) => item.alias === portName) ||
+    interfaces.find((item) => normalizeInterfaceSearchText(item.name) === normalizedPortName) ||
+    interfaces.find((item) => normalizeInterfaceSearchText(item.description) === normalizedPortName) ||
+    interfaces.find((item) => normalizeInterfaceSearchText(item.alias) === normalizedPortName) ||
+    interfaces.find((item) => interfaceMatchesKeyword(item, portName))
+}
+
 const historyCacheKey = (targetKeyValue: string, rangeValue: string, interval: string, monitorKey = 'traffic') =>
   `${targetKeyValue}|${rangeValue}|${interval}|${monitorKey}`
 
@@ -822,10 +853,7 @@ const Metrics = () => {
               return null
             }
 
-            const matchedInterface =
-              response.interfaces.find((item) => item.name === target.portName) ||
-              response.interfaces.find((item) => item.description === target.portName) ||
-              response.interfaces.find((item) => item.alias === target.portName)
+            const matchedInterface = findInterfaceByName(response.interfaces, target.portName)
 
             if (!matchedInterface) {
               return null
@@ -869,11 +897,12 @@ const Metrics = () => {
   }, [monitorSearchKeyword])
 
   const filteredInterfaces = useMemo(() => {
-    const keyword = portKeyword.trim().toLowerCase()
-    const selectedName = interfaces.find((item) => item.index === selectedInterfaceIndex)?.name.toLowerCase()
+    const keyword = portKeyword.trim()
+    const normalizedKeyword = normalizeInterfaceSearchText(keyword)
+    const selectedName = normalizeInterfaceSearchText(interfaces.find((item) => item.index === selectedInterfaceIndex)?.name)
     if (!keyword) return interfaces
-    if (selectedName && keyword === selectedName) return interfaces
-    return interfaces.filter((item) => item.name.toLowerCase().includes(keyword))
+    if (selectedName && normalizedKeyword === selectedName) return interfaces
+    return interfaces.filter((item) => interfaceMatchesKeyword(item, keyword))
   }, [interfaces, portKeyword, selectedInterfaceIndex])
 
   const sortedInterfaces = useMemo(() => {
