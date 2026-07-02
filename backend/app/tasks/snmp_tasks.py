@@ -106,6 +106,21 @@ ASTERNOS_COUNTER_METRICS = [
 ]
 
 
+
+
+def _telemetry_interface_enabled(device: Device) -> bool:
+    custom_fields = device.custom_fields or {}
+    if not isinstance(custom_fields, dict):
+        return False
+    monitoring = custom_fields.get("monitoring") or {}
+    if not isinstance(monitoring, dict):
+        return False
+    telemetry = monitoring.get("telemetry") or {}
+    if isinstance(telemetry, dict):
+        if telemetry.get("interface_stats") is True or telemetry.get("enabled") is True:
+            return True
+    return monitoring.get("telemetry_enabled") is True
+
 def _monitor_cache_key(kind: str, device_id: int, suffix: str = "") -> str:
     return f"monitor:cache:{kind}:{device_id}{suffix}"
 
@@ -1210,6 +1225,8 @@ def collect_all_snmp_interface_realtime():
             Device.is_monitored == True,
             or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
         ).order_by(Device.id.asc()).all()
+        telemetry_interface_skipped_total = sum(1 for device in devices if _telemetry_interface_enabled(device))
+        devices = [device for device in devices if not _telemetry_interface_enabled(device)]
 
         current_bucket = _next_round_robin_bucket("snmp_interface_realtime", SNMP_INTERFACE_BATCH_COUNT)
         devices_in_bucket = [
@@ -1262,6 +1279,7 @@ def collect_all_snmp_interface_realtime():
         logger.info(
             "SNMP端口高频采集完成",
             total_devices=len(devices),
+            telemetry_interface_skipped_total=telemetry_interface_skipped_total,
             bucket=current_bucket,
             bucket_count=SNMP_INTERFACE_BATCH_COUNT,
             devices_in_bucket=len(devices_in_bucket),
@@ -1275,6 +1293,7 @@ def collect_all_snmp_interface_realtime():
         )
         return {
             "total_devices": len(devices),
+            "telemetry_interface_skipped_total": telemetry_interface_skipped_total,
             "bucket": current_bucket,
             "bucket_count": SNMP_INTERFACE_BATCH_COUNT,
             "devices_in_bucket": len(devices_in_bucket),
