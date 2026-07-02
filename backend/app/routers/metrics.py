@@ -118,6 +118,30 @@ def _load_monitor_cache(kind: str, device_id: int, suffix: str = "") -> Optional
         return None
 
 
+def _telemetry_snmp_disabled(device: Device) -> bool:
+    custom_fields = device.custom_fields or {}
+    if not isinstance(custom_fields, dict):
+        return False
+    monitoring = custom_fields.get("monitoring") or {}
+    if not isinstance(monitoring, dict):
+        return False
+    telemetry = monitoring.get("telemetry") or {}
+    return isinstance(telemetry, dict) and telemetry.get("disable_snmp") is True
+
+
+def _telemetry_interface_enabled(device: Device) -> bool:
+    custom_fields = device.custom_fields or {}
+    if not isinstance(custom_fields, dict):
+        return False
+    monitoring = custom_fields.get("monitoring") or {}
+    if not isinstance(monitoring, dict):
+        return False
+    telemetry = monitoring.get("telemetry") or {}
+    if isinstance(telemetry, dict):
+        return telemetry.get("enabled") is True or telemetry.get("interface_stats") is True
+    return monitoring.get("telemetry_enabled") is True
+
+
 def _cache_collected_at(payload: Optional[Dict[str, Any]]) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
@@ -682,20 +706,25 @@ def _latest_interface_metrics_from_history(
     device_id: int,
     interface_index: int,
     interface_names: Optional[List[str]] = None,
+    preferred_source: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     interface_filter = _interface_history_filter(interface_index, interface_names)
+    source_filter = f'|> filter(fn: (r) => r.source == {_flux_string(preferred_source)})' if preferred_source else ""
     flux = f'''
     from(bucket: "{influx_client.bucket}")
       |> range(start: -1h)
       |> filter(fn: (r) => r._measurement == "interface_monitoring")
       |> filter(fn: (r) => r.device_id == "{device_id}")
       |> filter(fn: (r) => {interface_filter})
+      {source_filter}
       |> last()
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> sort(columns: ["_time"], desc: true)
       |> limit(n: 1)
     '''
     rows = influx_client.query(flux)
+    if not rows and preferred_source:
+        return _latest_interface_metrics_from_history(device_id, interface_index, interface_names, preferred_source=None)
     if not rows:
         return None
     row = rows[0]
@@ -1527,7 +1556,11 @@ async def get_monitor_device_interfaces(device_id: int, db: Session = Depends(ge
         raise HTTPException(status_code=400, detail="该设备未加入监控，或当前不是上线状态")
 
     monitor_source = get_effective_monitor_source(device)
-    if monitor_source == "asternos_exporter":
+    cached = _load_monitor_cache("interfaces", device.id)
+    cached_interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
+    if _telemetry_interface_enabled(device) and cached_interfaces:
+        interfaces = cached_interfaces
+    elif monitor_source == "asternos_exporter":
         cached = _load_monitor_cache("interfaces", device.id)
         interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
         if not interfaces:
@@ -1562,7 +1595,26 @@ async def get_monitor_device_interface_stats(
         raise HTTPException(status_code=400, detail="该设备未加入监控，或当前不是上线状态")
 
     monitor_source = get_effective_monitor_source(device)
-    if monitor_source == "asternos_exporter":
+    telemetry_cached_interfaces = _load_monitor_cache("interfaces", device.id)
+    telemetry_interface_names = []
+    if isinstance(telemetry_cached_interfaces, dict):
+        for item in telemetry_cached_interfaces.get("interfaces") or []:
+            if item.get("index") == interface_index:
+                telemetry_interface_names = [str(v) for v in [item.get("name"), item.get("alias")] if v]
+                break
+    if _telemetry_interface_enabled(device) and telemetry_interface_names:
+        interface_metrics = None if fresh else _latest_interface_metrics_from_history(device.id, interface_index, telemetry_interface_names, preferred_source="telemetry")
+        collected_at = datetime.now(timezone.utc).isoformat()
+        if not interface_metrics:
+            cached_item = next(
+                (item for item in (telemetry_cached_interfaces or {}).get("interfaces", []) if item.get("index") == interface_index),
+                None,
+            )
+            if cached_item:
+                interface_metrics = dict(cached_item)
+        if not interface_metrics:
+            raise HTTPException(status_code=404, detail="Telemetry 暂未收到该接口数据")
+    elif monitor_source == "asternos_exporter":
         lookup = await _resolve_asternos_interface_lookup(device, interface_index)
         interface_names = lookup["interface_names"]
         cached = _load_monitor_cache("interface_stats", device.id, suffix=f":{interface_index}")
@@ -1640,7 +1692,7 @@ async def get_monitor_device_interface_history(
         traffic_start_time = start_time.timestamp() - rate_window_seconds
         traffic_range_clause = f'start: {_flux_time(datetime.fromtimestamp(traffic_start_time, timezone.utc))}, stop: {_flux_time(end_time)}'
         normalized_group = (group or "traffic").strip() or "traffic"
-        cache_suffix = f":v10:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}:{rate_window_seconds}"
+        cache_suffix = f":v11:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}:{rate_window_seconds}"
         logger.info(
             "端口历史绝对时间查询",
             device_id=device_id,
@@ -1655,7 +1707,7 @@ async def get_monitor_device_interface_history(
         normalized_group = (group or "traffic").strip() or "traffic"
         range_clause = f"start: {range}"
         traffic_range_clause = f"start: -{traffic_start}"
-        cache_suffix = f":v10:{interface_index}:{normalized_group}:{range}:{interval}:{rate_window_seconds}"
+        cache_suffix = f":v11:{interface_index}:{normalized_group}:{range}:{interval}:{rate_window_seconds}"
     is_traffic_only = normalized_group == "traffic"
     fresh_sample_written = False
     if not is_traffic_only:
@@ -1668,7 +1720,15 @@ async def get_monitor_device_interface_history(
     if get_effective_monitor_source(device) == "asternos_exporter":
         lookup = await _resolve_asternos_interface_lookup(device, interface_index)
         interface_names = lookup["interface_names"]
+    elif _telemetry_interface_enabled(device):
+        cached_interfaces = _load_monitor_cache("interfaces", device.id)
+        if isinstance(cached_interfaces, dict):
+            for item in cached_interfaces.get("interfaces") or []:
+                if item.get("index") == interface_index:
+                    interface_names = [str(v) for v in [item.get("name"), item.get("alias")] if v]
+                    break
     interface_filter = _interface_history_filter(interface_index, interface_names)
+    source_filter = '|> filter(fn: (r) => r.source == "telemetry")' if _telemetry_interface_enabled(device) else ""
 
     other_field_filter = '''
         r._field == "speed_bps" or
@@ -1700,6 +1760,7 @@ async def get_monitor_device_interface_history(
       |> filter(fn: (r) => r._measurement == "interface_monitoring")
       |> filter(fn: (r) => r.device_id == "{device_id}")
       |> filter(fn: (r) => {interface_filter})
+      {source_filter}
       |> filter(fn: (r) =>
         r._field == "in_bps" or
         r._field == "out_bps"
@@ -1711,6 +1772,7 @@ async def get_monitor_device_interface_history(
       |> filter(fn: (r) => r._measurement == "interface_monitoring")
       |> filter(fn: (r) => r.device_id == "{device_id}")
       |> filter(fn: (r) => {interface_filter})
+      {source_filter}
       |> filter(fn: (r) =>
         r._field == "in_octets" or
         r._field == "out_octets"
@@ -1722,6 +1784,7 @@ async def get_monitor_device_interface_history(
       |> filter(fn: (r) => r._measurement == "interface_monitoring")
       |> filter(fn: (r) => r.device_id == "{device_id}")
       |> filter(fn: (r) => {interface_filter})
+      {source_filter}
       |> filter(fn: (r) =>
         {other_field_filter}
       )

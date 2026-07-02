@@ -28,6 +28,7 @@ LOGGER = logging.getLogger("telemetry_receiver")
 
 PATH_PATTERN = re.compile(r"([A-Za-z][A-Za-z0-9]+/[A-Za-z0-9_./-]+)")
 JSON_MARKER = b'{"Notification"'
+MONITOR_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 def _configure_logging() -> None:
@@ -76,6 +77,22 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(float(str(value).strip().rstrip("%")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _percent_value(value: Any) -> Optional[float]:
+    number = _safe_float(str(value).strip().rstrip("%") if value is not None else None)
+    if number is None:
+        return None
+    return round(number * 100, 1) if 0 <= number <= 1 else round(number, 1)
 
 
 def _speed_from_interface_name(name: str) -> Optional[float]:
@@ -139,23 +156,29 @@ class TelemetryInfluxWriter:
         self._resolver = DeviceResolver()
         self._written = 0
 
+    def _set_monitor_cache(self, kind: str, device_id: int, payload: Any, suffix: str = "") -> None:
+        try:
+            from app.utils import redis_client
+
+            redis_client.setex(
+                f"monitor:cache:{kind}:{device_id}{suffix}",
+                MONITOR_CACHE_TTL_SECONDS,
+                json.dumps(payload, ensure_ascii=False, default=str),
+            )
+            # 设备总览使用全量快照缓存；Telemetry 新数据进来后清理快照，避免页面继续看旧值。
+            for key in redis_client.scan_iter("monitor:cache:overview_snapshot*"):
+                redis_client.delete(key)
+        except Exception as exc:
+            LOGGER.warning("telemetry cache update failed kind=%s device_id=%s error=%s", kind, device_id, exc)
+
     def handle_payload(self, payload: bytes, received_at: datetime) -> int:
         if not self.enabled:
             return 0
         sensor_path = _extract_sensor_path(payload)
-        if sensor_path.lower() != "ifmgr/statistics":
-            self._maybe_flush()
-            return 0
+        sensor_path_lower = sensor_path.lower()
         obj = _extract_json_payload(payload)
         if not obj:
-            return 0
-        try:
-            interfaces = obj.get("Notification", {}).get("Ifmgr", {}).get("Statistics", {}).get("Interface", [])
-            if isinstance(interfaces, dict):
-                interfaces = [interfaces]
-        except Exception:
-            return 0
-        if not interfaces:
+            self._maybe_flush()
             return 0
 
         text = payload.decode("utf-8", errors="ignore")
@@ -165,6 +188,20 @@ class TelemetryInfluxWriter:
         if not device:
             return 0
 
+        cache_written = self._handle_cache_payload(device, sensor_path_lower, obj, received_at)
+        if sensor_path_lower != "ifmgr/statistics":
+            self._maybe_flush()
+            return cache_written
+
+        try:
+            interfaces = obj.get("Notification", {}).get("Ifmgr", {}).get("Statistics", {}).get("Interface", [])
+            if isinstance(interfaces, dict):
+                interfaces = [interfaces]
+        except Exception:
+            return 0
+        if not interfaces:
+            return 0
+
         added = 0
         for item in interfaces:
             point = self._interface_point(device, item, received_at)
@@ -172,7 +209,128 @@ class TelemetryInfluxWriter:
                 self._points.append(point)
                 added += 1
         self._maybe_flush()
-        return added
+        return added + cache_written
+
+    def _handle_cache_payload(self, device: dict[str, Any], sensor_path: str, obj: dict, received_at: datetime) -> int:
+        notification = obj.get("Notification") or {}
+        collected_at = received_at.isoformat()
+        device_id = int(device["id"])
+
+        if sensor_path == "diagnostic/cpuhistory":
+            cpus = notification.get("Diagnostic", {}).get("CPUHistory", {}).get("CPU", [])
+            if isinstance(cpus, dict):
+                cpus = [cpus]
+            values = [_percent_value(cpu.get("CPUUsage") or cpu.get("Last1mUsage")) for cpu in cpus if isinstance(cpu, dict)]
+            values = [value for value in values if value is not None]
+            if values:
+                self._merge_overview_cache(device, {"resources": {"cpu_percent": max(values)}}, collected_at)
+                return 1
+
+        if sensor_path == "diagnostic/memories":
+            memories = notification.get("Diagnostic", {}).get("Memories", {}).get("Memory", [])
+            if isinstance(memories, dict):
+                memories = [memories]
+            values = [_percent_value(mem.get("MemoryUsage")) for mem in memories if isinstance(mem, dict)]
+            values = [value for value in values if value is not None]
+            if values:
+                self._merge_overview_cache(device, {"resources": {"memory_percent": max(values)}}, collected_at)
+                return 1
+
+        if sensor_path == "ifmgr/interfaces":
+            interfaces = notification.get("Ifmgr", {}).get("Interfaces", {}).get("Interface", [])
+            if isinstance(interfaces, dict):
+                interfaces = [interfaces]
+            normalized = []
+            admin_up = oper_up = total = 0
+            for item in interfaces:
+                if not isinstance(item, dict):
+                    continue
+                index = _safe_int(item.get("IfIndex"))
+                name = item.get("Name") or item.get("AbbreviatedName")
+                if index is None or not name:
+                    continue
+                admin_status = "up" if _safe_int(item.get("AdminStatus")) == 1 else "down"
+                oper_status = "up" if _safe_int(item.get("OperStatus")) == 1 else "down"
+                speed_bps = _safe_float(item.get("Actual64Bandwidth") or item.get("ActualBandwidth") or item.get("ActualSpeed"))
+                if speed_bps and speed_bps < 10_000_000_000 and _speed_from_interface_name(name):
+                    speed_bps = _speed_from_interface_name(name)
+                normalized.append({
+                    "index": index,
+                    "name": name,
+                    "description": item.get("Description") or name,
+                    "admin_status": admin_status,
+                    "oper_status": oper_status,
+                    "speed_bps": speed_bps or _speed_from_interface_name(name),
+                    "alias": item.get("AbbreviatedName"),
+                    "last_change": item.get("LastChange"),
+                    "source": "telemetry",
+                })
+                total += 1
+                admin_up += 1 if admin_status == "up" else 0
+                oper_up += 1 if oper_status == "up" else 0
+            if normalized:
+                self._set_monitor_cache("interfaces", device_id, {"interfaces": normalized, "collected_at": collected_at, "source": "telemetry"})
+                self._merge_overview_cache(device, {"interfaces_summary": {"total": total, "admin_up": admin_up, "oper_up": oper_up}}, collected_at)
+                return len(normalized)
+
+        if sensor_path == "device/physicalentities":
+            entities = notification.get("Device", {}).get("PhysicalEntities", {}).get("Entity", [])
+            if isinstance(entities, dict):
+                entities = [entities]
+            chassis = None
+            for entity in entities:
+                if not isinstance(entity, dict):
+                    continue
+                if entity.get("SerialNumber") or entity.get("SoftwareRev") or entity.get("Model"):
+                    chassis = entity
+                    break
+            if chassis:
+                self._merge_overview_cache(device, {
+                    "system_info": {
+                        "sys_name": device.get("name"),
+                        "sys_descr": chassis.get("Description"),
+                        "software_version": chassis.get("SoftwareRev"),
+                        "snmp_model": chassis.get("Model") or chassis.get("Name"),
+                        "serial_number": chassis.get("SerialNumber"),
+                        "uptime_seconds": None,
+                    }
+                }, collected_at)
+                return 1
+
+        return 0
+
+    def _merge_overview_cache(self, device: dict[str, Any], patch: dict[str, Any], collected_at: str) -> None:
+        device_id = int(device["id"])
+        overview: dict[str, Any] = {}
+        try:
+            from app.utils import redis_client
+
+            raw = redis_client.get(f"monitor:cache:overview:{device_id}")
+            if raw:
+                overview = json.loads(raw)
+        except Exception:
+            overview = {}
+
+        overview.setdefault("connectivity", {"type": "telemetry", "status": "reachable", "message": "Telemetry 正在推送"})
+        overview["connectivity"] = {"type": "telemetry", "status": "reachable", "message": "Telemetry 正在推送"}
+        overview.setdefault("resources", {"cpu_percent": None, "memory_percent": None, "temperature": None, "storage_percent": None})
+        overview.setdefault("sessions", {"current": None, "total": None, "usage_percent": None})
+        overview.setdefault("hardware", {"fan_total": 0, "fan_down": 0, "fan_status_known": True, "power_total": 0, "power_down": 0, "power_status_known": True})
+        overview.setdefault("protocols", {"bgp": {"total": 0, "up": 0, "down": 0}, "ospf": {"total": 0, "up": 0, "down": 0}})
+        overview.setdefault("system_info", {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "serial_number": None, "uptime_seconds": None})
+        overview.setdefault("data_sources", {"resources": {}, "protocols": {}, "system_info": {}})
+
+        for section, values in patch.items():
+            if isinstance(values, dict):
+                target = overview.setdefault(section, {})
+                for key, value in values.items():
+                    target[key] = value
+                    if section in {"resources", "protocols", "system_info"}:
+                        overview.setdefault("data_sources", {}).setdefault(section, {})[key] = "telemetry"
+            else:
+                overview[section] = values
+        overview["collected_at"] = collected_at
+        self._set_monitor_cache("overview", device_id, overview)
 
     def _interface_point(self, device: dict[str, Any], item: dict[str, Any], timestamp: datetime) -> Optional[dict[str, Any]]:
         interface_index = item.get("IfIndex")

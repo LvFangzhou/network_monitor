@@ -121,6 +121,23 @@ def _telemetry_interface_enabled(device: Device) -> bool:
             return True
     return monitoring.get("telemetry_enabled") is True
 
+
+def _telemetry_snmp_disabled(device: Device) -> bool:
+    """Whether SNMP collection should be skipped because Telemetry is authoritative.
+
+    Kept as a custom-field switch so we can migrate one device at a time without
+    changing the global device monitor_source enum or surprising existing SNMP
+    devices.
+    """
+    custom_fields = device.custom_fields or {}
+    if not isinstance(custom_fields, dict):
+        return False
+    monitoring = custom_fields.get("monitoring") or {}
+    if not isinstance(monitoring, dict):
+        return False
+    telemetry = monitoring.get("telemetry") or {}
+    return isinstance(telemetry, dict) and telemetry.get("disable_snmp") is True
+
 def _monitor_cache_key(kind: str, device_id: int, suffix: str = "") -> str:
     return f"monitor:cache:{kind}:{device_id}{suffix}"
 
@@ -1002,6 +1019,9 @@ def collect_snmp_for_device(self, device_id: int):
         if (device.monitor_source or "snmp") != "snmp":
             logger.debug("设备监控方式非SNMP，跳过SNMP采集", device_id=device_id)
             return {"skipped": True, "reason": "监控方式非SNMP"}
+        if _telemetry_snmp_disabled(device):
+            logger.debug("设备已启用Telemetry替代SNMP，跳过SNMP采集", device_id=device_id, ip=device.ip_address)
+            return {"skipped": True, "reason": "Telemetry已替代SNMP"}
         
         if not device.snmp_version:
             logger.debug("设备未配置SNMP", device_id=device_id)
@@ -1157,6 +1177,8 @@ def collect_all_snmp():
             Device.is_monitored == True,
             or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
         ).order_by(Device.id.asc()).all()
+        telemetry_snmp_skipped_total = sum(1 for device in devices if _telemetry_snmp_disabled(device))
+        devices = [device for device in devices if not _telemetry_snmp_disabled(device)]
 
         current_bucket = _next_round_robin_bucket("snmp_full", SNMP_BATCH_COUNT)
         devices_in_bucket = [
@@ -1169,6 +1191,7 @@ def collect_all_snmp():
         logger.info(
             "开始批量SNMP采集",
             total_devices=len(devices),
+            telemetry_snmp_skipped_total=telemetry_snmp_skipped_total,
             bucket=current_bucket,
             bucket_count=SNMP_BATCH_COUNT,
             devices_in_bucket=len(devices_in_bucket),
@@ -1194,6 +1217,7 @@ def collect_all_snmp():
         
         return {
             "total_devices": len(devices),
+            "telemetry_snmp_skipped_total": telemetry_snmp_skipped_total,
             "bucket": current_bucket,
             "bucket_count": SNMP_BATCH_COUNT,
             "devices_in_bucket": len(devices_in_bucket),
