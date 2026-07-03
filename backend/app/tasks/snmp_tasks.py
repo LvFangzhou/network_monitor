@@ -109,6 +109,8 @@ ASTERNOS_COUNTER_METRICS = [
 
 
 def _telemetry_interface_enabled(device: Device) -> bool:
+    if bool(getattr(device, "gnmi_enabled", 0)):
+        return True
     custom_fields = device.custom_fields or {}
     if not isinstance(custom_fields, dict):
         return False
@@ -119,6 +121,27 @@ def _telemetry_interface_enabled(device: Device) -> bool:
     if isinstance(telemetry, dict):
         if telemetry.get("interface_stats") is True or telemetry.get("enabled") is True:
             return True
+    return monitoring.get("telemetry_enabled") is True
+
+
+def _telemetry_primary_enabled(device: Device) -> bool:
+    """Whether Telemetry should be treated as the authoritative data source.
+
+    For high-density switches we still keep SNMP credentials configured, but
+    SNMP should only fill gaps that are not currently covered by Telemetry
+    parsing, such as BGP/OSPF neighbor state during migration.
+    """
+    if bool(getattr(device, "gnmi_enabled", 0)):
+        return True
+    custom_fields = device.custom_fields or {}
+    if not isinstance(custom_fields, dict):
+        return False
+    monitoring = custom_fields.get("monitoring") or {}
+    if not isinstance(monitoring, dict):
+        return False
+    telemetry = monitoring.get("telemetry") or {}
+    if isinstance(telemetry, dict):
+        return telemetry.get("enabled") is True or telemetry.get("source") == "dialout"
     return monitoring.get("telemetry_enabled") is True
 
 
@@ -137,6 +160,64 @@ def _telemetry_snmp_disabled(device: Device) -> bool:
         return False
     telemetry = monitoring.get("telemetry") or {}
     return isinstance(telemetry, dict) and telemetry.get("disable_snmp") is True
+
+
+def _telemetry_snmp_protocol_fallback_enabled(device: Device) -> bool:
+    custom_fields = device.custom_fields or {}
+    if not isinstance(custom_fields, dict):
+        return True
+    monitoring = custom_fields.get("monitoring") or {}
+    if not isinstance(monitoring, dict):
+        return True
+    telemetry = monitoring.get("telemetry") or {}
+    if isinstance(telemetry, dict) and telemetry.get("snmp_fallback_protocols") is False:
+        return False
+    return True
+
+
+def _telemetry_snmp_optical_fallback_enabled(device: Device) -> bool:
+    custom_fields = device.custom_fields or {}
+    if not isinstance(custom_fields, dict):
+        return False
+    monitoring = custom_fields.get("monitoring") or {}
+    if not isinstance(monitoring, dict):
+        return False
+    telemetry = monitoring.get("telemetry") or {}
+    return isinstance(telemetry, dict) and telemetry.get("snmp_fallback_optical") is True
+
+
+def _protocol_summary_has_data(summary: Dict[str, Any]) -> bool:
+    for item in (summary or {}).values():
+        if isinstance(item, dict) and int(item.get("total") or 0) > 0:
+            return True
+    return False
+
+
+def _merge_protocols_into_overview_cache(device: Device, protocols: Dict[str, Any]) -> None:
+    if not _protocol_summary_has_data(protocols):
+        return
+    raw = redis_client.get(_monitor_cache_key("overview", device.id))
+    overview: Dict[str, Any] = {}
+    if raw:
+        try:
+            overview = json.loads(raw)
+        except Exception:
+            overview = {}
+    overview.setdefault("connectivity", {
+        "type": "telemetry" if _telemetry_primary_enabled(device) else "snmp",
+        "status": "reachable",
+        "message": "Telemetry 正在推送" if _telemetry_primary_enabled(device) else f"SNMP {device.snmp_version}",
+    })
+    overview.setdefault("resources", {"cpu_percent": None, "memory_percent": None, "temperature": None, "storage_percent": None})
+    overview.setdefault("sessions", {"current": None, "total": None, "usage_percent": None})
+    overview.setdefault("hardware", {"fan_total": 0, "fan_down": 0, "fan_status_known": True, "power_total": 0, "power_down": 0, "power_status_known": True})
+    overview.setdefault("system_info", {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "serial_number": None, "uptime_seconds": None})
+    overview["protocols"] = protocols
+    overview.setdefault("data_sources", {}).setdefault("protocols", {})
+    for protocol in protocols:
+        overview["data_sources"]["protocols"][protocol] = "snmp"
+    overview["collected_at"] = datetime.now(timezone.utc).isoformat()
+    _set_monitor_cache("overview", device.id, overview)
 
 def _monitor_cache_key(kind: str, device_id: int, suffix: str = "") -> str:
     return f"monitor:cache:{kind}:{device_id}{suffix}"
@@ -1019,10 +1100,6 @@ def collect_snmp_for_device(self, device_id: int):
         if (device.monitor_source or "snmp") != "snmp":
             logger.debug("设备监控方式非SNMP，跳过SNMP采集", device_id=device_id)
             return {"skipped": True, "reason": "监控方式非SNMP"}
-        if _telemetry_snmp_disabled(device):
-            logger.debug("设备已启用Telemetry替代SNMP，跳过SNMP采集", device_id=device_id, ip=device.ip_address)
-            return {"skipped": True, "reason": "Telemetry已替代SNMP"}
-        
         if not device.snmp_version:
             logger.debug("设备未配置SNMP", device_id=device_id)
             return {"skipped": True, "reason": "未配置SNMP"}
@@ -1032,25 +1109,36 @@ def collect_snmp_for_device(self, device_id: int):
         result: Dict[str, Any] = {}
         protocol_status_result: Dict[str, Any] = {}
         optical_result: Dict[str, Any] = {}
+        telemetry_primary = _telemetry_primary_enabled(device) or _telemetry_snmp_disabled(device)
 
-        try:
-            result = snmp_collector.collect_device(device)
-        except Exception as exc:
-            logger.error("设备SNMP指标采集失败", device_id=device_id, error=str(exc))
+        if telemetry_primary:
+            logger.info(
+                "设备已启用Telemetry主采集，跳过SNMP资源/接口全量采集，仅保留缺口补采",
+                device_id=device_id,
+                ip=device.ip_address,
+            )
+        else:
+            try:
+                result = snmp_collector.collect_device(device)
+            except Exception as exc:
+                logger.error("设备SNMP指标采集失败", device_id=device_id, error=str(exc))
 
-        try:
-            protocol_status_result = snmp_collector.collect_protocol_status(device)
-        except Exception as exc:
-            logger.error("协议状态采集失败", device_id=device_id, error=str(exc))
+        if (not telemetry_primary) or _telemetry_snmp_protocol_fallback_enabled(device):
+            try:
+                protocol_status_result = snmp_collector.collect_protocol_status(device)
+            except Exception as exc:
+                logger.error("协议状态采集失败", device_id=device_id, error=str(exc))
 
-        try:
-            optical_result = snmp_collector.collect_optical_monitoring(device)
-        except Exception as exc:
-            logger.error("光模块指标采集失败", device_id=device_id, error=str(exc))
+        if (not telemetry_primary) or _telemetry_snmp_optical_fallback_enabled(device):
+            try:
+                optical_result = snmp_collector.collect_optical_monitoring(device)
+            except Exception as exc:
+                logger.error("光模块指标采集失败", device_id=device_id, error=str(exc))
 
         logger.info(
             "SNMP采集完成",
             device_id=device_id,
+            telemetry_primary=telemetry_primary,
             points=result.get("points_written", 0),
             interface_points=0,
             protocol_points=protocol_status_result.get("points_written", 0),
@@ -1085,6 +1173,20 @@ def collect_snmp_for_device(self, device_id: int):
             }
 
         _clear_device_failure_state_for_device(device)
+
+        if telemetry_primary:
+            _merge_protocols_into_overview_cache(device, protocol_status_result.get("protocols") or {})
+            return {
+                "device_id": device_id,
+                "success": True,
+                "telemetry_primary": True,
+                "points_written": 0,
+                "interface_points_written": 0,
+                "interfaces_monitored": 0,
+                "protocol_points_written": protocol_status_result.get("points_written", 0),
+                "optical_points_written": optical_result.get("points_written", 0),
+                "snmp_mode": "fallback_only",
+            }
 
         memory = result.get("memory") or {}
         sessions = result.get("sessions") or {}
@@ -1177,8 +1279,7 @@ def collect_all_snmp():
             Device.is_monitored == True,
             or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
         ).order_by(Device.id.asc()).all()
-        telemetry_snmp_skipped_total = sum(1 for device in devices if _telemetry_snmp_disabled(device))
-        devices = [device for device in devices if not _telemetry_snmp_disabled(device)]
+        telemetry_primary_total = sum(1 for device in devices if _telemetry_primary_enabled(device) or _telemetry_snmp_disabled(device))
 
         current_bucket = _next_round_robin_bucket("snmp_full", SNMP_BATCH_COUNT)
         devices_in_bucket = [
@@ -1191,7 +1292,7 @@ def collect_all_snmp():
         logger.info(
             "开始批量SNMP采集",
             total_devices=len(devices),
-            telemetry_snmp_skipped_total=telemetry_snmp_skipped_total,
+            telemetry_primary_fallback_total=telemetry_primary_total,
             bucket=current_bucket,
             bucket_count=SNMP_BATCH_COUNT,
             devices_in_bucket=len(devices_in_bucket),
@@ -1217,7 +1318,7 @@ def collect_all_snmp():
         
         return {
             "total_devices": len(devices),
-            "telemetry_snmp_skipped_total": telemetry_snmp_skipped_total,
+            "telemetry_primary_fallback_total": telemetry_primary_total,
             "bucket": current_bucket,
             "bucket_count": SNMP_BATCH_COUNT,
             "devices_in_bucket": len(devices_in_bucket),
