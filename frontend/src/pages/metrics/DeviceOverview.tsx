@@ -210,9 +210,9 @@ const ProtocolCell = ({ data, source }: { data: DeviceProtocolSummary; source?: 
 
 const ConnectivityTag = ({ item }: { item: DeviceOverviewItem }) => {
   const { status, message: detail } = item.connectivity
-  const source = String(item.monitor_source || 'snmp')
+  const source = String(item.connectivity?.type || item.monitor_source || 'snmp')
   const typeLabel =
-    source === 'asternos_exporter'
+    source === 'asternos_exporter' || source === 'exporter'
       ? 'Exporter'
       : source === 'telemetry'
         ? 'Telemetry'
@@ -342,7 +342,13 @@ const normalizeModelName = (value?: string | null) =>
   String(value || '')
     .trim()
     .toLowerCase()
+    .replace(/^(densivelo|h3c|yillion)\s+/i, '')
     .replace(/\s+/g, '')
+
+const formatCollectedModel = (value?: string | null) =>
+  String(value || '')
+    .trim()
+    .replace(/^(Densivelo|H3C|Yillion)\s+/i, '')
 
 const isSnmpModelMismatch = (record: DeviceOverviewItem) => {
   const snmpModel = normalizeModelName(record.system_info?.snmp_model)
@@ -761,7 +767,7 @@ const DeviceOverview = () => {
       width: 220,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => String(a.device.model || '').localeCompare(String(b.device.model || '')),
       render: (_: any, record: DeviceOverviewItem) => {
-        const snmpModel = record.system_info?.snmp_model
+        const snmpModel = formatCollectedModel(record.system_info?.snmp_model)
         const enteredModel = record.device.model || '-'
         const mismatch = isSnmpModelMismatch(record)
         return (
