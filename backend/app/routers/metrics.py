@@ -222,14 +222,19 @@ def persist_interface_metrics(device: Device, interface_metrics: dict, sync: boo
         )
     _sanitize_impossible_interface_rates(fields)
 
-    influx_client.write_point(
-        measurement="interface_monitoring",
-        tags={
+    tags = {
             "device_id": str(device.id),
             "device_name": device.name,
             "interface_index": str(interface_index),
             "interface_name": interface_metrics.get("name"),
-        },
+    }
+    history_source = interface_metrics.get("history_source")
+    if history_source:
+        tags["source"] = str(history_source)
+
+    influx_client.write_point(
+        measurement="interface_monitoring",
+        tags=tags,
         fields=fields,
         timestamp=datetime.utcnow(),
         sync=sync,
@@ -588,18 +593,29 @@ def _mark_stale_rate_samples(rows: List[Dict[str, Any]], interval_seconds: int, 
 
 
 async def _persist_fresh_interface_sample(device: Device, interface_index: int, range_seconds: int) -> bool:
+    return await _collect_and_persist_fresh_interface_sample(device, interface_index, range_seconds) is not None
+
+
+async def _collect_and_persist_fresh_interface_sample(
+    device: Device,
+    interface_index: int,
+    range_seconds: int,
+    history_source: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     if range_seconds > FRESH_INTERFACE_SAMPLE_MAX_RANGE_SECONDS:
-        return False
+        return None
     lock_key = _monitor_cache_key("interface_fresh_sample_lock", device.id, suffix=f":{interface_index}")
     if not redis_client.set(lock_key, "1", ex=FRESH_INTERFACE_SAMPLE_LOCK_SECONDS, nx=True):
-        return False
+        return None
     try:
         interface_metrics = await collect_current_interface_metrics(device, interface_index, allow_cache=False)
         if interface_metrics and interface_metrics.get("name"):
+            if history_source:
+                interface_metrics["history_source"] = history_source
             persist_interface_metrics(device, interface_metrics, sync=True)
             if get_effective_monitor_source(device) == "asternos_exporter":
                 persist_asternos_queue_detail_metrics(device, interface_metrics, sync=True)
-            return True
+            return interface_metrics
     except Exception as exc:
         logger.warning(
             "端口历史查询实时采集失败",
@@ -607,7 +623,7 @@ async def _persist_fresh_interface_sample(device: Device, interface_index: int, 
             interface_index=interface_index,
             error=str(exc),
         )
-    return False
+    return None
 
 
 def interface_metrics_to_history_point(interface_metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -1763,7 +1779,7 @@ async def get_monitor_device_interface_history(
                     interface_names = [str(v) for v in [item.get("name"), item.get("alias")] if v]
                     break
     interface_filter = _interface_history_filter(interface_index, interface_names)
-    source_filter = '|> filter(fn: (r) => r.source == "telemetry")' if telemetry_interface else ""
+    source_filter = '|> filter(fn: (r) => r.source == "telemetry" or r.source == "telemetry_fallback_snmp")' if telemetry_interface else ""
 
     other_field_filter = '''
         r._field == "speed_bps" or
@@ -1851,6 +1867,17 @@ async def get_monitor_device_interface_history(
         # 端口流量查询以展示真实已采集速率为最高优先级，不能把合法的 2 分钟样本误判为空。
         max_sample_seconds=max(180, rate_window_seconds + interval_seconds + 60),
     )
+    has_rate_history = any(row.get("in_bps") is not None or row.get("out_bps") is not None for row in history)
+    if (not history or not has_rate_history) and is_traffic_only and telemetry_interface and device.snmp_version:
+        fallback_metrics = await _collect_and_persist_fresh_interface_sample(
+            device,
+            interface_index,
+            range_seconds,
+            history_source="telemetry_fallback_snmp",
+        )
+        if fallback_metrics and fallback_metrics.get("name"):
+            fallback_point = interface_metrics_to_history_point(fallback_metrics)
+            history = [*history, fallback_point] if history else [fallback_point]
     cutoff = (start_time.timestamp() if use_absolute_range and start_time else datetime.now(timezone.utc).timestamp() - range_seconds)
     stop_ts = end_time.timestamp() if use_absolute_range else None
     history = [

@@ -115,6 +115,7 @@ def _speed_from_interface_name(name: str) -> Optional[float]:
 class DeviceResolver:
     def __init__(self) -> None:
         self._cache: dict[str, dict[str, Any]] = {}
+        self._marked_telemetry: set[str] = set()
 
     def get(self, ip_address: str) -> Optional[dict[str, Any]]:
         if not ip_address:
@@ -138,12 +139,60 @@ class DeviceResolver:
                     "vendor": device.vendor or "",
                 }
                 self._cache[ip_address] = data
+                self._mark_telemetry_primary(db, device)
                 return data
             finally:
                 db.close()
         except Exception as exc:
             LOGGER.warning("resolve telemetry device failed ip=%s error=%s", ip_address, exc)
             return None
+
+    def _mark_telemetry_primary(self, db: Any, device: Any) -> None:
+        """Persist Telemetry dial-out as the preferred monitor source.
+
+        This lets newly configured switches become Telemetry-primary
+        automatically after the first successful push, without waiting for a
+        manual CMDB edit.  SNMP stays available for protocol/gap fallback.
+        """
+        ip_address = getattr(device, "ip_address", "")
+        if not ip_address or ip_address in self._marked_telemetry:
+            return
+        try:
+            from copy import deepcopy
+            from sqlalchemy.orm.attributes import flag_modified
+
+            custom_fields = deepcopy(device.custom_fields or {}) if isinstance(device.custom_fields, dict) else {}
+            monitoring = custom_fields.setdefault("monitoring", {})
+            if not isinstance(monitoring, dict):
+                monitoring = {}
+                custom_fields["monitoring"] = monitoring
+            telemetry = monitoring.setdefault("telemetry", {})
+            if not isinstance(telemetry, dict):
+                telemetry = {}
+                monitoring["telemetry"] = telemetry
+
+            desired = {
+                "enabled": True,
+                "source": "dialout",
+                "interface_stats": True,
+                "disable_snmp": True,
+                "snmp_fallback_protocols": True,
+                "snmp_fallback_optical": False,
+            }
+            changed = False
+            for key, value in desired.items():
+                if telemetry.get(key) != value:
+                    telemetry[key] = value
+                    changed = True
+            if changed:
+                device.custom_fields = custom_fields
+                flag_modified(device, "custom_fields")
+                db.commit()
+                LOGGER.info("telemetry device auto-adapted ip=%s device_id=%s", ip_address, getattr(device, "id", None))
+            self._marked_telemetry.add(ip_address)
+        except Exception as exc:
+            db.rollback()
+            LOGGER.warning("mark telemetry primary failed ip=%s error=%s", ip_address, exc)
 
 
 class TelemetryInfluxWriter:
