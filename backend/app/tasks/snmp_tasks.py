@@ -219,6 +219,55 @@ def _merge_protocols_into_overview_cache(device: Device, protocols: Dict[str, An
     overview["collected_at"] = datetime.now(timezone.utc).isoformat()
     _set_monitor_cache("overview", device.id, overview)
 
+
+def _merge_snmp_gap_fill_into_overview_cache(device: Device, gap_fill: Dict[str, Any]) -> None:
+    """Merge lightweight SNMP-only overview gaps into Telemetry cache.
+
+    Telemetry-primary devices should keep Telemetry as the source for fast
+    resources/interfaces, but uptime and fan/PSU state can be filled by SNMP
+    until the Telemetry parser supports those paths.
+    """
+    if not gap_fill:
+        return
+    raw = redis_client.get(_monitor_cache_key("overview", device.id))
+    overview: Dict[str, Any] = {}
+    if raw:
+        try:
+            overview = json.loads(raw)
+        except Exception:
+            overview = {}
+    overview.setdefault("connectivity", {
+        "type": "telemetry" if _telemetry_primary_enabled(device) else "snmp",
+        "status": "reachable",
+        "message": "Telemetry 正在推送" if _telemetry_primary_enabled(device) else f"SNMP {device.snmp_version}",
+    })
+    overview.setdefault("resources", {"cpu_percent": None, "memory_percent": None, "temperature": None, "storage_percent": None})
+    overview.setdefault("sessions", {"current": None, "total": None, "usage_percent": None})
+    overview.setdefault("hardware", {"fan_total": 0, "fan_down": 0, "fan_status_known": True, "power_total": 0, "power_down": 0, "power_status_known": True})
+    overview.setdefault("protocols", {"bgp": {"total": 0, "up": 0, "down": 0}, "ospf": {"total": 0, "up": 0, "down": 0}})
+    overview.setdefault("system_info", {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "serial_number": None, "uptime_seconds": None})
+    sources = overview.setdefault("data_sources", {})
+    sources.setdefault("hardware", {})
+    sources.setdefault("system_info", {})
+
+    hardware = gap_fill.get("hardware")
+    if isinstance(hardware, dict) and ((hardware.get("fan_total") or 0) > 0 or (hardware.get("power_total") or 0) > 0):
+        overview["hardware"] = hardware
+        for key in ["fan_total", "fan_down", "fan_status_known", "power_total", "power_down", "power_status_known"]:
+            sources["hardware"][key] = "snmp"
+
+    system_info = gap_fill.get("system_info")
+    if isinstance(system_info, dict):
+        target_system_info = overview.setdefault("system_info", {})
+        for key in ["sys_name", "sys_descr", "software_version", "snmp_model", "serial_number", "uptime_seconds"]:
+            value = system_info.get(key)
+            if value is not None and value != "":
+                target_system_info[key] = value
+                sources["system_info"][key] = "snmp"
+
+    overview["collected_at"] = datetime.now(timezone.utc).isoformat()
+    _set_monitor_cache("overview", device.id, overview)
+
 def _monitor_cache_key(kind: str, device_id: int, suffix: str = "") -> str:
     return f"monitor:cache:{kind}:{device_id}{suffix}"
 
@@ -1107,6 +1156,7 @@ def collect_snmp_for_device(self, device_id: int):
         logger.debug("开始SNMP采集", device_id=device_id, ip=device.ip_address)
         
         result: Dict[str, Any] = {}
+        gap_fill_result: Dict[str, Any] = {}
         protocol_status_result: Dict[str, Any] = {}
         optical_result: Dict[str, Any] = {}
         telemetry_primary = _telemetry_primary_enabled(device) or _telemetry_snmp_disabled(device)
@@ -1117,6 +1167,10 @@ def collect_snmp_for_device(self, device_id: int):
                 device_id=device_id,
                 ip=device.ip_address,
             )
+            try:
+                gap_fill_result = snmp_collector.collect_overview_gap_fill(device)
+            except Exception as exc:
+                logger.error("Telemetry设备SNMP缺口补采失败", device_id=device_id, error=str(exc))
         else:
             try:
                 result = snmp_collector.collect_device(device)
@@ -1140,6 +1194,7 @@ def collect_snmp_for_device(self, device_id: int):
             device_id=device_id,
             telemetry_primary=telemetry_primary,
             points=result.get("points_written", 0),
+            gap_fill_points=gap_fill_result.get("points_written", 0),
             interface_points=0,
             protocol_points=protocol_status_result.get("points_written", 0),
             optical_points=optical_result.get("points_written", 0),
@@ -1147,6 +1202,7 @@ def collect_snmp_for_device(self, device_id: int):
 
         total_points_written = (
             int(result.get("points_written") or 0)
+            + int(gap_fill_result.get("points_written") or 0)
             + int(protocol_status_result.get("points_written") or 0)
             + int(optical_result.get("points_written") or 0)
         )
@@ -1175,12 +1231,15 @@ def collect_snmp_for_device(self, device_id: int):
         _clear_device_failure_state_for_device(device)
 
         if telemetry_primary:
+            _merge_snmp_gap_fill_into_overview_cache(device, gap_fill_result)
             _merge_protocols_into_overview_cache(device, protocol_status_result.get("protocols") or {})
             return {
                 "device_id": device_id,
                 "success": True,
                 "telemetry_primary": True,
-                "points_written": 0,
+                "points_written": gap_fill_result.get("points_written", 0),
+                "gap_fill_points_written": gap_fill_result.get("points_written", 0),
+                "hardware_count": gap_fill_result.get("hardware_count", 0),
                 "interface_points_written": 0,
                 "interfaces_monitored": 0,
                 "protocol_points_written": protocol_status_result.get("points_written", 0),

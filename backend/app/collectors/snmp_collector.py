@@ -1724,6 +1724,93 @@ class SNMPCollector(LoggerMixin):
             "snmp_model": snmp_model,
             "serial_number": serial_number,
         }
+
+    def collect_overview_gap_fill(self, device: Any) -> Dict[str, Any]:
+        """Lightweight SNMP fallback for Telemetry-primary devices.
+
+        Telemetry is the authoritative source for high-frequency interface and
+        resource metrics, but some devices do not currently expose/parse uptime
+        and fan/PSU state through Telemetry.  This method deliberately collects
+        only low-cardinality overview fields and avoids interface/NAT/storage
+        walks so Telemetry devices do not fall back to the expensive full SNMP
+        collector.
+        """
+        timestamp = datetime.now()
+        points: List[Dict[str, Any]] = []
+
+        hardware_rows = self.collect_hardware_status(device)
+        for item in hardware_rows:
+            points.append({
+                "measurement": "snmp_hardware",
+                "tags": {
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                    "component_type": item.get("component_type"),
+                    "component": item.get("component"),
+                },
+                "fields": {
+                    "state": item.get("state"),
+                    "up": item.get("up"),
+                    "speed": item.get("speed"),
+                    "present": item.get("present"),
+                    "status_known": item.get("status_known"),
+                },
+                "timestamp": timestamp,
+            })
+
+        uptime = self.collect_uptime(device)
+        system_info = self.collect_system_info(device)
+        if uptime is not None:
+            points.append({
+                "measurement": "snmp_metrics",
+                "tags": {
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                    "metric_type": "uptime",
+                },
+                "fields": {"seconds": uptime},
+                "timestamp": timestamp,
+            })
+
+        if uptime is not None or system_info.get("sys_name") or system_info.get("sys_descr"):
+            points.append({
+                "measurement": "snmp_system_info",
+                "tags": {
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                    "sys_name": system_info.get("sys_name"),
+                    "sys_descr": system_info.get("sys_descr"),
+                    "software_version": system_info.get("software_version"),
+                    "snmp_model": system_info.get("snmp_model"),
+                    "serial_number": system_info.get("serial_number"),
+                },
+                "fields": {"uptime_seconds": float(uptime or 0)},
+                "timestamp": timestamp,
+            })
+
+        if points:
+            influx_client.write_points(points)
+
+        hardware = {
+            "fan_total": sum(1 for item in hardware_rows if item.get("component_type") == "fan" and item.get("present", 1) != 0),
+            "fan_down": sum(1 for item in hardware_rows if item.get("component_type") == "fan" and item.get("up") == 0),
+            "fan_status_known": all(item.get("status_known", 1) != 0 for item in hardware_rows if item.get("component_type") == "fan"),
+            "power_total": sum(1 for item in hardware_rows if item.get("component_type") == "power" and item.get("present", 1) != 0),
+            "power_down": sum(1 for item in hardware_rows if item.get("component_type") == "power" and item.get("up") == 0),
+            "power_status_known": all(item.get("status_known", 1) != 0 for item in hardware_rows if item.get("component_type") == "power"),
+        }
+        return {
+            "device_id": device.id,
+            "timestamp": timestamp,
+            "hardware": hardware,
+            "hardware_count": len(hardware_rows),
+            "uptime": uptime,
+            "system_info": {
+                **system_info,
+                "uptime_seconds": uptime,
+            },
+            "points_written": len(points),
+        }
     
     def collect_device(self, device: Any) -> Dict[str, Any]:
         """采集设备所有SNMP指标"""
