@@ -442,27 +442,27 @@ const parseIntervalMs = (interval: string) => {
 const getAdaptiveInterval = (rangeValue: string) => {
   const intervalMap: Record<string, string> = {
     '-10m': '10s',
-    '-30m': '30s',
-    '-1h': '1m',
+    '-30m': '10s',
+    '-1h': '30s',
     '-6h': '1m',
     '-12h': '2m',
     '-24h': '5m',
-    '-3d': '5m',
-    '-7d': '5m',
+    '-3d': '15m',
+    '-7d': '30m',
   }
   return intervalMap[rangeValue] || '30s'
 }
 
 const getAdaptiveRateWindow = (rangeValue: string) => {
   const rateWindowMap: Record<string, string> = {
-    '-10m': '60s',
-    '-30m': '60s',
-    '-1h': '60s',
+    '-10m': '10s',
+    '-30m': '10s',
+    '-1h': '30s',
     '-6h': '60s',
     '-12h': '2m',
     '-24h': '5m',
-    '-3d': '5m',
-    '-7d': '5m',
+    '-3d': '15m',
+    '-7d': '30m',
   }
   return rateWindowMap[rangeValue] || '5m'
 }

@@ -531,6 +531,28 @@ def _history_interval_seconds(interval: str) -> int:
     return _parse_flux_duration_seconds(interval, 30)
 
 
+def _telemetry_history_interval(range_seconds: int) -> str:
+    """Use finer buckets for Telemetry-backed interface charts.
+
+    Telemetry samples interface counters around every 10 seconds.  Short
+    troubleshooting views should keep that granularity; longer views gradually
+    coarsen the bucket to avoid rendering too many points.
+    """
+    if range_seconds <= 30 * 60:
+        return "10s"
+    if range_seconds <= 60 * 60:
+        return "30s"
+    if range_seconds <= 6 * 60 * 60:
+        return "1m"
+    if range_seconds <= 12 * 60 * 60:
+        return "2m"
+    if range_seconds <= 24 * 60 * 60:
+        return "5m"
+    if range_seconds <= 3 * 24 * 60 * 60:
+        return "15m"
+    return "30m"
+
+
 def _history_rate_window_seconds(interval_seconds: int) -> int:
     # 端口查询的短时间视图用于压测/故障定位，不能用 5 分钟窗口把突增流量抹成缓慢爬坡。
     # SNMP 接口实时采集通常 30~60 秒一轮，窗口保持在 1~2 个采样周期即可兼顾准确和抗抖。
@@ -1679,13 +1701,26 @@ async def get_monitor_device_interface_history(
         int((end_time - start_time).total_seconds()) if use_absolute_range and start_time else _parse_flux_duration_seconds(range, 600),
         MAX_INTERFACE_HISTORY_SECONDS,
     )
+    if _telemetry_interface_enabled(device):
+        telemetry_interval = _telemetry_history_interval(range_seconds)
+        requested_interval_seconds = _history_interval_seconds(interval)
+        telemetry_interval_seconds = _history_interval_seconds(telemetry_interval)
+        # Old browser bundles may still request coarser buckets such as 1m for
+        # a one-hour Telemetry chart.  Prefer the Telemetry-aware interval, but
+        # keep explicitly finer custom requests intact.
+        if requested_interval_seconds > telemetry_interval_seconds:
+            interval = telemetry_interval
+    telemetry_interface = _telemetry_interface_enabled(device)
     interval_seconds = _history_interval_seconds(interval)
     requested_rate_window_seconds = _parse_flux_duration_seconds(rate_window, 0) if rate_window else 0
-    rate_window_seconds = (
-        max(interval_seconds, min(requested_rate_window_seconds, 5 * 60))
-        if requested_rate_window_seconds > 0
-        else _history_rate_window_seconds(interval_seconds)
-    )
+    if telemetry_interface:
+        rate_window_seconds = interval_seconds
+    else:
+        rate_window_seconds = (
+            max(interval_seconds, min(requested_rate_window_seconds, 5 * 60))
+            if requested_rate_window_seconds > 0
+            else _history_rate_window_seconds(interval_seconds)
+        )
     traffic_start = _flux_duration(range_seconds + rate_window_seconds)
     if use_absolute_range and start_time:
         range_clause = f'start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}'
@@ -1720,7 +1755,7 @@ async def get_monitor_device_interface_history(
     if get_effective_monitor_source(device) == "asternos_exporter":
         lookup = await _resolve_asternos_interface_lookup(device, interface_index)
         interface_names = lookup["interface_names"]
-    elif _telemetry_interface_enabled(device):
+    elif telemetry_interface:
         cached_interfaces = _load_monitor_cache("interfaces", device.id)
         if isinstance(cached_interfaces, dict):
             for item in cached_interfaces.get("interfaces") or []:
@@ -1728,7 +1763,7 @@ async def get_monitor_device_interface_history(
                     interface_names = [str(v) for v in [item.get("name"), item.get("alias")] if v]
                     break
     interface_filter = _interface_history_filter(interface_index, interface_names)
-    source_filter = '|> filter(fn: (r) => r.source == "telemetry")' if _telemetry_interface_enabled(device) else ""
+    source_filter = '|> filter(fn: (r) => r.source == "telemetry")' if telemetry_interface else ""
 
     other_field_filter = '''
         r._field == "speed_bps" or
