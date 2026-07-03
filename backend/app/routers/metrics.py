@@ -435,6 +435,9 @@ def _flux_time(value: datetime) -> str:
 
 
 def _apply_windowed_octet_rates(rows: List[Dict[str, Any]], window_seconds: int) -> None:
+    if window_seconds <= 0:
+        return
+
     timed_rows = [(row, _parse_history_time(row)) for row in rows]
     timed_rows = [(row, row_time) for row, row_time in timed_rows if row_time is not None]
     timed_rows.sort(key=lambda item: item[1])
@@ -450,12 +453,14 @@ def _apply_windowed_octet_rates(rows: List[Dict[str, Any]], window_seconds: int)
             cutoff = row_time.timestamp() - window_seconds
             candidates = [(time_value, value) for time_value, value in candidates if time_value.timestamp() >= cutoff]
             previous = candidates[0] if candidates else last_seen
-            existing_rate = _safe_float(row.get(bps_key))
-            if previous and existing_rate is None:
+            if previous:
                 previous_time, previous_value = previous
                 elapsed = (row_time - previous_time).total_seconds()
                 delta = current_value - previous_value
                 if 0 < elapsed <= RATE_FALLBACK_MAX_SECONDS and delta >= 0:
+                    # Grafana/Prometheus 的常见写法是 rate(ifHC*Octets[5m]) * 8。
+                    # 这里同样优先用 counter 在窗口内的增量重新计算展示速率，
+                    # 覆盖采集侧较短窗口写入的 *_bps，避免 SNMP 轮询抖动直接映射到曲线。
                     row[bps_key] = round((delta * 8) / elapsed, 2)
                     row["sample_seconds"] = round(elapsed, 2)
             candidates.append((row_time, current_value))
@@ -559,15 +564,10 @@ def _telemetry_history_interval(range_seconds: int) -> str:
 
 
 def _history_rate_window_seconds(interval_seconds: int) -> int:
-    # 端口查询的短时间视图用于压测/故障定位，不能用 5 分钟窗口把突增流量抹成缓慢爬坡。
-    # SNMP 接口实时采集通常 30~60 秒一轮，窗口保持在 1~2 个采样周期即可兼顾准确和抗抖。
-    if interval_seconds <= 10:
-        return 60
-    if interval_seconds <= 30:
-        return 60
-    if interval_seconds <= 60:
-        return 60
-    return min(5 * 60, max(interval_seconds * 2, 120))
+    # 与 Grafana/Prometheus 的常见公式保持一致：
+    # rate(ifHCIn/OutOctets[5m]) * 8。
+    # 展示粒度可以随时间范围变化，但速率计算窗口默认稳定为 5 分钟。
+    return 5 * 60
 
 
 def _mark_stale_rate_samples(rows: List[Dict[str, Any]], interval_seconds: int, max_sample_seconds: int = 75) -> None:
@@ -1743,23 +1743,34 @@ async def get_monitor_device_interface_history(
         if requested_interval_seconds > telemetry_interval_seconds:
             interval = telemetry_interval
     telemetry_interface = _telemetry_interface_enabled(device)
+    normalized_group = (group or "traffic").strip() or "traffic"
+    is_traffic_only = normalized_group == "traffic"
     interval_seconds = _history_interval_seconds(interval)
     requested_rate_window_seconds = _parse_flux_duration_seconds(rate_window, 0) if rate_window else 0
     if telemetry_interface:
         rate_window_seconds = interval_seconds
+    elif is_traffic_only:
+        # SNMP 接口流量统一按 Grafana/Prometheus 风格的 5m rate 窗口展示。
+        # 即使旧前端仍传 rate_window=30s，也不要回退到短窗口抖动曲线。
+        rate_window_seconds = 5 * 60
     else:
         rate_window_seconds = (
-            max(interval_seconds, min(requested_rate_window_seconds, 5 * 60))
+            min(requested_rate_window_seconds, 5 * 60)
             if requested_rate_window_seconds > 0
             else _history_rate_window_seconds(interval_seconds)
         )
+        rate_window_seconds = max(rate_window_seconds, 60)
+    octet_interval = interval
+    if is_traffic_only and not telemetry_interface and rate_window_seconds < interval_seconds:
+        # 长时间范围页面可能以 15m/30m 展示，但 bps 必须先按 5m counter
+        # 窗口算出来，再由前端/图表展示；否则峰值会被粗粒度 counter 差值摊平。
+        octet_interval = _flux_duration(rate_window_seconds)
     traffic_start = _flux_duration(range_seconds + rate_window_seconds)
     if use_absolute_range and start_time:
         range_clause = f'start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}'
         traffic_start_time = start_time.timestamp() - rate_window_seconds
         traffic_range_clause = f'start: {_flux_time(datetime.fromtimestamp(traffic_start_time, timezone.utc))}, stop: {_flux_time(end_time)}'
-        normalized_group = (group or "traffic").strip() or "traffic"
-        cache_suffix = f":v11:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}:{rate_window_seconds}"
+        cache_suffix = f":v12:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}:{octet_interval}:{rate_window_seconds}"
         logger.info(
             "端口历史绝对时间查询",
             device_id=device_id,
@@ -1771,11 +1782,9 @@ async def get_monitor_device_interface_history(
             interval=interval,
         )
     else:
-        normalized_group = (group or "traffic").strip() or "traffic"
         range_clause = f"start: {range}"
         traffic_range_clause = f"start: -{traffic_start}"
-        cache_suffix = f":v11:{interface_index}:{normalized_group}:{range}:{interval}:{rate_window_seconds}"
-    is_traffic_only = normalized_group == "traffic"
+        cache_suffix = f":v12:{interface_index}:{normalized_group}:{range}:{interval}:{octet_interval}:{rate_window_seconds}"
     fresh_sample_written = False
     if not is_traffic_only:
         fresh_sample_written = await _persist_fresh_interface_sample(device, interface_index, range_seconds)
@@ -1844,7 +1853,7 @@ async def get_monitor_device_interface_history(
         r._field == "in_octets" or
         r._field == "out_octets"
       )
-      |> aggregateWindow(every: {interval}, fn: last, createEmpty: false)
+      |> aggregateWindow(every: {octet_interval}, fn: last, createEmpty: false)
 
     other = from(bucket: "{influx_client.bucket}")
       |> range({range_clause})

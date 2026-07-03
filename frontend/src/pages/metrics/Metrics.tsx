@@ -446,25 +446,15 @@ const getAdaptiveInterval = (rangeValue: string) => {
     '-1h': '30s',
     '-6h': '1m',
     '-12h': '2m',
-    '-24h': '5m',
-    '-3d': '15m',
-    '-7d': '30m',
+    '-24h': '2m',
+    '-3d': '5m',
+    '-7d': '5m',
   }
   return intervalMap[rangeValue] || '30s'
 }
 
-const getAdaptiveRateWindow = (rangeValue: string) => {
-  const rateWindowMap: Record<string, string> = {
-    '-10m': '10s',
-    '-30m': '10s',
-    '-1h': '30s',
-    '-6h': '60s',
-    '-12h': '2m',
-    '-24h': '5m',
-    '-3d': '15m',
-    '-7d': '30m',
-  }
-  return rateWindowMap[rangeValue] || '5m'
+const getAdaptiveRateWindow = (_rangeValue: string) => {
+  return '5m'
 }
 
 const getGapThresholdMs = (rangeValue: string, interval: string, refreshSeconds: number) => {
