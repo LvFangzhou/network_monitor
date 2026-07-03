@@ -56,8 +56,14 @@ const DATACENTER_BADGE_COLORS = [
 
 const CONNECTIVITY_OPTIONS = [
   { value: '', label: '全部连通性' },
-  { value: 'reachable', label: '可达' },
-  { value: 'unreachable', label: '不可达' },
+  { value: 'snmp_reachable', label: 'SNMP可达' },
+  { value: 'snmp_unreachable', label: 'SNMP不可达' },
+  { value: 'exporter_reachable', label: 'Exporter可达' },
+  { value: 'exporter_unreachable', label: 'Exporter不可达' },
+  { value: 'telemetry_reachable', label: 'Telemetry可达' },
+  { value: 'telemetry_unreachable', label: 'Telemetry不可达' },
+  { value: 'reachable', label: '全部可达' },
+  { value: 'unreachable', label: '全部不可达' },
   { value: 'unknown', label: '未知' },
   { value: 'not_configured', label: '未配置' },
 ]
@@ -160,6 +166,26 @@ const sourceLabel = (value?: string) => {
   return ''
 }
 
+const connectivitySource = (item: DeviceOverviewItem) => {
+  const source = String(item.connectivity?.type || item.monitor_source || 'snmp')
+  if (source === 'asternos_exporter') return 'exporter'
+  return source || 'snmp'
+}
+
+const connectivityKey = (item: DeviceOverviewItem) => {
+  const status = String(item.connectivity?.status || 'unknown')
+  if (['reachable', 'unreachable'].includes(status)) {
+    return `${connectivitySource(item)}_${status}`
+  }
+  return status
+}
+
+const matchesConnectivityFilter = (item: DeviceOverviewItem, value?: string) => {
+  if (!value) return true
+  const status = String(item.connectivity?.status || 'unknown')
+  return status === value || connectivityKey(item) === value
+}
+
 const ResourceCell = ({ value, source }: { value?: number | null; source?: string }) => {
   const normalized = normalizePercent(value)
   if (normalized === null) return <Text type="secondary">-</Text>
@@ -208,16 +234,16 @@ const ProtocolCell = ({ data }: { data: DeviceProtocolSummary }) => {
 
 const ConnectivityTag = ({ item }: { item: DeviceOverviewItem }) => {
   const { status, message: detail } = item.connectivity
-  const source = String(item.connectivity?.type || item.monitor_source || 'snmp')
+  const source = connectivitySource(item)
   const typeLabel =
-    source === 'asternos_exporter' || source === 'exporter'
+    source === 'exporter'
       ? 'Exporter'
       : source === 'telemetry'
         ? 'Telemetry'
         : 'SNMP'
   const color =
     status === 'reachable'
-      ? source === 'asternos_exporter'
+      ? source === 'exporter'
         ? 'green'
         : source === 'telemetry'
           ? 'purple'
@@ -559,7 +585,7 @@ const DeviceOverview = () => {
       if (modelKeyword && !String(item.device.model || '').toLowerCase().includes(modelKeyword)) {
         return false
       }
-      if (connectivity && item.connectivity.status !== connectivity) {
+      if (!matchesConnectivityFilter(item, connectivity)) {
         return false
       }
       if (!keyword) {
@@ -833,7 +859,7 @@ const DeviceOverview = () => {
       key: 'connectivity',
       width: 140,
       filters: CONNECTIVITY_OPTIONS.filter((item) => item.value).map((item) => ({ text: item.label, value: item.value })),
-      onFilter: (value: any, record: DeviceOverviewItem) => record.connectivity.status === value,
+      onFilter: (value: any, record: DeviceOverviewItem) => matchesConnectivityFilter(record, String(value)),
       render: (_: any, record: DeviceOverviewItem) => <ConnectivityTag item={record} />,
     },
     {

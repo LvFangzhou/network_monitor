@@ -1493,6 +1493,22 @@ def _device_base_overview(device: Device) -> Dict[str, Any]:
     }
 
 
+def _connectivity_source_key(connectivity: Dict[str, Any], fallback_source: Optional[str] = None) -> str:
+    source = str((connectivity or {}).get("type") or fallback_source or "snmp")
+    if source == "asternos_exporter":
+        return "exporter"
+    return source or "snmp"
+
+
+def _connectivity_filter_matches(item: Dict[str, Any], connectivity: Optional[str]) -> bool:
+    if not connectivity:
+        return True
+    connectivity_data = item.get("connectivity") or {}
+    status = str(connectivity_data.get("status") or "unknown")
+    source = _connectivity_source_key(connectivity_data, item.get("monitor_source"))
+    return connectivity == status or connectivity == f"{source}_{status}"
+
+
 def _counter_cache_key(device_id: int, metric_base: str, target_key: str) -> str:
     return f"monitor:asternos_counter:{device_id}:{metric_base}:{target_key}"
 
@@ -2331,7 +2347,7 @@ async def get_monitor_devices_overview(
             filtered_items = []
             for item in items:
                 device = item.get("device") or {}
-                if connectivity and (item.get("connectivity") or {}).get("status") != connectivity:
+                if not _connectivity_filter_matches(item, connectivity):
                     continue
                 if vendor_keyword and vendor_keyword not in str(device.get("vendor") or "").lower():
                     continue
@@ -2454,7 +2470,7 @@ async def get_monitor_devices_overview(
         filtered_items = []
         for item in items:
             device = item.get("device") or {}
-            if connectivity and (item.get("connectivity") or {}).get("status") != connectivity:
+            if not _connectivity_filter_matches(item, connectivity):
                 continue
             if vendor_keyword and vendor_keyword not in str(device.get("vendor") or "").lower():
                 continue
