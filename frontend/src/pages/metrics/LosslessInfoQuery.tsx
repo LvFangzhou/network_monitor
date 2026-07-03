@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Card, Input, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd'
+import { Alert, Button, Card, Input, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd'
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import {
   getControllerAssets,
@@ -30,6 +30,73 @@ const sortOptions = [
   { value: 'ingressOverrunCounters', label: '入Buffer超限' },
   { value: 'headroomOverrunCounters', label: 'Headroom超限' },
 ]
+
+const telemetryLosslessCapabilities = [
+  {
+    category: 'PFC',
+    metrics: 'PFC TX/RX、Pause 帧、PFC No-drop、PFC Deadlock',
+    paths: 'pfcstatistics / pfcspeeds / pfcports/port / portnodrops / portdeadlocks',
+    refresh: '60秒 / 事件',
+    status: '已收到，待结构化展示',
+    priority: '高',
+  },
+  {
+    category: 'Buffer',
+    metrics: '端口/队列入向、出向、共享 Buffer、Headroom 使用量与超限次数',
+    paths: 'commbufferusages / commheadroomusages / ingressdrops / egressdrops',
+    refresh: '60秒',
+    status: '已收到，待结构化展示',
+    priority: '高',
+  },
+  {
+    category: 'Queue',
+    metrics: '队列深度、队列使用率、队列丢包、队列长度',
+    paths: 'qstat/queuestat / qos/interfaces/interface/input/queues/queue/state',
+    refresh: '60秒',
+    status: '已收到，待结构化展示',
+    priority: '高',
+  },
+  {
+    category: 'ECN / WRED',
+    metrics: 'ECN 标记速率、WRED 丢弃速率、Tail Drop',
+    paths: 'ecnandwredstatistics / wred/ifqueuewreds / dropparameters',
+    refresh: '60秒',
+    status: '已收到，待结构化展示',
+    priority: '高',
+  },
+  {
+    category: '无损事件',
+    metrics: 'Queue Drop、Buffer Overrun、资源告警、Telemetry 系统事件',
+    paths: 'portquedropevent / portqueoverrunevent / resourceevent / telemetryftrace/genevent',
+    refresh: '实时事件',
+    status: '已收到，待接入告警中心',
+    priority: '高',
+  },
+  {
+    category: 'FEC / BER / ESNR',
+    metrics: 'Pre-FEC BER、ESNR、FEC 相关健康指标',
+    paths: 'ifmgr/iffecdata / optical-channel/state/pre-fec-ber / optical-channel/state/esnr',
+    refresh: '300秒',
+    status: '已收到，待关联模块信息',
+    priority: '中',
+  },
+  {
+    category: 'MQC / QoS',
+    metrics: '策略、分类、行为、匹配包数、匹配字节、丢弃、Remark',
+    paths: 'mqc/rules / globalcategorypolicyaccount / ifcategorypolicyaccount / ifpolicyaccount',
+    refresh: '60秒 / 300秒',
+    status: '已收到，待专题展示',
+    priority: '中',
+  },
+]
+
+const statusColorMap: Record<string, string> = {
+  '已接入页面': 'green',
+  '已收到，待结构化展示': 'blue',
+  '已收到，待接入告警中心': 'orange',
+  '已收到，待关联模块信息': 'purple',
+  '已收到，待专题展示': 'cyan',
+}
 
 const LosslessInfoQuery = () => {
   const [controllers, setControllers] = useState<ControllerOption[]>([])
@@ -274,6 +341,65 @@ const LosslessInfoQuery = () => {
                       { title: '队列', dataIndex: 'queInfoList', width: 100, render: (value) => value?.length ? <Tag color="blue">{value.length} 队列</Tag> : <Text type="secondary">-</Text> },
                     ]}
                   />
+                </Card>
+              </Space>
+            ),
+          },
+          {
+            key: 'telemetry-plan',
+            label: 'Telemetry 接入规划',
+            children: (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                <Alert
+                  type="info"
+                  showIcon
+                  message="这些是当前已经从交换机 Telemetry 收到、但还没有全部解析到无损页面的能力项。"
+                  description="后续可以按优先级逐步落表：先做 PFC / Buffer / Queue / ECN / WRED，再接入无损告警，最后补充 FEC/BER、MQC/QoS 等专题信息。"
+                />
+                <Card title="待接入无损 Telemetry 数据源">
+                  <Table
+                    rowKey={(record) => record.category}
+                    dataSource={telemetryLosslessCapabilities}
+                    pagination={false}
+                    scroll={{ x: 1200 }}
+                    columns={[
+                      {
+                        title: '类别',
+                        dataIndex: 'category',
+                        width: 140,
+                        fixed: 'left',
+                        render: (value) => <Text strong>{value}</Text>,
+                      },
+                      { title: '可展示指标', dataIndex: 'metrics', width: 320 },
+                      {
+                        title: 'Telemetry Path',
+                        dataIndex: 'paths',
+                        width: 360,
+                        render: (value) => <Text code style={{ whiteSpace: 'normal' }}>{value}</Text>,
+                      },
+                      { title: '建议刷新', dataIndex: 'refresh', width: 120 },
+                      {
+                        title: '状态',
+                        dataIndex: 'status',
+                        width: 170,
+                        render: (value) => <Tag color={statusColorMap[value] || 'default'}>{value}</Tag>,
+                      },
+                      {
+                        title: '优先级',
+                        dataIndex: 'priority',
+                        width: 90,
+                        render: (value) => <Tag color={value === '高' ? 'red' : 'gold'}>{value}</Tag>,
+                      },
+                    ]}
+                  />
+                </Card>
+                <Card title="建议落地顺序">
+                  <Space direction="vertical" size={8}>
+                    <Text>1. 先把 PFC、Buffer、Queue、ECN/WRED 做成端口 + 队列维度表格，支持设备/IP/接口/队列筛选。</Text>
+                    <Text>2. 将 Queue Drop、PFC Deadlock、Buffer Overrun 这类事件接入告警中心，减少 SNMP 轮询告警压力。</Text>
+                    <Text>3. 把 BER / ESNR / FEC 与模块信息查询联动，用于判断 400G 链路质量。</Text>
+                    <Text>4. MQC / QoS 暂作为专题页，后续用于分析策略命中、丢包和 Remark 情况。</Text>
+                  </Space>
                 </Card>
               </Space>
             ),
