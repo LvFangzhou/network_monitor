@@ -5,6 +5,28 @@ import { useAuthStore } from './store/auth'
 import request from './api/request'
 import Layout from './components/Layout'
 
+const CHUNK_RELOAD_FLAG = 'nmChunkReloadedForVersion'
+
+const isChunkLoadError = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /Loading chunk|ChunkLoadError|dynamically imported module|Failed to fetch dynamically imported module|Importing a module script failed/i.test(message)
+}
+
+const lazyWithReload = <T extends React.ComponentType<any>>(loader: () => Promise<{ default: T }>) => lazy(async () => {
+  try {
+    const mod = await loader()
+    sessionStorage.removeItem(CHUNK_RELOAD_FLAG)
+    return mod
+  } catch (error) {
+    if (isChunkLoadError(error) && sessionStorage.getItem(CHUNK_RELOAD_FLAG) !== '1') {
+      sessionStorage.setItem(CHUNK_RELOAD_FLAG, '1')
+      window.location.reload()
+      return new Promise<{ default: T }>(() => undefined)
+    }
+    throw error
+  }
+})
+
 const loadLogin = () => import('./pages/Login')
 const loadDashboard = () => import('./pages/Dashboard')
 const loadDeviceList = () => import('./pages/devices/DeviceList')
@@ -30,30 +52,30 @@ const loadSettings = () => import('./pages/Settings')
 const loadTacacsManager = () => import('./pages/TacacsManager')
 const loadConfigBackups = () => import('./pages/ConfigBackups')
 
-const Login = lazy(loadLogin)
-const Dashboard = lazy(loadDashboard)
-const DeviceList = lazy(loadDeviceList)
-const DeviceDictionaryManager = lazy(loadDeviceDictionaryManager)
-const DeviceForm = lazy(loadDeviceForm)
-const DeviceDetail = lazy(loadDeviceDetail)
-const DatacenterList = lazy(loadDatacenterList)
-const CustomerList = lazy(loadCustomerList)
-const VendorList = lazy(loadVendorList)
-const PublicCircuitList = lazy(loadPublicCircuitList)
-const PrivateCircuitList = lazy(loadPrivateCircuitList)
-const IPDBList = lazy(loadIPDBList)
-const AlertRules = lazy(loadAlertRules)
-const AlertHistory = lazy(loadAlertHistory)
-const AlertAudit = lazy(loadAlertAudit)
-const AlertSilences = lazy(loadAlertSilences)
-const Metrics = lazy(loadMetrics)
-const DeviceOverview = lazy(loadDeviceOverview)
-const IPFlowQuery = lazy(loadIPFlowQuery)
-const ModuleInfoQuery = lazy(loadModuleInfoQuery)
-const LosslessInfoQuery = lazy(loadLosslessInfoQuery)
-const Settings = lazy(loadSettings)
-const TacacsManager = lazy(loadTacacsManager)
-const ConfigBackups = lazy(loadConfigBackups)
+const Login = lazyWithReload(loadLogin)
+const Dashboard = lazyWithReload(loadDashboard)
+const DeviceList = lazyWithReload(loadDeviceList)
+const DeviceDictionaryManager = lazyWithReload(loadDeviceDictionaryManager)
+const DeviceForm = lazyWithReload(loadDeviceForm)
+const DeviceDetail = lazyWithReload(loadDeviceDetail)
+const DatacenterList = lazyWithReload(loadDatacenterList)
+const CustomerList = lazyWithReload(loadCustomerList)
+const VendorList = lazyWithReload(loadVendorList)
+const PublicCircuitList = lazyWithReload(loadPublicCircuitList)
+const PrivateCircuitList = lazyWithReload(loadPrivateCircuitList)
+const IPDBList = lazyWithReload(loadIPDBList)
+const AlertRules = lazyWithReload(loadAlertRules)
+const AlertHistory = lazyWithReload(loadAlertHistory)
+const AlertAudit = lazyWithReload(loadAlertAudit)
+const AlertSilences = lazyWithReload(loadAlertSilences)
+const Metrics = lazyWithReload(loadMetrics)
+const DeviceOverview = lazyWithReload(loadDeviceOverview)
+const IPFlowQuery = lazyWithReload(loadIPFlowQuery)
+const ModuleInfoQuery = lazyWithReload(loadModuleInfoQuery)
+const LosslessInfoQuery = lazyWithReload(loadLosslessInfoQuery)
+const Settings = lazyWithReload(loadSettings)
+const TacacsManager = lazyWithReload(loadTacacsManager)
+const ConfigBackups = lazyWithReload(loadConfigBackups)
 
 const preloadRouteModules = () => {
   void Promise.allSettled([
@@ -172,6 +194,10 @@ class RouteErrorBoundary extends React.Component<{ children: React.ReactNode }, 
 
   componentDidCatch(error: unknown) {
     console.error('页面加载失败:', error)
+    if (isChunkLoadError(error) && sessionStorage.getItem(CHUNK_RELOAD_FLAG) !== '1') {
+      sessionStorage.setItem(CHUNK_RELOAD_FLAG, '1')
+      window.location.reload()
+    }
   }
 
   render() {
