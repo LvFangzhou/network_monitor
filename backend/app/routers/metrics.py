@@ -1867,8 +1867,30 @@ async def get_monitor_device_interface_history(
         # 端口流量查询以展示真实已采集速率为最高优先级，不能把合法的 2 分钟样本误判为空。
         max_sample_seconds=max(180, rate_window_seconds + interval_seconds + 60),
     )
-    has_rate_history = any(row.get("in_bps") is not None or row.get("out_bps") is not None for row in history)
-    if (not history or not has_rate_history) and is_traffic_only and telemetry_interface and device.snmp_version:
+    cutoff = (start_time.timestamp() if use_absolute_range and start_time else datetime.now(timezone.utc).timestamp() - range_seconds)
+    stop_ts = end_time.timestamp() if use_absolute_range else None
+    recent_rate_rows = []
+    for row in history:
+        row_time = _parse_history_time(row)
+        if not row_time:
+            continue
+        row_ts = row_time.timestamp()
+        if row_ts < cutoff or (stop_ts is not None and row_ts > stop_ts):
+            continue
+        if row.get("in_bps") is not None or row.get("out_bps") is not None:
+            recent_rate_rows.append((row_ts, row))
+    newest_rate_ts = max((row_ts for row_ts, _row in recent_rate_rows), default=0)
+    fallback_needed = (
+        is_traffic_only
+        and telemetry_interface
+        and bool(device.snmp_version)
+        and (
+            not recent_rate_rows
+            or len(recent_rate_rows) < 2
+            or newest_rate_ts < datetime.now(timezone.utc).timestamp() - max(interval_seconds * 2, 20)
+        )
+    )
+    if fallback_needed:
         fallback_metrics = await _collect_and_persist_fresh_interface_sample(
             device,
             interface_index,
@@ -1878,8 +1900,6 @@ async def get_monitor_device_interface_history(
         if fallback_metrics and fallback_metrics.get("name"):
             fallback_point = interface_metrics_to_history_point(fallback_metrics)
             history = [*history, fallback_point] if history else [fallback_point]
-    cutoff = (start_time.timestamp() if use_absolute_range and start_time else datetime.now(timezone.utc).timestamp() - range_seconds)
-    stop_ts = end_time.timestamp() if use_absolute_range else None
     history = [
         row for row in history
         if (

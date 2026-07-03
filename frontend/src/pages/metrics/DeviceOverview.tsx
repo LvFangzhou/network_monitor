@@ -193,15 +193,13 @@ const HardwareCell = ({
   return <Tag color={down > 0 ? 'red' : 'green'}>{label} {total - down}/{total}</Tag>
 }
 
-const ProtocolCell = ({ data, source }: { data: DeviceProtocolSummary; source?: string }) => {
+const ProtocolCell = ({ data }: { data: DeviceProtocolSummary }) => {
   if (!data || data.total <= 0) return <Text type="secondary">-</Text>
   const color = data.down > 0 ? 'red' : 'green'
-  const label = sourceLabel(source)
   return (
     <Space direction="vertical" size={2} style={{ lineHeight: 1.2 }}>
       <Space size={4} wrap={false}>
         <Tag color={color}>{data.up}/{data.total}</Tag>
-        {label ? <Tag color="blue">{label}</Tag> : null}
       </Space>
       {data.down > 0 ? <Text type="danger">异常 {data.down}</Text> : null}
     </Space>
@@ -900,14 +898,14 @@ const DeviceOverview = () => {
       key: 'bgp',
       width: 130,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => a.protocols.bgp.down - b.protocols.bgp.down,
-      render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.bgp} source={record.data_sources?.protocols?.bgp} />,
+      render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.bgp} />,
     },
     {
       title: 'OSPF',
       key: 'ospf',
       width: 130,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => a.protocols.ospf.down - b.protocols.ospf.down,
-      render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.ospf} source={record.data_sources?.protocols?.ospf} />,
+      render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.ospf} />,
     },
     {
       title: '更新时间',
