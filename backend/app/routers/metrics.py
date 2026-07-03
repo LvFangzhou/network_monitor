@@ -138,8 +138,8 @@ def _telemetry_interface_enabled(device: Device) -> bool:
         return False
     telemetry = monitoring.get("telemetry") or {}
     if isinstance(telemetry, dict):
-        return telemetry.get("enabled") is True or telemetry.get("interface_stats") is True
-    return monitoring.get("telemetry_enabled") is True
+        return telemetry.get("interface_stats_primary") is True or telemetry.get("disable_snmp") is True
+    return False
 
 
 def _cache_collected_at(payload: Optional[Dict[str, Any]]) -> Optional[str]:

@@ -139,7 +139,7 @@ class DeviceResolver:
                     "vendor": device.vendor or "",
                 }
                 self._cache[ip_address] = data
-                self._mark_telemetry_primary(db, device)
+                self._mark_telemetry_seen(db, device)
                 return data
             finally:
                 db.close()
@@ -147,12 +147,13 @@ class DeviceResolver:
             LOGGER.warning("resolve telemetry device failed ip=%s error=%s", ip_address, exc)
             return None
 
-    def _mark_telemetry_primary(self, db: Any, device: Any) -> None:
-        """Persist Telemetry dial-out as the preferred monitor source.
+    def _mark_telemetry_seen(self, db: Any, device: Any) -> None:
+        """Record that Telemetry dial-out is reachable without changing source.
 
-        This lets newly configured switches become Telemetry-primary
-        automatically after the first successful push, without waiting for a
-        manual CMDB edit.  SNMP stays available for protocol/gap fallback.
+        Telemetry is still useful as supplemental data, but it must not make a
+        device skip SNMP automatically.  SNMP remains the authoritative baseline
+        for basic monitoring and alerting unless an operator explicitly enables
+        a future Telemetry-primary mode.
         """
         ip_address = getattr(device, "ip_address", "")
         if not ip_address or ip_address in self._marked_telemetry:
@@ -174,10 +175,11 @@ class DeviceResolver:
             desired = {
                 "enabled": True,
                 "source": "dialout",
-                "interface_stats": True,
-                "disable_snmp": True,
+                "last_seen": True,
+                "interface_stats": False,
+                "disable_snmp": False,
                 "snmp_fallback_protocols": True,
-                "snmp_fallback_optical": False,
+                "snmp_fallback_optical": True,
             }
             changed = False
             for key, value in desired.items():
