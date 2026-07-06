@@ -39,6 +39,8 @@ INTERFACE_ALERT_RECOVERY_LOCK_TTL_SECONDS = 45
 EXPORTER_SCRAPE_CACHE_TTL_SECONDS = 5
 ROBOT_NOTIFICATION_INTERVAL_SECONDS = 2
 PENDING_ALERT_TTL_SECONDS = 7200
+INTERFACE_ADMIN_UP_OPER_DOWN_MIN_TRIGGER_SECONDS = 120
+INTERFACE_ADMIN_UP_OPER_DOWN_MAX_SAMPLE_AGE_SECONDS = 180
 _EXPORTER_SCRAPE_CACHE: Dict[int, Dict[str, Any]] = {}
 _EXPORTER_SCRAPE_CACHE_LOCK = threading.Lock()
 EXPORTER_DELTA_CACHE_TTL_SECONDS = 86400
@@ -700,26 +702,96 @@ def _clear_pending_recovery(rule: AlertRule, device: Device, target: Dict[str, A
     redis_client.delete(_pending_recovery_key(rule, device, target))
 
 
+def _parse_row_time(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _row_age_seconds(row: Dict[str, Any]) -> Optional[float]:
+    row_time = _parse_row_time(row.get("_time") or row.get("time"))
+    if not row_time:
+        return None
+    return max((_utc_now() - row_time).total_seconds(), 0.0)
+
+
 def _duration_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any], value: float) -> bool:
     duration_seconds = max(int(rule.duration or 0), 0)
+    if rule.metric_type == "interface_admin_up_oper_down":
+        duration_seconds = max(duration_seconds, INTERFACE_ADMIN_UP_OPER_DOWN_MIN_TRIGGER_SECONDS)
+
     if duration_seconds <= 0:
         return True
+
+    sample_time = str(target.get("sample_time") or "")
+    sample_age = target.get("sample_age_seconds")
+    if rule.metric_type == "interface_admin_up_oper_down" and sample_age is not None:
+        try:
+            if float(sample_age) > INTERFACE_ADMIN_UP_OPER_DOWN_MAX_SAMPLE_AGE_SECONDS:
+                logger.info(
+                    "跳过过期接口AdminUp物理Down样本",
+                    rule_id=rule.id,
+                    device_id=device.id,
+                    target=target.get("target_name"),
+                    sample_time=sample_time,
+                    sample_age_seconds=sample_age,
+                )
+                return False
+        except (TypeError, ValueError):
+            pass
 
     now = time.time()
     key = _pending_alert_key(rule, device, target)
     pending_raw = redis_client.get(key)
     first_seen = now
+    first_sample_time = sample_time
+    latest_sample_time = sample_time
     if pending_raw:
         try:
-            first_seen = float(json.loads(pending_raw).get("first_seen") or now)
+            pending_payload = json.loads(pending_raw)
+            first_seen = float(pending_payload.get("first_seen") or now)
+            first_sample_time = str(pending_payload.get("first_sample_time") or sample_time)
+            latest_sample_time = str(pending_payload.get("latest_sample_time") or first_sample_time or sample_time)
         except (TypeError, ValueError, json.JSONDecodeError):
             first_seen = now
+            first_sample_time = sample_time
+            latest_sample_time = sample_time
+        if sample_time and sample_time != latest_sample_time:
+            latest_sample_time = sample_time
+            redis_client.set(
+                key,
+                json.dumps(
+                    {
+                        "first_seen": first_seen,
+                        "first_sample_time": first_sample_time,
+                        "latest_sample_time": latest_sample_time,
+                        "rule_id": rule.id,
+                        "device_id": device.id,
+                        "target_key": target.get("target_key"),
+                        "target_name": target.get("target_name"),
+                        "value": value,
+                    },
+                    ensure_ascii=False,
+                ),
+                ex=max(duration_seconds * 3, duration_seconds + 60, PENDING_ALERT_TTL_SECONDS),
+            )
     else:
         redis_client.set(
             key,
             json.dumps(
                 {
                     "first_seen": first_seen,
+                    "first_sample_time": first_sample_time,
+                    "latest_sample_time": latest_sample_time,
                     "rule_id": rule.id,
                     "device_id": device.id,
                     "target_key": target.get("target_key"),
@@ -738,6 +810,10 @@ def _duration_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
             duration_seconds=duration_seconds,
             value=value,
         )
+
+    if rule.metric_type == "interface_admin_up_oper_down" and sample_time and first_sample_time == latest_sample_time:
+        # 不能因为同一个异常样本被规则任务反复读取，就把瞬时/过期异常升级为 P1。
+        return False
 
     return (now - first_seen) >= duration_seconds
 
@@ -2569,6 +2645,8 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
         for item in result:
             interface_name = item.get("interface_name")
             interface_index = item.get("interface_index")
+            sample_age_seconds = _row_age_seconds(item)
+            sample_time_value = item.get("_time") or item.get("time")
             if not _matches_text_filter(
                 interface_name,
                 str(extra_config.get("interface_name")) if extra_config.get("interface_name") else None,
@@ -2585,11 +2663,28 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
             value = item.get("value")
             if value is None:
                 continue
+            if (
+                metric_type == "interface_admin_up_oper_down"
+                and float(value) >= 1.0
+                and sample_age_seconds is not None
+                and sample_age_seconds > INTERFACE_ADMIN_UP_OPER_DOWN_MAX_SAMPLE_AGE_SECONDS
+            ):
+                logger.info(
+                    "跳过过期接口AdminUp物理Down采样",
+                    device_id=device.id,
+                    interface=interface_name,
+                    interface_index=interface_index,
+                    sample_age_seconds=round(sample_age_seconds, 2),
+                    sample_time=str(sample_time_value),
+                )
+                continue
             targets.append(_enrich_interface_target_with_resources(db, device, {
                 "target_type": "interface",
                 "target_key": str(interface_index or interface_name),
                 "target_name": interface_name or f"if{interface_index}",
                 "value": float(value),
+                "sample_time": str(sample_time_value) if sample_time_value is not None else None,
+                "sample_age_seconds": round(sample_age_seconds, 3) if sample_age_seconds is not None else None,
             }))
         return targets
 
