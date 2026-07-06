@@ -445,6 +445,30 @@ export const getInterfaceTopIps = async (params: {
   }
 }
 
+export interface SflowInterfaceOption {
+  interface_index: number | string
+  label: string
+  total_bps?: number | null
+  last_seen?: string | null
+}
+
+export const getSflowInterfaces = async (params: {
+  agent_ip: string
+  range?: string
+}): Promise<{
+  agent_ip: string
+  range: string
+  items: SflowInterfaceOption[]
+  total: number
+}> => {
+  return await request.get('/metrics/flow/sflow-interfaces', { params }) as {
+    agent_ip: string
+    range: string
+    items: SflowInterfaceOption[]
+    total: number
+  }
+}
+
 export interface InterfaceIpSeriesPoint {
   _time?: string
   time?: string

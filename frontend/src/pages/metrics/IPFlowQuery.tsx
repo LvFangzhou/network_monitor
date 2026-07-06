@@ -1,10 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Card, Empty, Input, InputNumber, Select, Space, Spin, Table, Tag, Typography, message, theme } from 'antd'
+import { Button, Card, Empty, Input, Select, Space, Spin, Table, Tag, Typography, message, theme } from 'antd'
 import { LineChartOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts'
 import { useSearchParams } from 'react-router-dom'
-import { getInterfaceIpSeries, getIpFlowTraffic, type InterfaceTopIpItem, type IpFlowPoint } from '../../api/metrics'
+import {
+  getInterfaceIpSeries,
+  getIpFlowTraffic,
+  getSflowInterfaces,
+  type InterfaceTopIpItem,
+  type IpFlowPoint,
+  type SflowInterfaceOption,
+} from '../../api/metrics'
 
 const { Text } = Typography
 
@@ -140,6 +147,8 @@ export default function IPFlowQuery() {
     searchParams.get('interface_index') ? Number(searchParams.get('interface_index')) : null
   )
   const [analyzerLoading, setAnalyzerLoading] = useState(false)
+  const [sflowInterfacesLoading, setSflowInterfacesLoading] = useState(false)
+  const [sflowInterfaces, setSflowInterfaces] = useState<SflowInterfaceOption[]>([])
   const [topIps, setTopIps] = useState<InterfaceTopIpItem[]>([])
   const [analyzerSeries, setAnalyzerSeries] = useState<AnalyzerChartPoint[]>([])
   const [analyzerFilterIp, setAnalyzerFilterIp] = useState('')
@@ -184,6 +193,42 @@ export default function IPFlowQuery() {
     }
   }
 
+  const fetchSflowInterfaces = async (agentIpValue = analyzerDeviceIp, silent = false) => {
+    const trimmedIp = agentIpValue.trim()
+    if (!trimmedIp) {
+      setSflowInterfaces([])
+      return
+    }
+    if (!isIpLike(trimmedIp)) {
+      if (!silent) message.warning('请输入正确的设备 IP')
+      return
+    }
+    setSflowInterfacesLoading(true)
+    try {
+      const result = await getSflowInterfaces({
+        agent_ip: trimmedIp,
+        range: selectedRange.value,
+      })
+      const items = result.items || []
+      setAnalyzerDeviceIp(result.agent_ip)
+      setSflowInterfaces(items)
+      if (!analyzerInterfaceIndex && items.length) {
+        const firstIndex = Number(items[0].interface_index)
+        if (Number.isFinite(firstIndex)) {
+          setAnalyzerInterfaceIndex(firstIndex)
+        }
+      }
+      if (!silent && !items.length) {
+        message.info('当前时间范围内没有查询到该设备的 sFlow 接口数据')
+      }
+    } catch (error: any) {
+      if (!silent) message.error(error?.response?.data?.detail || '获取sFlow接口失败')
+      setSflowInterfaces([])
+    } finally {
+      setSflowInterfacesLoading(false)
+    }
+  }
+
   const fetchInterfaceAnalysis = async (ipValue = analyzerFilterIp) => {
     const trimmedIp = analyzerDeviceIp.trim()
     if (!isIpLike(trimmedIp)) {
@@ -219,6 +264,12 @@ export default function IPFlowQuery() {
         pointMap.set(timestamp, point)
       }
       setAnalyzerSeries(Array.from(pointMap.values()).sort((a, b) => a.timestamp - b.timestamp))
+      setSearchParams({
+        ...(currentIp ? { ip: currentIp } : {}),
+        range: selectedRange.value,
+        agent_ip: result.agent_ip,
+        interface_index: String(result.interface_index),
+      })
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取接口IP分析失败')
       setTopIps([])
@@ -242,8 +293,19 @@ export default function IPFlowQuery() {
     if (initialIp) {
       fetchTraffic(initialIp, rangeValue)
     }
+    const initialAgentIp = searchParams.get('agent_ip')
+    if (initialAgentIp) {
+      void fetchSflowInterfaces(initialAgentIp, true)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  useEffect(() => {
+    if (analyzerDeviceIp && isIpLike(analyzerDeviceIp)) {
+      void fetchSflowInterfaces(analyzerDeviceIp, true)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rangeValue])
 
   const chartMeta = useMemo(() => {
     const validPoints = points.filter((point) => typeof point.in_bps === 'number' || typeof point.out_bps === 'number')
@@ -344,16 +406,35 @@ export default function IPFlowQuery() {
         <Space wrap size={10} align="center" style={{ marginBottom: 14 }}>
           <Input
             value={analyzerDeviceIp}
-            onChange={(event) => setAnalyzerDeviceIp(event.target.value)}
-            placeholder="设备IP，例如 10.242.2.2"
+            onChange={(event) => {
+              setAnalyzerDeviceIp(event.target.value)
+              setSflowInterfaces([])
+            }}
+            onPressEnter={() => fetchSflowInterfaces(analyzerDeviceIp)}
+            placeholder="sFlow Agent IP，例如 10.239.3.1"
             style={{ width: 220 }}
           />
-          <InputNumber
+          <Button icon={<ReloadOutlined />} loading={sflowInterfacesLoading} onClick={() => fetchSflowInterfaces(analyzerDeviceIp)}>
+            读取接口
+          </Button>
+          <Select
+            showSearch
+            allowClear
             value={analyzerInterfaceIndex}
             onChange={(value) => setAnalyzerInterfaceIndex(typeof value === 'number' ? value : null)}
-            placeholder="接口 ifIndex"
-            min={1}
-            style={{ width: 140 }}
+            placeholder="选择 sFlow 接口"
+            loading={sflowInterfacesLoading}
+            style={{ width: 260 }}
+            optionFilterProp="label"
+            options={sflowInterfaces.map((item) => {
+              const numericValue = Number(item.interface_index)
+              const value = Number.isFinite(numericValue) ? numericValue : -1
+              return {
+                value,
+                label: `${item.label || `ifIndex ${item.interface_index}`} · ${formatBps(item.total_bps || 0)}`,
+                disabled: value < 1,
+              }
+            })}
           />
           <Input
             value={analyzerFilterIp}

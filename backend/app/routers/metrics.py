@@ -2184,6 +2184,52 @@ async def get_interface_top_ips(
     }
 
 
+@router.get("/flow/sflow-interfaces")
+async def get_sflow_interfaces(
+    agent_ip: str = Query(..., description="sFlow Agent/设备 IP"),
+    range: str = Query("-30m", description="历史时间范围，例如 -10m/-30m/-1h"),
+):
+    """列出某个 sFlow Agent 最近上报过数据的接口。"""
+    try:
+        agent_value = str(ipaddress.ip_address(str(agent_ip).strip()))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="设备 IP 地址格式不正确") from exc
+
+    range_value = _normalize_query_range(range, "-30m")
+    flux = f'''
+    from(bucket: "{influx_client.bucket}")
+      |> range(start: {range_value})
+      |> filter(fn: (r) => r._measurement == "sflow_interface_ip_traffic")
+      |> filter(fn: (r) => r.agent_ip == {_flux_string(agent_value)})
+      |> filter(fn: (r) => r._field == "total_bps")
+      |> group(columns: ["interface_index"])
+      |> last()
+      |> keep(columns: ["_time", "_value", "interface_index"])
+    '''
+    rows = []
+    for row in influx_client.query(flux):
+        interface_index = row.get("interface_index")
+        if interface_index is None:
+            continue
+        try:
+            numeric_index = int(str(interface_index))
+        except (TypeError, ValueError):
+            numeric_index = None
+        rows.append({
+            "interface_index": numeric_index if numeric_index is not None else str(interface_index),
+            "label": f"ifIndex {interface_index}",
+            "total_bps": float(row.get("_value") or row.get("value") or 0.0),
+            "last_seen": row.get("_time") or row.get("time"),
+        })
+    rows.sort(key=lambda item: (0 if isinstance(item.get("interface_index"), int) else 1, item.get("interface_index")))
+    return {
+        "agent_ip": agent_value,
+        "range": range_value,
+        "items": rows,
+        "total": len(rows),
+    }
+
+
 @router.get("/flow/interface-ip-series")
 async def get_interface_ip_series(
     agent_ip: str = Query(..., description="sFlow Agent/设备 IP"),
