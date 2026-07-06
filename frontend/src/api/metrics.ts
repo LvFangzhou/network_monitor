@@ -448,6 +448,11 @@ export const getInterfaceTopIps = async (params: {
 export interface SflowInterfaceOption {
   interface_index: number | string
   label: string
+  interface_name?: string | null
+  alias?: string | null
+  admin_status?: string | null
+  oper_status?: string | null
+  speed_bps?: number | null
   total_bps?: number | null
   last_seen?: string | null
 }

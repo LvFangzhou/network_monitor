@@ -429,9 +429,11 @@ export default function IPFlowQuery() {
             options={sflowInterfaces.map((item) => {
               const numericValue = Number(item.interface_index)
               const value = Number.isFinite(numericValue) ? numericValue : -1
+              const statusText = item.oper_status ? ` ${String(item.oper_status).toUpperCase()}` : ''
+              const aliasText = item.alias && item.alias !== item.interface_name ? ` / ${item.alias}` : ''
               return {
                 value,
-                label: `${item.label || `ifIndex ${item.interface_index}`} · ${formatBps(item.total_bps || 0)}`,
+                label: `${item.label || `ifIndex ${item.interface_index}`}${aliasText}${statusText} · ${formatBps(item.total_bps || 0)}`,
                 disabled: value < 1,
               }
             })}

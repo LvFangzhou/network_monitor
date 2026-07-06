@@ -118,6 +118,46 @@ def _load_monitor_cache(kind: str, device_id: int, suffix: str = "") -> Optional
         return None
 
 
+def _store_monitor_cache(kind: str, device_id: int, payload: Any, ttl_seconds: int, suffix: str = "") -> None:
+    redis_client.setex(
+        _monitor_cache_key(kind, device_id, suffix),
+        ttl_seconds,
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
+
+
+def _get_device_interface_name_map(device: Device) -> Dict[str, Dict[str, Any]]:
+    """Return ifIndex -> interface metadata map, preferring cached SNMP interface list."""
+    cached = _load_monitor_cache("interfaces", device.id)
+    interfaces = []
+    if isinstance(cached, dict):
+        interfaces = cached.get("interfaces") or []
+    if not interfaces and device.snmp_version:
+        try:
+            interfaces = snmp_collector.list_interfaces(device)
+            _store_monitor_cache(
+                "interfaces",
+                device.id,
+                {
+                    "device_id": device.id,
+                    "interfaces": interfaces,
+                    "collected_at": datetime.now(timezone.utc).isoformat(),
+                },
+                3600,
+            )
+        except Exception as exc:
+            logger.warning("sFlow接口名映射读取SNMP接口表失败", device_id=device.id, ip=device.ip_address, error=str(exc))
+            interfaces = []
+
+    mapping: Dict[str, Dict[str, Any]] = {}
+    for item in interfaces:
+        index = item.get("index")
+        if index is None:
+            continue
+        mapping[str(index)] = item
+    return mapping
+
+
 def _telemetry_snmp_disabled(device: Device) -> bool:
     custom_fields = device.custom_fields or {}
     if not isinstance(custom_fields, dict):
@@ -2188,6 +2228,7 @@ async def get_interface_top_ips(
 async def get_sflow_interfaces(
     agent_ip: str = Query(..., description="sFlow Agent/设备 IP"),
     range: str = Query("-30m", description="历史时间范围，例如 -10m/-30m/-1h"),
+    db: Session = Depends(get_db),
 ):
     """列出某个 sFlow Agent 最近上报过数据的接口。"""
     try:
@@ -2206,6 +2247,8 @@ async def get_sflow_interfaces(
       |> last()
       |> keep(columns: ["_time", "_value", "interface_index"])
     '''
+    device = db.query(Device).filter(Device.ip_address == agent_value).first()
+    interface_map = _get_device_interface_name_map(device) if device else {}
     rows = []
     for row in influx_client.query(flux):
         interface_index = row.get("interface_index")
@@ -2215,9 +2258,18 @@ async def get_sflow_interfaces(
             numeric_index = int(str(interface_index))
         except (TypeError, ValueError):
             numeric_index = None
+        interface_meta = interface_map.get(str(interface_index)) or {}
+        interface_name = interface_meta.get("name") or interface_meta.get("description")
+        interface_alias = interface_meta.get("alias")
+        display_name = interface_name or f"ifIndex {interface_index}"
         rows.append({
             "interface_index": numeric_index if numeric_index is not None else str(interface_index),
-            "label": f"ifIndex {interface_index}",
+            "interface_name": interface_name,
+            "alias": interface_alias,
+            "admin_status": interface_meta.get("admin_status"),
+            "oper_status": interface_meta.get("oper_status"),
+            "speed_bps": interface_meta.get("speed_bps"),
+            "label": display_name,
             "total_bps": float(row.get("_value") or row.get("value") or 0.0),
             "last_seen": row.get("_time") or row.get("time"),
         })
