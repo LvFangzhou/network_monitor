@@ -2503,7 +2503,8 @@ async def get_interface_ip_series(
       |> filter(fn: (r) => r.interface_index == {_flux_string(interface_index)})
       |> filter(fn: (r) => {ip_filter})
       |> filter(fn: (r) => r._field == "total_bps")
-      |> aggregateWindow(every: {interval_value}, fn: mean, createEmpty: false)
+      |> aggregateWindow(every: {interval_value}, fn: mean, createEmpty: true)
+      |> fill(value: 0.0)
       |> keep(columns: ["_time", "_value", "ip"])
       |> sort(columns: ["_time"])
     '''

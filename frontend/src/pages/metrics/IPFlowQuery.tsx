@@ -157,6 +157,7 @@ export default function IPFlowQuery() {
   const [analyzerSeries, setAnalyzerSeries] = useState<AnalyzerChartPoint[]>([])
   const [analyzerFilterIp, setAnalyzerFilterIp] = useState('')
   const [selectedRank, setSelectedRank] = useState<number | null>(null)
+  const [visibleTopIps, setVisibleTopIps] = useState<string[]>([])
 
   const selectedRange = RANGE_OPTIONS.find((item) => item.value === rangeValue) || RANGE_OPTIONS[1]
 
@@ -291,6 +292,7 @@ export default function IPFlowQuery() {
         ip: targetIp || undefined,
       })
       setTopIps(result.top_ips || [])
+      setVisibleTopIps([])
       setSelectedRank(result.selected_rank ?? null)
       const pointMap = new Map<number, AnalyzerChartPoint>()
       for (const item of result.series || []) {
@@ -376,8 +378,9 @@ export default function IPFlowQuery() {
   }, [points, rangeValue])
 
   const analyzerChartMeta = useMemo(() => {
+    const chartIps = visibleTopIps.length ? topIps.filter((item) => visibleTopIps.includes(item.ip)) : topIps
     const values = analyzerSeries.flatMap((point) =>
-      topIps.map((item) => Number(point[getAnalyzerDataKey(item.ip)] || 0))
+      chartIps.map((item) => Number(point[getAnalyzerDataKey(item.ip)] || 0))
     )
     const maxValue = Math.max(...values, 0)
     const yMax = niceCeil(maxValue * 1.12)
@@ -394,8 +397,9 @@ export default function IPFlowQuery() {
       xDomain: [adjustedStart, adjustedEnd] as [number, number],
       xTicks: buildTicks(adjustedStart, adjustedEnd, getXAxisTickCount(rangeValue)),
       scale,
+      chartIps,
     }
-  }, [analyzerSeries, topIps, rangeValue])
+  }, [analyzerSeries, topIps, visibleTopIps, rangeValue])
 
   const lineColors = ['#52c41a', '#f4d000', '#1677ff', '#fa8c16', '#722ed1', '#13c2c2', '#eb2f96', '#a0d911', '#fa541c', '#2f54eb']
 
@@ -561,7 +565,7 @@ export default function IPFlowQuery() {
           </Space>
         }
       >
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 360px', gap: 16, marginBottom: 16 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 520px', gap: 14, marginBottom: 14, alignItems: 'start' }}>
           <Space wrap size={10} align="center">
             <Select
               showSearch
@@ -627,12 +631,11 @@ export default function IPFlowQuery() {
               border: `1px solid ${token.colorBorderSecondary}`,
               background: token.colorFillAlter,
               borderRadius: 10,
-              padding: 12,
-              minHeight: 118,
+              padding: '10px 12px',
             }}
           >
-            <Space direction="vertical" size={6} style={{ width: '100%' }}>
-              <Space wrap size={6}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 12, rowGap: 6, fontSize: 13 }}>
+              <Space wrap size={6} style={{ gridColumn: '1 / -1' }}>
                 <Tag color="processing">{selectedSflowAgent?.device?.datacenter?.name || '未知机房'}</Tag>
                 {selectedSflowInterface?.circuit?.operator_name && (
                   <Tag color={getOperatorColor(selectedSflowInterface.circuit.operator_name)}>
@@ -640,20 +643,17 @@ export default function IPFlowQuery() {
                   </Tag>
                 )}
                 {selectedSflowInterface?.circuit?.line_type && <Tag>{selectedSflowInterface.circuit.line_type}</Tag>}
+                {selectedSflowInterface?.oper_status && <Tag color={selectedSflowInterface.oper_status === 'up' ? 'success' : 'error'}>{String(selectedSflowInterface.oper_status).toUpperCase()}</Tag>}
               </Space>
-              <Text strong>{selectedSflowInterface?.label || selectedSflowAgent?.device?.name || '请选择 Agent 和接口'}</Text>
-              <Text type="secondary">
-                描述：{selectedSflowInterface?.alias || '暂无接口描述'}
+              <Text strong ellipsis title={selectedSflowInterface?.label || selectedSflowAgent?.device?.name || ''}>
+                {selectedSflowInterface?.label || selectedSflowAgent?.device?.name || '请选择 Agent 和接口'}
               </Text>
-              <Text type="secondary">
-                线路：{selectedSflowInterface?.circuit?.name || '未匹配录入线路'}；接口状态：
-                {selectedSflowInterface?.oper_status ? String(selectedSflowInterface.oper_status).toUpperCase() : '-'}；
-                最近流量：{formatBps(selectedSflowInterface?.total_bps || 0)}
-              </Text>
-              <Text type="secondary">
-                Agent：{analyzerDeviceIp || '-'}；已发现接口：{selectedSflowAgent?.interface_count ?? sflowInterfaces.length} 个
-              </Text>
-            </Space>
+              <Text type="secondary">最近：{formatBps(selectedSflowInterface?.total_bps || 0)}</Text>
+              <Text type="secondary" ellipsis title={selectedSflowInterface?.alias || ''}>描述：{selectedSflowInterface?.alias || '暂无'}</Text>
+              <Text type="secondary" ellipsis title={selectedSflowInterface?.circuit?.name || ''}>线路：{selectedSflowInterface?.circuit?.name || '未匹配'}</Text>
+              <Text type="secondary">Agent：{analyzerDeviceIp || '-'}</Text>
+              <Text type="secondary">接口：{selectedSflowAgent?.interface_count ?? sflowInterfaces.length} 个</Text>
+            </div>
           </div>
         </div>
 
@@ -696,7 +696,7 @@ export default function IPFlowQuery() {
                       labelFormatter={(value) => dayjs(Number(value)).format('YYYY-MM-DD HH:mm:ss')}
                       formatter={(value: any, name: any) => [formatBps(Number(value)), name]}
                     />
-                    {topIps.map((item, index) => (
+                    {analyzerChartMeta.chartIps.map((item, index) => (
                       <Line
                         key={item.ip}
                         type="linear"
@@ -721,9 +721,40 @@ export default function IPFlowQuery() {
               dataSource={topIps}
               pagination={false}
               scroll={{ y: 315 }}
+              title={() => (
+                <Space size={8} wrap>
+                  <Text type="secondary">点击 IP 可只看该 IP；再次点击取消。未选择时显示全部。</Text>
+                  {visibleTopIps.length ? (
+                    <Button size="small" onClick={() => setVisibleTopIps([])}>显示全部</Button>
+                  ) : null}
+                </Space>
+              )}
+              onRow={(record) => ({
+                onClick: () => {
+                  setVisibleTopIps((prev) =>
+                    prev.includes(record.ip)
+                      ? prev.filter((item) => item !== record.ip)
+                      : [...prev, record.ip]
+                  )
+                },
+                style: {
+                  cursor: 'pointer',
+                  background: visibleTopIps.includes(record.ip) ? token.colorPrimaryBg : undefined,
+                },
+              })}
               columns={[
                 { title: '排名', key: 'rank', width: 58, render: (_: unknown, record: InterfaceTopIpItem, index: number) => record.rank || index + 1 },
-                { title: 'IP地址', dataIndex: 'ip', key: 'ip', width: 138 },
+                {
+                  title: 'IP地址',
+                  dataIndex: 'ip',
+                  key: 'ip',
+                  width: 138,
+                  render: (value: string) => (
+                    <Text strong={visibleTopIps.includes(value)} style={{ color: visibleTopIps.includes(value) ? token.colorPrimary : undefined }}>
+                      {value}
+                    </Text>
+                  ),
+                },
                 { title: '总平均', dataIndex: 'total_bps', key: 'total_bps', align: 'right', render: (value: number) => <Text strong>{formatBps(value)}</Text> },
               ]}
             />
