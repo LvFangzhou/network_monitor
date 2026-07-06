@@ -453,8 +453,61 @@ export interface SflowInterfaceOption {
   admin_status?: string | null
   oper_status?: string | null
   speed_bps?: number | null
+  device?: {
+    id: number
+    name: string
+    ip_address: string
+    vendor?: string | null
+    model?: string | null
+    datacenter?: { id: number; name: string; code?: string | null } | null
+  } | null
+  circuit?: {
+    id: number
+    name: string
+    operator_name?: string | null
+    line_type?: string | null
+    bandwidth_mbps?: number | null
+    status?: string | null
+  } | null
   total_bps?: number | null
   last_seen?: string | null
+}
+
+export interface SflowAgentOption {
+  agent_ip: string
+  interface_count: number
+  total_bps?: number | null
+  last_seen?: string | null
+  device?: {
+    id: number
+    name: string
+    ip_address: string
+    vendor?: string | null
+    model?: string | null
+    datacenter?: { id: number; name: string; code?: string | null } | null
+  } | null
+  circuits?: Array<{
+    id: number
+    name: string
+    operator_name?: string | null
+    line_type?: string | null
+    bandwidth_mbps?: number | null
+    status?: string | null
+  } | null>
+}
+
+export const getSflowAgents = async (params?: {
+  range?: string
+}): Promise<{
+  range: string
+  items: SflowAgentOption[]
+  total: number
+}> => {
+  return await request.get('/metrics/flow/sflow-agents', { params }) as {
+    range: string
+    items: SflowAgentOption[]
+    total: number
+  }
 }
 
 export const getSflowInterfaces = async (params: {

@@ -158,6 +158,75 @@ def _get_device_interface_name_map(device: Device) -> Dict[str, Dict[str, Any]]:
     return mapping
 
 
+def _normalize_interface_label(value: Optional[str]) -> str:
+    """Normalize interface text for loose matching between SNMP/sFlow and resource records."""
+    if not value:
+        return ""
+    return re.sub(r"[\s_\-]+", "", str(value).strip().lower())
+
+
+def _circuit_payload(circuit: Optional[Circuit]) -> Optional[Dict[str, Any]]:
+    if not circuit:
+        return None
+    return {
+        "id": circuit.id,
+        "name": circuit.name,
+        "operator_name": circuit.operator_name,
+        "line_type": circuit.line_type,
+        "bandwidth_mbps": circuit.bandwidth_mbps,
+        "status": circuit.status,
+    }
+
+
+def _match_circuit_for_interface(db: Session, device: Optional[Device], interface_name: Optional[str], alias: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Match a device interface to the recorded circuit/public-line metadata when possible."""
+    if not device:
+        return None
+    candidates = {
+        _normalize_interface_label(interface_name),
+        _normalize_interface_label(alias),
+    }
+    candidates.discard("")
+    if not candidates:
+        return None
+
+    circuits = db.query(Circuit).filter(
+        (
+            (Circuit.primary_device_id == device.id)
+            | (Circuit.secondary_device_id == device.id)
+            | (Circuit.aggregation_monitor_device_id == device.id)
+        ),
+        Circuit.status != "deleted",
+    ).all()
+    for circuit in circuits:
+        ports = {
+            _normalize_interface_label(circuit.primary_port_name),
+            _normalize_interface_label(circuit.secondary_port_name),
+            _normalize_interface_label(circuit.aggregation_interface_name),
+        }
+        ports.discard("")
+        if candidates & ports:
+            return _circuit_payload(circuit)
+    return None
+
+
+def _device_payload_for_flow(device: Optional[Device]) -> Optional[Dict[str, Any]]:
+    if not device:
+        return None
+    return {
+        "id": device.id,
+        "name": device.name,
+        "ip_address": device.ip_address,
+        "vendor": device.vendor,
+        "model": device.model,
+        "datacenter": {
+            "id": device.datacenter_ref.id,
+            "name": device.datacenter_ref.name,
+            "code": device.datacenter_ref.code,
+        } if device.datacenter_ref else None,
+    }
+
+
 def _telemetry_snmp_disabled(device: Device) -> bool:
     custom_fields = device.custom_fields or {}
     if not isinstance(custom_fields, dict):
@@ -2224,6 +2293,69 @@ async def get_interface_top_ips(
     }
 
 
+@router.get("/flow/sflow-agents")
+async def get_sflow_agents(
+    range: str = Query("-30m", description="历史时间范围，例如 -10m/-30m/-1h"),
+    db: Session = Depends(get_db),
+):
+    """列出最近有 sFlow 数据的 Agent，便于前端直接下拉选择。"""
+    range_value = _normalize_query_range(range, "-30m")
+    flux = f'''
+    from(bucket: "{influx_client.bucket}")
+      |> range(start: {range_value})
+      |> filter(fn: (r) => r._measurement == "sflow_interface_ip_traffic")
+      |> filter(fn: (r) => r._field == "total_bps")
+      |> group(columns: ["agent_ip", "interface_index"])
+      |> last()
+      |> keep(columns: ["_time", "_value", "agent_ip", "interface_index"])
+    '''
+    agent_map: Dict[str, Dict[str, Any]] = {}
+    for row in influx_client.query(flux):
+        agent_ip = row.get("agent_ip")
+        if not agent_ip:
+            continue
+        item = agent_map.setdefault(str(agent_ip), {
+            "agent_ip": str(agent_ip),
+            "interface_count": 0,
+            "total_bps": 0.0,
+            "last_seen": None,
+        })
+        item["interface_count"] += 1
+        item["total_bps"] += float(row.get("_value") or row.get("value") or 0.0)
+        row_time = row.get("_time") or row.get("time")
+        if row_time and (not item.get("last_seen") or str(row_time) > str(item.get("last_seen"))):
+            item["last_seen"] = row_time
+
+    if not agent_map:
+        return {"range": range_value, "items": [], "total": 0}
+
+    devices = db.query(Device).filter(Device.ip_address.in_(list(agent_map.keys()))).all()
+    device_map = {device.ip_address: device for device in devices}
+    for agent_ip, item in agent_map.items():
+        device = device_map.get(agent_ip)
+        item["device"] = _device_payload_for_flow(device)
+        if device:
+            circuits = db.query(Circuit).filter(
+                (
+                    (Circuit.primary_device_id == device.id)
+                    | (Circuit.secondary_device_id == device.id)
+                    | (Circuit.aggregation_monitor_device_id == device.id)
+                ),
+                Circuit.status != "deleted",
+            ).limit(6).all()
+            item["circuits"] = [_circuit_payload(circuit) for circuit in circuits if circuit]
+        else:
+            item["circuits"] = []
+
+    def _agent_sort_key(item: Dict[str, Any]) -> str:
+        device = item.get("device") or {}
+        datacenter = device.get("datacenter") or {}
+        return f"{datacenter.get('name') or ''}|{device.get('name') or ''}|{item.get('agent_ip') or ''}"
+
+    rows = sorted(agent_map.values(), key=_agent_sort_key)
+    return {"range": range_value, "items": rows, "total": len(rows)}
+
+
 @router.get("/flow/sflow-interfaces")
 async def get_sflow_interfaces(
     agent_ip: str = Query(..., description="sFlow Agent/设备 IP"),
@@ -2262,6 +2394,7 @@ async def get_sflow_interfaces(
         interface_name = interface_meta.get("name") or interface_meta.get("description")
         interface_alias = interface_meta.get("alias")
         display_name = interface_name or f"ifIndex {interface_index}"
+        circuit = _match_circuit_for_interface(db, device, interface_name, interface_alias)
         rows.append({
             "interface_index": numeric_index if numeric_index is not None else str(interface_index),
             "interface_name": interface_name,
@@ -2269,6 +2402,8 @@ async def get_sflow_interfaces(
             "admin_status": interface_meta.get("admin_status"),
             "oper_status": interface_meta.get("oper_status"),
             "speed_bps": interface_meta.get("speed_bps"),
+            "device": _device_payload_for_flow(device),
+            "circuit": circuit,
             "label": display_name,
             "total_bps": float(row.get("_value") or row.get("value") or 0.0),
             "last_seen": row.get("_time") or row.get("time"),

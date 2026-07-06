@@ -7,9 +7,11 @@ import { useSearchParams } from 'react-router-dom'
 import {
   getInterfaceIpSeries,
   getIpFlowTraffic,
+  getSflowAgents,
   getSflowInterfaces,
   type InterfaceTopIpItem,
   type IpFlowPoint,
+  type SflowAgentOption,
   type SflowInterfaceOption,
 } from '../../api/metrics'
 
@@ -147,6 +149,8 @@ export default function IPFlowQuery() {
     searchParams.get('interface_index') ? Number(searchParams.get('interface_index')) : null
   )
   const [analyzerLoading, setAnalyzerLoading] = useState(false)
+  const [sflowAgentsLoading, setSflowAgentsLoading] = useState(false)
+  const [sflowAgents, setSflowAgents] = useState<SflowAgentOption[]>([])
   const [sflowInterfacesLoading, setSflowInterfacesLoading] = useState(false)
   const [sflowInterfaces, setSflowInterfaces] = useState<SflowInterfaceOption[]>([])
   const [topIps, setTopIps] = useState<InterfaceTopIpItem[]>([])
@@ -155,6 +159,16 @@ export default function IPFlowQuery() {
   const [selectedRank, setSelectedRank] = useState<number | null>(null)
 
   const selectedRange = RANGE_OPTIONS.find((item) => item.value === rangeValue) || RANGE_OPTIONS[1]
+
+  const selectedSflowAgent = useMemo(
+    () => sflowAgents.find((item) => item.agent_ip === analyzerDeviceIp),
+    [sflowAgents, analyzerDeviceIp]
+  )
+
+  const selectedSflowInterface = useMemo(
+    () => sflowInterfaces.find((item) => Number(item.interface_index) === Number(analyzerInterfaceIndex)),
+    [sflowInterfaces, analyzerInterfaceIndex]
+  )
 
   const fetchTraffic = async (ipValue = currentIp, range = rangeValue, silent = false) => {
     const trimmedIp = ipValue.trim()
@@ -193,6 +207,27 @@ export default function IPFlowQuery() {
     }
   }
 
+  const fetchSflowAgents = async (silent = false) => {
+    setSflowAgentsLoading(true)
+    try {
+      const result = await getSflowAgents({ range: selectedRange.value })
+      const items = result.items || []
+      setSflowAgents(items)
+      if (!analyzerDeviceIp && items.length) {
+        setAnalyzerDeviceIp(items[0].agent_ip)
+        void fetchSflowInterfaces(items[0].agent_ip, true)
+      }
+      if (!silent && !items.length) {
+        message.info('当前时间范围内暂未发现 sFlow Agent 数据')
+      }
+    } catch (error: any) {
+      if (!silent) message.error(error?.response?.data?.detail || '获取sFlow Agent失败')
+      setSflowAgents([])
+    } finally {
+      setSflowAgentsLoading(false)
+    }
+  }
+
   const fetchSflowInterfaces = async (agentIpValue = analyzerDeviceIp, silent = false) => {
     const trimmedIp = agentIpValue.trim()
     if (!trimmedIp) {
@@ -212,12 +247,13 @@ export default function IPFlowQuery() {
       const items = result.items || []
       setAnalyzerDeviceIp(result.agent_ip)
       setSflowInterfaces(items)
-      if (!analyzerInterfaceIndex && items.length) {
-        const firstIndex = Number(items[0].interface_index)
-        if (Number.isFinite(firstIndex)) {
-          setAnalyzerInterfaceIndex(firstIndex)
+      setAnalyzerInterfaceIndex((currentValue) => {
+        if (currentValue && items.some((item) => Number(item.interface_index) === Number(currentValue))) {
+          return currentValue
         }
-      }
+        const firstIndex = items.length ? Number(items[0].interface_index) : null
+        return firstIndex && Number.isFinite(firstIndex) ? firstIndex : null
+      })
       if (!silent && !items.length) {
         message.info('当前时间范围内没有查询到该设备的 sFlow 接口数据')
       }
@@ -293,6 +329,7 @@ export default function IPFlowQuery() {
     if (initialIp) {
       fetchTraffic(initialIp, rangeValue)
     }
+    void fetchSflowAgents(true)
     const initialAgentIp = searchParams.get('agent_ip')
     if (initialAgentIp) {
       void fetchSflowInterfaces(initialAgentIp, true)
@@ -362,17 +399,130 @@ export default function IPFlowQuery() {
 
   const lineColors = ['#52c41a', '#f4d000', '#1677ff', '#fa8c16', '#722ed1', '#13c2c2', '#eb2f96', '#a0d911', '#fa541c', '#2f54eb']
 
+  const getOperatorColor = (operator?: string | null) => {
+    const value = operator || ''
+    if (value.includes('电信') || value.toLowerCase().includes('ctcc')) return 'blue'
+    if (value.includes('联通') || value.toLowerCase().includes('cucc')) return 'magenta'
+    if (value.includes('移动') || value.toLowerCase().includes('cmcc')) return 'green'
+    if (value.toLowerCase().includes('bgp')) return 'purple'
+    return 'default'
+  }
+
+  const renderIpTrafficChart = () => (
+    <Spin spinning={loading}>
+      {chartMeta.data.length ? (
+        <>
+          <div
+            style={{
+              width: '100%',
+              height: 360,
+              border: `1px solid ${token.colorBorderSecondary}`,
+              borderRadius: 8,
+              padding: '16px 14px 6px 8px',
+              background: token.colorBgContainer,
+            }}
+          >
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={chartMeta.data} margin={{ top: 12, right: 24, left: 20, bottom: 18 }}>
+                <CartesianGrid stroke={token.colorBorderSecondary} horizontal vertical />
+                <XAxis
+                  type="number"
+                  dataKey="timestamp"
+                  domain={chartMeta.xDomain}
+                  ticks={chartMeta.xTicks}
+                  tickFormatter={(value) => formatXAxisTick(Number(value), rangeValue)}
+                  tick={{ fill: token.colorTextSecondary, fontSize: 12 }}
+                  axisLine={{ stroke: token.colorBorder }}
+                  tickLine={{ stroke: token.colorBorder }}
+                  allowDataOverflow
+                />
+                <YAxis
+                  type="number"
+                  domain={chartMeta.yDomain}
+                  ticks={chartMeta.yTicks}
+                  tickFormatter={(value) => formatBps(Number(value), chartMeta.scale)}
+                  tick={{ fill: token.colorTextSecondary, fontSize: 12 }}
+                  axisLine={{ stroke: token.colorBorder }}
+                  tickLine={{ stroke: token.colorBorder }}
+                  width={82}
+                />
+                <RechartsTooltip
+                  labelFormatter={(value) => dayjs(Number(value)).format('YYYY-MM-DD HH:mm:ss')}
+                  formatter={(value: any, name: any) => [formatBps(Number(value)), name]}
+                />
+                <Line
+                  type="linear"
+                  dataKey="in_bps"
+                  name="IP入向流量"
+                  stroke="#70d34f"
+                  strokeWidth={1.5}
+                  dot={{ r: 2, strokeWidth: 1.4, fill: '#fff' }}
+                  activeDot={{ r: 4 }}
+                  connectNulls={false}
+                />
+                <Line
+                  type="linear"
+                  dataKey="out_bps"
+                  name="IP出向流量"
+                  stroke="#f4d000"
+                  strokeWidth={1.5}
+                  dot={{ r: 2, strokeWidth: 1.4, fill: '#fff' }}
+                  activeDot={{ r: 4 }}
+                  connectNulls={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 110px 110px 110px', gap: 8, marginTop: 12, paddingInline: 6, fontSize: 13 }}>
+            <Text type="secondary">Name</Text>
+            <Text strong style={{ textAlign: 'right' }}>Last</Text>
+            <Text strong style={{ textAlign: 'right' }}>Min</Text>
+            <Text strong style={{ textAlign: 'right' }}>Max</Text>
+            <Space size={8}><span style={{ width: 14, height: 3, background: '#70d34f', display: 'inline-block' }} />IP入向流量</Space>
+            <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.lastIn)}</Text>
+            <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.minIn)}</Text>
+            <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.maxIn)}</Text>
+            <Space size={8}><span style={{ width: 14, height: 3, background: '#f4d000', display: 'inline-block' }} />IP出向流量</Space>
+            <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.lastOut)}</Text>
+            <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.minOut)}</Text>
+            <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.maxOut)}</Text>
+          </div>
+        </>
+      ) : (
+        <Empty description={currentIp ? '当前时间范围内暂无IP流量数据' : '请输入IP地址查询流量'} style={{ padding: '72px 0' }} />
+      )}
+    </Spin>
+  )
+
   return (
     <div style={{ padding: 24, background: token.colorBgLayout, minHeight: '100%' }}>
-      <Card style={{ marginBottom: 16, borderRadius: 6 }} bodyStyle={{ padding: 16 }}>
-        <Space wrap size={10} align="center">
+      <Card
+        style={{ marginBottom: 16, borderRadius: 12 }}
+        bodyStyle={{ padding: 18 }}
+        title={
+          <Space size={8}>
+            <LineChartOutlined style={{ color: '#52c41a' }} />
+            <span>单 IP 流量分析</span>
+            {currentIp && <Tag color="blue">{currentIp}</Tag>}
+          </Space>
+        }
+        extra={
+          <Space size={8} wrap>
+            <Tag>单位 {chartMeta.scale.suffix}</Tag>
+            <Tag>粒度 {selectedRange.interval}</Tag>
+            {flowSource === 'sflow_interface' && <Tag color="green">sFlow接口样本</Tag>}
+            {customers.length ? customers.map((item) => <Tag color="blue" key={item.id}>{item.name}</Tag>) : <Tag>未匹配客户</Tag>}
+          </Space>
+        }
+      >
+        <Space wrap size={10} align="center" style={{ marginBottom: 14 }}>
           <Input
             value={ipInput}
             onChange={(event) => setIpInput(event.target.value)}
             onPressEnter={() => fetchTraffic(ipInput, rangeValue)}
-            placeholder="输入公网IP，例如 119.167.167.59"
+            placeholder="输入要分析的 IP，例如 119.167.167.59"
             prefix={<SearchOutlined />}
-            style={{ width: 300 }}
+            style={{ width: 320 }}
           />
           <Select
             value={rangeValue}
@@ -390,74 +540,130 @@ export default function IPFlowQuery() {
             onChange={setRefreshSeconds}
           />
           <Button type="primary" icon={<SearchOutlined />} onClick={() => fetchTraffic(ipInput, rangeValue)}>
-            查询
+            查询IP流量
           </Button>
           <Button icon={<ReloadOutlined />} onClick={() => fetchTraffic(currentIp || ipInput, rangeValue)} />
           {lastUpdatedAt && <Text type="secondary">更新时间 {lastUpdatedAt}</Text>}
         </Space>
+        {renderIpTrafficChart()}
       </Card>
 
       <Card
-        style={{ marginBottom: 16, borderRadius: 6 }}
-        bodyStyle={{ padding: 16 }}
-        title="sFlow接口分析器"
-        extra={<Tag>按平均带宽排序</Tag>}
+        style={{ borderRadius: 12 }}
+        bodyStyle={{ padding: 18 }}
+        title="sFlow 接口 Top10 IP 分析"
+        extra={
+          <Space size={8}>
+            <Tag>按平均带宽排序</Tag>
+            <Button size="small" icon={<ReloadOutlined />} loading={sflowAgentsLoading} onClick={() => fetchSflowAgents()}>
+              刷新Agent
+            </Button>
+          </Space>
+        }
       >
-        <Space wrap size={10} align="center" style={{ marginBottom: 14 }}>
-          <Input
-            value={analyzerDeviceIp}
-            onChange={(event) => {
-              setAnalyzerDeviceIp(event.target.value)
-              setSflowInterfaces([])
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 360px', gap: 16, marginBottom: 16 }}>
+          <Space wrap size={10} align="center">
+            <Select
+              showSearch
+              allowClear
+              value={analyzerDeviceIp || undefined}
+              loading={sflowAgentsLoading}
+              placeholder="选择 sFlow Agent / 设备"
+              style={{ width: 360 }}
+              optionFilterProp="label"
+              onChange={(value) => {
+                const nextIp = value || ''
+                setAnalyzerDeviceIp(nextIp)
+                setSflowInterfaces([])
+                setAnalyzerInterfaceIndex(null)
+                if (nextIp) void fetchSflowInterfaces(nextIp, true)
+              }}
+              options={sflowAgents.map((item) => {
+                const device = item.device
+                const dcName = device?.datacenter?.name
+                const label = `${item.agent_ip}${device?.name ? ` / ${device.name}` : ''}${dcName ? ` / ${dcName}` : ''}`
+                return {
+                  value: item.agent_ip,
+                  label,
+                }
+              })}
+            />
+            <Button icon={<ReloadOutlined />} loading={sflowInterfacesLoading} onClick={() => fetchSflowInterfaces(analyzerDeviceIp)}>
+              读取接口
+            </Button>
+            <Select
+              showSearch
+              allowClear
+              value={analyzerInterfaceIndex}
+              onChange={(value) => setAnalyzerInterfaceIndex(typeof value === 'number' ? value : null)}
+              placeholder="选择接口"
+              loading={sflowInterfacesLoading}
+              style={{ width: 260 }}
+              optionFilterProp="label"
+              options={sflowInterfaces.map((item) => {
+                const numericValue = Number(item.interface_index)
+                const value = Number.isFinite(numericValue) ? numericValue : -1
+                return {
+                  value,
+                  label: `${item.label || `ifIndex ${item.interface_index}`} · ${formatBps(item.total_bps || 0)}`,
+                  disabled: value < 1,
+                }
+              })}
+            />
+            <Input
+              value={analyzerFilterIp}
+              onChange={(event) => setAnalyzerFilterIp(event.target.value)}
+              onPressEnter={() => fetchInterfaceAnalysis(analyzerFilterIp)}
+              placeholder="指定IP，可留空看Top10"
+              style={{ width: 220 }}
+            />
+            <Button type="primary" icon={<SearchOutlined />} onClick={() => fetchInterfaceAnalysis(analyzerFilterIp)}>
+              分析Top10
+            </Button>
+            {selectedRank && <Tag color="blue">当前IP排名 {selectedRank}</Tag>}
+          </Space>
+          <div
+            style={{
+              border: `1px solid ${token.colorBorderSecondary}`,
+              background: token.colorFillAlter,
+              borderRadius: 10,
+              padding: 12,
+              minHeight: 118,
             }}
-            onPressEnter={() => fetchSflowInterfaces(analyzerDeviceIp)}
-            placeholder="sFlow Agent IP，例如 10.239.3.1"
-            style={{ width: 220 }}
-          />
-          <Button icon={<ReloadOutlined />} loading={sflowInterfacesLoading} onClick={() => fetchSflowInterfaces(analyzerDeviceIp)}>
-            读取接口
-          </Button>
-          <Select
-            showSearch
-            allowClear
-            value={analyzerInterfaceIndex}
-            onChange={(value) => setAnalyzerInterfaceIndex(typeof value === 'number' ? value : null)}
-            placeholder="选择 sFlow 接口"
-            loading={sflowInterfacesLoading}
-            style={{ width: 260 }}
-            optionFilterProp="label"
-            options={sflowInterfaces.map((item) => {
-              const numericValue = Number(item.interface_index)
-              const value = Number.isFinite(numericValue) ? numericValue : -1
-              const statusText = item.oper_status ? ` ${String(item.oper_status).toUpperCase()}` : ''
-              const aliasText = item.alias && item.alias !== item.interface_name ? ` / ${item.alias}` : ''
-              return {
-                value,
-                label: `${item.label || `ifIndex ${item.interface_index}`}${aliasText}${statusText} · ${formatBps(item.total_bps || 0)}`,
-                disabled: value < 1,
-              }
-            })}
-          />
-          <Input
-            value={analyzerFilterIp}
-            onChange={(event) => setAnalyzerFilterIp(event.target.value)}
-            onPressEnter={() => fetchInterfaceAnalysis(analyzerFilterIp)}
-            placeholder="指定IP，可留空看Top10"
-            style={{ width: 220 }}
-          />
-          <Button type="primary" icon={<SearchOutlined />} onClick={() => fetchInterfaceAnalysis(analyzerFilterIp)}>
-            分析排行
-          </Button>
-          {selectedRank && <Tag color="blue">当前IP排名 {selectedRank}</Tag>}
-          <Text type="secondary">只统计已收到的 sFlow flow sample，按当前时间范围聚合。</Text>
-        </Space>
+          >
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              <Space wrap size={6}>
+                <Tag color="processing">{selectedSflowAgent?.device?.datacenter?.name || '未知机房'}</Tag>
+                {selectedSflowInterface?.circuit?.operator_name && (
+                  <Tag color={getOperatorColor(selectedSflowInterface.circuit.operator_name)}>
+                    {selectedSflowInterface.circuit.operator_name}
+                  </Tag>
+                )}
+                {selectedSflowInterface?.circuit?.line_type && <Tag>{selectedSflowInterface.circuit.line_type}</Tag>}
+              </Space>
+              <Text strong>{selectedSflowInterface?.label || selectedSflowAgent?.device?.name || '请选择 Agent 和接口'}</Text>
+              <Text type="secondary">
+                描述：{selectedSflowInterface?.alias || '暂无接口描述'}
+              </Text>
+              <Text type="secondary">
+                线路：{selectedSflowInterface?.circuit?.name || '未匹配录入线路'}；接口状态：
+                {selectedSflowInterface?.oper_status ? String(selectedSflowInterface.oper_status).toUpperCase() : '-'}；
+                最近流量：{formatBps(selectedSflowInterface?.total_bps || 0)}
+              </Text>
+              <Text type="secondary">
+                Agent：{analyzerDeviceIp || '-'}；已发现接口：{selectedSflowAgent?.interface_count ?? sflowInterfaces.length} 个
+              </Text>
+            </Space>
+          </div>
+        </div>
+
         <Spin spinning={analyzerLoading}>
           <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 420px', gap: 16, alignItems: 'stretch' }}>
             <div
               style={{
                 height: 360,
                 border: `1px solid ${token.colorBorderSecondary}`,
-                borderRadius: 4,
+                borderRadius: 8,
                 padding: '14px 12px 4px 4px',
                 background: token.colorBgContainer,
               }}
@@ -506,7 +712,7 @@ export default function IPFlowQuery() {
                   </LineChart>
                 </ResponsiveContainer>
               ) : (
-                <Empty description="暂无接口IP趋势数据" style={{ paddingTop: 105 }} />
+                <Empty description="选择 Agent 和接口后点击分析Top10" style={{ paddingTop: 105 }} />
               )}
             </div>
             <Table
@@ -522,109 +728,6 @@ export default function IPFlowQuery() {
               ]}
             />
           </div>
-        </Spin>
-      </Card>
-
-      <Card
-        style={{ borderRadius: 6 }}
-        bodyStyle={{ padding: 18 }}
-        title={
-          <Space size={8}>
-            <LineChartOutlined style={{ color: '#52c41a' }} />
-            <span>{currentIp || 'IP流量'} 出入向流量</span>
-          </Space>
-        }
-        extra={
-          <Space size={8}>
-            <Tag>单位 {chartMeta.scale.suffix}</Tag>
-            <Tag>粒度 {selectedRange.interval}</Tag>
-            {flowSource === 'sflow_interface' && <Tag color="green">sFlow接口样本</Tag>}
-            {customers.length ? customers.map((item) => <Tag color="blue" key={item.id}>{item.name}</Tag>) : <Tag>未匹配客户</Tag>}
-          </Space>
-        }
-      >
-        <Spin spinning={loading}>
-          {chartMeta.data.length ? (
-            <>
-              <div
-                style={{
-                  width: '100%',
-                  height: 390,
-                  border: `1px solid ${token.colorBorderSecondary}`,
-                  borderRadius: 4,
-                  padding: '16px 14px 6px 8px',
-                  background: token.colorBgContainer,
-                }}
-              >
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartMeta.data} margin={{ top: 12, right: 24, left: 20, bottom: 18 }}>
-                    <CartesianGrid stroke={token.colorBorderSecondary} horizontal vertical />
-                    <XAxis
-                      type="number"
-                      dataKey="timestamp"
-                      domain={chartMeta.xDomain}
-                      ticks={chartMeta.xTicks}
-                      tickFormatter={(value) => formatXAxisTick(Number(value), rangeValue)}
-                      tick={{ fill: token.colorTextSecondary, fontSize: 12 }}
-                      axisLine={{ stroke: token.colorBorder }}
-                      tickLine={{ stroke: token.colorBorder }}
-                      allowDataOverflow
-                    />
-                    <YAxis
-                      type="number"
-                      domain={chartMeta.yDomain}
-                      ticks={chartMeta.yTicks}
-                      tickFormatter={(value) => formatBps(Number(value), chartMeta.scale)}
-                      tick={{ fill: token.colorTextSecondary, fontSize: 12 }}
-                      axisLine={{ stroke: token.colorBorder }}
-                      tickLine={{ stroke: token.colorBorder }}
-                      width={82}
-                    />
-                    <RechartsTooltip
-                      labelFormatter={(value) => dayjs(Number(value)).format('YYYY-MM-DD HH:mm:ss')}
-                      formatter={(value: any, name: any) => [formatBps(Number(value)), name]}
-                    />
-                    <Line
-                      type="linear"
-                      dataKey="in_bps"
-                      name="IP入向流量"
-                      stroke="#70d34f"
-                      strokeWidth={1.5}
-                      dot={{ r: 2, strokeWidth: 1.4, fill: '#fff' }}
-                      activeDot={{ r: 4 }}
-                      connectNulls={false}
-                    />
-                    <Line
-                      type="linear"
-                      dataKey="out_bps"
-                      name="IP出向流量"
-                      stroke="#f4d000"
-                      strokeWidth={1.5}
-                      dot={{ r: 2, strokeWidth: 1.4, fill: '#fff' }}
-                      activeDot={{ r: 4 }}
-                      connectNulls={false}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 110px 110px 110px', gap: 8, marginTop: 12, paddingInline: 6, fontSize: 13 }}>
-                <Text type="secondary">Name</Text>
-                <Text strong style={{ textAlign: 'right' }}>Last</Text>
-                <Text strong style={{ textAlign: 'right' }}>Min</Text>
-                <Text strong style={{ textAlign: 'right' }}>Max</Text>
-                <Space size={8}><span style={{ width: 14, height: 3, background: '#70d34f', display: 'inline-block' }} />IP入向流量</Space>
-                <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.lastIn)}</Text>
-                <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.minIn)}</Text>
-                <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.maxIn)}</Text>
-                <Space size={8}><span style={{ width: 14, height: 3, background: '#f4d000', display: 'inline-block' }} />IP出向流量</Space>
-                <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.lastOut)}</Text>
-                <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.minOut)}</Text>
-                <Text style={{ textAlign: 'right' }}>{formatBps(chartMeta.maxOut)}</Text>
-              </div>
-            </>
-          ) : (
-            <Empty description={currentIp ? '当前时间范围内暂无IP流量数据' : '请输入IP地址查询流量'} style={{ padding: '80px 0' }} />
-          )}
         </Spin>
       </Card>
     </div>
