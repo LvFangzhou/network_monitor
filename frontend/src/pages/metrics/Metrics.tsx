@@ -529,50 +529,9 @@ const insertCollectionGaps = (
   return result
 }
 
-const interpolateValue = (
-  before: ChartPoint | undefined,
-  after: ChartPoint | undefined,
-  timestamp: number,
-  key: string,
-  gapThresholdMs: number
-) => {
-  const beforeValue = before?.[key]
-  const afterValue = after?.[key]
-  const beforeNumber = typeof beforeValue === 'number' ? beforeValue : null
-  const afterNumber = typeof afterValue === 'number' ? afterValue : null
-
-  if (before && Math.abs(timestamp - before.timestamp) <= 1 && beforeNumber !== null) {
-    return beforeNumber
-  }
-  if (after && Math.abs(after.timestamp - timestamp) <= 1 && afterNumber !== null) {
-    return afterNumber
-  }
-  if (
-    before &&
-    after &&
-    before.timestamp < timestamp &&
-    after.timestamp > timestamp &&
-    after.timestamp - before.timestamp <= gapThresholdMs &&
-    beforeNumber !== null &&
-    afterNumber !== null
-  ) {
-    const ratio = (timestamp - before.timestamp) / (after.timestamp - before.timestamp)
-    return beforeNumber + (afterNumber - beforeNumber) * ratio
-  }
-  if (before && timestamp - before.timestamp <= gapThresholdMs && beforeNumber !== null) {
-    return beforeNumber
-  }
-  if (after && after.timestamp - timestamp <= gapThresholdMs && afterNumber !== null) {
-    return afterNumber
-  }
-  return 0
-}
-
 const resampleChartData = (
   points: ChartPoint[],
   series: MonitorGroup['series'],
-  domain: [number, number],
-  interval: string,
   gapThresholdMs: number,
   unit: MonitorGroup['unit']
 ) => {
@@ -585,38 +544,13 @@ const resampleChartData = (
     .sort((a, b) => a.timestamp - b.timestamp)
   if (!validPoints.length) return []
 
-  const stepMs = parseIntervalMs(interval)
-  const start = Math.max(domain[0], Math.ceil(validPoints[0].timestamp / stepMs) * stepMs)
-  const end = Math.min(domain[1], Math.floor(validPoints[validPoints.length - 1].timestamp / stepMs) * stepMs)
-  if (end < start) return validPoints
-
-  const pointsByTimestamp = new Map(validPoints.map((point) => [point.timestamp, point]))
-  const sampled: ChartPoint[] = []
-  let cursor = 0
-
-  for (let timestamp = start; timestamp <= end; timestamp += stepMs) {
-    while (cursor < validPoints.length && validPoints[cursor].timestamp < timestamp) {
-      cursor += 1
-    }
-    const exact = pointsByTimestamp.get(timestamp)
-    const before = exact || validPoints[cursor - 1]
-    const after = exact || validPoints[cursor]
-    const point: ChartPoint = {
-      timestamp,
-      sample_seconds: exact?.sample_seconds ?? before?.sample_seconds ?? after?.sample_seconds ?? null,
-      speed_bps: exact?.speed_bps ?? before?.speed_bps ?? after?.speed_bps ?? null,
-    }
-
-    for (const serie of series) {
-      point[serie.key] = exact && typeof exact[serie.key] === 'number'
-        ? exact[serie.key] as number
-        : interpolateValue(before, after, timestamp, serie.key, gapThresholdMs)
-    }
-
-    sampled.push(point)
-  }
-
-  return sampled
+  // Interface traffic must reflect real collection samples.  The previous
+  // resampling logic generated 10s buckets and returned 0 when a bucket had no
+  // nearby sample, so sparse SNMP polling looked like real traffic drops.
+  // Keep the collected points, and only insert null gaps for genuinely long
+  // collection holes. Recharts will connect normal sparse samples without
+  // inventing zero-rate traffic.
+  return insertCollectionGaps(validPoints, series, gapThresholdMs, null)
 }
 
 const trimChartPointsToRange = (points: ChartPoint[], rangeValue: string, now = Date.now()) => {
@@ -627,6 +561,22 @@ const trimChartPointsToRange = (points: ChartPoint[], rangeValue: string, now = 
 const trimChartPointsToRetention = (points: ChartPoint[], now = Date.now()) => {
   const threshold = now - HISTORY_CACHE_RETENTION_MS
   return points.filter((point) => point.timestamp >= threshold && point.timestamp <= now)
+}
+
+const alignTimeDomainToMinute = (start: number, end: number): [number, number] => [
+  Math.floor(start / 60_000) * 60_000,
+  Math.ceil(end / 60_000) * 60_000,
+]
+
+const getSampleIntervalLabel = (points: ChartPoint[]) => {
+  const samples = points
+    .map((point) => point.sample_seconds)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b)
+  if (!samples.length) return null
+  const median = samples[Math.floor(samples.length / 2)]
+  if (median >= 60) return `实际采样约 ${Math.round(median / 60)}m`
+  return `实际采样约 ${Math.round(median)}s`
 }
 
 const compactChartPoint = (point: ChartPoint): ChartPoint => (
@@ -1312,8 +1262,8 @@ const Metrics = () => {
         : rawData
       const xDomain: [number, number] = zoomRange?.start && zoomRange?.end
         ? [zoomRange.start, zoomRange.end]
-        : [rangeStart, now]
-      const data = resampleChartData(zoomedData, series, xDomain, effectiveInterval, gapThresholdMs, selectedMonitorGroup.unit)
+        : alignTimeDomainToMinute(rangeStart, now)
+      const data = resampleChartData(zoomedData, series, gapThresholdMs, selectedMonitorGroup.unit)
       const pointCount = data.filter((point) => hasSeriesValue(point, series)).length
       const dotStride = getChartDotStride(effectiveRangeValue, pointCount)
       const values = series.flatMap((serie) =>
@@ -1330,6 +1280,7 @@ const Metrics = () => {
       const latestPoint = [...data].reverse().find((point) => hasSeriesValue(point, series))
       const xTicks = getLinearXAxisTicks(xDomain, effectiveRangeValue)
       const axisMax = yAxis.domain[1]
+      const sampleIntervalLabel = getSampleIntervalLabel(data)
 
       return {
         target,
@@ -1348,6 +1299,7 @@ const Metrics = () => {
         dragSelection: dragSelections[target.key],
         pointCount,
         dotStride,
+        sampleIntervalLabel,
       }
     })
   }, [historyMap, queueSeriesMap, selectedTargets, selectedMonitorGroup, selectedMonitorKey, selectedRange.interval, refreshValue, rangeValue, zoomRanges, dragSelections])
@@ -1576,7 +1528,7 @@ const Metrics = () => {
             alignItems: 'start',
           }}
         >
-          {chartCards.map(({ target, data, series, max, latestPoint, domain, yTicks, scale, zoomRange, effectiveRangeValue, effectiveInterval, xDomain, xTicks, dragSelection, dotStride }) => (
+          {chartCards.map(({ target, data, series, max, latestPoint, domain, yTicks, scale, zoomRange, effectiveRangeValue, effectiveInterval, xDomain, xTicks, dragSelection, dotStride, sampleIntervalLabel }) => (
             <Card
               key={target.key}
               onDragOver={(event) => {
@@ -1622,6 +1574,7 @@ const Metrics = () => {
                   <Tag>{`单位 ${getMonitorGroupUnitLabel(selectedMonitorGroup, scale)}`}</Tag>
                   <Tag>X轴 时间</Tag>
                   <Tag>{`粒度 ${effectiveInterval}`}</Tag>
+                  {sampleIntervalLabel ? <Tag color="blue">{sampleIntervalLabel}</Tag> : null}
                   {selectedMonitorGroup.unit === 'bps' ? <Tag>{`速率 ${selectedRange.rateWindow}`}</Tag> : null}
                   {zoomRange?.start && zoomRange?.end ? (
                     <Button size="small" onClick={() => resetChartZoom(target.key)}>
