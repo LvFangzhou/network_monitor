@@ -701,6 +701,82 @@ def _mark_stale_rate_samples(rows: List[Dict[str, Any]], interval_seconds: int, 
         previous_time = row_time
 
 
+def _suppress_isolated_zero_rate_dips(rows: List[Dict[str, Any]], speed_bps: Optional[float], max_gap_seconds: int = 360) -> None:
+    """Treat isolated zero-rate samples between healthy traffic points as collection artifacts.
+
+    SNMP counter polling occasionally returns a transient 0 bps sample when a
+    collection round misses an interface or a rate row is written without a
+    valid counter delta.  On a busy uplink this creates a misleading vertical
+    drop to the bottom of the chart.  Only suppress very short isolated zeros
+    with clear non-zero samples on both sides; sustained zeros remain visible.
+    """
+    timed_rows = [(row, _parse_history_time(row)) for row in rows]
+    timed_rows = [(row, row_time) for row, row_time in timed_rows if row_time is not None]
+    timed_rows.sort(key=lambda item: item[1])
+    if len(timed_rows) < 3:
+        return
+
+    # A "healthy" neighbor should be meaningfully above noise, but the
+    # threshold must not hide low-rate links.  Use a small absolute floor plus a
+    # conservative speed-relative floor capped at 50Mbps.
+    relative_floor = (speed_bps or 0) * 0.0005
+    healthy_floor = max(1_000_000.0, min(relative_floor, 50_000_000.0))
+
+    for bps_key, util_key in [("in_bps", "in_utilization_percent"), ("out_bps", "out_utilization_percent")]:
+        index = 0
+        while index < len(timed_rows):
+            row, row_time = timed_rows[index]
+            current_value = _safe_float(row.get(bps_key))
+            if current_value is None or current_value > 0:
+                index += 1
+                continue
+
+            run_start = index
+            run_end = index
+            while run_end + 1 < len(timed_rows):
+                next_value = _safe_float(timed_rows[run_end + 1][0].get(bps_key))
+                if next_value is None or next_value > 0:
+                    break
+                run_end += 1
+
+            prev_item = next(
+                (
+                    timed_rows[prev_index]
+                    for prev_index in range(run_start - 1, -1, -1)
+                    if _safe_float(timed_rows[prev_index][0].get(bps_key)) is not None
+                ),
+                None,
+            )
+            next_item = next(
+                (
+                    timed_rows[next_index]
+                    for next_index in range(run_end + 1, len(timed_rows))
+                    if _safe_float(timed_rows[next_index][0].get(bps_key)) is not None
+                ),
+                None,
+            )
+            if prev_item and next_item:
+                prev_row, prev_time = prev_item
+                next_row, next_time = next_item
+                prev_value = _safe_float(prev_row.get(bps_key)) or 0.0
+                next_value = _safe_float(next_row.get(bps_key)) or 0.0
+                first_zero_time = timed_rows[run_start][1]
+                last_zero_time = timed_rows[run_end][1]
+                zero_run_seconds = (last_zero_time - first_zero_time).total_seconds()
+                if (
+                    prev_value >= healthy_floor
+                    and next_value >= healthy_floor
+                    and 0 <= zero_run_seconds <= max_gap_seconds
+                    and 0 < (first_zero_time - prev_time).total_seconds() <= max_gap_seconds
+                    and 0 < (next_time - last_zero_time).total_seconds() <= max_gap_seconds
+                ):
+                    for zero_index in range(run_start, run_end + 1):
+                        timed_rows[zero_index][0][bps_key] = None
+                        timed_rows[zero_index][0][util_key] = None
+
+            index = run_end + 1
+
+
 async def _persist_fresh_interface_sample(device: Device, interface_index: int, range_seconds: int) -> bool:
     return await _collect_and_persist_fresh_interface_sample(device, interface_index, range_seconds) is not None
 
@@ -2001,6 +2077,14 @@ async def get_monitor_device_interface_history(
         # 端口流量查询以展示真实已采集速率为最高优先级，不能把合法的 2 分钟样本误判为空。
         max_sample_seconds=max(180, rate_window_seconds + interval_seconds + 60),
     )
+    if is_traffic_only:
+        speed_candidates = [_safe_float(row.get("speed_bps")) for row in history]
+        speed_bps = next((value for value in speed_candidates if value and value > 0), None)
+        _suppress_isolated_zero_rate_dips(
+            history,
+            speed_bps=speed_bps,
+            max_gap_seconds=max(rate_window_seconds + interval_seconds + 60, 240),
+        )
     cutoff = (start_time.timestamp() if use_absolute_range and start_time else datetime.now(timezone.utc).timestamp() - range_seconds)
     stop_ts = end_time.timestamp() if use_absolute_range else None
     recent_rate_rows = []
