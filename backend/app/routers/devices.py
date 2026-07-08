@@ -14,7 +14,7 @@ from app.database import get_db
 from app.models import AlertHistory, Device, DeviceGroup, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
 from app.collectors.snmp_collector import SNMPCollector
 from app.utils.interface_scope import alert_target_interface_is_monitored
-from app.redis_client import redis_client
+from app.utils.redis_client import redis_client
 from app.schemas import (
     DeviceCreate, DeviceUpdate, DeviceResponse,
     DeviceGroupCreate, DeviceGroupUpdate, DeviceGroupResponse,
