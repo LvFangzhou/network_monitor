@@ -86,7 +86,7 @@ const preloadRouteModules = () => {
   ])
 }
 
-const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/device-overview', '/port-query', '/ip-flow-query', '/module-info-query', '/lossless-info-query', '/config-backups']
+const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/port-query', '/ip-flow-query', '/module-info-query', '/lossless-info-query', '/config-backups']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/port-query']
 const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
 const ROUTE_ALIASES: Record<string, string[]> = {

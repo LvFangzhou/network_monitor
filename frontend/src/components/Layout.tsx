@@ -91,11 +91,9 @@ const Layout = () => {
       icon: <DesktopOutlined />,
       label: '资源管理',
       children: [
-        { key: '/devices', label: '网络设备' },
         { key: '/device-dictionaries', label: '字典管理' },
+        { key: '/devices', label: '网络设备' },
         { key: '/customers', label: '客户管理' },
-        { key: '/vendors', label: '供应商管理' },
-        { key: '/datacenters', label: '机房管理' },
         { key: '/public-circuits', label: '公网管理' },
         { key: '/private-circuits', label: '专线管理' },
         { key: '/ipdb', label: 'IPDB' },

@@ -155,6 +155,46 @@ def _get_silence_matched_alerts_page(
     return matched_page, matched_seen, exhausted
 
 
+
+
+def _normalize_vendor_text(value: Optional[str]) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if any(marker in text for marker in ["ruijie", "锐捷", "rgos"]):
+        return "ruijie 锐捷 rgos"
+    if any(marker in text for marker in ["h3c", "华三", "新华三", "comware"]):
+        return "h3c 华三 新华三 comware"
+    if any(marker in text for marker in ["hillstone", "山石"]):
+        return "hillstone 山石"
+    if any(marker in text for marker in ["aster", "asternos", "asterfusion", "星融元"]):
+        return "aster asternos asterfusion 星融元"
+    return text
+
+def _normalize_vendor_list(values: Any) -> List[str]:
+    if not values:
+        return []
+    if isinstance(values, str):
+        values = [item.strip() for item in values.split(",")]
+    if not isinstance(values, list):
+        return []
+    return [str(item).strip() for item in values if str(item or "").strip()]
+
+def _vendor_matches_any(raw_vendor: Optional[str], allowed_vendors: Any) -> bool:
+    allowed = _normalize_vendor_list(allowed_vendors)
+    if not allowed:
+        return True
+    normalized_vendor = _normalize_vendor_text(raw_vendor)
+    for value in allowed:
+        normalized_allowed = _normalize_vendor_text(value)
+        if normalized_allowed and (normalized_allowed.split()[0] in normalized_vendor or str(value).strip().lower() in normalized_vendor):
+            return True
+    return False
+
+def _rule_applicable_vendors(rule: AlertRule) -> List[str]:
+    extra_config = rule.extra_config or {}
+    return _normalize_vendor_list(extra_config.get("applicable_vendors") or extra_config.get("vendors"))
+
 def _get_silence_match_rule_filters(
     db: Session,
     silence: AlertSilence,
@@ -499,10 +539,9 @@ def _silence_match_count_queue_lock_key(silence_id: int, include_total: bool = F
 
 def _get_silence_match_count_cached(silence: AlertSilence, *, active_only: bool) -> Dict[str, Any]:
     cache_key = _silence_match_count_cache_key(silence, active_only)
-    cached = redis_client.get(cache_key)
+    cached, exact_raw = redis_client.mget([cache_key, f"{cache_key}:exact"])
     if cached is not None:
         try:
-            exact_raw = redis_client.get(f"{cache_key}:exact")
             if isinstance(exact_raw, bytes):
                 exact_raw = exact_raw.decode()
             return {"count": int(cached), "cached": True, "pending": False, "exact": exact_raw != "0"}
@@ -513,14 +552,13 @@ def _get_silence_match_count_cached(silence: AlertSilence, *, active_only: bool)
 
 def _get_silence_cached_count_and_exact(silence: AlertSilence, *, active_only: bool) -> tuple[Optional[int], bool]:
     cache_key = _silence_match_count_cache_key(silence, active_only)
-    cached_count = redis_client.get(cache_key)
+    cached_count, exact_raw = redis_client.mget([cache_key, f"{cache_key}:exact"])
     if cached_count is None:
         return None, False
     try:
         count = int(cached_count)
     except (TypeError, ValueError):
         return None, False
-    exact_raw = redis_client.get(f"{cache_key}:exact")
     if isinstance(exact_raw, bytes):
         exact_raw = exact_raw.decode()
     return count, exact_raw != "0"
@@ -579,11 +617,7 @@ def _count_silence_matches_with_lock(db: Session, silence: AlertSilence, *, acti
 
 
 def _clear_silence_match_cache() -> None:
-    try:
-        for key in redis_client.scan_iter(f"{SILENCE_MATCH_CACHE_PREFIX}:*"):
-            redis_client.delete(key)
-    except Exception as exc:
-        logger.warning("清理告警屏蔽命中缓存失败", error=str(exc))
+    logger.info("告警屏蔽命中缓存已改为短 TTL 自动失效，不再执行全量扫描清理")
 
 
 def _resolve_active_alerts_for_disabled_rule(db: Session, rule_id: int) -> int:
@@ -688,6 +722,7 @@ def _serialize_rule(rule: AlertRule) -> dict:
         "device_group_id": rule.device_group_id,
         "device_ids": rule.device_ids,
         "extra_config": rule.extra_config or {},
+        "applicable_vendors": _rule_applicable_vendors(rule),
         "notification_channels": rule.notification_channels,
         "created_at": rule.created_at,
         "updated_at": rule.updated_at,
@@ -728,6 +763,10 @@ def _get_rule_applicable_devices(db: Session, rule: AlertRule) -> List[Device]:
         devices = db.query(Device).filter(Device.id.in_(rule.device_ids)).all()
     else:
         devices = db.query(Device).all()
+
+    applicable_vendors = _rule_applicable_vendors(rule)
+    if applicable_vendors:
+        devices = [device for device in devices if _vendor_matches_any(device.vendor, applicable_vendors)]
 
     if rule.metric_type == "device_reachability":
         return [
@@ -820,7 +859,8 @@ async def list_alert_rules(
     limit: int = Query(20, ge=1, le=100),
     enabled: Optional[bool] = None,
     severity: Optional[str] = None,
-    search: Optional[str] = None
+    search: Optional[str] = None,
+    vendor: Optional[str] = None
 ):
     """获取告警规则列表"""
     query = db.query(AlertRule)
@@ -831,9 +871,12 @@ async def list_alert_rules(
         query = query.filter(AlertRule.severity.in_(_severity_filter_values(severity)))
     if search:
         query = query.filter(AlertRule.name.ilike(f"%{search}%"))
-    
-    total = query.count()
-    rules = query.offset(skip).limit(limit).all()
+    all_rules = query.order_by(AlertRule.id.asc()).all()
+    if vendor:
+        all_rules = [rule for rule in all_rules if _vendor_matches_any(vendor, _rule_applicable_vendors(rule))]
+
+    total = len(all_rules)
+    rules = all_rules[skip:skip + limit]
     
     return {
         "total": total,
@@ -851,6 +894,7 @@ async def list_alert_rules(
             "device_group_id": r.device_group_id,
             "device_ids": r.device_ids,
             "extra_config": r.extra_config or {},
+            "applicable_vendors": _rule_applicable_vendors(r),
             "suppress_duration": r.suppress_duration,
             "notification_channels": r.notification_channels,
             "created_at": r.created_at,
@@ -1238,6 +1282,7 @@ async def get_alert_history_summary(
     search: Optional[str] = None,
     older_than_days: Optional[int] = Query(None, ge=0),
     limit: int = Query(10, ge=1, le=50),
+    refresh: bool = Query(False, description="是否绕过缓存直接重算"),
 ):
     """按当前筛选条件聚合告警历史。"""
     cache_payload = {
@@ -1257,12 +1302,13 @@ async def get_alert_history_summary(
         f"{ALERT_HISTORY_SUMMARY_CACHE_PREFIX}:"
         f"{hashlib.sha1(json.dumps(cache_payload, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()}"
     )
-    try:
-        cached = redis_client.get(cache_key)
-        if cached:
-            return json.loads(cached)
-    except Exception as exc:
-        logger.warning("读取告警历史统计缓存失败", error=str(exc))
+    if not refresh:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception as exc:
+            logger.warning("读取告警历史统计缓存失败", error=str(exc))
 
     base_query = _build_alert_history_query(
         db,
@@ -1559,15 +1605,29 @@ async def list_alert_silences(
         query = query.filter(AlertSilence.enabled == (1 if enabled else 0))
     total = query.count()
     items = query.order_by(AlertSilence.created_at.desc()).offset(skip).limit(limit).all()
+    active_keys: List[str] = []
+    total_keys: List[str] = []
+    if include_match_counts and items:
+        active_keys = [_silence_match_count_cache_key(item, True) for item in items]
+        if include_total_match_counts:
+            total_keys = [_silence_match_count_cache_key(item, False) for item in items]
+    active_values = redis_client.mget(active_keys) if active_keys else []
+    total_values = redis_client.mget(total_keys) if total_keys else []
     response_items = []
-    for item in items:
+    for index, item in enumerate(items):
         data = item.to_dict()
         if include_match_counts:
-            cached_active = redis_client.get(_silence_match_count_cache_key(item, True))
-            data["matched_active_alerts"] = int(cached_active) if cached_active is not None else None
+            cached_active = active_values[index] if index < len(active_values) else None
+            try:
+                data["matched_active_alerts"] = int(cached_active) if cached_active is not None else None
+            except (TypeError, ValueError):
+                data["matched_active_alerts"] = None
             if include_total_match_counts:
-                cached_total = redis_client.get(_silence_match_count_cache_key(item, False))
-                data["matched_total_alerts"] = int(cached_total) if cached_total is not None else None
+                cached_total = total_values[index] if index < len(total_values) else None
+                try:
+                    data["matched_total_alerts"] = int(cached_total) if cached_total is not None else None
+                except (TypeError, ValueError):
+                    data["matched_total_alerts"] = None
             else:
                 data["matched_total_alerts"] = None
         else:

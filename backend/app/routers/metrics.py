@@ -22,7 +22,7 @@ from app.schemas import MetricQuery, MetricResponse, DashboardStats
 from app.database import get_db
 from app.models import Device, AlertHistory, AlertRule, Circuit, Customer, Datacenter
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from app.core import get_logger
 from app.config import settings
 from app.collectors import snmp_collector
@@ -43,8 +43,10 @@ MAX_INTERFACE_HISTORY_SECONDS = 7 * 24 * 60 * 60
 RATE_FALLBACK_MAX_SECONDS = 5 * 60
 HISTORY_REQUEST_CACHE_SECONDS = 8
 DASHBOARD_STATS_CACHE_SECONDS = 300
-DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS = 15 * 60
+DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS = 2 * 60
 DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX = "monitor:cache:overview_snapshot"
+DEVICE_OVERVIEW_LAST_SUCCESS_CACHE_PREFIX = "monitor:cache:last_success_overview_snapshot"
+DEVICE_OVERVIEW_REVISION_KEY = "monitor:cache:overview_revision"
 FRESH_INTERFACE_SAMPLE_LOCK_SECONDS = 8
 FRESH_INTERFACE_SAMPLE_MAX_RANGE_SECONDS = 60 * 60
 INTERFACE_RATE_CAP_MULTIPLIER = 1.03
@@ -104,8 +106,93 @@ QUEUE_MONITOR_COLORS = [
 ]
 
 
+
+
+def _normalize_vendor_text(value: Optional[str]) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if any(marker in text for marker in ["ruijie", "锐捷", "rgos"]):
+        return "ruijie 锐捷 rgos"
+    if any(marker in text for marker in ["h3c", "华三", "新华三", "comware"]):
+        return "h3c 华三 新华三 comware"
+    if any(marker in text for marker in ["hillstone", "山石"]):
+        return "hillstone 山石"
+    if any(marker in text for marker in ["aster", "asternos", "asterfusion", "星融元"]):
+        return "aster asternos asterfusion 星融元"
+    return text
+
+def _vendor_filter_matches(raw_vendor: Optional[str], keyword: Optional[str]) -> bool:
+    key = str(keyword or "").strip().lower()
+    if not key:
+        return True
+    return key in _normalize_vendor_text(raw_vendor) or _normalize_vendor_text(key).split()[0] in _normalize_vendor_text(raw_vendor)
+
 def _monitor_cache_key(kind: str, device_id: int, suffix: str = "") -> str:
     return f"monitor:cache:{kind}:{device_id}{suffix}"
+
+
+def _normalize_neighbor_device_name(value: Optional[str]) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^to-", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"-(?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet)\d+(?:/\d+)+(?:[:/]\d+)?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text.strip().lower()
+
+
+def _apply_lldp_device_ip_fallback(db: Session, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return rows
+    candidates = {
+        _normalize_neighbor_device_name(item.get("remote_system"))
+        for item in rows
+        if _normalize_neighbor_device_name(item.get("remote_system"))
+    }
+    if not candidates:
+        return rows
+    devices = db.query(Device.id, Device.name, Device.hostname, Device.ip_address).all()
+    device_map: Dict[str, str] = {}
+    ip_name_map: Dict[str, str] = {}
+    for device_id, name, hostname, ip_address in devices:
+        if ip_address:
+            ip_name_map[str(ip_address)] = str(name or hostname or ip_address)
+        for raw in (name, hostname):
+            normalized = _normalize_neighbor_device_name(raw)
+            if normalized and normalized not in device_map and ip_address:
+                device_map[normalized] = str(ip_address)
+
+    def _looks_like_mac(value: Optional[str]) -> bool:
+        text = str(value or "").strip()
+        return bool(re.fullmatch(r"(?:[0-9A-Fa-f]{2}[\s:-]?){5}[0-9A-Fa-f]{2}", text))
+
+    def _looks_like_generic_short_name(value: Optional[str]) -> bool:
+        text = str(value or "").strip()
+        return bool(re.fullmatch(r"[A-Za-z]?\d{3,6}", text))
+
+    for item in rows:
+        raw_mgmt_ip = str(item.get("remote_mgmt_addr") or "").strip()
+        item["remote_kind"] = "未知"
+        if raw_mgmt_ip in ip_name_map:
+            item["remote_kind"] = "网络设备"
+        elif _looks_like_generic_short_name(item.get("remote_system")):
+            item["remote_kind"] = "服务器"
+        elif _looks_like_mac(item.get("remote_system")):
+            item["remote_kind"] = "未知"
+        normalized = _normalize_neighbor_device_name(item.get("remote_system"))
+        mapped_ip = device_map.get(normalized)
+        if mapped_ip:
+            item["remote_mgmt_addr"] = mapped_ip
+            item["remote_mgmt_addr_source"] = "cmdb"
+            item["remote_kind"] = "网络设备"
+        else:
+            item["remote_mgmt_addr_source"] = "snmp"
+    return rows
 
 
 def _load_monitor_cache(kind: str, device_id: int, suffix: str = "") -> Optional[Any]:
@@ -124,6 +211,19 @@ def _store_monitor_cache(kind: str, device_id: int, payload: Any, ttl_seconds: i
         ttl_seconds,
         json.dumps(payload, ensure_ascii=False, default=str),
     )
+
+
+def _invalidate_device_overview_response_cache(device_id: Optional[int] = None) -> None:
+    """Invalidate overview snapshots without doing Redis-wide scans in the request path."""
+    try:
+        redis_client.incr(DEVICE_OVERVIEW_REVISION_KEY)
+    except Exception:
+        pass
+    try:
+        if device_id is not None:
+            redis_client.delete(_monitor_cache_key("overview", device_id))
+    except Exception as exc:
+        logger.warning("设备总览单设备缓存清理失败", device_id=device_id, error=str(exc))
 
 
 def _get_device_interface_name_map(device: Device) -> Dict[str, Dict[str, Any]]:
@@ -239,15 +339,8 @@ def _telemetry_snmp_disabled(device: Device) -> bool:
 
 
 def _telemetry_interface_enabled(device: Device) -> bool:
-    custom_fields = device.custom_fields or {}
-    if not isinstance(custom_fields, dict):
-        return False
-    monitoring = custom_fields.get("monitoring") or {}
-    if not isinstance(monitoring, dict):
-        return False
-    telemetry = monitoring.get("telemetry") or {}
-    if isinstance(telemetry, dict):
-        return telemetry.get("interface_stats_primary") is True or telemetry.get("disable_snmp") is True
+    # Telemetry gRPC 目前存在周期性断开，展示与端口历史先恢复 SNMP 主导。
+    # 保留接收服务和写入能力，但不再让 Telemetry 覆盖设备总览/端口查询。
     return False
 
 
@@ -259,7 +352,7 @@ def _cache_collected_at(payload: Optional[Dict[str, Any]]) -> Optional[str]:
 
 def is_asternos_vendor(vendor: str | None) -> bool:
     vendor_value = (vendor or "").lower()
-    return any(marker in vendor_value for marker in ["asternos", "asterfusion", "asteros", "星融元"])
+    return any(marker in vendor_value for marker in ["asternos", "asterfusion", "asteros", "aster", "星融元"])
 
 
 def get_effective_monitor_source(device: Device) -> str:
@@ -1517,7 +1610,7 @@ def _get_snmp_protocol_neighbors(device_id: int) -> Dict[str, List[Dict[str, Any
         peer = str(row.get("peer") or "")
         grouped.setdefault((protocol, peer), []).append(row)
 
-    result: Dict[str, List[Dict[str, Any]]] = {"bgp": [], "ospf": []}
+    result: Dict[str, List[Dict[str, Any]]] = {"bgp": [], "ospf": [], "lldp": []}
     for (protocol, peer), protocol_rows in grouped.items():
         latest = protocol_rows[0]
         instance = str(latest.get("instance") or "")
@@ -1535,8 +1628,10 @@ def _get_snmp_protocol_neighbors(device_id: int) -> Dict[str, List[Dict[str, Any
             "protocol": protocol,
             "peer": peer,
             "neighbor": peer,
-            "remote_as": None,
-            "interface": None,
+            "remote_as": latest.get("remote_as") or None,
+            "local_addr": latest.get("local_addr") or None,
+            "local_address": latest.get("local_addr") or None,
+            "interface": latest.get("interface") or None,
             "instance": instance or None,
             "state": latest_state or "-",
             "status": "up" if is_up else "down",
@@ -2637,36 +2732,62 @@ async def get_monitor_devices_overview(
     include_storage: bool = Query(False, description="是否查询存储数据"),
     include_hardware: bool = Query(False, description="是否查询风扇/电源数据"),
     include_sessions: bool = Query(False, description="是否查询会话数据"),
+    refresh: bool = Query(False, description="是否绕过响应缓存并重建首屏快照"),
     limit: int = Query(500, ge=1, le=1000),
     db: Session = Depends(get_db),
 ):
     """设备总览：汇总设备资源、监控连通性和路由协议状态。"""
     # 设备总览是高频入口页。这里缓存“全量首屏快照”，再在内存中过滤搜索条件，
     # 避免用户第一次进入、搜索或取消搜索时反复触发重聚合。
+    version_query = db.query(func.count(Device.id), func.max(Device.id)).filter(Device.status.in_(["active", "online"]))
+    if monitored_only:
+        version_query = version_query.filter(Device.is_monitored == True)
+    device_count, max_device_id = version_query.one()
+    overview_revision = redis_client.get(DEVICE_OVERVIEW_REVISION_KEY) or 0
+    if isinstance(overview_revision, bytes):
+        overview_revision = overview_revision.decode("utf-8", errors="ignore")
+    cache_version = {
+        "device_count": int(device_count or 0),
+        "max_device_id": int(max_device_id or 0),
+        "revision": str(overview_revision),
+    }
+
+    def _snapshot_version_matches(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return payload.get("cache_version") == cache_version
+
+    has_filter = any([search, vendor, model, connectivity])
+    # 厂商/型号/搜索先在数据库层尽量缩小候选集，避免“先 limit 截断再过滤”导致结果为 0，
+    # 也避免冷缓存时为了筛选一次同步构造所有设备总览。
+    snapshot_limit = limit
     snapshot_cache_key = ":".join([
         DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX,
         str(int(monitored_only)),
         str(int(include_storage)),
         str(int(include_hardware)),
         str(int(include_sessions)),
-        str(limit),
+        str(snapshot_limit),
     ])
     last_success_cache_key = ":".join([
-        "monitor:cache:last_success_overview_snapshot",
+        DEVICE_OVERVIEW_LAST_SUCCESS_CACHE_PREFIX,
         str(int(monitored_only)),
         str(int(include_storage)),
         str(int(include_hardware)),
         str(int(include_sessions)),
-        str(limit),
+        str(snapshot_limit),
     ])
-    cached_snapshot = redis_client.get(snapshot_cache_key)
+    cached_snapshot = None if refresh else redis_client.get(snapshot_cache_key)
     stale_snapshot = False
-    if not cached_snapshot:
-        cached_snapshot = redis_client.get(last_success_cache_key)
-        stale_snapshot = bool(cached_snapshot)
     if cached_snapshot:
         try:
             payload = json.loads(cached_snapshot)
+            if not _snapshot_version_matches(payload):
+                redis_client.delete(snapshot_cache_key)
+                if stale_snapshot:
+                    redis_client.delete(last_success_cache_key)
+                cached_snapshot = None
+                raise ValueError("device overview snapshot version changed")
             items = payload.get("items", []) if isinstance(payload, dict) else []
             keyword = (search or "").strip().lower()
             vendor_keyword = (vendor or "").strip().lower()
@@ -2676,7 +2797,7 @@ async def get_monitor_devices_overview(
                 device = item.get("device") or {}
                 if not _connectivity_filter_matches(item, connectivity):
                     continue
-                if vendor_keyword and vendor_keyword not in str(device.get("vendor") or "").lower():
+                if vendor_keyword and not _vendor_filter_matches(device.get("vendor"), vendor_keyword):
                     continue
                 if model_keyword and model_keyword not in str(device.get("model") or "").lower():
                     continue
@@ -2703,14 +2824,53 @@ async def get_monitor_devices_overview(
                         continue
                 filtered_items.append(item)
             return {"items": filtered_items, "total": len(filtered_items), "cached": True, "stale": stale_snapshot}
+        except ValueError:
+            pass
         except Exception:
             redis_client.delete(snapshot_cache_key)
+
+    # If the short-lived response snapshot expired, prefer serving the last successful
+    # overview immediately. Device Overview is an overview page and can tolerate stale
+    # 5-15 minute data; this avoids making the first user after TTL expiry rebuild 300+ rows.
+    last_success_snapshot = redis_client.get(last_success_cache_key)
+    if last_success_snapshot and not has_filter:
+        try:
+            payload = json.loads(last_success_snapshot)
+            if isinstance(payload, dict) and payload.get("items"):
+                items = payload.get("items", [])
+                # Refill the short snapshot briefly so concurrent menu clicks are fast too.
+                redis_client.setex(
+                    snapshot_cache_key,
+                    DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS,
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                )
+                return {"items": items, "total": len(items), "cached": True, "stale": True}
+        except Exception:
+            redis_client.delete(last_success_cache_key)
 
     query = db.query(Device).filter(Device.status.in_(["active", "online"]))
     if monitored_only:
         query = query.filter(Device.is_monitored == True)
+    vendor_keyword = (vendor or "").strip()
+    model_keyword = (model or "").strip()
+    keyword = (search or "").strip()
+    if vendor_keyword:
+        vendor_norm = _normalize_vendor_text(vendor_keyword)
+        vendor_aliases = [value for value in vendor_norm.split() if value]
+        vendor_filters = [Device.vendor.ilike(f"%{value}%") for value in vendor_aliases] or [Device.vendor.ilike(f"%{vendor_keyword}%")]
+        query = query.filter(or_(*vendor_filters))
+    if model_keyword:
+        query = query.filter(Device.model.ilike(f"%{model_keyword}%"))
+    if keyword:
+        query = query.filter(or_(
+            Device.name.ilike(f"%{keyword}%"),
+            Device.hostname.ilike(f"%{keyword}%"),
+            Device.ip_address.ilike(f"%{keyword}%"),
+            Device.vendor.ilike(f"%{keyword}%"),
+            Device.model.ilike(f"%{keyword}%"),
+        ))
 
-    devices = query.order_by(Device.ip_address.asc()).limit(limit).all()
+    devices = query.order_by(Device.ip_address.asc()).limit(snapshot_limit).all()
     items: List[Dict[str, Any]] = []
     controller_data = await _load_controller_overview_fallbacks()
     for device in devices:
@@ -2751,12 +2911,26 @@ async def get_monitor_devices_overview(
             cached_overview = _load_monitor_cache("overview", device.id)
             if isinstance(cached_overview, dict):
                 item.update(cached_overview)
+                # 当前先以 SNMP 为设备总览主口径；Telemetry 仅作为后台数据源，
+                # 不参与连通性展示，避免 gRPC 周期性断开误导。
                 snmp_status = redis_client.get(_snmp_status_key(device.id)) or "unknown"
-                if snmp_status == SNMP_STATUS_UNREACHABLE:
+                if snmp_status == SNMP_STATUS_REACHABLE:
+                    item["connectivity"] = {
+                        "type": "snmp",
+                        "status": "reachable",
+                        "message": "SNMP v2c",
+                    }
+                elif snmp_status == SNMP_STATUS_UNREACHABLE:
                     item["connectivity"] = {
                         "type": "snmp",
                         "status": "unreachable",
                         "message": "SNMP最近采集不可达，当前展示最近一次后台采集结果",
+                    }
+                elif (item.get("connectivity") or {}).get("type") == "telemetry":
+                    item["connectivity"] = {
+                        "type": "snmp",
+                        "status": "unknown",
+                        "message": "等待SNMP采集结果",
                     }
             else:
                 overview = _build_snmp_overview(
@@ -2777,7 +2951,7 @@ async def get_monitor_devices_overview(
         item["collected_at"] = item.get("collected_at") or datetime.now(timezone.utc).isoformat()
         items.append(item)
 
-    payload = {"items": items, "total": len(items)}
+    payload = {"items": items, "total": len(items), "cache_version": cache_version}
     redis_client.setex(
         snapshot_cache_key,
         DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS,
@@ -2799,7 +2973,7 @@ async def get_monitor_devices_overview(
             device = item.get("device") or {}
             if not _connectivity_filter_matches(item, connectivity):
                 continue
-            if vendor_keyword and vendor_keyword not in str(device.get("vendor") or "").lower():
+            if vendor_keyword and not _vendor_filter_matches(device.get("vendor"), vendor_keyword):
                 continue
             if model_keyword and model_keyword not in str(device.get("model") or "").lower():
                 continue
@@ -2835,6 +3009,7 @@ async def refresh_monitor_devices_overview():
     """手动触发一次监控设备采集，用于新增/修改 SNMP 后立即刷新总览。"""
     from app.tasks.snmp_tasks import collect_all_asternos_exporter, collect_all_snmp
 
+    _invalidate_device_overview_response_cache()
     snmp_task = collect_all_snmp.delay()
     asternos_task = collect_all_asternos_exporter.delay()
     return {
@@ -2860,11 +3035,13 @@ async def refresh_monitor_device(device_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="设备不是上线状态，无法触发采集")
 
     if get_effective_monitor_source(device) == "asternos_exporter":
+        _invalidate_device_overview_response_cache(device.id)
         task = collect_asternos_for_device.delay(device.id)
         source = "asternos_exporter"
     else:
         if not device.snmp_version:
             raise HTTPException(status_code=400, detail="设备未配置SNMP参数")
+        _invalidate_device_overview_response_cache(device.id)
         task = collect_snmp_for_device.delay(device.id)
         source = "snmp"
 
@@ -2890,9 +3067,63 @@ async def get_monitor_device_protocol_neighbors(device_id: int, db: Session = De
                 "neighbors": cached["neighbors"],
                 "collected_at": cached.get("collected_at") or datetime.now(timezone.utc).isoformat(),
             }
-        neighbors = {"bgp": [], "ospf": []}
+        neighbors = {"bgp": [], "ospf": [], "lldp": []}
     else:
         neighbors = _get_snmp_protocol_neighbors(device.id)
+        cached_bgp_details = _load_monitor_cache("bgp_peer_details", device.id)
+        cached_lldp = _load_monitor_cache("lldp_neighbors", device.id)
+
+        async def _load_bgp_details() -> List[Dict[str, Any]]:
+            if isinstance(cached_bgp_details, dict) and isinstance(cached_bgp_details.get("neighbors"), list):
+                return cached_bgp_details.get("neighbors") or []
+            try:
+                bgp_rows = await asyncio.to_thread(snmp_collector.collect_bgp_peer_details, device)
+                _store_monitor_cache("bgp_peer_details", device.id, {
+                    "neighbors": bgp_rows,
+                    "collected_at": datetime.now(timezone.utc).isoformat(),
+                }, ttl_seconds=1800)
+                return bgp_rows
+            except Exception as exc:
+                logger.warning("BGP邻居详情采集失败", device_id=device.id, device_ip=device.ip_address, error=str(exc))
+                return []
+
+        async def _load_lldp_details() -> List[Dict[str, Any]]:
+            if isinstance(cached_lldp, dict) and isinstance(cached_lldp.get("neighbors"), list):
+                return cached_lldp.get("neighbors") or []
+            try:
+                lldp_rows = await asyncio.to_thread(snmp_collector.collect_lldp_neighbors, device)
+                _store_monitor_cache("lldp_neighbors", device.id, {
+                    "neighbors": lldp_rows,
+                    "collected_at": datetime.now(timezone.utc).isoformat(),
+                }, ttl_seconds=1800)
+                return lldp_rows
+            except Exception as exc:
+                logger.warning("LLDP邻居采集失败", device_id=device.id, device_ip=device.ip_address, error=str(exc))
+                return []
+
+        bgp_details, lldp_rows = await asyncio.gather(_load_bgp_details(), _load_lldp_details())
+        if bgp_details:
+            detail_map = {
+                (str(item.get("peer") or ""), str(item.get("instance") or "")): item
+                for item in bgp_details
+            }
+            existing_keys = set()
+            merged_bgp = []
+            for item in neighbors.get("bgp") or []:
+                key = (str(item.get("peer") or ""), str(item.get("instance") or ""))
+                existing_keys.add(key)
+                detail = detail_map.get(key) or detail_map.get((key[0], "")) or {}
+                merged = {**item}
+                for field in ("remote_as", "local_addr", "local_address", "interface"):
+                    if not merged.get(field) and detail.get(field):
+                        merged[field] = detail.get(field)
+                merged_bgp.append(merged)
+            for key, detail in detail_map.items():
+                if key not in existing_keys:
+                    merged_bgp.append(detail)
+            neighbors["bgp"] = merged_bgp
+        neighbors["lldp"] = lldp_rows
+        neighbors["lldp"] = _apply_lldp_device_ip_fallback(db, neighbors.get("lldp") or [])
     return {
         "device": serialize_monitor_device(device),
         "neighbors": neighbors,
@@ -3022,15 +3253,19 @@ async def get_latest_metrics(
 
 
 @router.get("/dashboard/stats")
-async def get_dashboard_stats(db: Session = Depends(get_db)):
+async def get_dashboard_stats(
+    refresh: bool = Query(False, description="是否绕过缓存直接重算"),
+    db: Session = Depends(get_db),
+):
     """获取Dashboard统计数据"""
     cache_key = "dashboard:stats:v2"
-    try:
-        cached = redis_client.get(cache_key)
-        if cached:
-            return json.loads(cached)
-    except Exception as e:
-        logger.warning("读取Dashboard缓存失败", error=str(e))
+    if not refresh:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception as e:
+            logger.warning("读取Dashboard缓存失败", error=str(e))
 
     try:
         # 设备统计

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Row, Col, Card, Statistic, Spin, Progress, Space, Typography, theme, Segmented } from 'antd'
+import { Row, Col, Card, Statistic, Spin, Progress, Space, Typography, theme, Segmented, Tooltip as AntTooltip } from 'antd'
 import {
   DesktopOutlined,
   CheckCircleOutlined,
@@ -8,6 +8,7 @@ import {
   BankOutlined,
   GlobalOutlined,
   ApartmentOutlined,
+  QuestionCircleOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { getDashboardStats, getServerResources, ServerResourceStats } from '../api/metrics'
@@ -69,6 +70,26 @@ const formatUptime = (seconds: number) => {
   return `${minutes}分钟`
 }
 
+const formatLoadAverage = (values?: number[] | null) => {
+  if (!values || values.length < 3) return '暂无负载信息'
+  return `平均负载（1/5/15分钟）：${values.map((value) => Number(value).toFixed(2)).join(' / ')}`
+}
+
+const getLoadStatus = (loadAvg?: number[] | null, cores?: number) => {
+  if (!loadAvg || loadAvg.length < 1 || !cores || cores <= 0) {
+    return { label: '状态未知', color: '#8c8c8c' }
+  }
+  const latestLoad = Number(loadAvg[0] || 0)
+  const ratio = latestLoad / cores
+  if (ratio >= 1) {
+    return { label: '高负载', color: '#cf1322' }
+  }
+  if (ratio >= 0.7) {
+    return { label: '偏高', color: '#d48806' }
+  }
+  return { label: '正常', color: '#389e0d' }
+}
+
 const Dashboard = () => {
   const navigate = useNavigate()
   const { token } = theme.useToken()
@@ -92,6 +113,10 @@ const Dashboard = () => {
       private_circuits: [] as NamedCount[],
     },
   })
+  const loadStatus = useMemo(
+    () => getLoadStatus(serverResources?.cpu.load_avg, serverResources?.cpu.cores),
+    [serverResources?.cpu.load_avg, serverResources?.cpu.cores]
+  )
 
   useEffect(() => {
     fetchStats()
@@ -434,17 +459,29 @@ const Dashboard = () => {
                   <Col xs={24} md={8}>
                     <Card size="small">
                       <Statistic
-                        title={`CPU 使用率 (${serverResources.cpu.cores}核)`}
+                        title={
+                          <Space size={6}>
+                            <span>{`CPU 使用率 (${serverResources.cpu.cores}核)`}</span>
+                            <AntTooltip
+                              title={`平均负载表示最近 1 分钟、5 分钟、15 分钟内，系统中处于运行或等待 CPU 的任务数。当前是 ${serverResources.cpu.cores} 核服务器，负载长期接近或超过 ${serverResources.cpu.cores} 才说明 CPU 压力较大。`}
+                            >
+                              <QuestionCircleOutlined style={{ color: '#8c8c8c', cursor: 'help' }} />
+                            </AntTooltip>
+                          </Space>
+                        }
                         value={serverResources.cpu.percent}
                         suffix="%"
                         valueStyle={{ color: serverResources.cpu.percent >= 80 ? '#cf1322' : '#1677ff' }}
                       />
                       <Progress percent={serverResources.cpu.percent} showInfo={false} strokeColor="#1677ff" />
-                      <Text type="secondary">
-                        {serverResources.cpu.load_avg
-                          ? `负载 ${serverResources.cpu.load_avg.join(' / ')}`
-                          : '暂无负载信息'}
-                      </Text>
+                      <Space direction="vertical" size={2}>
+                        <Text type="secondary">
+                          {formatLoadAverage(serverResources.cpu.load_avg)}
+                        </Text>
+                        <Text style={{ color: loadStatus.color }}>
+                          {`负载状态：${loadStatus.label}`}
+                        </Text>
+                      </Space>
                     </Card>
                   </Col>
                   <Col xs={24} md={8}>

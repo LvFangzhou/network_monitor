@@ -15,6 +15,7 @@ import {
   Modal,
   Form,
   Select,
+  Progress,
   theme,
 } from 'antd'
 import {
@@ -37,7 +38,7 @@ const { Search } = Input
 const { Text } = Typography
 const { Option } = Select
 const DEVICE_LIST_STORAGE_KEY = 'resource-network-device-list-state'
-const DEVICE_LIST_STORAGE_VERSION = 6
+const DEVICE_LIST_STORAGE_VERSION = 7
 const COLUMN_FILTER_KEYS = ['name', 'ip_address', 'status', 'is_monitored', 'datacenter', 'model', 'device_type', 'serial_number'] as const
 type ColumnFilterKey = typeof COLUMN_FILTER_KEYS[number]
 type SortField = ColumnFilterKey
@@ -54,15 +55,15 @@ const DEFAULT_VISIBLE_COLUMNS = [
   'action',
 ]
 const DEFAULT_COLUMN_WIDTHS = {
-  name: 180,
-  status: 120,
-  is_monitored: 110,
-  ip_address: 84,
-  datacenter: 180,
-  device_type: 140,
-  device_role: 130,
-  vendor: 120,
-  model: 160,
+  name: 240,
+  status: 110,
+  is_monitored: 100,
+  ip_address: 120,
+  datacenter: 240,
+  device_type: 120,
+  device_role: 120,
+  vendor: 100,
+  model: 150,
   serial_number: 180,
   action: 150,
 }
@@ -192,6 +193,7 @@ const DeviceList = () => {
 
   const [devices, setDevices] = useState<Device[]>([])
   const [loading, setLoading] = useState(false)
+  const [listProgress, setListProgress] = useState(0)
   const [total, setTotal] = useState(0)
   const [currentPage, setCurrentPage] = useState(persistedState?.currentPage || 1)
   const [pageSize, setPageSize] = useState(persistedState?.pageSize || 20)
@@ -269,8 +271,15 @@ const DeviceList = () => {
     const fetchSeq = fetchSeqRef.current + 1
     fetchSeqRef.current = fetchSeq
     const silent = Boolean(params?.silent)
+    let timer: number | null = null
     if (!silent) {
       setLoading(true)
+      let progress = 8
+      setListProgress(progress)
+      timer = window.setInterval(() => {
+        progress = Math.min(progress + (progress < 60 ? 12 : progress < 85 ? 6 : 2), 92)
+        setListProgress(progress)
+      }, 500)
     }
     try {
       const effectiveSearch = (params?.search ?? searchKeyword) || undefined
@@ -307,9 +316,15 @@ const DeviceList = () => {
         : result.items
       setDevices(nextItems)
       setTotal(result.total)
+      if (!silent) {
+        setListProgress(100)
+      }
     } catch (error) {
       console.error('获取设备列表失败:', error)
     } finally {
+      if (timer) {
+        window.clearInterval(timer)
+      }
       if (!silent && fetchSeq === fetchSeqRef.current) {
         setLoading(false)
       }
@@ -1257,6 +1272,15 @@ const DeviceList = () => {
           ) : null}
         </Space>
       </div>
+
+      {loading ? (
+        <Card bodyStyle={{ padding: 12, marginBottom: 16 }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            正在加载网络设备...
+          </Text>
+          <Progress percent={listProgress} size="small" status="active" showInfo={false} style={{ marginTop: 6 }} />
+        </Card>
+      ) : null}
 
       <div className="network-device-table">
       <Table

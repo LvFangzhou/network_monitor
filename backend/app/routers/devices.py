@@ -14,6 +14,7 @@ from app.database import get_db
 from app.models import AlertHistory, Device, DeviceGroup, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
 from app.collectors.snmp_collector import SNMPCollector
 from app.utils.interface_scope import alert_target_interface_is_monitored
+from app.redis_client import redis_client
 from app.schemas import (
     DeviceCreate, DeviceUpdate, DeviceResponse,
     DeviceGroupCreate, DeviceGroupUpdate, DeviceGroupResponse,
@@ -30,6 +31,60 @@ router = APIRouter()
 
 
 ACTIVE_ALERT_STATUSES = ("firing", "acknowledged", "ignored", "snoozed")
+DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX = "monitor:cache:overview_snapshot"
+DEVICE_OVERVIEW_LAST_SUCCESS_CACHE_PREFIX = "monitor:cache:last_success_overview_snapshot"
+DEVICE_OVERVIEW_REVISION_KEY = "monitor:cache:overview_revision"
+
+
+def _invalidate_device_overview_response_cache() -> None:
+    try:
+        keys = []
+        for prefix in [DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX, DEVICE_OVERVIEW_LAST_SUCCESS_CACHE_PREFIX]:
+            cursor = 0
+            while True:
+                cursor, matched = redis_client.scan(cursor=cursor, match=f"{prefix}:*", count=200)
+                if matched:
+                    keys.extend(matched)
+                if cursor == 0:
+                    break
+        if keys:
+            redis_client.delete(*keys)
+    except Exception:
+        logger.warning("清理设备总览缓存失败", exc_info=True)
+
+
+def _bump_device_overview_revision() -> None:
+    try:
+        redis_client.incr(DEVICE_OVERVIEW_REVISION_KEY)
+    except Exception:
+        logger.warning("递增设备总览版本失败", exc_info=True)
+
+
+def _trigger_monitor_refresh_for_device(device: Device) -> None:
+    if not device or not device.id:
+        return
+    if not bool(device.is_monitored):
+        return
+    if str(device.status or "") not in {"active", "online"}:
+        return
+
+    _bump_device_overview_revision()
+    _invalidate_device_overview_response_cache()
+
+    try:
+        if resolve_monitor_source_by_vendor(device.vendor, device.monitor_source) == "asternos_exporter":
+            from app.tasks.snmp_tasks import collect_asternos_for_device
+
+            collect_asternos_for_device.delay(device.id)
+        else:
+            if not device.snmp_version:
+                logger.info("设备已加入监控但未配置SNMP参数，跳过自动触发采集", device_id=device.id)
+                return
+            from app.tasks.snmp_tasks import collect_snmp_for_device
+
+            collect_snmp_for_device.delay(device.id)
+    except Exception:
+        logger.warning("自动触发设备采集失败", device_id=getattr(device, "id", None), exc_info=True)
 
 
 def resolve_active_alerts_for_unmonitored_devices(db: Session, device_ids: list[int]) -> int:
@@ -134,7 +189,7 @@ def normalize_monitoring_config(
 
 def is_asternos_vendor(vendor: str | None) -> bool:
     value = (vendor or "").strip().lower()
-    return any(marker in value for marker in ["asternos", "asterfusion", "asteros", "星融元"])
+    return any(marker in value for marker in ["asternos", "asterfusion", "asteros", "aster", "星融元"])
 
 
 def resolve_monitor_source_by_vendor(vendor: str | None, requested_source: str | None) -> str:
@@ -937,6 +992,7 @@ async def create_device(device: DeviceCreate, db: Session = Depends(get_db)):
     db.add(db_device)
     db.commit()
     db.refresh(db_device)
+    _trigger_monitor_refresh_for_device(db_device)
     
     logger.info("设备创建成功", device_id=db_device.id, name=db_device.name)
     return db_device.to_dict()
@@ -1068,6 +1124,7 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
         resolved_alerts = resolve_active_interface_alerts_outside_scope(db, db_device)
     db.commit()
     db.refresh(db_device)
+    _trigger_monitor_refresh_for_device(db_device)
     
     logger.info("设备更新成功", device_id=device_id, auto_resolved_alerts=resolved_alerts)
     return db_device.to_dict()

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import type { DragEvent } from 'react'
 import {
   Button,
@@ -60,8 +60,6 @@ const CONNECTIVITY_OPTIONS = [
   { value: 'snmp_unreachable', label: 'SNMP不可达' },
   { value: 'exporter_reachable', label: 'Exporter可达' },
   { value: 'exporter_unreachable', label: 'Exporter不可达' },
-  { value: 'telemetry_reachable', label: 'Telemetry可达' },
-  { value: 'telemetry_unreachable', label: 'Telemetry不可达' },
   { value: 'reachable', label: '全部可达' },
   { value: 'unreachable', label: '全部不可达' },
   { value: 'unknown', label: '未知' },
@@ -103,6 +101,70 @@ const compareIpAddress = (left?: string, right?: string) => {
 
 const compareText = (left?: string | number | null, right?: string | number | null) =>
   String(left ?? '').localeCompare(String(right ?? ''), 'zh-CN', { numeric: true, sensitivity: 'base' })
+
+const extractLastInterfaceToken = (value?: string | null) => {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  const patterns = [
+    /(?:FourHundredGigE|400G)\d+(?:\/\d+)+/i,
+    /(?:TwoHundredGigE|200G)\d+(?:\/\d+)+(?::\d+)?/i,
+    /(?:HundredGigE|100G)\d+(?:\/\d+)+(?::\d+)?/i,
+    /(?:FiftyGigE|50G)\d+(?:\/\d+)+(?::\d+)?/i,
+    /(?:Twenty-FiveGigE|TwentyFiveGigE|25G)\d+(?:\/\d+)+(?::\d+)?/i,
+    /(?:Ten-GigabitEthernet|TenGigabitEthernet|10G)\d+(?:\/\d+)+(?::\d+)?/i,
+    /(?:M-GigabitEthernet|MGigabitEthernet|GigabitEthernet|GE)\d+(?:\/\d+)+(?::\d+)?/i,
+    /(?:XGigabitEthernet|XGE)\d+(?:\/\d+)+(?::\d+)?/i,
+    /(?:Bridge-Aggregation|Eth-Trunk|Port-Channel|Vlan-interface|LoopBack|NULL|InLoopBack|Auxiliary)\S*/i,
+  ]
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (match) return match[0]
+  }
+  return text
+}
+
+const formatShortInterfaceName = (value?: string | null) => {
+  const token = extractLastInterfaceToken(value)
+  if (!token) return '-'
+  return token
+    .replace(/^FourHundredGigE/i, '400G')
+    .replace(/^TwoHundredGigE/i, '200G')
+    .replace(/^HundredGigE/i, '100G')
+    .replace(/^FiftyGigE/i, '50G')
+    .replace(/^Twenty-FiveGigE/i, '25G')
+    .replace(/^TwentyFiveGigE/i, '25G')
+    .replace(/^Ten-GigabitEthernet/i, '10G')
+    .replace(/^TenGigabitEthernet/i, '10G')
+    .replace(/^M-GigabitEthernet/i, 'GE')
+    .replace(/^MGigabitEthernet/i, 'GE')
+    .replace(/^GigabitEthernet/i, 'GE')
+    .replace(/^XGigabitEthernet/i, 'XGE')
+}
+
+const formatDeviceOnlyName = (value?: string | null) => {
+  const text = String(value || '').trim()
+  if (!text) return '-'
+  return text.replace(/^to-/i, '').replace(/-(?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet)\d+(?:\/\d+)+(?:[:/]\d+)?$/i, '')
+}
+
+const temperatureTooltip = (record: DeviceOverviewItem) => {
+  const details = record.resources.temperature_details || []
+  if (!details.length) return null
+  const sorted = [...details]
+    .filter((item) => item?.temperature !== null && item?.temperature !== undefined)
+    .sort((a, b) => Number(b.temperature || 0) - Number(a.temperature || 0))
+  if (!sorted.length) return null
+  return (
+    <div style={{ maxHeight: 320, overflow: 'auto', minWidth: 180 }}>
+      {sorted.map((item, index) => (
+        <div key={`${item.sensor || 'temp'}-${index}`} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+          <span>{item.sensor || '-'}</span>
+          <span>{Number(item.temperature).toFixed(1)}℃</span>
+        </div>
+      ))}
+    </div>
+  )
+}
 
 const normalizePercent = (value?: number | null) => {
   if (value === undefined || value === null) return null
@@ -169,6 +231,7 @@ const sourceLabel = (value?: string) => {
 const connectivitySource = (item: DeviceOverviewItem) => {
   const source = String(item.connectivity?.type || item.monitor_source || 'snmp')
   if (source === 'asternos_exporter') return 'exporter'
+  if (source === 'telemetry') return 'snmp'
   return source || 'snmp'
 }
 
@@ -235,18 +298,11 @@ const ProtocolCell = ({ data }: { data: DeviceProtocolSummary }) => {
 const ConnectivityTag = ({ item }: { item: DeviceOverviewItem }) => {
   const { status, message: detail } = item.connectivity
   const source = connectivitySource(item)
-  const typeLabel =
-    source === 'exporter'
-      ? 'Exporter'
-      : source === 'telemetry'
-        ? 'Telemetry'
-        : 'SNMP'
+  const typeLabel = source === 'exporter' ? 'Exporter' : 'SNMP'
   const color =
     status === 'reachable'
       ? source === 'exporter'
         ? 'green'
-        : source === 'telemetry'
-          ? 'purple'
         : 'blue'
       : status === 'unreachable'
         ? 'red'
@@ -380,8 +436,83 @@ const isSnmpModelMismatch = (record: DeviceOverviewItem) => {
   return Boolean(snmpModel && enteredModel && snmpModel !== enteredModel)
 }
 
+
+const normalizeVendorText = (value?: string | null) => {
+  const text = String(value || '').trim().toLowerCase()
+  if (!text) return ''
+  if (['ruijie', '锐捷', 'rgos'].some((marker) => text.includes(marker))) return 'ruijie 锐捷 rgos'
+  if (['h3c', '华三', '新华三', 'comware'].some((marker) => text.includes(marker))) return 'h3c 华三 新华三 comware'
+  if (['hillstone', '山石'].some((marker) => text.includes(marker))) return 'hillstone 山石'
+  if (['aster', 'asternos', 'asterfusion', '星融元'].some((marker) => text.includes(marker))) return 'aster asternos asterfusion 星融元'
+  return text
+}
+
+const matchesVendorFilter = (rawVendor?: string | null, keyword?: string) => {
+  const key = String(keyword || '').trim().toLowerCase()
+  if (!key) return true
+  const normalizedVendor = normalizeVendorText(rawVendor)
+  const normalizedKey = normalizeVendorText(key)
+  return normalizedVendor.includes(key) || normalizedVendor.includes(normalizedKey.split(' ')[0])
+}
+
 const OVERVIEW_CACHE_KEY = 'device-overview:last-success'
 const COLUMN_ORDER_STORAGE_KEY = 'device-overview:visible-column-order-v2'
+const COLUMN_WIDTH_STORAGE_KEY = 'device-overview:column-widths-v1'
+
+const DEFAULT_COLUMN_WIDTHS: Record<string, number> = {
+  device: 320,
+  vendor: 170,
+  datacenter: 240,
+  uptime: 130,
+  software_version: 210,
+  connectivity: 130,
+  cpu: 115,
+  memory: 115,
+  temperature: 95,
+  storage: 115,
+  fan: 100,
+  power: 100,
+  bgp: 120,
+  ospf: 120,
+  updated_at: 160,
+  detail: 145,
+}
+
+const MIN_COLUMN_WIDTHS: Record<string, number> = {
+  device: 220,
+  vendor: 130,
+  datacenter: 180,
+  detail: 120,
+}
+
+const ResizableHeaderCell = ({ onResizeStart, children, style, ...restProps }: any) => (
+  <th
+    {...restProps}
+    style={{
+      ...style,
+      position: 'relative',
+    }}
+  >
+    {children}
+    {onResizeStart ? (
+      <span
+        onMouseDown={onResizeStart}
+        onClick={(event: ReactMouseEvent<HTMLSpanElement>) => event.stopPropagation()}
+        style={{
+          position: 'absolute',
+          top: 0,
+          right: -4,
+          width: 8,
+          height: '100%',
+          cursor: 'col-resize',
+          userSelect: 'none',
+          zIndex: 3,
+        }}
+      />
+    ) : null}
+  </th>
+)
+
 const DEFAULT_VISIBLE_COLUMN_KEYS = [
   'datacenter',
   'uptime',
@@ -402,6 +533,7 @@ type DeviceOverviewCachePayload = {
 
 const DeviceOverview = () => {
   const [loading, setLoading] = useState(false)
+  const [overviewProgress, setOverviewProgress] = useState(0)
   const [refreshingDeviceId, setRefreshingDeviceId] = useState<number | null>(null)
   const [items, setItems] = useState<DeviceOverviewItem[]>([])
   const [search, setSearch] = useState('')
@@ -412,12 +544,25 @@ const DeviceOverview = () => {
   const [sortKey, setSortKey] = useState('ip_asc')
   const [refreshIntervalSeconds, setRefreshIntervalSeconds] = useState(300)
   const [tablePageSize, setTablePageSize] = useState(20)
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
+    try {
+      const raw = window.localStorage.getItem(COLUMN_WIDTH_STORAGE_KEY)
+      const saved = raw ? JSON.parse(raw) : null
+      return { ...DEFAULT_COLUMN_WIDTHS, ...(saved || {}) }
+    } catch {
+      return DEFAULT_COLUMN_WIDTHS
+    }
+  })
   const [detailOpen, setDetailOpen] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [detailProgress, setDetailProgress] = useState(0)
   const [detailDevice, setDetailDevice] = useState<DeviceOverviewItem | null>(null)
-  const [neighbors, setNeighbors] = useState<{ bgp: ProtocolNeighbor[]; ospf: ProtocolNeighbor[] }>({ bgp: [], ospf: [] })
+  const [neighbors, setNeighbors] = useState<{ bgp: ProtocolNeighbor[]; ospf: ProtocolNeighbor[]; lldp: ProtocolNeighbor[] }>({ bgp: [], ospf: [], lldp: [] })
+  const detailCacheRef = useRef<Record<number, { at: number; neighbors: { bgp: ProtocolNeighbor[]; ospf: ProtocolNeighbor[]; lldp: ProtocolNeighbor[] } }>>({})
+  const [lldpPageSize, setLldpPageSize] = useState(20)
   const [syncingField, setSyncingField] = useState<string | null>(null)
   const filtersReadyRef = useRef(false)
+  const resizeStateRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null)
   const [draggingColumnKey, setDraggingColumnKey] = useState<string | null>(null)
   const [dragOverColumnKey, setDragOverColumnKey] = useState<string | null>(null)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<string[]>(() => {
@@ -429,6 +574,25 @@ const DeviceOverview = () => {
       return DEFAULT_VISIBLE_COLUMN_KEYS
     }
   })
+
+  const lldpPeerMap = useMemo(() => {
+    const mapping = new Map<string, { remoteSystem: string; remotePort: string }>()
+    for (const item of neighbors.lldp) {
+      const localKeys = [
+        formatShortInterfaceName(item.local_port_id),
+        formatShortInterfaceName(item.local_port),
+        String(item.local_port_num || '').trim(),
+      ].filter(Boolean)
+      const value = {
+        remoteSystem: formatDeviceOnlyName(item.remote_system),
+        remotePort: formatShortInterfaceName(item.remote_port_id || item.remote_port),
+      }
+      localKeys.forEach((key) => {
+        if (key && key !== '-') mapping.set(key, value)
+      })
+    }
+    return mapping
+  }, [neighbors.lldp])
 
   const columnOptions = [
     { label: '所属机房', value: 'datacenter' },
@@ -478,6 +642,40 @@ const DeviceOverview = () => {
     })
   }
 
+
+  const handleResizeStart = (key: string) => (event: ReactMouseEvent<HTMLSpanElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    resizeStateRef.current = {
+      key,
+      startX: event.clientX,
+      startWidth: columnWidths[key] || DEFAULT_COLUMN_WIDTHS[key] || 120,
+    }
+  }
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      const resizeState = resizeStateRef.current
+      if (!resizeState) return
+      const minWidth = MIN_COLUMN_WIDTHS[resizeState.key] || 90
+      const nextWidth = Math.max(minWidth, resizeState.startWidth + event.clientX - resizeState.startX)
+      setColumnWidths((prev) => {
+        const next = { ...prev, [resizeState.key]: nextWidth }
+        window.localStorage.setItem(COLUMN_WIDTH_STORAGE_KEY, JSON.stringify(next))
+        return next
+      })
+    }
+    const handleMouseUp = () => {
+      resizeStateRef.current = null
+    }
+    document.addEventListener('mousemove', handleMouseMove)
+    document.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [])
+
   const moveVisibleColumn = (sourceKey: string, targetKey: string) => {
     if (sourceKey === targetKey) return
     updateVisibleColumnKeys((current) => {
@@ -493,8 +691,15 @@ const DeviceOverview = () => {
 
   const loadData = async (options?: { silent?: boolean }) => {
     const silent = Boolean(options?.silent)
+    let timer: number | null = null
     if (!silent || items.length === 0) {
       setLoading(true)
+      let progress = 8
+      setOverviewProgress(progress)
+      timer = window.setInterval(() => {
+        progress = Math.min(progress + (progress < 60 ? 12 : progress < 85 ? 6 : 2), 92)
+        setOverviewProgress(progress)
+      }, 500)
     }
     try {
       const result = await getDeviceOverview({
@@ -506,6 +711,9 @@ const DeviceOverview = () => {
       })
       const nextItems = result.items || []
       setItems(nextItems)
+      if (!silent || items.length === 0) {
+        setOverviewProgress(100)
+      }
       const payload: DeviceOverviewCachePayload = {
         items: nextItems,
         savedAt: new Date().toISOString(),
@@ -514,6 +722,9 @@ const DeviceOverview = () => {
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取设备总览失败')
     } finally {
+      if (timer) {
+        window.clearInterval(timer)
+      }
       if (!silent || items.length === 0) {
         setLoading(false)
       }
@@ -579,7 +790,7 @@ const DeviceOverview = () => {
       if (datacenter !== DATACENTER_ALL_VALUE && (item.device.datacenter?.name || '') !== datacenter) {
         return false
       }
-      if (vendor && !String(item.device.vendor || '').toLowerCase().includes(vendor.toLowerCase())) {
+      if (vendor && !matchesVendorFilter(item.device.vendor, vendor)) {
         return false
       }
       if (modelKeyword && !String(item.device.model || '').toLowerCase().includes(modelKeyword)) {
@@ -640,14 +851,36 @@ const DeviceOverview = () => {
   const openDetail = async (item: DeviceOverviewItem) => {
     setDetailDevice(item)
     setDetailOpen(true)
+    setDetailProgress(0)
+    const cachedDetail = detailCacheRef.current[item.device.id]
+    if (cachedDetail && Date.now() - cachedDetail.at < 30 * 60 * 1000) {
+      setNeighbors(cachedDetail.neighbors)
+      setDetailLoading(false)
+      setDetailProgress(100)
+      return
+    }
     setDetailLoading(true)
+    let progress = 8
+    setDetailProgress(progress)
+    const timer = window.setInterval(() => {
+      progress = Math.min(progress + (progress < 60 ? 12 : progress < 85 ? 6 : 2), 92)
+      setDetailProgress(progress)
+    }, 500)
     try {
       const result = await getDeviceProtocolNeighbors(item.device.id)
-      setNeighbors(result.neighbors)
+      const nextNeighbors = {
+        bgp: result.neighbors.bgp || [],
+        ospf: result.neighbors.ospf || [],
+        lldp: result.neighbors.lldp || [],
+      }
+      detailCacheRef.current[item.device.id] = { at: Date.now(), neighbors: nextNeighbors }
+      setNeighbors(nextNeighbors)
+      setDetailProgress(100)
     } catch (error: any) {
-      setNeighbors({ bgp: [], ospf: [] })
+      setNeighbors({ bgp: [], ospf: [], lldp: [] })
       message.error(error?.response?.data?.detail || '获取协议邻居失败')
     } finally {
+      window.clearInterval(timer)
       setDetailLoading(false)
     }
   }
@@ -704,12 +937,97 @@ const DeviceOverview = () => {
     }
   }
 
+  const bgpRemoteDeviceName = (record: ProtocolNeighbor) => {
+    const key = formatShortInterfaceName(record.interface)
+    return lldpPeerMap.get(key)?.remoteSystem || '-'
+  }
+
+  const bgpRemotePortName = (record: ProtocolNeighbor) => {
+    const key = formatShortInterfaceName(record.interface)
+    return lldpPeerMap.get(key)?.remotePort || '-'
+  }
+
   const neighborColumns = [
     {
       title: '邻居',
       dataIndex: 'peer',
       key: 'peer',
-      width: 160,
+      width: 130,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareIpAddress(a.peer, b.peer),
+      ...neighborColumnSearch((record) => record.peer, '搜索邻居'),
+    },
+    {
+      title: '状态',
+      key: 'status',
+      width: 100,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(a.state || a.status, b.state || b.status),
+      ...neighborColumnSearch((record) => record.state || record.status, '搜索状态'),
+      render: (_: any, record: ProtocolNeighbor) => (
+        <Tag color={record.status === 'up' ? 'green' : 'red'}>{record.state || record.status}</Tag>
+      ),
+    },
+    {
+      title: '接口',
+      dataIndex: 'interface',
+      key: 'interface',
+      width: 120,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(formatShortInterfaceName(a.interface), formatShortInterfaceName(b.interface)),
+      ...neighborColumnSearch((record) => formatShortInterfaceName(record.interface), '搜索接口'),
+      render: (value: string | null) => formatShortInterfaceName(value),
+    },
+    {
+      title: '对端设备',
+      key: 'remote_system',
+      width: 380,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(bgpRemoteDeviceName(a), bgpRemoteDeviceName(b)),
+      ...neighborColumnSearch((record) => bgpRemoteDeviceName(record), '搜索对端设备'),
+      render: (_: any, record: ProtocolNeighbor) => (
+        <Tooltip title={bgpRemoteDeviceName(record)}>
+          <Text style={{ whiteSpace: 'nowrap', display: 'inline-block' }}>{bgpRemoteDeviceName(record)}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      title: '对端端口',
+      key: 'remote_port',
+      width: 120,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(bgpRemotePortName(a), bgpRemotePortName(b)),
+      ...neighborColumnSearch((record) => bgpRemotePortName(record), '搜索对端端口'),
+      render: (_: any, record: ProtocolNeighbor) => bgpRemotePortName(record),
+    },
+    {
+      title: '本端IP',
+      key: 'local_addr',
+      width: 130,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareIpAddress(a.local_addr || a.local_address || '', b.local_addr || b.local_address || ''),
+      ...neighborColumnSearch((record) => record.local_addr || record.local_address, '搜索本端IP'),
+      render: (_: any, record: ProtocolNeighbor) => record.local_addr || record.local_address || '-',
+    },
+    {
+      title: <span style={{ whiteSpace: 'nowrap' }}>Remote AS</span>,
+      dataIndex: 'remote_as',
+      key: 'remote_as',
+      width: 110,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(a.remote_as, b.remote_as),
+      ...neighborColumnSearch((record) => record.remote_as, '搜索 Remote AS'),
+      render: (value: string | number | null) => value || '-',
+    },
+    {
+      title: '持续时间',
+      key: 'duration',
+      width: 130,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => Number(a.duration_seconds || 0) - Number(b.duration_seconds || 0),
+      ...neighborColumnSearch((record) => formatDuration(record.duration_seconds, record.duration_text), '搜索持续时间'),
+      render: (_: any, record: ProtocolNeighbor) => formatDuration(record.duration_seconds, record.duration_text),
+    },
+  ]
+
+  const ospfNeighborColumns = [
+    {
+      title: '邻居',
+      dataIndex: 'peer',
+      key: 'peer',
+      width: 180,
       sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareIpAddress(a.peer, b.peer),
       ...neighborColumnSearch((record) => record.peer, '搜索邻居'),
     },
@@ -727,27 +1045,81 @@ const DeviceOverview = () => {
       title: '接口',
       dataIndex: 'interface',
       key: 'interface',
-      width: 180,
-      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(a.interface, b.interface),
-      ...neighborColumnSearch((record) => record.interface, '搜索接口'),
-      render: (value: string | null) => value || '-',
-    },
-    {
-      title: 'Remote AS',
-      dataIndex: 'remote_as',
-      key: 'remote_as',
-      width: 120,
-      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(a.remote_as, b.remote_as),
-      ...neighborColumnSearch((record) => record.remote_as, '搜索 Remote AS'),
-      render: (value: string | number | null) => value || '-',
+      width: 160,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(formatShortInterfaceName(a.interface), formatShortInterfaceName(b.interface)),
+      ...neighborColumnSearch((record) => formatShortInterfaceName(record.interface), '搜索接口'),
+      render: (value: string | null) => formatShortInterfaceName(value),
     },
     {
       title: '持续时间',
       key: 'duration',
-      width: 150,
+      width: 160,
       sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => Number(a.duration_seconds || 0) - Number(b.duration_seconds || 0),
       ...neighborColumnSearch((record) => formatDuration(record.duration_seconds, record.duration_text), '搜索持续时间'),
       render: (_: any, record: ProtocolNeighbor) => formatDuration(record.duration_seconds, record.duration_text),
+    },
+  ]
+
+  const lldpColumns = [
+    {
+      title: '本端端口',
+      dataIndex: 'local_port',
+      key: 'local_port',
+      width: 120,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(formatShortInterfaceName(a.local_port_id || a.local_port), formatShortInterfaceName(b.local_port_id || b.local_port)),
+      ...neighborColumnSearch((record) => formatShortInterfaceName(record.local_port_id || record.local_port), '搜索本端端口'),
+      render: (_: any, record: ProtocolNeighbor) => formatShortInterfaceName(record.local_port_id || record.local_port || record.local_port_num),
+    },
+    {
+      title: '对端设备',
+      dataIndex: 'remote_system',
+      key: 'remote_system',
+      width: 360,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(formatDeviceOnlyName(a.remote_system), formatDeviceOnlyName(b.remote_system)),
+      ...neighborColumnSearch((record) => formatDeviceOnlyName(record.remote_system), '搜索对端设备'),
+      render: (_: any, record: ProtocolNeighbor) => (
+        <Tooltip title={formatDeviceOnlyName(record.remote_system)}>
+          <Text style={{ whiteSpace: 'nowrap', display: 'inline-block' }}>{formatDeviceOnlyName(record.remote_system)}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      title: '类型',
+      dataIndex: 'remote_kind',
+      key: 'remote_kind',
+      width: 90,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(a.remote_kind, b.remote_kind),
+      render: (value: string | null) => {
+        const text = value || '未知'
+        const color = text === '网络设备' ? 'blue' : text === '服务器' ? 'green' : 'default'
+        return <Tag color={color}>{text}</Tag>
+      },
+    },
+    {
+      title: '对端端口',
+      dataIndex: 'remote_port',
+      key: 'remote_port',
+      width: 120,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(formatShortInterfaceName(a.remote_port_id || a.remote_port), formatShortInterfaceName(b.remote_port_id || b.remote_port)),
+      ...neighborColumnSearch((record) => formatShortInterfaceName(record.remote_port_id || record.remote_port), '搜索对端端口'),
+      render: (_: any, record: ProtocolNeighbor) => formatShortInterfaceName(record.remote_port_id || record.remote_port),
+    },
+    {
+      title: '对端管理地址',
+      dataIndex: 'remote_mgmt_addr',
+      key: 'remote_mgmt_addr',
+      width: 130,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareIpAddress(a.remote_mgmt_addr || '', b.remote_mgmt_addr || ''),
+      ...neighborColumnSearch((record) => record.remote_mgmt_addr, '搜索管理地址'),
+      render: (value: string | null) => value || '-',
+    },
+    {
+      title: '来源',
+      dataIndex: 'source',
+      key: 'source',
+      width: 100,
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(a.source, b.source),
+      render: (value: string | null) => <Tag color="blue">{value || 'SNMP'}</Tag>,
     },
   ]
 
@@ -756,7 +1128,7 @@ const DeviceOverview = () => {
       title: '设备',
       key: 'device',
       fixed: 'left',
-      width: 260,
+      width: columnWidths.device,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => compareIpAddress(a.device.ip_address, b.device.ip_address),
       render: (_: any, record: DeviceOverviewItem) => {
         const enteredName = record.device.name || record.device.hostname || record.device.ip_address
@@ -764,7 +1136,7 @@ const DeviceOverview = () => {
         const mismatch = isSnmpNameMismatch(record)
         return (
           <Space direction="vertical" size={2}>
-            <Text strong type={mismatch ? 'danger' : undefined}>{enteredName}</Text>
+            <Tooltip title={enteredName}><Text strong type={mismatch ? 'danger' : undefined} ellipsis style={{ maxWidth: (columnWidths.device || DEFAULT_COLUMN_WIDTHS.device) - 28 }}>{enteredName}</Text></Tooltip>
             <Text type="secondary">{record.device.ip_address}</Text>
             {mismatch ? (
               <Space size={6} wrap>
@@ -788,7 +1160,7 @@ const DeviceOverview = () => {
     {
       title: '厂商/型号',
       key: 'vendor',
-      width: 220,
+      width: columnWidths.vendor,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => String(a.device.model || '').localeCompare(String(b.device.model || '')),
       render: (_: any, record: DeviceOverviewItem) => {
         const snmpModel = formatCollectedModel(record.system_info?.snmp_model)
@@ -796,8 +1168,8 @@ const DeviceOverview = () => {
         const mismatch = isSnmpModelMismatch(record)
         return (
           <Space direction="vertical" size={2}>
-            <Text>{record.device.vendor || '-'}</Text>
-            <Text type={mismatch ? 'danger' : 'secondary'}>{enteredModel}</Text>
+            <Text ellipsis style={{ maxWidth: (columnWidths.vendor || DEFAULT_COLUMN_WIDTHS.vendor) - 24 }}>{record.device.vendor || '-'}</Text>
+            <Tooltip title={enteredModel}><Text type={mismatch ? 'danger' : 'secondary'} ellipsis style={{ maxWidth: (columnWidths.vendor || DEFAULT_COLUMN_WIDTHS.vendor) - 24 }}>{enteredModel}</Text></Tooltip>
             {mismatch ? (
               <Space size={6} wrap>
                 <Tooltip title={`录入型号：${enteredModel}；采集型号：${snmpModel}`}>
@@ -820,7 +1192,7 @@ const DeviceOverview = () => {
     {
       title: '所属机房',
       key: 'datacenter',
-      width: 180,
+      width: columnWidths.datacenter,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
         String(a.device.datacenter?.name || '').localeCompare(String(b.device.datacenter?.name || ''), 'zh-CN'),
       render: (_: any, record: DeviceOverviewItem) => (
@@ -833,7 +1205,7 @@ const DeviceOverview = () => {
     {
       title: '运行时间',
       key: 'uptime',
-      width: 130,
+      width: columnWidths.uptime,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
         (a.system_info?.uptime_seconds || -1) - (b.system_info?.uptime_seconds || -1),
       render: (_: any, record: DeviceOverviewItem) => formatDuration(record.system_info?.uptime_seconds),
@@ -841,7 +1213,7 @@ const DeviceOverview = () => {
     {
       title: '软件版本',
       key: 'software_version',
-      width: 210,
+      width: columnWidths.software_version,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) =>
         formatSoftwareVersion(a.system_info?.software_version).localeCompare(formatSoftwareVersion(b.system_info?.software_version)),
       render: (_: any, record: DeviceOverviewItem) => {
@@ -857,7 +1229,7 @@ const DeviceOverview = () => {
     {
       title: '连通性',
       key: 'connectivity',
-      width: 140,
+      width: columnWidths.connectivity,
       filters: CONNECTIVITY_OPTIONS.filter((item) => item.value).map((item) => ({ text: item.label, value: item.value })),
       onFilter: (value: any, record: DeviceOverviewItem) => matchesConnectivityFilter(record, String(value)),
       render: (_: any, record: DeviceOverviewItem) => <ConnectivityTag item={record} />,
@@ -865,38 +1237,42 @@ const DeviceOverview = () => {
     {
       title: 'CPU',
       key: 'cpu',
-      width: 130,
+      width: columnWidths.cpu,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => (normalizePercent(a.resources.cpu_percent) || -1) - (normalizePercent(b.resources.cpu_percent) || -1),
       render: (_: any, record: DeviceOverviewItem) => <ResourceCell value={record.resources.cpu_percent} source={record.data_sources?.resources?.cpu_percent} />,
     },
     {
       title: '内存',
       key: 'memory',
-      width: 130,
+      width: columnWidths.memory,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => (normalizePercent(a.resources.memory_percent) || -1) - (normalizePercent(b.resources.memory_percent) || -1),
       render: (_: any, record: DeviceOverviewItem) => <ResourceCell value={record.resources.memory_percent} source={record.data_sources?.resources?.memory_percent} />,
     },
     {
       title: '温度',
       key: 'temperature',
-      width: 100,
+      width: columnWidths.temperature,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => (a.resources.temperature || -1) - (b.resources.temperature || -1),
       render: (_: any, record: DeviceOverviewItem) =>
         record.resources.temperature === undefined || record.resources.temperature === null
           ? <Text type="secondary">-</Text>
-          : <Text>{Number(record.resources.temperature).toFixed(1)}℃</Text>,
+          : (
+            <Tooltip title={temperatureTooltip(record)}>
+              <Text>{Number(record.resources.temperature).toFixed(1)}℃</Text>
+            </Tooltip>
+          ),
     },
     {
       title: '存储',
       key: 'storage',
-      width: 130,
+      width: columnWidths.storage,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => (normalizePercent(a.resources.storage_percent) || -1) - (normalizePercent(b.resources.storage_percent) || -1),
       render: (_: any, record: DeviceOverviewItem) => <ResourceCell value={record.resources.storage_percent} />,
     },
     {
       title: '风扇',
       key: 'fan',
-      width: 110,
+      width: columnWidths.fan,
       render: (_: any, record: DeviceOverviewItem) => (
         <HardwareCell
           label="正常"
@@ -909,7 +1285,7 @@ const DeviceOverview = () => {
     {
       title: '电源',
       key: 'power',
-      width: 110,
+      width: columnWidths.power,
       render: (_: any, record: DeviceOverviewItem) => (
         <HardwareCell
           label="正常"
@@ -922,27 +1298,27 @@ const DeviceOverview = () => {
     {
       title: 'BGP',
       key: 'bgp',
-      width: 130,
+      width: columnWidths.bgp,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => a.protocols.bgp.down - b.protocols.bgp.down,
       render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.bgp} />,
     },
     {
       title: 'OSPF',
       key: 'ospf',
-      width: 130,
+      width: columnWidths.ospf,
       sorter: (a: DeviceOverviewItem, b: DeviceOverviewItem) => a.protocols.ospf.down - b.protocols.ospf.down,
       render: (_: any, record: DeviceOverviewItem) => <ProtocolCell data={record.protocols.ospf} />,
     },
     {
       title: '更新时间',
       key: 'updated_at',
-      width: 170,
+      width: columnWidths.updated_at,
       render: (_: any, record: DeviceOverviewItem) => dayjs(record.collected_at).format('YYYY-MM-DD HH:mm:ss'),
     },
     {
       title: '操作',
       key: 'detail',
-      width: 150,
+      width: columnWidths.detail,
       fixed: 'right',
       render: (_: any, record: DeviceOverviewItem) => (
         <Space size={8}>
@@ -970,7 +1346,7 @@ const DeviceOverview = () => {
     return {
       ...column,
       title: (
-        <Tooltip title="按住表头左右拖动，可调整列顺序">
+        <Tooltip title="拖动表头可调整顺序；拖动右侧边缘可调整宽度">
           <span style={{ cursor: 'grab', userSelect: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
             {column.title}
             <span style={{ color: '#1677ff', fontSize: 12, opacity: draggingColumnKey === key ? 1 : 0.45 }}>↔</span>
@@ -979,6 +1355,7 @@ const DeviceOverview = () => {
       ),
       onHeaderCell: () => ({
         draggable: true,
+        onResizeStart: handleResizeStart(key),
         onDragStart: (event: DragEvent<HTMLElement>) => {
           setDraggingColumnKey(key)
           setDragOverColumnKey(null)
@@ -1127,14 +1504,26 @@ const DeviceOverview = () => {
             <Tag color={stats.ospfDown > 0 ? 'red' : 'default'}>OSPF 异常 {stats.ospfDown}</Tag>
           </Tooltip>
         </Space>
+        {loading ? (
+          <div style={{ marginTop: 12 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              正在加载设备总览...
+            </Text>
+            <Progress percent={overviewProgress} size="small" status="active" showInfo={false} style={{ marginTop: 6 }} />
+          </div>
+        ) : null}
       </Card>
 
       <Card bodyStyle={{ padding: 0 }}>
         <Table<DeviceOverviewItem>
+          components={{
+            header: { cell: ResizableHeaderCell },
+          } as any}
           rowKey={(record) => record.device.id}
           loading={loading}
           dataSource={sortedItems}
-          scroll={{ x: 1500, y: 'calc(100vh - 360px)' }}
+          tableLayout="fixed"
+          scroll={{ x: 1700, y: 'calc(100vh - 360px)' }}
           pagination={{
             pageSize: tablePageSize,
             showSizeChanger: true,
@@ -1151,8 +1540,14 @@ const DeviceOverview = () => {
         title={detailDevice ? `${detailDevice.device.name || detailDevice.device.ip_address} 协议邻居` : '协议邻居'}
         open={detailOpen}
         onClose={() => setDetailOpen(false)}
-        width={860}
+        width={1450}
       >
+        {detailLoading ? (
+          <div style={{ marginBottom: 12 }}>
+            <Text type="secondary">正在读取设备实时邻居信息，请稍候…</Text>
+            <Progress percent={detailProgress} size="small" status="active" showInfo={false} />
+          </div>
+        ) : null}
         <Tabs
           items={[
             {
@@ -1164,7 +1559,9 @@ const DeviceOverview = () => {
                   loading={detailLoading}
                   dataSource={neighbors.bgp}
                   columns={neighborColumns}
+                  scroll={{ x: 1200 }}
                   pagination={false}
+                  tableLayout="fixed"
                   size="small"
                 />
               ),
@@ -1177,8 +1574,32 @@ const DeviceOverview = () => {
                   rowKey={(record, index) => `${record.protocol}-${record.peer}-${index}`}
                   loading={detailLoading}
                   dataSource={neighbors.ospf}
-                  columns={neighborColumns}
+                  columns={ospfNeighborColumns}
+                  scroll={{ x: 720 }}
                   pagination={false}
+                  tableLayout="fixed"
+                  size="small"
+                />
+              ),
+            },
+            {
+              key: 'lldp',
+              label: `LLDP (${neighbors.lldp.length})`,
+              children: (
+                <Table<ProtocolNeighbor>
+                  rowKey={(record, index) => `lldp-${record.local_port || record.local_port_id}-${record.remote_system || record.remote_chassis_id}-${record.remote_port || record.remote_port_id}-${index}`}
+                  loading={detailLoading}
+                  dataSource={neighbors.lldp}
+                  columns={lldpColumns}
+                  scroll={{ x: 1120 }}
+                  pagination={{
+                    pageSize: lldpPageSize,
+                    showSizeChanger: true,
+                    pageSizeOptions: ['20', '50', '100', '200'],
+                    onShowSizeChange: (_current, size) => setLldpPageSize(size),
+                    onChange: (_page, size) => setLldpPageSize(size),
+                  }}
+                  tableLayout="fixed"
                   size="small"
                 />
               ),

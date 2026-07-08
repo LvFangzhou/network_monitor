@@ -23,14 +23,6 @@ API_BASE_URL = os.getenv("MENU_CACHE_PREWARM_API_BASE_URL", "http://api:8000/api
 PREWARM_LOCK_TTL_SECONDS = 55
 
 
-def _delete_scan(pattern: str) -> int:
-    count = 0
-    for key in redis_client.scan_iter(pattern):
-        redis_client.delete(key)
-        count += 1
-    return count
-
-
 def _prewarm_endpoint(path: str, *, timeout: float = 30.0) -> dict:
     url = f"{API_BASE_URL}{path}"
     started_at = time.time()
@@ -45,10 +37,9 @@ def _prewarm_endpoint(path: str, *, timeout: float = 30.0) -> dict:
     }
 
 
-def _prewarm(paths: Iterable[str], delete_keys: Iterable[str] = (), delete_patterns: Iterable[str] = ()) -> dict:
+def _prewarm(paths: Iterable[str], delete_keys: Iterable[str] = ()) -> dict:
     for key in delete_keys:
         redis_client.delete(key)
-    deleted_patterns = {pattern: _delete_scan(pattern) for pattern in delete_patterns}
 
     results: List[dict] = []
     errors: List[dict] = []
@@ -61,7 +52,6 @@ def _prewarm(paths: Iterable[str], delete_keys: Iterable[str] = (), delete_patte
     return {
         "results": results,
         "errors": errors,
-        "deleted_patterns": deleted_patterns,
     }
 
 
@@ -89,16 +79,13 @@ def prewarm_fast_menu_caches():
         "menu_cache:prewarm:fast:lock",
         lambda: _prewarm(
             [
-                "/metrics/dashboard/stats",
-                "/alerts/history/summary",
+                "/metrics/dashboard/stats?refresh=true",
+                "/alerts/history/summary?refresh=true",
                 "/config-backups/filters",
             ],
             delete_keys=[
                 "dashboard:stats:v2",
                 "config_backups:filters:v1",
-            ],
-            delete_patterns=[
-                "alerts:history_summary:*",
             ],
         ),
     )
@@ -111,10 +98,7 @@ def prewarm_device_overview_cache():
         "menu_cache:prewarm:device_overview:lock",
         lambda: _prewarm(
             [
-                "/metrics/monitoring/devices/overview?limit=1000",
-            ],
-            delete_patterns=[
-                "monitor:cache:overview_snapshot*",
+                "/metrics/monitoring/devices/overview?limit=1000&refresh=true",
             ],
         ),
     )
