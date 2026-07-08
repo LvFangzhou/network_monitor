@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import os
 import hashlib
 import io
@@ -12,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.core import get_logger
 from app.database import SessionLocal
-from app.models import ConfigBackupJob, ConfigBackupResult, Device
+from app.models import ConfigBackupJob, ConfigBackupResult, Datacenter, Device
 from app.tasks import celery_app
 from app.tasks.system_tasks import _notification_channels
 from app.utils import notification_manager
@@ -34,10 +35,34 @@ def _backup_command(device: Device) -> str:
     if any(marker in vendor for marker in ["asteros", "asternos", "asterfusion", "星融元", "ruijie", "锐捷"]):
         return "show running-config"
     if any(marker in vendor for marker in ["hillstone", "山石"]):
-        return "show configuration"
+        return "show configuration running"
     if any(marker in vendor for marker in ["cisco", "nexus", "ios", "nx-os"]):
         return "show running-config"
     return "display current-configuration"
+
+
+def _startup_config_command(device: Device) -> Optional[str]:
+    vendor = _vendor_text(device)
+    if any(marker in vendor for marker in ["h3c", "华三"]):
+        return "display saved-configuration"
+    if _is_asteros(device) or _is_ruijie(device):
+        return "show startup-config"
+    if _is_hillstone(device):
+        return "show configuration startup"
+    return None
+
+
+def _save_config_command(device: Device) -> Optional[str]:
+    vendor = _vendor_text(device)
+    if any(marker in vendor for marker in ["h3c", "华三"]):
+        return "save force"
+    if _is_asteros(device):
+        return "write running-config"
+    if _is_ruijie(device):
+        return "write"
+    if _is_hillstone(device):
+        return "save"
+    return None
 
 
 def _vendor_text(device: Device) -> str:
@@ -48,10 +73,22 @@ def _is_asteros(device: Device) -> bool:
     return any(marker in _vendor_text(device) for marker in ["asteros", "asternos", "asterfusion", "星融元"])
 
 
+def _is_h3c(device: Device) -> bool:
+    return any(marker in _vendor_text(device) for marker in ["h3c", "华三"])
+
+
+def _is_hillstone(device: Device) -> bool:
+    return any(marker in _vendor_text(device) for marker in ["hillstone", "山石"])
+
+
+def _is_ruijie(device: Device) -> bool:
+    return any(marker in _vendor_text(device) for marker in ["ruijie", "锐捷", "rgos"])
+
+
 def _prefer_paramiko_shell(device: Device) -> bool:
     """已知用交互 shell 更稳定的设备，避免 Netmiko 先空等超时再回退。"""
     vendor = _vendor_text(device)
-    return any(marker in vendor for marker in ["h3c", "华三", "asteros", "asternos", "asterfusion", "星融元"])
+    return any(marker in vendor for marker in ["h3c", "华三", "asteros", "asternos", "asterfusion", "星融元", "ruijie", "锐捷", "rgos"])
 
 
 def _looks_like_interactive_prompt(text: str) -> bool:
@@ -75,9 +112,9 @@ def _looks_like_byte_pager(text: str) -> bool:
 def _expected_config_end_marker(device: Device, command: str) -> Optional[str]:
     vendor = _vendor_text(device)
     normalized_command = command.strip().lower()
-    if normalized_command in {"dis current-configuration", "display current-configuration"} and any(marker in vendor for marker in ["h3c", "华三"]):
+    if normalized_command in {"dis current-configuration", "display current-configuration", "display saved-configuration"} and any(marker in vendor for marker in ["h3c", "华三"]):
         return "return"
-    if normalized_command == "show running-config" and any(marker in vendor for marker in ["asteros", "asternos", "asterfusion", "星融元", "ruijie", "锐捷", "cisco", "nexus", "ios", "nx-os"]):
+    if normalized_command in {"show running-config", "show startup-config"} and any(marker in vendor for marker in ["asteros", "asternos", "asterfusion", "星融元", "ruijie", "锐捷", "cisco", "nexus", "ios", "nx-os"]):
         return "end"
     return None
 
@@ -242,8 +279,8 @@ def _strip_backspace_overstrikes(text: str) -> str:
     return text
 
 
-def _clean_config_output(output: str, command: str) -> str:
-    text = _strip_backspace_overstrikes(output).replace("\r\n", "\n").replace("\r", "\n")
+def _strip_terminal_control(text: str) -> str:
+    text = _strip_backspace_overstrikes(text).replace("\r\n", "\n").replace("\r", "\n")
     # 清理 ANSI/VT 控制序列。Asteros 部分设备会输出 ESC[?1h、ESC=、ESC[m 等终端控制符。
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
     text = re.sub(r"\x1b[()][A-Za-z0-9]", "", text)
@@ -251,6 +288,22 @@ def _clean_config_output(output: str, command: str) -> str:
     text = re.sub(r"\x1b[@-Z\\-_]", "", text)
     text = text.replace("\x1b", "")
     text = text.replace("\x07", "")
+    return text
+
+
+def _looks_like_prompt_line(line: str) -> bool:
+    stripped = line.strip()
+    return bool(re.fullmatch(r"(?:<[^<>\s]{1,160}>|[A-Za-z0-9_.:/-]{1,160}#)", stripped))
+
+
+def _output_returned_to_prompt(output: str) -> bool:
+    text = _strip_terminal_control(output)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return any(_looks_like_prompt_line(line) for line in lines[-8:])
+
+
+def _clean_config_output(output: str, command: str) -> str:
+    text = _strip_terminal_control(output)
     text = text.replace("--More--", "").replace("---- More ----", "")
     lines = [line.rstrip() for line in text.splitlines()]
     cleaned: List[str] = []
@@ -274,6 +327,8 @@ def _clean_config_output(output: str, command: str) -> str:
         if not line.strip():
             # 配置文件里空行基本没有语义，删除多余空行，保留 # / ! 这类厂商自己的段落分隔符。
             continue
+        if _looks_like_prompt_line(line):
+            continue
         compacted.append(line.rstrip())
     while compacted and not compacted[0].strip():
         compacted.pop(0)
@@ -281,9 +336,128 @@ def _clean_config_output(output: str, command: str) -> str:
         compacted.pop()
     if compacted:
         tail = compacted[-1].strip()
-        if re.fullmatch(r"(?:<[^<>\s]{1,128}>|[A-Za-z0-9_.:/-]{1,128}#)", tail):
+        if _looks_like_prompt_line(tail):
             compacted.pop()
     return "\n".join(compacted).strip()
+
+
+def _expand_number_range_list(value: str, limit: int = 4096) -> List[int]:
+    """展开 2001,2201-2205 这类配置展示。异常片段直接忽略，避免误伤备份。"""
+    numbers: List[int] = []
+    seen: set[int] = set()
+    for part in re.split(r"\s*,\s*", value.strip()):
+        if not part:
+            continue
+        if re.fullmatch(r"\d+", part):
+            start = end = int(part)
+        else:
+            match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+            if not match:
+                continue
+            start, end = int(match.group(1)), int(match.group(2))
+            if start > end:
+                start, end = end, start
+        if end - start > limit:
+            continue
+        for number in range(start, end + 1):
+            if number not in seen:
+                seen.add(number)
+                numbers.append(number)
+    return numbers
+
+
+def _normalize_config_for_compare(config: str, device: Optional[Device] = None) -> List[str]:
+    """归一化运行配置/启动配置，忽略时间戳、空行、分页提示和自动生成注释。"""
+    normalized: List[str] = []
+    asteros_like = bool(device and _is_asteros(device))
+    seen_vlan_declarations: set[str] = set()
+    vlan_declarations: List[str] = []
+    volatile_patterns = [
+        r"^\s*$",
+        r"^!?\s*(last|current)\s+(configuration|change|updated|saved).*",
+        r"^!?\s*(generated|created)\s+by\s+.*",
+        r"^!?\s*generated\s+at\s+.*",
+        r"^!?\s*time\s*[:=].*",
+        r"^!?\s*timestamp\s*[:=].*",
+        r"^#\s*configuration\s+(last\s+)?(modified|saved|generated).*",
+        r"^\s*building\s+configuration.*",
+        r"^\s*current\s+configuration.*",
+        r"^\s*running\s+configuration\s*:?\s*$",
+        r"^\s*startup\s+configuration\s*:?\s*$",
+        r"^\s*正在收集配置.*",
+        r"^#\s*generated\s+by\s+.*",
+        r"^#\s*size\s+is\s+\d+\s+bytes\s*$",
+        r"^#\s*software\s+version\s+.*",
+        r"^\s*display\s+.*configuration\s*$",
+        r"^\s*show\s+.*config\s*$",
+        r"^.*[#>]\s*(?:display|dis|show)\s+.*config(?:uration)?\s*$",
+    ]
+    compiled = [re.compile(pattern, re.IGNORECASE) for pattern in volatile_patterns]
+    for raw_line in (config or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped in {"#", "!", "return", "end"}:
+            # 段落分隔符不影响配置语义，跳过后能减少无意义 diff。
+            continue
+        lower_stripped = stripped.lower()
+        if lower_stripped in {"exit", "exit-vrf"}:
+            # Asteros/CX 与启动配置之间经常把同一层级结束符显示成 exit 或 !，
+            # 这类段落结束符不影响配置语义。
+            continue
+        if asteros_like and re.fullmatch(r"(?:lacp\s+fallback|mode\s+dynamic|commit)", stripped, re.IGNORECASE):
+            # Asteros startup-config 会在 link-aggregation 段落里展开默认 LACP/commit 行，
+            # running-config 经常省略；这不是实际配置不一致。
+            continue
+        if asteros_like and re.fullmatch(r"description\s+\S+", stripped, re.IGNORECASE):
+            # Asteros startup-config 常把 VLAN/接口默认描述展开显示，running-config 省略。
+            continue
+        if asteros_like and re.fullmatch(r"switchport\s+access\s+vlan\s+\d+", stripped, re.IGNORECASE):
+            # Asteros link-aggregation 默认 access vlan 会在 startup 中展开显示。
+            continue
+        if any(pattern.search(stripped) for pattern in compiled):
+            continue
+        vlan_range_match = re.fullmatch(r"vlan\s+range\s+(.+)", stripped, re.IGNORECASE)
+        if vlan_range_match:
+            for vlan_id in _expand_number_range_list(vlan_range_match.group(1)):
+                declaration = f"vlan {vlan_id}"
+                if declaration not in seen_vlan_declarations:
+                    seen_vlan_declarations.add(declaration)
+                    vlan_declarations.append(declaration)
+            continue
+        trunk_range_match = re.fullmatch(r"switchport\s+trunk\s+range\s+vlan\s+(.+)", stripped, re.IGNORECASE)
+        if trunk_range_match:
+            for vlan_id in _expand_number_range_list(trunk_range_match.group(1)):
+                normalized.append(f"switchport trunk vlan {vlan_id}")
+            continue
+        vlan_declaration_match = re.fullmatch(r"vlan\s+(\d+)", stripped, re.IGNORECASE)
+        if vlan_declaration_match:
+            declaration = f"vlan {int(vlan_declaration_match.group(1))}"
+            if declaration in seen_vlan_declarations:
+                continue
+            seen_vlan_declarations.add(declaration)
+            vlan_declarations.append(declaration)
+            continue
+        normalized.append(stripped)
+    if vlan_declarations:
+        normalized.extend(sorted(vlan_declarations, key=lambda item: int(item.split()[1])))
+    return normalized
+
+
+def _config_diff_summary(running_config: str, startup_config: str, max_lines: int = 80, device: Optional[Device] = None) -> str:
+    running_lines = _normalize_config_for_compare(running_config, device)
+    startup_lines = _normalize_config_for_compare(startup_config, device)
+    diff_lines = list(
+        difflib.unified_diff(
+            startup_lines,
+            running_lines,
+            fromfile="startup(saved)",
+            tofile="running(current)",
+            lineterm="",
+        )
+    )
+    return "\n".join(diff_lines[:max_lines])
 
 
 def _handle_login_prompts(shell: Any, initial_output: str) -> str:
@@ -294,8 +468,21 @@ def _handle_login_prompts(shell: Any, initial_output: str) -> str:
     return output
 
 
+def _config_read_tuning(device: Device, command: str) -> Tuple[int, float, float, float]:
+    normalized_command = command.strip().lower()
+    if _is_asteros(device):
+        return 3, 4.0, 150.0, 90.0
+    if _is_h3c(device) and normalized_command in {"dis current-configuration", "display current-configuration", "display saved-configuration"}:
+        # H3C 大配置输出中途可能有 1~2 秒空隙，idle 太短会把半截配置误认为结束。
+        # 这里用更长 idle 和总超时，优先保证配置完整性。
+        return 2, 3.0, 240.0, 90.0
+    if _is_hillstone(device):
+        return 2, 2.0, 120.0, 60.0
+    return 1, 1.2, 60.0, 30.0
+
+
 def _run_shell_config_command(shell: Any, device: Device, command: str) -> str:
-    attempts = 3 if _is_asteros(device) else 1
+    attempts, idle_seconds, timeout_seconds, confirm_timeout_seconds = _config_read_tuning(device, command)
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         # 清空上一次非法命令/提示符残留，避免把残留误认为配置内容。
@@ -306,21 +493,32 @@ def _run_shell_config_command(shell: Any, device: Device, command: str) -> str:
         shell.send(command + "\n")
         output = _read_shell_output(
             shell,
-            idle_seconds=4.0 if _is_asteros(device) else 1.2,
-            timeout_seconds=150 if _is_asteros(device) else 60,
+            idle_seconds=idle_seconds,
+            timeout_seconds=timeout_seconds,
         )
         if re.search(r"press\s+(return|enter)", output, re.IGNORECASE):
             shell.send("\n")
             output += _read_shell_output(
                 shell,
-                idle_seconds=4.0 if _is_asteros(device) else 1.2,
-                timeout_seconds=90 if _is_asteros(device) else 30,
+                idle_seconds=idle_seconds,
+                timeout_seconds=confirm_timeout_seconds,
             )
         config = _clean_config_output(output, command)
         try:
             _validate_config_content(device, command, config)
             return config
         except Exception as exc:
+            # 部分设备的 startup/saved 输出正常返回设备提示符，但尾部不一定带 end/return。
+            # 只要已经回到提示符，就认为不是分页/截断。这个对 Asteros 和部分 H3C saved-config 都适用。
+            if "结束标记" in str(exc) and _output_returned_to_prompt(output):
+                logger.info(
+                    "配置未包含结束标记但已返回提示符，按完整输出处理",
+                    device_id=getattr(device, "id", None),
+                    ip=getattr(device, "ip_address", None),
+                    command=command,
+                    attempt=attempt,
+                )
+                return config
             last_error = exc
             logger.info(
                 "配置输出校验失败，准备重试",
@@ -332,6 +530,81 @@ def _run_shell_config_command(shell: Any, device: Device, command: str) -> str:
             )
             time.sleep(3)
     raise RuntimeError(str(last_error) if last_error else "配置备份失败")
+
+
+def _run_shell_save_command(shell: Any, device: Device, command: str) -> str:
+    shell.send("\n")
+    _read_shell_output(shell, idle_seconds=0.5, timeout_seconds=4)
+    shell.send(command + "\n")
+    output = _read_shell_output(shell, idle_seconds=1.0, timeout_seconds=30)
+    if _is_asteros(device):
+        # Asteros write running-config 会提示确认，按一次回车确认。
+        shell.send("\n")
+        output += _read_shell_output(shell, idle_seconds=1.2, timeout_seconds=45)
+    if _is_ruijie(device):
+        # Ruijie write 可能直接保存，也可能要求 y/回车确认；两种都兼容。
+        if re.search(r"\b(?:y/n|yes/no|continue|confirm|overwrite)\b|\[y/n\]", output, re.IGNORECASE):
+            shell.send("y\n")
+            output += _read_shell_output(shell, idle_seconds=1.2, timeout_seconds=45)
+        elif not _output_returned_to_prompt(output):
+            shell.send("\n")
+            output += _read_shell_output(shell, idle_seconds=1.2, timeout_seconds=45)
+    if _is_hillstone(device):
+        # 山石 save 需要两次 y 确认。
+        for _ in range(2):
+            if _output_returned_to_prompt(output) and not re.search(r"\b(?:y/n|yes/no|continue|overwrite)\\b|\\[y/n\\]", output, re.IGNORECASE):
+                break
+            shell.send("y\n")
+            output += _read_shell_output(shell, idle_seconds=1.2, timeout_seconds=45)
+    normalized = output.lower()
+    failure_markers = ["error", "failed", "invalid", "permission denied", "incomplete", "unknown command"]
+    if any(marker in normalized for marker in failure_markers):
+        raise RuntimeError(_strip_backspace_overstrikes(output).strip()[-500:] or "保存配置失败")
+    return _strip_backspace_overstrikes(output).strip()
+
+
+def _build_sync_payload(
+    device: Device,
+    running_command: str,
+    running_config: str,
+    startup_command: Optional[str],
+    startup_config: Optional[str],
+    save_command: Optional[str],
+    save_status: Optional[str],
+    save_message: Optional[str],
+    sync_error: Optional[str] = None,
+) -> Dict[str, Any]:
+    running_normalized = "\n".join(_normalize_config_for_compare(running_config, device))
+    startup_normalized = "\n".join(_normalize_config_for_compare(startup_config or "", device)) if startup_config is not None else ""
+
+    if sync_error:
+        sync_status = "check_failed"
+        diff = sync_error[:2000]
+    elif not startup_command:
+        sync_status = "unsupported"
+        diff = "当前厂商暂未配置 running/startup 一致性检查命令"
+    elif running_normalized == startup_normalized:
+        sync_status = "matched"
+        diff = None
+    else:
+        sync_status = "changed_saved" if save_status == "success" else "changed_save_failed"
+        diff = _config_diff_summary(running_config, startup_config or "", device=device)
+
+    return {
+        "command": running_command,
+        "config_content": running_config,
+        "config_hash": hashlib.sha256(running_config.encode("utf-8", errors="ignore")).hexdigest(),
+        "line_count": len(running_config.splitlines()),
+        "startup_command": startup_command,
+        "startup_config_content": startup_config,
+        "startup_config_hash": hashlib.sha256((startup_config or "").encode("utf-8", errors="ignore")).hexdigest() if startup_config is not None else None,
+        "startup_line_count": len((startup_config or "").splitlines()) if startup_config is not None else 0,
+        "config_sync_status": sync_status,
+        "config_sync_diff": diff,
+        "config_save_command": save_command,
+        "config_save_status": save_status,
+        "config_save_message": save_message,
+    }
 
 
 def _collect_config(device: Device) -> Tuple[str, str]:
@@ -404,11 +677,104 @@ def _collect_config(device: Device) -> Tuple[str, str]:
         client.close()
 
 
+def _collect_config_with_sync(device: Device) -> Dict[str, Any]:
+    """采集 running 配置，并检查 startup 是否一致；不一致时自动保存。"""
+    # 目前只有 H3C/Asteros 明确要求自动保存。其他厂商仍走原有备份逻辑，避免误操作。
+    startup_command = _startup_config_command(device)
+    save_command = _save_config_command(device)
+    if not startup_command or not save_command:
+        command, config = _collect_config(device)
+        return _build_sync_payload(device, command, config, None, None, None, None, None)
+
+    try:
+        import paramiko
+    except ImportError as exc:
+        raise RuntimeError("缺少 paramiko 依赖，无法执行 SSH 配置备份") from exc
+
+    username = (device.ssh_username or "").strip()
+    password = device.ssh_password or None
+    key_text = (device.ssh_key or "").strip()
+    if not username:
+        raise RuntimeError("设备未配置 SSH 用户名")
+    if not password and not key_text:
+        raise RuntimeError("设备未配置 SSH 密码或密钥")
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    connect_kwargs: Dict[str, Any] = {
+        "hostname": device.ip_address,
+        "port": int(device.ssh_port or 22),
+        "username": username,
+        "timeout": 12,
+        "banner_timeout": 12,
+        "auth_timeout": 12,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    if key_text:
+        key_file = io.StringIO(key_text)
+        key = None
+        key_errors = []
+        for key_cls in (paramiko.RSAKey, paramiko.ECDSAKey, paramiko.Ed25519Key):
+            key_file.seek(0)
+            try:
+                key = key_cls.from_private_key(key_file, password=password)
+                break
+            except Exception as exc:
+                key_errors.append(str(exc))
+        if not key:
+            raise RuntimeError(f"SSH 密钥解析失败：{'; '.join(key_errors[:2])}")
+        connect_kwargs["pkey"] = key
+    else:
+        connect_kwargs["password"] = password
+
+    running_command = _backup_command(device)
+    try:
+        client.connect(**connect_kwargs)
+        shell = client.invoke_shell(width=240, height=5000)
+        initial_output = _read_shell_output(shell, idle_seconds=0.8, timeout_seconds=8)
+        _handle_login_prompts(shell, initial_output)
+        for disable_command in _screen_disable_commands(device):
+            shell.send(disable_command + "\n")
+            _read_shell_output(shell, idle_seconds=0.5, timeout_seconds=4)
+
+        running_config = _run_shell_config_command(shell, device, running_command)
+        startup_config: Optional[str] = None
+        save_status: Optional[str] = None
+        save_message: Optional[str] = None
+        sync_error: Optional[str] = None
+        try:
+            startup_config = _run_shell_config_command(shell, device, startup_command)
+            running_normalized = _normalize_config_for_compare(running_config, device)
+            startup_normalized = _normalize_config_for_compare(startup_config, device)
+            if running_normalized != startup_normalized:
+                try:
+                    save_message = _run_shell_save_command(shell, device, save_command)
+                    save_status = "success"
+                except Exception as exc:
+                    save_status = "failed"
+                    save_message = str(exc)[:2000]
+        except Exception as exc:
+            sync_error = f"启动配置检查失败：{exc}"
+        return _build_sync_payload(
+            device,
+            running_command,
+            running_config,
+            startup_command,
+            startup_config,
+            save_command,
+            save_status,
+            save_message,
+            sync_error=sync_error,
+        )
+    finally:
+        client.close()
+
+
 def _build_notification_content(job: ConfigBackupJob, datacenter_stats: Dict[str, Dict[str, int]]) -> Tuple[str, List[Dict[str, str]]]:
     lines = [
-        f"配置备份完成：成功 {job.success_count} 台，失败 {job.failed_count} 台，共 {job.total_devices} 台。",
-        "",
-        "按机房统计：",
+        f"配置备份完成：共 {job.total_devices} 台，成功 {job.success_count} 台，失败 {job.failed_count} 台。",
+        f"运行/启动配置检查：不一致 {getattr(job, 'config_changed_count', 0) or 0} 台，已自动保存 {getattr(job, 'config_saved_count', 0) or 0} 台，保存失败 {getattr(job, 'config_save_failed_count', 0) or 0} 台。",
     ]
     rows: List[Dict[str, str]] = [
         {"label": "任务ID", "value": str(job.id)},
@@ -416,12 +782,108 @@ def _build_notification_content(job: ConfigBackupJob, datacenter_stats: Dict[str
         {"label": "总设备", "value": str(job.total_devices)},
         {"label": "成功", "value": str(job.success_count)},
         {"label": "失败", "value": str(job.failed_count)},
+        {"label": "配置不一致", "value": str(getattr(job, "config_changed_count", 0) or 0)},
+        {"label": "已自动保存", "value": str(getattr(job, "config_saved_count", 0) or 0)},
+        {"label": "保存失败", "value": str(getattr(job, "config_save_failed_count", 0) or 0)},
     ]
     for datacenter, stats in sorted(datacenter_stats.items(), key=lambda item: item[0]):
-        line = f"- {datacenter}：成功 {stats.get('success', 0)} 台，失败 {stats.get('failed', 0)} 台"
-        lines.append(line)
-        rows.append({"label": datacenter, "value": f"成功 {stats.get('success', 0)} / 失败 {stats.get('failed', 0)}"})
+        rows.append({
+            "label": datacenter,
+            "value": (
+                f"成功 {stats.get('success', 0)} / 失败 {stats.get('failed', 0)} / "
+                f"不一致 {stats.get('changed', 0)} / 已保存 {stats.get('saved', 0)} / 保存失败 {stats.get('save_failed', 0)}"
+            ),
+        })
     return "\n".join(lines), rows
+
+
+def _seconds_between(started_at: Optional[datetime], finished_at: Optional[datetime]) -> Optional[int]:
+    if not started_at or not finished_at:
+        return None
+    try:
+        return max(0, int((finished_at - started_at).total_seconds()))
+    except Exception:
+        return None
+
+
+def _format_duration(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "-"
+    if seconds < 60:
+        return f"{seconds}秒"
+    minutes, rest = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}分{rest}秒" if rest else f"{minutes}分"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}小时{minutes}分" if minutes else f"{hours}小时"
+
+
+def _split_network_owner_emails(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    mentions = []
+    for item in re.split(r"[,，;；\s]+", value):
+        item = item.strip().lstrip("@")
+        if item:
+            mentions.append(item)
+    return list(dict.fromkeys(mentions))
+
+
+def _load_datacenter_contacts(datacenter_names: List[str]) -> Dict[str, Dict[str, Any]]:
+    names = [name for name in dict.fromkeys(datacenter_names) if name and name != "未设置机房"]
+    if not names:
+        return {}
+    db = SessionLocal()
+    try:
+        rows = db.query(Datacenter).filter(Datacenter.name.in_(names)).all()
+        return {
+            row.name: {
+                "network_owner": row.network_owner or row.contact_person,
+                "network_owner_emails": _split_network_owner_emails(getattr(row, "network_owner_email", None)),
+            }
+            for row in rows
+        }
+    finally:
+        db.close()
+
+
+def _build_backup_card_data(job: ConfigBackupJob, datacenter_stats: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
+    failed = job.failed_count or 0
+    save_failed = getattr(job, "config_save_failed_count", 0) or 0
+    changed = getattr(job, "config_changed_count", 0) or 0
+    saved = getattr(job, "config_saved_count", 0) or 0
+    duration_seconds = _seconds_between(job.started_at, job.finished_at)
+    contact_map = _load_datacenter_contacts(list(datacenter_stats.keys()))
+    datacenter_rows = []
+    for datacenter, stats in sorted(datacenter_stats.items(), key=lambda item: item[0]):
+        contact_info = contact_map.get(datacenter, {})
+        datacenter_rows.append({
+            "name": datacenter,
+            "success": stats.get("success", 0),
+            "failed": stats.get("failed", 0),
+            "changed": stats.get("changed", 0),
+            "saved": stats.get("saved", 0),
+            "save_failed": stats.get("save_failed", 0),
+            "network_owner": contact_info.get("network_owner"),
+            "network_owner_emails": contact_info.get("network_owner_emails") or [],
+        })
+    return {
+        "severity": "P2" if failed == 0 and save_failed == 0 else "P1",
+        "notification_kind": "config_backup",
+        "backup_summary": {
+            "job_id": job.id,
+            "trigger_type": "定时" if job.trigger_type == "scheduled" else "手动",
+            "started_by": job.started_by or "-",
+            "duration": _format_duration(duration_seconds),
+            "total": job.total_devices or 0,
+            "success": job.success_count or 0,
+            "failed": failed,
+            "changed": changed,
+            "saved": saved,
+            "save_failed": save_failed,
+        },
+        "datacenters": datacenter_rows,
+    }
 
 
 def _send_backup_notification(job: ConfigBackupJob, datacenter_stats: Dict[str, Dict[str, int]]) -> None:
@@ -431,18 +893,17 @@ def _send_backup_notification(job: ConfigBackupJob, datacenter_stats: Dict[str, 
         return
 
     content, rows = _build_notification_content(job, datacenter_stats)
-    title = "网络设备配置备份完成" if job.failed_count == 0 else "网络设备配置备份完成（存在失败）"
-    card_data = {
-        "severity": "P2" if job.failed_count == 0 else "P1",
-        "rows": rows,
-        "notification_kind": "config_backup",
-    }
+    has_save_failed = (getattr(job, "config_save_failed_count", 0) or 0) > 0
+    title = "网络设备配置备份完成" if job.failed_count == 0 and not has_save_failed else "网络设备配置备份完成（存在失败/保存异常）"
+    card_data = _build_backup_card_data(job, datacenter_stats)
+    card_data["rows"] = rows
 
     async def _send_all() -> None:
         for channel in channels:
+            channel_config = dict(channel["config"] or {})
             await notification_manager.send_notification(
                 channel["type"],
-                channel["config"],
+                channel_config,
                 title,
                 content,
                 card_data,
@@ -470,14 +931,11 @@ def _backup_device_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     started_at = _utc_now()
     device = SimpleNamespace(**payload)
     try:
-        command, config = _collect_config(device)
+        sync_payload = _collect_config_with_sync(device)
         return {
             **payload,
             "status": "success",
-            "command": command,
-            "config_content": config,
-            "config_hash": hashlib.sha256(config.encode("utf-8", errors="ignore")).hexdigest(),
-            "line_count": len(config.splitlines()),
+            **sync_payload,
             "error_message": None,
             "started_at": started_at,
             "finished_at": _utc_now(),
@@ -491,6 +949,14 @@ def _backup_device_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "config_content": None,
             "config_hash": None,
             "line_count": 0,
+            "startup_command": None,
+            "startup_config_hash": None,
+            "startup_line_count": 0,
+            "config_sync_status": "check_failed",
+            "config_sync_diff": None,
+            "config_save_command": None,
+            "config_save_status": None,
+            "config_save_message": None,
             "error_message": str(exc)[:2000],
             "started_at": started_at,
             "finished_at": _utc_now(),
@@ -500,7 +966,7 @@ def _backup_device_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 @celery_app.task(bind=True, name="app.tasks.config_backup_tasks.run_config_backup", time_limit=7200, soft_time_limit=6900)
 def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "manual", actor: Optional[str] = None) -> Dict[str, Any]:
     db = SessionLocal()
-    datacenter_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"success": 0, "failed": 0})
+    datacenter_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"success": 0, "failed": 0, "changed": 0, "saved": 0, "save_failed": 0})
     try:
         if job_id:
             job = db.query(ConfigBackupJob).filter(ConfigBackupJob.id == int(job_id)).first()
@@ -534,6 +1000,9 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
         job.total_devices = len(devices)
         job.success_count = 0
         job.failed_count = 0
+        job.config_changed_count = 0
+        job.config_saved_count = 0
+        job.config_save_failed_count = 0
         db.commit()
 
         payloads = [_device_payload(device) for device in devices]
@@ -609,6 +1078,15 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
                             "config_content": None,
                             "config_hash": None,
                             "line_count": 0,
+                            "startup_command": None,
+                            "startup_config_content": None,
+                            "startup_config_hash": None,
+                            "startup_line_count": 0,
+                            "config_sync_status": "check_failed",
+                            "config_sync_diff": None,
+                            "config_save_command": None,
+                            "config_save_status": None,
+                            "config_save_message": None,
                             "error_message": str(exc)[:2000],
                             "started_at": _utc_now(),
                             "finished_at": _utc_now(),
@@ -626,6 +1104,15 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
                     result.config_content = backup_result.get("config_content")
                     result.config_hash = backup_result.get("config_hash")
                     result.line_count = backup_result.get("line_count") or 0
+                    result.startup_command = backup_result.get("startup_command")
+                    result.startup_config_content = backup_result.get("startup_config_content")
+                    result.startup_config_hash = backup_result.get("startup_config_hash")
+                    result.startup_line_count = backup_result.get("startup_line_count") or 0
+                    result.config_sync_status = backup_result.get("config_sync_status")
+                    result.config_sync_diff = backup_result.get("config_sync_diff")
+                    result.config_save_command = backup_result.get("config_save_command")
+                    result.config_save_status = backup_result.get("config_save_status")
+                    result.config_save_message = backup_result.get("config_save_message")
                     result.error_message = backup_result.get("error_message")
                     result.started_at = backup_result.get("started_at")
                     result.finished_at = backup_result.get("finished_at")
@@ -634,6 +1121,17 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
                     if result.status == "success":
                         job.success_count += 1
                         datacenter_stats[datacenter]["success"] += 1
+                        sync_status = result.config_sync_status or ""
+                        save_status = result.config_save_status or ""
+                        if sync_status in {"changed_saved", "changed_save_failed"}:
+                            job.config_changed_count = (job.config_changed_count or 0) + 1
+                            datacenter_stats[datacenter]["changed"] += 1
+                        if save_status == "success":
+                            job.config_saved_count = (job.config_saved_count or 0) + 1
+                            datacenter_stats[datacenter]["saved"] += 1
+                        elif save_status == "failed":
+                            job.config_save_failed_count = (job.config_save_failed_count or 0) + 1
+                            datacenter_stats[datacenter]["save_failed"] += 1
                     else:
                         job.failed_count += 1
                         datacenter_stats[datacenter]["failed"] += 1
@@ -650,7 +1148,8 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-        job.status = "success" if job.failed_count == 0 else ("partial_failed" if job.success_count else "failed")
+        save_failed_count = getattr(job, "config_save_failed_count", 0) or 0
+        job.status = "success" if job.failed_count == 0 and save_failed_count == 0 else ("partial_failed" if job.success_count else "failed")
         job.finished_at = _utc_now()
         content, _rows = _build_notification_content(job, datacenter_stats)
         job.summary = content

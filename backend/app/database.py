@@ -59,6 +59,12 @@ def ensure_compatible_schema() -> None:
                 connection.execute(text("ALTER TABLE datacenters ADD COLUMN code VARCHAR(50)"))
             if "contact_email" not in datacenter_columns:
                 connection.execute(text("ALTER TABLE datacenters ADD COLUMN contact_email VARCHAR(100)"))
+            if "network_owner" not in datacenter_columns:
+                connection.execute(text("ALTER TABLE datacenters ADD COLUMN network_owner VARCHAR(100)"))
+            if "network_owner_email" not in datacenter_columns:
+                connection.execute(text("ALTER TABLE datacenters ADD COLUMN network_owner_email VARCHAR(255)"))
+            if "robot_mention" not in datacenter_columns:
+                connection.execute(text("ALTER TABLE datacenters ADD COLUMN robot_mention VARCHAR(255)"))
             if "build_date" not in datacenter_columns:
                 connection.execute(text("ALTER TABLE datacenters ADD COLUMN build_date TIMESTAMP WITH TIME ZONE"))
 

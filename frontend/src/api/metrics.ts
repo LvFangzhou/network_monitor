@@ -304,6 +304,10 @@ export interface DeviceOverviewItem {
     cpu_percent?: number | null
     memory_percent?: number | null
     temperature?: number | null
+    temperature_details?: Array<{
+      sensor?: string | null
+      temperature?: number | null
+    }>
     storage_percent?: number | null
   }
   sessions?: {
@@ -574,7 +578,21 @@ export interface ProtocolNeighbor {
   peer: string
   neighbor?: string | null
   remote_as?: string | number | null
+  local_addr?: string | null
+  local_address?: string | null
   interface?: string | null
+  local_port?: string | null
+  local_port_id?: string | null
+  local_port_num?: string | null
+  remote_system?: string | null
+  remote_display_name?: string | null
+  remote_port?: string | null
+  remote_port_id?: string | null
+  remote_chassis_id?: string | null
+  remote_mgmt_addr?: string | null
+  remote_mgmt_addr_source?: string | null
+  remote_kind?: string | null
+  remote_sys_desc?: string | null
   state: string
   status: 'up' | 'down' | string
   duration_seconds?: number | null
@@ -589,6 +607,7 @@ export const getDeviceProtocolNeighbors = async (
   neighbors: {
     bgp: ProtocolNeighbor[]
     ospf: ProtocolNeighbor[]
+    lldp: ProtocolNeighbor[]
   }
   collected_at: string
 }> => {
@@ -597,6 +616,7 @@ export const getDeviceProtocolNeighbors = async (
     neighbors: {
       bgp: ProtocolNeighbor[]
       ospf: ProtocolNeighbor[]
+      lldp: ProtocolNeighbor[]
     }
     collected_at: string
   }

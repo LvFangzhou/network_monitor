@@ -28,6 +28,9 @@ class Datacenter(Base):
     contact_person = Column(String(100))  # 联系人
     contact_phone = Column(String(20))  # 联系电话
     contact_email = Column(String(100))  # 联系邮箱
+    network_owner = Column(String(100))  # 网络负责人
+    network_owner_email = Column(String(255))  # 网络负责人邮箱，多个用逗号分隔
+    robot_mention = Column(String(255))  # 历史兼容字段：原机器人艾特标识，页面不再使用
     build_date = Column(DateTime(timezone=True))  # 建设时间
     description = Column(Text)  # 描述
     is_active = Column(Boolean, default=True)  # 是否启用
@@ -47,6 +50,9 @@ class Datacenter(Base):
             "contact_person": self.contact_person,
             "contact_phone": self.contact_phone,
             "contact_email": self.contact_email,
+            "network_owner": self.network_owner,
+            "network_owner_email": self.network_owner_email,
+            "robot_mention": self.robot_mention,
             "build_date": self.build_date.isoformat() if self.build_date else None,
             "description": self.description,
             "is_active": self.is_active,

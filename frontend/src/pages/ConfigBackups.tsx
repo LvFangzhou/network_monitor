@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react'
+import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import { Button, Card, Col, Drawer, Form, Input, Progress, Row, Select, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
 import { CloudDownloadOutlined, EyeOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import {
@@ -47,6 +47,21 @@ const statusLabel: Record<string, string> = {
   cancelled: '已取消',
 }
 
+const syncStatusMeta: Record<string, { label: string; color: string }> = {
+  matched: { label: '一致', color: 'green' },
+  changed_saved: { label: '不一致/已保存', color: 'orange' },
+  changed_save_failed: { label: '不一致/保存失败', color: 'red' },
+  check_failed: { label: '检查失败', color: 'red' },
+  unsupported: { label: '暂不支持', color: 'default' },
+}
+
+const renderSyncStatus = (record: ConfigBackupResult) => {
+  const meta = syncStatusMeta[record.config_sync_status || ''] || { label: '-', color: 'default' }
+  const extra = record.config_save_message || record.config_sync_diff
+  const tag = <Tag color={meta.color}>{meta.label}</Tag>
+  return extra ? <Tooltip title={<pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{extra}</pre>}>{tag}</Tooltip> : tag
+}
+
 const formatTime = (value?: string | null) => value ? new Date(value).toLocaleString() : '-'
 
 const maskWebhook = (value?: string) => {
@@ -67,6 +82,25 @@ const highlightText = (text: string, keyword: string) => {
       {text.slice(index + keyword.length)}
     </>
   )
+}
+
+const parseDiffLineSets = (diff?: string | null) => {
+  const added = new Set<string>()
+  const removed = new Set<string>()
+  for (const line of (diff || '').split('\n')) {
+    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) continue
+    if (line.startsWith('+')) added.add(line.slice(1).trim())
+    if (line.startsWith('-')) removed.add(line.slice(1).trim())
+  }
+  return { added, removed }
+}
+
+const findFirstChangedLine = (content: string, changedLines: Set<string>) => {
+  const lines = content.split('\n')
+  for (let index = 0; index < lines.length; index += 1) {
+    if (changedLines.has(lines[index].trim())) return index + 1
+  }
+  return null
 }
 
 type WidthMap = Record<string, number>
@@ -101,6 +135,7 @@ const ConfigBackups = () => {
   const [resultLoading, setResultLoading] = useState(false)
   const [resultDetail, setResultDetail] = useState<ConfigBackupResult | null>(null)
   const [highlightLine, setHighlightLine] = useState<number | null>(null)
+  const [highlightStartupLine, setHighlightStartupLine] = useState<number | null>(null)
   const [jobResultsOpen, setJobResultsOpen] = useState(false)
   const [jobResultsLoading, setJobResultsLoading] = useState(false)
   const [jobResults, setJobResults] = useState<ConfigBackupResult[]>([])
@@ -121,6 +156,7 @@ const ConfigBackups = () => {
     device: 230,
     datacenter: 130,
     status: 90,
+    sync: 130,
     finishedAt: 160,
     action: 100,
   })
@@ -131,6 +167,9 @@ const ConfigBackups = () => {
     line: 360,
     action: 82,
   })
+  const runningConfigScrollRef = useRef<HTMLDivElement | null>(null)
+  const startupConfigScrollRef = useRef<HTMLDivElement | null>(null)
+  const syncingConfigScrollRef = useRef(false)
 
   const resizableTitle = (
     title: string,
@@ -334,6 +373,7 @@ const ConfigBackups = () => {
   const openResult = async (resultId: number, lineNumber?: number) => {
     setResultDetail(null)
     setHighlightLine(lineNumber || null)
+    setHighlightStartupLine(null)
     setResultDrawerOpen(true)
     setResultLoading(true)
     try {
@@ -343,6 +383,21 @@ const ConfigBackups = () => {
         window.setTimeout(() => {
           document.getElementById(`config-line-${lineNumber}`)?.scrollIntoView({ block: 'center' })
         }, 120)
+      } else if (detail.config_sync_diff) {
+        const parsed = parseDiffLineSets(detail.config_sync_diff)
+        const runningLine = findFirstChangedLine(detail.config_content || '', parsed.added)
+        const startupLine = findFirstChangedLine(detail.startup_config_content || '', parsed.removed)
+        if (runningLine) {
+          setHighlightLine(runningLine)
+          window.setTimeout(() => {
+            document.getElementById(`config-line-${runningLine}`)?.scrollIntoView({ block: 'center' })
+          }, 180)
+        } else if (startupLine) {
+          setHighlightStartupLine(startupLine)
+          window.setTimeout(() => {
+            document.getElementById(`startup-config-line-${startupLine}`)?.scrollIntoView({ block: 'center' })
+          }, 180)
+        }
       }
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取配置详情失败')
@@ -445,35 +500,101 @@ const ConfigBackups = () => {
     vendors: uniqueFilterOptions(jobResults.map((item) => item.vendor)),
   }), [jobResults])
 
+  const syncConfigScroll = (source: HTMLDivElement, target: HTMLDivElement | null) => {
+    if (!target || syncingConfigScrollRef.current) return
+    syncingConfigScrollRef.current = true
+    target.scrollTop = source.scrollTop
+    target.scrollLeft = source.scrollLeft
+    window.requestAnimationFrame(() => {
+      syncingConfigScrollRef.current = false
+    })
+  }
+
+  const diffLineSets = useMemo(() => parseDiffLineSets(resultDetail?.config_sync_diff), [resultDetail?.config_sync_diff])
+
+  const renderConfigLines = (content: string, side: 'running' | 'startup' = 'running') => {
+    const changedSet = side === 'running' ? diffLineSets.added : diffLineSets.removed
+    return content.split('\n').map((line, index) => {
+      const lineNumber = index + 1
+      const active = side === 'running' ? highlightLine === lineNumber : highlightStartupLine === lineNumber
+      const changed = changedSet.has(line.trim())
+      return (
+        <div
+          key={`${side}-${lineNumber}`}
+          id={side === 'running' ? `config-line-${lineNumber}` : `startup-config-line-${lineNumber}`}
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '56px 1fr',
+            gap: 10,
+            padding: '1px 8px',
+            borderRadius: 8,
+            background: active ? 'rgba(250, 204, 21, 0.34)' : changed ? (side === 'running' ? 'rgba(251, 146, 60, 0.18)' : 'rgba(248, 113, 113, 0.16)') : 'transparent',
+            color: active ? '#7c2d12' : undefined,
+            fontWeight: active || changed ? 800 : 500,
+          }}
+        >
+          <Text type="secondary" style={{ userSelect: 'none', textAlign: 'right' }}>{lineNumber}</Text>
+          <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{side === 'running' ? highlightText(line, keyword.trim()) : line}</span>
+        </div>
+      )
+    })
+  }
+
   const renderConfigContent = () => {
     if (resultLoading) return '正在加载配置内容...'
     const content = resultDetail?.config_content || ''
     if (!content) return '暂无配置内容'
+    const startupContent = resultDetail?.startup_config_content || ''
+    const showCompare = Boolean(startupContent && resultDetail?.config_sync_status && resultDetail.config_sync_status !== 'matched')
+    const header = resultDetail?.config_sync_status ? (
+      <div style={{ marginBottom: 12, padding: 12, borderRadius: 10, background: colorBgContainer, border: '1px solid rgba(148,163,184,0.22)', fontFamily: 'inherit' }}>
+        <Space wrap>
+          <Text strong>运行/启动配置：</Text>
+          {renderSyncStatus(resultDetail)}
+          {resultDetail.startup_command ? <Text type="secondary">启动配置命令：{resultDetail.startup_command}</Text> : null}
+          {resultDetail.config_save_command ? <Text type="secondary">保存命令：{resultDetail.config_save_command}</Text> : null}
+        </Space>
+        {!showCompare && resultDetail.config_sync_diff ? (
+          <pre style={{ margin: '10px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 180, overflow: 'auto' }}>{resultDetail.config_sync_diff}</pre>
+        ) : null}
+      </div>
+    ) : null
+
+    if (showCompare) {
+      const paneStyle = {
+        background: colorFillQuaternary,
+        borderRadius: 12,
+        padding: 12,
+        minHeight: '62vh',
+        maxHeight: '72vh',
+        overflow: 'auto',
+        border: '1px solid rgba(148,163,184,0.18)',
+      } as const
+      return (
+        <div style={{ fontFamily: 'Menlo, Consolas, monospace', fontSize: 13, lineHeight: 1.7 }}>
+          {header}
+          <Row gutter={12}>
+            <Col span={12}>
+              <div style={{ marginBottom: 8 }}><Tag color="orange">运行配置 current</Tag><Text type="secondary">{resultDetail?.command || '-'}</Text></div>
+              <div ref={runningConfigScrollRef} style={paneStyle} onScroll={(event) => syncConfigScroll(event.currentTarget, startupConfigScrollRef.current)}>
+                {renderConfigLines(content, 'running')}
+              </div>
+            </Col>
+            <Col span={12}>
+              <div style={{ marginBottom: 8 }}><Tag color="red">保存配置 startup</Tag><Text type="secondary">{resultDetail?.startup_command || '-'}</Text></div>
+              <div ref={startupConfigScrollRef} style={paneStyle} onScroll={(event) => syncConfigScroll(event.currentTarget, runningConfigScrollRef.current)}>
+                {renderConfigLines(startupContent, 'startup')}
+              </div>
+            </Col>
+          </Row>
+        </div>
+      )
+    }
+
     return (
       <div style={{ fontFamily: 'Menlo, Consolas, monospace', fontSize: 13, lineHeight: 1.7 }}>
-        {content.split('\n').map((line, index) => {
-          const lineNumber = index + 1
-          const active = highlightLine === lineNumber
-          return (
-            <div
-              key={lineNumber}
-              id={`config-line-${lineNumber}`}
-              style={{
-                display: 'grid',
-                gridTemplateColumns: '72px 1fr',
-                gap: 12,
-                padding: '1px 8px',
-                borderRadius: 8,
-                background: active ? 'rgba(250, 204, 21, 0.34)' : 'transparent',
-                color: active ? '#7c2d12' : undefined,
-                fontWeight: active ? 800 : 500,
-              }}
-            >
-              <Text type="secondary" style={{ userSelect: 'none', textAlign: 'right' }}>{lineNumber}</Text>
-              <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{highlightText(line, keyword.trim())}</span>
-            </div>
-          )
-        })}
+        {header}
+        {renderConfigLines(content, 'running')}
       </div>
     )
   }
@@ -702,11 +823,12 @@ const ConfigBackups = () => {
               dataSource={filteredLatestResults}
               pagination={false}
               virtual
-              scroll={{ x: 720, y: 470 }}
+              scroll={{ x: 860, y: 470 }}
               columns={[
                 { title: resizableTitle('设备', 'device', latestColumnWidths, setLatestColumnWidths, 160), width: latestColumnWidths.device, sorter: (a, b) => ipToNumber(a.device_ip) - ipToNumber(b.device_ip), render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text strong>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
                 { title: resizableTitle('机房', 'datacenter', latestColumnWidths, setLatestColumnWidths, 90), dataIndex: 'datacenter_name', width: latestColumnWidths.datacenter, filters: latestResultOptions.datacenters.map((value) => ({ text: value, value })), onFilter: (value, record) => record.datacenter_name === value, sorter: (a, b) => String(a.datacenter_name || '').localeCompare(String(b.datacenter_name || '')), render: (value?: string) => value || '-' },
                 { title: resizableTitle('状态', 'status', latestColumnWidths, setLatestColumnWidths, 80), dataIndex: 'status', width: latestColumnWidths.status, filters: uniqueFilterOptions(latestResults.map((item) => item.status)), onFilter: (value, record) => record.status === value, sorter: (a, b) => String(a.status).localeCompare(String(b.status)), render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : value === 'pending' ? 'blue' : 'default'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value === 'pending' ? '等待' : value}</Tag> },
+                { title: resizableTitle('配置一致性', 'sync', latestColumnWidths, setLatestColumnWidths, 110), dataIndex: 'config_sync_status', width: latestColumnWidths.sync, filters: uniqueFilterOptions(latestResults.map((item) => syncStatusMeta[item.config_sync_status || '']?.label || item.config_sync_status)), onFilter: (value, record) => (syncStatusMeta[record.config_sync_status || '']?.label || record.config_sync_status) === value, render: (_: unknown, record: ConfigBackupResult) => renderSyncStatus(record) },
                 { title: resizableTitle('完成时间', 'finishedAt', latestColumnWidths, setLatestColumnWidths, 130), dataIndex: 'finished_at', width: latestColumnWidths.finishedAt, sorter: (a, b) => new Date(a.finished_at || 0).getTime() - new Date(b.finished_at || 0).getTime(), render: formatTime },
                 { title: resizableTitle('操作', 'action', latestColumnWidths, setLatestColumnWidths, 80), width: latestColumnWidths.action, render: (_: unknown, record: ConfigBackupResult) => <Button size="small" icon={<EyeOutlined />} disabled={record.status !== 'success'} onClick={() => openResult(record.id)}>查看</Button> },
               ]}
@@ -766,7 +888,7 @@ const ConfigBackups = () => {
         title={resultDetail ? `${resultDetail.device_name} (${resultDetail.device_ip}) 配置` : '配置详情'}
         open={resultDrawerOpen}
         onClose={() => setResultDrawerOpen(false)}
-        width="min(900px, 72vw)"
+        width="min(1380px, 92vw)"
       >
         <Spin spinning={resultLoading}>
           <div style={{ background: colorFillQuaternary, borderRadius: 12, padding: 16, minHeight: '60vh', maxHeight: '74vh', overflow: 'auto' }}>
@@ -788,15 +910,16 @@ const ConfigBackups = () => {
           dataSource={jobResults}
           pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total) => `共 ${total} 台` }}
           virtual
-          scroll={{ x: 1300, y: Math.max(520, window.innerHeight - 205) }}
+          scroll={{ x: 1540, y: Math.max(520, window.innerHeight - 205) }}
           style={{ flex: 1, minHeight: 0 }}
           columns={[
-            { title: '设备', width: 260, sorter: (a, b) => ipToNumber(a.device_ip) - ipToNumber(b.device_ip), render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
+            { title: '设备', width: 340, sorter: (a, b) => ipToNumber(a.device_ip) - ipToNumber(b.device_ip), render: (_: unknown, record: ConfigBackupResult) => <Space direction="vertical" size={0}><Text>{record.device_name}</Text><Text type="secondary">{record.device_ip}</Text></Space> },
             { title: '机房', dataIndex: 'datacenter_name', width: 150, filters: jobResultOptions.datacenters, onFilter: (value, record) => record.datacenter_name === value, sorter: (a, b) => String(a.datacenter_name || '').localeCompare(String(b.datacenter_name || '')), render: (value?: string) => value || '-' },
-            { title: '命令', dataIndex: 'command', width: 180, filters: uniqueFilterOptions(jobResults.map((item) => item.command)), onFilter: (value, record) => record.command === value, render: (value?: string) => value || '-' },
+            { title: '命令', dataIndex: 'command', width: 170, filters: uniqueFilterOptions(jobResults.map((item) => item.command)), onFilter: (value, record) => record.command === value, render: (value?: string) => value || '-' },
             { title: '行数', dataIndex: 'line_count', width: 90, sorter: (a, b) => (a.line_count || 0) - (b.line_count || 0), render: (value?: number) => value || '-' },
             { title: '状态', dataIndex: 'status', width: 100, filters: jobResultOptions.statuses, onFilter: (value, record) => record.status === value, sorter: (a, b) => String(a.status).localeCompare(String(b.status)), render: (value: string) => <Tag color={value === 'success' ? 'green' : value === 'failed' ? 'red' : value === 'pending' ? 'blue' : 'default'}>{value === 'success' ? '成功' : value === 'failed' ? '失败' : value === 'pending' ? '等待' : value}</Tag> },
-            { title: '错误信息', dataIndex: 'error_message', ellipsis: true, render: (value?: string) => value ? <Tooltip title={value}>{value}</Tooltip> : <Text type="secondary">-</Text> },
+            { title: '配置一致性', dataIndex: 'config_sync_status', width: 150, filters: uniqueFilterOptions(jobResults.map((item) => syncStatusMeta[item.config_sync_status || '']?.label || item.config_sync_status)), onFilter: (value, record) => (syncStatusMeta[record.config_sync_status || '']?.label || record.config_sync_status) === value, render: (_: unknown, record: ConfigBackupResult) => renderSyncStatus(record) },
+            { title: '错误信息', dataIndex: 'error_message', width: 260, ellipsis: true, render: (value?: string) => value ? <Tooltip title={value}>{value}</Tooltip> : <Text type="secondary">-</Text> },
             { title: '完成时间', dataIndex: 'finished_at', width: 180, render: formatTime },
             {
               title: '操作',

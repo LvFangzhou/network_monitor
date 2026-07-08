@@ -9,6 +9,9 @@ export interface Datacenter {
   contact_person?: string
   contact_phone?: string
   contact_email?: string
+  network_owner?: string
+  network_owner_email?: string
+  robot_mention?: string
   build_date?: string
   description?: string
   is_active: boolean

@@ -91,9 +91,49 @@ def enqueue_alert_notification(
         raise
 
 
+
+
+def _normalize_vendor_text(value: Optional[str]) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if any(marker in text for marker in ["ruijie", "锐捷", "rgos"]):
+        return "ruijie 锐捷 rgos"
+    if any(marker in text for marker in ["h3c", "华三", "新华三", "comware"]):
+        return "h3c 华三 新华三 comware"
+    if any(marker in text for marker in ["hillstone", "山石"]):
+        return "hillstone 山石"
+    if any(marker in text for marker in ["aster", "asternos", "asterfusion", "星融元"]):
+        return "aster asternos asterfusion 星融元"
+    return text
+
+def _normalize_vendor_list(values: Any) -> List[str]:
+    if not values:
+        return []
+    if isinstance(values, str):
+        values = [item.strip() for item in values.split(",")]
+    if not isinstance(values, list):
+        return []
+    return [str(item).strip() for item in values if str(item or "").strip()]
+
+def _vendor_matches_any(raw_vendor: Optional[str], allowed_vendors: Any) -> bool:
+    allowed = _normalize_vendor_list(allowed_vendors)
+    if not allowed:
+        return True
+    normalized_vendor = _normalize_vendor_text(raw_vendor)
+    for value in allowed:
+        normalized_allowed = _normalize_vendor_text(value)
+        if normalized_allowed and (normalized_allowed.split()[0] in normalized_vendor or str(value).strip().lower() in normalized_vendor):
+            return True
+    return False
+
+def _rule_applicable_vendors(rule: AlertRule) -> List[str]:
+    extra_config = rule.extra_config or {}
+    return _normalize_vendor_list(extra_config.get("applicable_vendors") or extra_config.get("vendors"))
+
 def _is_asternos_vendor(vendor: Optional[str]) -> bool:
     vendor_value = (vendor or "").strip().lower()
-    return any(marker in vendor_value for marker in ["asternos", "asterfusion", "asteros", "星融元"])
+    return any(marker in vendor_value for marker in ["asternos", "asterfusion", "asteros", "aster", "星融元"])
 
 
 def _is_hillstone_vendor(vendor: Optional[str]) -> bool:
@@ -604,10 +644,19 @@ def _build_notification_card_data(
 def _build_channel_config(channel: Dict[str, Any], mention_users: List[str]) -> Dict[str, Any]:
     config = dict(channel.get("config", {}) or {})
     if mention_users:
-        config.setdefault("mentioned_list", mention_users)
-        mobile_targets = [item for item in mention_users if item.isdigit()]
+        normalized_targets = []
+        for item in mention_users:
+            raw_text = str(item).strip()
+            if not raw_text:
+                continue
+            normalized_targets.append("@all" if raw_text.lower() == "@all" else raw_text.lstrip("@"))
+        mobile_targets = [item for item in normalized_targets if item.isdigit()]
+        user_targets = [item for item in normalized_targets if not item.isdigit()]
+        if user_targets:
+            config.setdefault("mentioned_list", user_targets)
         if mobile_targets:
             config.setdefault("at_mobiles", mobile_targets)
+            config.setdefault("mentioned_mobile_list", mobile_targets)
     return config
 
 
@@ -1315,6 +1364,10 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
     else:
         # 应用到所有设备
         devices = db.query(Device).all()
+
+    applicable_vendors = _rule_applicable_vendors(rule)
+    if applicable_vendors:
+        devices = [device for device in devices if _vendor_matches_any(device.vendor, applicable_vendors)]
 
     if rule.metric_type == "device_reachability":
         devices = [

@@ -2,9 +2,10 @@
 指标查询路由
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 import asyncio
+import io
 import ipaddress
 import json
 import math
@@ -12,6 +13,7 @@ import os
 import platform
 import re
 import socket
+import time
 
 import psutil
 
@@ -146,6 +148,31 @@ def _normalize_neighbor_device_name(value: Optional[str]) -> str:
     return text.strip().lower()
 
 
+def _extract_device_name_from_port_alias(value: Optional[str]) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(
+        r"to-([^-]+(?:-[^-]+)*?)-(?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet)\d+(?:/\d+)+(?:[:/]\d+)?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def _extract_device_name_from_sys_desc(value: Optional[str]) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        if re.search(r"[A-Za-z0-9]+.*-(?:Leaf|Spine|EX|CSW|DWW|Stor|GW|TOR|SW)", line, flags=re.IGNORECASE):
+            return line
+    return ""
+
+
 def _apply_lldp_device_ip_fallback(db: Session, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not rows:
         return rows
@@ -167,31 +194,96 @@ def _apply_lldp_device_ip_fallback(db: Session, rows: List[Dict[str, Any]]) -> L
             if normalized and normalized not in device_map and ip_address:
                 device_map[normalized] = str(ip_address)
 
+    name_map: Dict[str, str] = {}
+    for _, name, hostname, ip_address in devices:
+        display_name = str(name or hostname or ip_address or "").strip()
+        for raw in (name, hostname):
+            normalized = _normalize_neighbor_device_name(raw)
+            if normalized and normalized not in name_map and display_name:
+                name_map[normalized] = display_name
+
     def _looks_like_mac(value: Optional[str]) -> bool:
         text = str(value or "").strip()
         return bool(re.fullmatch(r"(?:[0-9A-Fa-f]{2}[\s:-]?){5}[0-9A-Fa-f]{2}", text))
+
+    def _looks_like_interconnect_ip(value: Optional[str]) -> bool:
+        text = str(value or "").strip()
+        return text.startswith("10.239.5.")
 
     def _looks_like_generic_short_name(value: Optional[str]) -> bool:
         text = str(value or "").strip()
         return bool(re.fullmatch(r"[A-Za-z]?\d{3,6}", text))
 
+    def _looks_like_server_port(value: Optional[str]) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        return bool(re.search(r"(?:^|[^A-Za-z0-9])(?:eth|enp|eno|ens|bond|team|p\d+|rail\d+)(?:[^A-Za-z0-9]|$)", text, flags=re.IGNORECASE))
+
+    reverse_ip_map: Dict[str, str] = {}
+    for _, name, hostname, ip_address in devices:
+        if not ip_address:
+            continue
+        tail = str(ip_address).strip().split(".")[-1]
+        if tail and tail not in reverse_ip_map:
+            reverse_ip_map[tail] = str(name or hostname or ip_address)
+
     for item in rows:
         raw_mgmt_ip = str(item.get("remote_mgmt_addr") or "").strip()
-        item["remote_kind"] = "未知"
-        if raw_mgmt_ip in ip_name_map:
-            item["remote_kind"] = "网络设备"
-        elif _looks_like_generic_short_name(item.get("remote_system")):
-            item["remote_kind"] = "服务器"
-        elif _looks_like_mac(item.get("remote_system")):
-            item["remote_kind"] = "未知"
-        normalized = _normalize_neighbor_device_name(item.get("remote_system"))
+        raw_remote_system = str(item.get("remote_system") or "").strip()
+        remote_port_alias_name = _extract_device_name_from_port_alias(item.get("local_port"))
+        local_port_alias_name = _extract_device_name_from_port_alias(item.get("remote_port"))
+        sys_desc_name = _extract_device_name_from_sys_desc(item.get("remote_sys_desc"))
+        alias_name = remote_port_alias_name or local_port_alias_name or sys_desc_name
+        normalized = _normalize_neighbor_device_name(alias_name or raw_remote_system)
         mapped_ip = device_map.get(normalized)
+        mapped_name = name_map.get(normalized)
+        item["remote_kind"] = "未知"
+        item["remote_display_name"] = alias_name or raw_remote_system or "-"
+        if alias_name:
+            item["remote_system"] = alias_name
+        if mapped_name:
+            item["remote_system"] = mapped_name
+            item["remote_display_name"] = mapped_name
         if mapped_ip:
-            item["remote_mgmt_addr"] = mapped_ip
+            if not raw_mgmt_ip or raw_mgmt_ip.startswith("10.239.5."):
+                item["remote_mgmt_addr"] = mapped_ip
             item["remote_mgmt_addr_source"] = "cmdb"
             item["remote_kind"] = "网络设备"
+        elif raw_mgmt_ip in ip_name_map and not _looks_like_mac(raw_remote_system):
+            item["remote_kind"] = "网络设备"
+            item["remote_display_name"] = raw_remote_system or ip_name_map[raw_mgmt_ip]
+            item["remote_mgmt_addr_source"] = "snmp"
+        elif raw_mgmt_ip.startswith("10.239.5."):
+            tail = raw_mgmt_ip.split(".")[-1]
+            mapped_by_tail = reverse_ip_map.get(tail)
+            if mapped_by_tail:
+                item["remote_system"] = mapped_by_tail
+                item["remote_display_name"] = mapped_by_tail
+                item["remote_kind"] = "网络设备"
+                item["remote_mgmt_addr_source"] = "cmdb"
+        elif _looks_like_generic_short_name(item.get("remote_system")):
+            item["remote_kind"] = "服务器"
+            item["remote_mgmt_addr_source"] = "snmp"
+        elif _looks_like_server_port(item.get("remote_port")) or _looks_like_server_port(item.get("local_port")):
+            item["remote_kind"] = "服务器"
+            item["remote_mgmt_addr_source"] = "snmp"
+            if _looks_like_mac(item.get("remote_system")):
+                if raw_mgmt_ip:
+                    item["remote_display_name"] = raw_mgmt_ip
+                    item["peer"] = raw_mgmt_ip
+                else:
+                    item["remote_display_name"] = "服务器"
+                    item["peer"] = "服务器"
+        elif _looks_like_mac(item.get("remote_system")):
+            item["remote_kind"] = "未知"
         else:
             item["remote_mgmt_addr_source"] = "snmp"
+        if _looks_like_interconnect_ip(item.get("remote_mgmt_addr")) and mapped_ip:
+            item["remote_mgmt_addr"] = mapped_ip
+            item["remote_mgmt_addr_source"] = "cmdb"
+        if not item.get("peer") or item.get("peer") == raw_remote_system:
+            item["peer"] = item.get("remote_system") or raw_remote_system or item.get("peer") or "-"
     return rows
 
 
@@ -211,6 +303,309 @@ def _store_monitor_cache(kind: str, device_id: int, payload: Any, ttl_seconds: i
         ttl_seconds,
         json.dumps(payload, ensure_ascii=False, default=str),
     )
+
+
+def _device_identity_text(device: Device) -> str:
+    return " ".join([
+        str(getattr(device, "vendor", "") or ""),
+        str(getattr(device, "model", "") or ""),
+        str(getattr(device, "name", "") or ""),
+        str(getattr(device, "hostname", "") or ""),
+    ]).lower()
+
+
+def _lldp_cli_profile(device: Device) -> Optional[Tuple[str, List[str]]]:
+    identity = _device_identity_text(device)
+    if any(marker in identity for marker in ["ruijie", "锐捷", "rgos"]):
+        return "ruijie", ["terminal length 0", "screen-length 0 temporary", "show lldp neighbors"]
+    if any(marker in identity for marker in ["hillstone", "山石", "sg-6000"]):
+        return "hillstone", ["terminal length 0", "screen-length 0 temporary", "show lldp neighbor-information"]
+    if any(marker in identity for marker in ["aster", "asternos", "asterfusion", "星融元"]):
+        return "asteros", ["show lldp neighbor summary"]
+    if any(marker in identity for marker in ["h3c", "华三", "新华三", "comware", "densivelo", "s9867", "s9850", "s9820"]):
+        return "h3c", ["screen-length 0 temporary", "display lldp neighbor-information list"]
+    return None
+
+
+def _strip_terminal_control(text: str) -> str:
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text or "")
+    text = text.replace("\r", "")
+    text = re.sub(r"--More--|More:\s*<space>|\x08+", "", text, flags=re.IGNORECASE)
+    return text
+
+
+def _read_ssh_channel(channel: Any, idle_seconds: float = 0.7, timeout_seconds: float = 8.0) -> str:
+    chunks: List[str] = []
+    start = time.time()
+    last_data = time.time()
+    while time.time() - start < timeout_seconds:
+        if channel.recv_ready():
+            data = channel.recv(65535)
+            if not data:
+                break
+            text = data.decode("utf-8", errors="ignore")
+            if "--More--" in text or "More:" in text:
+                try:
+                    channel.send(" ")
+                except Exception:
+                    pass
+            chunks.append(text)
+            last_data = time.time()
+            continue
+        if chunks and time.time() - last_data >= idle_seconds:
+            break
+        time.sleep(0.08)
+    return _strip_terminal_control("".join(chunks))
+
+
+def _run_lldp_cli_command(device: Device, commands: List[str]) -> str:
+    username = str(getattr(device, "ssh_username", "") or "").strip()
+    password = getattr(device, "ssh_password", None) or None
+    key_text = str(getattr(device, "ssh_key", "") or "").strip()
+    if not username or (not password and not key_text):
+        return ""
+    try:
+        import paramiko
+    except Exception as exc:
+        logger.warning("LLDP CLI采集跳过：缺少paramiko", device_id=device.id, error=str(exc))
+        return ""
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    connect_kwargs: Dict[str, Any] = {
+        "hostname": device.ip_address,
+        "port": int(getattr(device, "ssh_port", 22) or 22),
+        "username": username,
+        "timeout": 8,
+        "banner_timeout": 8,
+        "auth_timeout": 8,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    if key_text:
+        key_file = io.StringIO(key_text)
+        key = None
+        for key_cls in (paramiko.RSAKey, paramiko.ECDSAKey, paramiko.Ed25519Key):
+            key_file.seek(0)
+            try:
+                key = key_cls.from_private_key(key_file, password=password)
+                break
+            except Exception:
+                continue
+        if not key:
+            return ""
+        connect_kwargs["pkey"] = key
+    else:
+        connect_kwargs["password"] = password
+    try:
+        client.connect(**connect_kwargs)
+        shell = client.invoke_shell(width=240, height=5000)
+        output_parts = [_read_ssh_channel(shell, idle_seconds=0.5, timeout_seconds=3)]
+        for command in commands:
+            shell.send(command + "\n")
+            output_parts.append(_read_ssh_channel(shell, idle_seconds=0.8, timeout_seconds=12))
+        return "\n".join(output_parts)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _normalize_lldp_interface_key(value: Optional[str]) -> str:
+    raw_text = str(value or "").strip()
+    extracted = re.search(
+        r"((?:FourHundredGigE|FourHundredGigabitEthernet|400GE|FHGigabitEthernet|FH|TwoHundredGigE|TwoHundredGigabitEthernet|200GE|HundredGigE|HundredGigabitEthernet|100GE|HGE|FiftyGigE|FiftyGigabitEthernet|50GE|Twenty-?FiveGigE|Twenty-?FiveGigabitEthernet|25GE|Ten-?GigabitEthernet|TenGigE|XGigabitEthernet|XGE|M-?GigabitEthernet|MGE|GigabitEthernet|GE|xethernet|cethernet|ethernet)\s*\d+(?:/\d+)+(?:[:/]\d+)?)",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
+    if extracted:
+        raw_text = extracted.group(1)
+    text = raw_text.lower()
+    if not text or text == "-":
+        return ""
+    text = text.replace(" ", "").replace("_", "").replace("-", "")
+    text = text.replace("interface", "")
+    match = re.match(r"^([a-z]+)([0-9].*)$", text)
+    if not match:
+        return text
+    prefix, suffix = match.group(1), match.group(2)
+    prefix_map = [
+        (("fourhundredgige", "fourhundredgigabitethernet", "400ge", "fhgigabitethernet", "fh"), "400g"),
+        (("twohundredgige", "twohundredgigabitethernet", "200ge"), "200g"),
+        (("hundredgige", "hundredgigabitethernet", "100ge", "hge"), "100g"),
+        (("fiftygige", "fiftygigabitethernet", "50ge"), "50g"),
+        (("twentyfivegige", "twentyfivegigabitethernet", "25ge"), "25g"),
+        (("tengigabitethernet", "tengige", "xgigabitethernet", "xge", "te"), "10g"),
+        (("mgigabitethernet", "mgigabitethernet", "mgigabitethernet", "mgigabitethernet", "mgigabitethernet", "mge", "mg"), "mg"),
+        (("gigabitethernet", "gige", "ge"), "1g"),
+        (("ethernet", "eth"), "eth"),
+        (("cethernet",), "ceth"),
+        (("xethernet",), "xeth"),
+    ]
+    for markers, canonical in prefix_map:
+        if prefix in markers or any(prefix.startswith(marker) for marker in markers):
+            return f"{canonical}{suffix}"
+    return f"{prefix}{suffix}"
+
+
+def _is_probable_mac(value: Optional[str]) -> bool:
+    text = str(value or "").strip()
+    return bool(re.fullmatch(r"(?:[0-9A-Fa-f]{2}[-:.]?){5}[0-9A-Fa-f]{2}|[0-9A-Fa-f]{4}(?:[.-][0-9A-Fa-f]{4}){2}", text))
+
+
+def _lldp_cli_row(local_port: str, remote_system: str, remote_port: str = "", chassis_id: str = "", source: str = "cli") -> Dict[str, Any]:
+    remote_name = str(remote_system or "").strip() or str(chassis_id or "").strip() or "-"
+    return {
+        "protocol": "lldp",
+        "local_port": str(local_port or "").strip(),
+        "local_port_id": str(local_port or "").strip(),
+        "remote_system": remote_name,
+        "remote_display_name": remote_name,
+        "remote_port": str(remote_port or "").strip() or "-",
+        "remote_port_id": str(remote_port or "").strip(),
+        "remote_chassis_id": str(chassis_id or "").strip(),
+        "remote_mgmt_addr": None,
+        "peer": remote_name,
+        "interface": str(local_port or "").strip(),
+        "state": "up",
+        "status": "up",
+        "source": source,
+        "remote_name_source": "cli",
+    }
+
+
+def _parse_h3c_lldp_cli(output: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for raw_line in _strip_terminal_control(output).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("<") or "Chassis ID" in line or "Local Interface" in line or "-- --" in line:
+            continue
+        parts = re.split(r"\s{2,}", line)
+        if len(parts) >= 4 and re.match(r"^[A-Za-z0-9/-]+$", parts[0]) and _is_probable_mac(parts[1]):
+            rows.append(_lldp_cli_row(parts[0], parts[3], parts[2], parts[1], "cli:h3c"))
+    return rows
+
+
+def _parse_ruijie_lldp_cli(output: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for raw_line in _strip_terminal_control(output).splitlines():
+        line = raw_line.strip()
+        if not line or line.endswith("#show lldp neighbors") or "Capability codes" in line or "System Name" in line:
+            continue
+        parts = re.split(r"\s{2,}", line)
+        if len(parts) >= 5:
+            rows.append(_lldp_cli_row(parts[1], parts[0], parts[2], "", "cli:ruijie"))
+    return rows
+
+
+def _parse_asteros_lldp_cli(output: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for raw_line in _strip_terminal_control(output).splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("Capability codes") or stripped.startswith("LocalPort") or stripped.startswith("---"):
+            continue
+        parts = re.split(r"\s{2,}", stripped)
+        if len(parts) >= 5:
+            rows.append(_lldp_cli_row(parts[0], parts[1], parts[2], "", "cli:asteros"))
+    return rows
+
+
+def _parse_hillstone_lldp_cli(output: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for raw_line in _strip_terminal_control(output).splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("Total lldp", "=", "-")) or "System Name" in stripped:
+            continue
+        match = re.match(r"^(.+?)\s+(xethernet\S+|cethernet\S+|ethernet\S+|ge\S+|GigabitEthernet\S+|HundredGigE\S+)\s+([0-9A-Fa-f:.\-]+)\s+(.+?)\s*$", stripped)
+        if match:
+            rows.append(_lldp_cli_row(match.group(2), match.group(1).strip(), match.group(4).strip(), match.group(3), "cli:hillstone"))
+    return rows
+
+
+def _parse_lldp_cli_output(vendor_key: str, output: str) -> List[Dict[str, Any]]:
+    if not output:
+        return []
+    if vendor_key == "ruijie":
+        return _parse_ruijie_lldp_cli(output)
+    if vendor_key == "asteros":
+        return _parse_asteros_lldp_cli(output)
+    if vendor_key == "hillstone":
+        return _parse_hillstone_lldp_cli(output)
+    return _parse_h3c_lldp_cli(output)
+
+
+def _collect_lldp_neighbors_from_cli(device: Device) -> List[Dict[str, Any]]:
+    profile = _lldp_cli_profile(device)
+    if not profile:
+        return []
+    vendor_key, commands = profile
+    try:
+        output = _run_lldp_cli_command(device, commands)
+        return _parse_lldp_cli_output(vendor_key, output)
+    except Exception as exc:
+        logger.warning("LLDP CLI采集失败", device_id=device.id, device_ip=device.ip_address, error=str(exc))
+        return []
+
+
+def _lldp_row_interface_keys(row: Dict[str, Any]) -> List[str]:
+    keys: List[str] = []
+    for field in ("local_port", "local_port_id", "interface", "remote_port", "remote_port_id"):
+        key = _normalize_lldp_interface_key(row.get(field))
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _merge_lldp_snmp_and_cli(snmp_rows: List[Dict[str, Any]], cli_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not cli_rows:
+        return snmp_rows or []
+    if not snmp_rows:
+        return cli_rows
+    cli_by_port: Dict[str, List[Dict[str, Any]]] = {}
+    for row in cli_rows:
+        for key in _lldp_row_interface_keys(row):
+            cli_by_port.setdefault(key, []).append(row)
+    merged_rows: List[Dict[str, Any]] = []
+    used_cli_ids = set()
+    for snmp_row in snmp_rows:
+        row = {**snmp_row}
+        cli_row = None
+        for key in _lldp_row_interface_keys(row):
+            matches = cli_by_port.get(key) or []
+            if matches:
+                cli_row = matches[0]
+                break
+        if cli_row:
+            used_cli_ids.add(id(cli_row))
+            cli_remote = str(cli_row.get("remote_system") or "").strip()
+            if cli_remote and (not row.get("remote_system") or _is_probable_mac(row.get("remote_system")) or row.get("remote_system") == "-"):
+                row["remote_system"] = cli_remote
+                row["remote_display_name"] = cli_remote
+                row["peer"] = cli_remote
+                row["remote_name_source"] = "cli"
+            elif cli_remote:
+                row["remote_system"] = cli_remote
+                row["remote_display_name"] = cli_remote
+                row["peer"] = cli_remote
+                row["remote_name_source"] = "cli"
+            if cli_row.get("remote_port") and (not row.get("remote_port") or _is_probable_mac(row.get("remote_port")) or row.get("remote_port") == "-"):
+                row["remote_port"] = cli_row.get("remote_port")
+                row["remote_port_id"] = cli_row.get("remote_port_id") or cli_row.get("remote_port")
+            if cli_row.get("remote_chassis_id") and not row.get("remote_chassis_id"):
+                row["remote_chassis_id"] = cli_row.get("remote_chassis_id")
+            row["source"] = "snmp+cli"
+        merged_rows.append(row)
+    existing_keys = {key for row in merged_rows for key in _lldp_row_interface_keys(row)}
+    for cli_row in cli_rows:
+        cli_keys = _lldp_row_interface_keys(cli_row)
+        key = cli_keys[0] if cli_keys else ""
+        if id(cli_row) not in used_cli_ids and not any(cli_key in existing_keys for cli_key in cli_keys):
+            merged_rows.append(cli_row)
+            existing_keys.update(cli_keys)
+    return merged_rows
 
 
 def _invalidate_device_overview_response_cache(device_id: Optional[int] = None) -> None:
@@ -2832,10 +3227,13 @@ async def get_monitor_devices_overview(
     # If the short-lived response snapshot expired, prefer serving the last successful
     # overview immediately. Device Overview is an overview page and can tolerate stale
     # 5-15 minute data; this avoids making the first user after TTL expiry rebuild 300+ rows.
-    last_success_snapshot = redis_client.get(last_success_cache_key)
+    last_success_snapshot = None if refresh else redis_client.get(last_success_cache_key)
     if last_success_snapshot and not has_filter:
         try:
             payload = json.loads(last_success_snapshot)
+            if not _snapshot_version_matches(payload):
+                redis_client.delete(last_success_cache_key)
+                raise ValueError("device overview last-success snapshot version changed")
             if isinstance(payload, dict) and payload.get("items"):
                 items = payload.get("items", [])
                 # Refill the short snapshot briefly so concurrent menu clicks are fast too.
@@ -2845,6 +3243,8 @@ async def get_monitor_devices_overview(
                     json.dumps(payload, ensure_ascii=False, default=str),
                 )
                 return {"items": items, "total": len(items), "cached": True, "stale": True}
+        except ValueError:
+            pass
         except Exception:
             redis_client.delete(last_success_cache_key)
 
@@ -3071,7 +3471,7 @@ async def get_monitor_device_protocol_neighbors(device_id: int, db: Session = De
     else:
         neighbors = _get_snmp_protocol_neighbors(device.id)
         cached_bgp_details = _load_monitor_cache("bgp_peer_details", device.id)
-        cached_lldp = _load_monitor_cache("lldp_neighbors", device.id)
+        cached_lldp = _load_monitor_cache("lldp_neighbors_v2", device.id)
 
         async def _load_bgp_details() -> List[Dict[str, Any]]:
             if isinstance(cached_bgp_details, dict) and isinstance(cached_bgp_details.get("neighbors"), list):
@@ -3091,8 +3491,11 @@ async def get_monitor_device_protocol_neighbors(device_id: int, db: Session = De
             if isinstance(cached_lldp, dict) and isinstance(cached_lldp.get("neighbors"), list):
                 return cached_lldp.get("neighbors") or []
             try:
-                lldp_rows = await asyncio.to_thread(snmp_collector.collect_lldp_neighbors, device)
-                _store_monitor_cache("lldp_neighbors", device.id, {
+                snmp_lldp_task = asyncio.to_thread(snmp_collector.collect_lldp_neighbors, device)
+                cli_lldp_task = asyncio.to_thread(_collect_lldp_neighbors_from_cli, device)
+                snmp_lldp_rows, cli_lldp_rows = await asyncio.gather(snmp_lldp_task, cli_lldp_task)
+                lldp_rows = _merge_lldp_snmp_and_cli(snmp_lldp_rows or [], cli_lldp_rows or [])
+                _store_monitor_cache("lldp_neighbors_v2", device.id, {
                     "neighbors": lldp_rows,
                     "collected_at": datetime.now(timezone.utc).isoformat(),
                 }, ttl_seconds=1800)

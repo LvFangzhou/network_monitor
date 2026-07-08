@@ -115,6 +115,19 @@ const detectWebhookChannel = (url?: string) => {
 
 const normalizeSeverityValue = (value?: string | null) => severityLabels[value || ''] || 'P1'
 
+const vendorOptions = [
+  { value: 'H3C', label: 'H3C / 华三' },
+  { value: 'Ruijie', label: '锐捷 / Ruijie' },
+  { value: 'Asteros', label: 'Asteros / 星融元' },
+  { value: 'Hillstone', label: '山石 / Hillstone' },
+]
+
+const formatApplicableVendors = (rule: AlertRule) => {
+  const vendors = rule.applicable_vendors || rule.extra_config?.applicable_vendors || rule.extra_config?.vendors || []
+  if (!Array.isArray(vendors) || vendors.length === 0) return '全部厂商'
+  return vendors.map(String).join('、')
+}
+
 const AlertRules = () => {
   const [rules, setRules] = useState<AlertRule[]>([])
   const [total, setTotal] = useState(0)
@@ -123,6 +136,7 @@ const AlertRules = () => {
   const [searchText, setSearchText] = useState('')
   const [severityFilter, setSeverityFilter] = useState<string | null>(null)
   const [enabledFilter, setEnabledFilter] = useState<boolean | null>(null)
+  const [vendorFilter, setVendorFilter] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [editingRule, setEditingRule] = useState<AlertRule | null>(null)
@@ -152,7 +166,8 @@ const AlertRules = () => {
     nextPageSize = pageSize,
     keyword = searchText,
     severity = severityFilter,
-    enabled = enabledFilter
+    enabled = enabledFilter,
+    vendor = vendorFilter
   ) => {
     setLoading(true)
     try {
@@ -162,6 +177,7 @@ const AlertRules = () => {
         search: keyword.trim() || undefined,
         severity: severity || undefined,
         enabled: enabled === null ? undefined : enabled,
+        vendor: vendor || undefined,
       })
       setRules(result.items)
       setTotal(result.total)
@@ -169,6 +185,7 @@ const AlertRules = () => {
       setPageSize(nextPageSize)
       setSeverityFilter(severity)
       setEnabledFilter(enabled)
+      setVendorFilter(vendor)
     } catch (error) {
       message.error('获取告警规则失败')
     } finally {
@@ -223,11 +240,11 @@ const AlertRules = () => {
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      fetchRules(1, pageSize, searchText, severityFilter, enabledFilter)
+      fetchRules(1, pageSize, searchText, severityFilter, enabledFilter, vendorFilter)
     }, 300)
     return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchText, severityFilter, enabledFilter])
+  }, [searchText, severityFilter, enabledFilter, vendorFilter])
 
   const fetchDeviceOptions = async (keyword = deviceKeyword) => {
     setLoadingDevices(true)
@@ -267,7 +284,8 @@ const AlertRules = () => {
     setSearchText('')
     setSeverityFilter(null)
     setEnabledFilter(null)
-    fetchRules(1, pageSize, '', null, null)
+    setVendorFilter(null)
+    fetchRules(1, pageSize, '', null, null, null)
   }
 
   const openCreate = () => {
@@ -287,6 +305,7 @@ const AlertRules = () => {
       device_ids: [],
       mention_users_text: '',
       extra_config_text: '',
+      applicable_vendors: [],
       notification_channels: [],
     })
     setDetectedWebhookLabel('未填写')
@@ -312,6 +331,7 @@ const AlertRules = () => {
         ? rule.extra_config?.mention_users.join(', ')
         : '',
       extra_config_text: JSON.stringify(rule.extra_config || {}, null, 2),
+      applicable_vendors: rule.applicable_vendors || rule.extra_config?.applicable_vendors || rule.extra_config?.vendors || [],
       webhook_url: existingWebhookUrl,
       notification_channels: rule.notification_channels || [],
     })
@@ -341,6 +361,7 @@ const AlertRules = () => {
         .map((item: string) => item.trim())
         .filter(Boolean)
       extraConfig.mention_users = mentionUsers
+      extraConfig.applicable_vendors = values.applicable_vendors || []
       const payload: AlertRulePayload = {
         name: values.name,
         description: values.description,
@@ -407,7 +428,11 @@ const AlertRules = () => {
     try {
       await form.validateFields(['webhook_url'])
       setTestingWebhook(true)
-      const result = await testAlertNotification(webhookUrl)
+      const mentionUsers = String(form.getFieldValue('mention_users_text') || '')
+        .split(/[,，;；\s]+/)
+        .map((item: string) => item.trim())
+        .filter(Boolean)
+      const result = await testAlertNotification(webhookUrl, mentionUsers)
       message.success(result.message)
     } catch (error: any) {
       if (!error?.errorFields) {
@@ -472,6 +497,14 @@ const AlertRules = () => {
               { value: 'P3', label: 'P3' },
             ]}
           />
+          <Select
+            allowClear
+            placeholder="适用厂商"
+            value={vendorFilter ?? undefined}
+            onChange={(value) => setVendorFilter(value || null)}
+            style={{ width: 150 }}
+            options={vendorOptions}
+          />
           <Tooltip title="重置筛选">
             <Button icon={<ReloadOutlined />} onClick={handleResetFilters}>
               重置
@@ -499,7 +532,7 @@ const AlertRules = () => {
           pageSizeOptions: [10, 20, 50, 100],
           showTotal: (count, range) => `第 ${range[0]}-${range[1]} 条 / 共 ${count} 条`,
 	          onChange: (nextPage, nextPageSize) => {
-	            fetchRules(nextPage, nextPageSize, searchText, severityFilter, enabledFilter)
+	            fetchRules(nextPage, nextPageSize, searchText, severityFilter, enabledFilter, vendorFilter)
 	          },
         }}
         columns={[
@@ -535,6 +568,13 @@ const AlertRules = () => {
             title: '重复告警间隔',
             dataIndex: 'suppress_duration',
             render: (value?: number) => `${value || 0}s`,
+          },
+          {
+            title: '适用厂商',
+            render: (_: unknown, record: AlertRule) => {
+              const label = formatApplicableVendors(record)
+              return label === '全部厂商' ? <Tag>全部厂商</Tag> : <Tag color="blue">{label}</Tag>
+            },
           },
           {
             title: '状态',
@@ -716,6 +756,13 @@ const AlertRules = () => {
                 { value: 'specific', label: '指定设备' },
               ]}
             />
+          </Form.Item>
+          <Form.Item
+            name="applicable_vendors"
+            label="适用厂商"
+            extra="不选择表示所有厂商；选择后，新设备会按录入厂商自动匹配对应厂商规则。"
+          >
+            <Select mode="multiple" allowClear options={vendorOptions} placeholder="例如：锐捷 / Ruijie" />
           </Form.Item>
           <Form.Item
             noStyle

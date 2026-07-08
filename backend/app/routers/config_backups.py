@@ -38,6 +38,9 @@ def _job_to_dict(job: ConfigBackupJob, include_results: bool = False) -> Dict[st
         "total_devices": job.total_devices,
         "success_count": job.success_count,
         "failed_count": job.failed_count,
+        "config_changed_count": getattr(job, "config_changed_count", 0) or 0,
+        "config_saved_count": getattr(job, "config_saved_count", 0) or 0,
+        "config_save_failed_count": getattr(job, "config_save_failed_count", 0) or 0,
         "summary": job.summary,
         "error_message": job.error_message,
         "started_by": job.started_by,
@@ -65,12 +68,21 @@ def _result_to_dict(result: ConfigBackupResult, include_content: bool = False) -
         "command": result.command,
         "config_hash": result.config_hash,
         "line_count": result.line_count,
+        "startup_command": getattr(result, "startup_command", None),
+        "startup_config_hash": getattr(result, "startup_config_hash", None),
+        "startup_line_count": getattr(result, "startup_line_count", 0) or 0,
+        "config_sync_status": getattr(result, "config_sync_status", None),
+        "config_sync_diff": getattr(result, "config_sync_diff", None),
+        "config_save_command": getattr(result, "config_save_command", None),
+        "config_save_status": getattr(result, "config_save_status", None),
+        "config_save_message": getattr(result, "config_save_message", None),
         "error_message": result.error_message,
         "started_at": result.started_at.isoformat() if result.started_at else None,
         "finished_at": result.finished_at.isoformat() if result.finished_at else None,
     }
     if include_content:
         data["config_content"] = result.config_content
+        data["startup_config_content"] = getattr(result, "startup_config_content", None)
     return data
 
 

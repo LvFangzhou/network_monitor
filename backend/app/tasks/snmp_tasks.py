@@ -368,6 +368,11 @@ def _set_monitor_cache(kind: str, device_id: int, payload: Any, suffix: str = ""
         _monitor_cache_ttl_seconds(kind),
         json.dumps(payload, ensure_ascii=False, default=str),
     )
+    if kind == "overview":
+        try:
+            redis_client.incr("monitor:cache:overview_revision")
+        except Exception:
+            pass
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -1259,6 +1264,7 @@ def collect_snmp_for_device(self, device_id: int):
                 "cpu_percent": result.get("cpu"),
                 "memory_percent": memory.get("usage_percent") or memory.get("used_percent") or memory.get("percent"),
                 "temperature": result.get("temperature"),
+                "temperature_details": result.get("temperature_details") or [],
                 "storage_percent": result.get("storage_percent"),
             },
             "sessions": {
@@ -1623,7 +1629,7 @@ def collect_all_asternos_exporter():
             monitor_source = str(device.monitor_source or "")
             if (
                 monitor_source == "asternos_exporter"
-                or any(marker in vendor for marker in ["asternos", "asterfusion", "asteros", "星融元"])
+                or any(marker in vendor for marker in ["asternos", "asterfusion", "asteros", "aster", "星融元"])
             ):
                 devices.append(device)
 
@@ -1677,7 +1683,7 @@ def collect_all_asternos_interface_realtime():
             monitor_source = str(device.monitor_source or "")
             if (
                 monitor_source == "asternos_exporter"
-                or any(marker in vendor for marker in ["asternos", "asterfusion", "asteros", "星融元"])
+                or any(marker in vendor for marker in ["asternos", "asterfusion", "asteros", "aster", "星融元"])
             ):
                 devices.append(device)
 

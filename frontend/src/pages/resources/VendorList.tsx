@@ -17,7 +17,7 @@ const tablePagination = {
   showTotal: (total: number, range: [number, number]) => `第 ${range[0]}-${range[1]} 条 / 共 ${total} 条`,
 }
 
-const VendorList = () => {
+const VendorList = ({ embedded = false }: { embedded?: boolean }) => {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -87,15 +87,15 @@ const VendorList = () => {
     }
   }
 
-  return (
-    <Card
-      title="供应商管理"
-      extra={canModify ? (
-        <Tooltip title="新增供应商">
-          <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>新增供应商</Button>
-        </Tooltip>
-      ) : null}
-    >
+  const content = (
+    <>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+        {canModify ? (
+          <Tooltip title="新增供应商">
+            <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>新增供应商</Button>
+          </Tooltip>
+        ) : null}
+      </div>
       <Table
         rowKey="id"
         loading={loading}
@@ -174,8 +174,14 @@ const VendorList = () => {
           </Form.Item>
         </Form>
       </Modal>
-    </Card>
+    </>
   )
+
+  if (embedded) {
+    return content
+  }
+
+  return <Card title="供应商管理">{content}</Card>
 }
 
 export default VendorList

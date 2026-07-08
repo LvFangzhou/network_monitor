@@ -34,7 +34,7 @@ const tablePagination = {
   showTotal: (total: number, range: [number, number]) => `第 ${range[0]}-${range[1]} 条 / 共 ${total} 条`,
 }
 
-const VISIBLE_COLUMNS_STORAGE_KEY = 'datacenter-visible-columns'
+const VISIBLE_COLUMNS_STORAGE_KEY = 'datacenter-visible-columns-v3'
 const defaultVisibleColumns = [
   'name',
   'code',
@@ -42,11 +42,13 @@ const defaultVisibleColumns = [
   'address',
   'contact_person',
   'contact_phone',
+  'network_owner',
+  'network_owner_email',
   'build_date',
   'is_active',
 ]
 
-const DatacenterList = () => {
+const DatacenterList = ({ embedded = false }: { embedded?: boolean }) => {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -188,6 +190,18 @@ const DatacenterList = () => {
       render: (value: string) => value || '-',
     },
     {
+      title: '网络负责人',
+      dataIndex: 'network_owner',
+      key: 'network_owner',
+      render: (value: string) => value || '-',
+    },
+    {
+      title: '网络负责人邮箱',
+      dataIndex: 'network_owner_email',
+      key: 'network_owner_email',
+      render: (value: string) => value || '-',
+    },
+    {
       title: '建设时间',
       dataIndex: 'build_date',
       key: 'build_date',
@@ -233,10 +247,9 @@ const DatacenterList = () => {
     return visibleColumns.includes(String(column.key))
   })
 
-  return (
-    <Card
-      title="机房管理"
-      extra={(
+  const content = (
+    <>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
         <Space>
           <Dropdown
             trigger={['click']}
@@ -275,8 +288,7 @@ const DatacenterList = () => {
             </Tooltip>
           ) : null}
         </Space>
-      )}
-    >
+      </div>
       <Table
         rowKey="id"
         loading={loading}
@@ -346,6 +358,22 @@ const DatacenterList = () => {
           </Form.Item>
 
           <Form.Item
+            name="network_owner"
+            label="网络负责人"
+            tooltip="用于标记该机房网络问题默认负责人，后续机器人通告可以按机房带出。"
+          >
+            <Input placeholder="例如：张三 / 网络一组" />
+          </Form.Item>
+
+          <Form.Item
+            name="network_owner_email"
+            label="网络负责人邮箱"
+            tooltip="用于后续机器人通告或邮件通知中带出该机房网络负责人的邮箱；多人用英文逗号分隔。"
+          >
+            <Input placeholder="例如：zhangsan@example.com,lisi@example.com" />
+          </Form.Item>
+
+          <Form.Item
             name="build_date"
             label="建设时间"
           >
@@ -368,8 +396,14 @@ const DatacenterList = () => {
           </Form.Item>
         </Form>
       </Modal>
-    </Card>
+    </>
   )
+
+  if (embedded) {
+    return content
+  }
+
+  return <Card title="机房管理">{content}</Card>
 }
 
 export default DatacenterList

@@ -35,6 +35,7 @@ from app.tasks.alert_tasks import (
     _get_metric_targets,
     _is_hillstone_vendor,
     _is_targeted_metric,
+    _build_channel_config,
     _silence_matches,
 )
 from app.tasks import celery_app
@@ -1191,6 +1192,12 @@ async def test_notification(
 
     channel_type = _detect_notification_type(webhook_url)
     config = {"url": webhook_url} if channel_type == "webhook" else {"webhook": webhook_url}
+    mention_users = payload.get("mention_users") or payload.get("mention_targets") or []
+    if isinstance(mention_users, str):
+        mention_users = [item.strip() for item in re.split(r"[,，;；\s]+", mention_users) if item.strip()]
+    elif not isinstance(mention_users, list):
+        mention_users = [mention_users]
+    config = _build_channel_config({"config": config}, mention_users)
 
     success = await notification_manager.send_notification(
         channel_type,

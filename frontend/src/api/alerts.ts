@@ -20,6 +20,7 @@ export interface AlertRule {
   device_group_id?: number | null
   device_ids?: number[]
   extra_config?: Record<string, any>
+  applicable_vendors?: string[]
   notification_channels: NotificationChannel[]
   created_at?: string
   updated_at?: string | null
@@ -183,6 +184,7 @@ export const getAlertRules = async (params?: {
   enabled?: boolean
   severity?: string
   search?: string
+  vendor?: string
 }): Promise<{ total: number; items: AlertRule[] }> => {
   return await request.get('/alerts/rules', { params }) as { total: number; items: AlertRule[] }
 }
@@ -287,8 +289,8 @@ export const getSyslogEvents = async (params?: {
   return await request.get('/alerts/syslog', { params }) as { total: number; items: SyslogEvent[] }
 }
 
-export const testAlertNotification = async (url: string): Promise<{ success: boolean; channel_type: string; message: string }> => {
-  return await request.post('/alerts/test-notification', { url }) as { success: boolean; channel_type: string; message: string }
+export const testAlertNotification = async (url: string, mentionUsers?: string[]): Promise<{ success: boolean; channel_type: string; message: string }> => {
+  return await request.post('/alerts/test-notification', { url, mention_users: mentionUsers || [] }) as { success: boolean; channel_type: string; message: string }
 }
 
 export const getAlertSilences = async (params?: {

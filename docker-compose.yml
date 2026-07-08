@@ -600,8 +600,8 @@ services:
     build: ./backend
     image: network_monitor-backend:latest
     container_name: nm-celery-worker-snmp-circuit
-    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 24 --prefetch-multiplier=1 -Ofair
-    cpu_shares: 8192
+    command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 36 --prefetch-multiplier=1 -Ofair
+    cpu_shares: 12288
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -629,7 +629,7 @@ services:
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=160
-      - SNMP_INTERFACE_REALTIME_MAX_WORKERS=20
+      - SNMP_INTERFACE_REALTIME_MAX_WORKERS=32
       - LOG_LEVEL=INFO
     volumes:
       - ./backend/app:/app/app
@@ -646,8 +646,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '12'
-          memory: 3G
+          cpus: '16'
+          memory: 4G
 
 
   # Telemetry gRPC Dial-out 接收探针
@@ -672,9 +672,14 @@ services:
       - LOG_LEVEL=INFO
       - TELEMETRY_RECEIVER_PORT=50051
       - TELEMETRY_RECEIVER_SPOOL_DIR=/app/data/telemetry
-      - TELEMETRY_RECEIVER_MAX_WORKERS=16
-      - TELEMETRY_RECEIVER_LOG_EVERY=100
+      - TELEMETRY_RECEIVER_MAX_WORKERS=256
+      - TELEMETRY_RECEIVER_LOG_EVERY=5000
       - TELEMETRY_RECEIVER_WRITE_INFLUX=true
+      - TELEMETRY_RECEIVER_RECORD_MESSAGES=false
+      - TELEMETRY_RECEIVER_RECORD_PAYLOADS=false
+      - TELEMETRY_RECEIVER_RECORD_EVENTS=false
+      - TELEMETRY_RECEIVER_MAX_SAVED_MESSAGES=0
+      - TELEMETRY_RECEIVER_ACK_EVERY=0
     volumes:
       - ./backend/app:/app/app
       - ${DATA_ROOT:-./data}/telemetry:/app/data/telemetry
@@ -691,8 +696,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
-          memory: 512M
+          cpus: '8'
+          memory: 8G
 
   # 前端 Web 应用
   frontend:

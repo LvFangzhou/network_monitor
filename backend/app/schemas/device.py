@@ -15,6 +15,9 @@ class DatacenterBase(BaseModel):
     contact_person: Optional[str] = Field(None, max_length=100, description="联系人")
     contact_phone: Optional[str] = Field(None, max_length=20, description="联系电话")
     contact_email: Optional[str] = Field(None, max_length=100, description="联系邮箱")
+    network_owner: Optional[str] = Field(None, max_length=100, description="网络负责人")
+    network_owner_email: Optional[str] = Field(None, max_length=255, description="网络负责人邮箱，多个用逗号分隔")
+    robot_mention: Optional[str] = Field(None, max_length=255, description="历史兼容字段：原机器人艾特标识，页面不再使用")
     build_date: Optional[datetime] = Field(None, description="建设时间")
     description: Optional[str] = None
     is_active: bool = True
@@ -32,6 +35,9 @@ class DatacenterUpdate(BaseModel):
     contact_person: Optional[str] = None
     contact_phone: Optional[str] = None
     contact_email: Optional[str] = None
+    network_owner: Optional[str] = None
+    network_owner_email: Optional[str] = None
+    robot_mention: Optional[str] = None
     build_date: Optional[datetime] = None
     description: Optional[str] = None
     is_active: Optional[bool] = None

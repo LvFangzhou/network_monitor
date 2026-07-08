@@ -147,6 +147,24 @@ const formatDeviceOnlyName = (value?: string | null) => {
   return text.replace(/^to-/i, '').replace(/-(?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet)\d+(?:\/\d+)+(?:[:/]\d+)?$/i, '')
 }
 
+const protocolNeighborDisplayName = (
+  record?:
+    | Pick<ProtocolNeighbor, 'remote_display_name' | 'remote_system'>
+    | { remoteSystem?: string | null; remoteDisplayName?: string | null }
+    | null
+) => {
+  if (!record) return '-'
+  const data = record as {
+    remote_display_name?: string | null
+    remote_system?: string | null
+    remoteDisplayName?: string | null
+    remoteSystem?: string | null
+  }
+  const displayName = data.remote_display_name || data.remoteDisplayName
+  const systemName = data.remote_system || data.remoteSystem
+  return formatDeviceOnlyName(displayName || systemName)
+}
+
 const temperatureTooltip = (record: DeviceOverviewItem) => {
   const details = record.resources.temperature_details || []
   if (!details.length) return null
@@ -575,6 +593,14 @@ const DeviceOverview = () => {
     }
   })
 
+  const getProgressHint = (progress: number) => {
+    if (progress < 25) return '正在连接数据源...'
+    if (progress < 55) return '正在读取设备数据...'
+    if (progress < 80) return '正在汇总展示内容...'
+    if (progress < 96) return '正在整理最后结果...'
+    return '即将完成...'
+  }
+
   const lldpPeerMap = useMemo(() => {
     const mapping = new Map<string, { remoteSystem: string; remotePort: string }>()
     for (const item of neighbors.lldp) {
@@ -694,12 +720,15 @@ const DeviceOverview = () => {
     let timer: number | null = null
     if (!silent || items.length === 0) {
       setLoading(true)
-      let progress = 8
+      let progress = 5
       setOverviewProgress(progress)
       timer = window.setInterval(() => {
-        progress = Math.min(progress + (progress < 60 ? 12 : progress < 85 ? 6 : 2), 92)
+        progress = Math.min(
+          progress + (progress < 20 ? 4 : progress < 45 ? 5 : progress < 70 ? 4 : progress < 85 ? 2 : 1),
+          95,
+        )
         setOverviewProgress(progress)
-      }, 500)
+      }, 700)
     }
     try {
       const result = await getDeviceOverview({
@@ -853,19 +882,22 @@ const DeviceOverview = () => {
     setDetailOpen(true)
     setDetailProgress(0)
     const cachedDetail = detailCacheRef.current[item.device.id]
-    if (cachedDetail && Date.now() - cachedDetail.at < 30 * 60 * 1000) {
+    if (cachedDetail && Date.now() - cachedDetail.at < 2 * 60 * 1000) {
       setNeighbors(cachedDetail.neighbors)
       setDetailLoading(false)
       setDetailProgress(100)
       return
     }
     setDetailLoading(true)
-    let progress = 8
+    let progress = 5
     setDetailProgress(progress)
     const timer = window.setInterval(() => {
-      progress = Math.min(progress + (progress < 60 ? 12 : progress < 85 ? 6 : 2), 92)
+      progress = Math.min(
+        progress + (progress < 20 ? 4 : progress < 45 ? 5 : progress < 70 ? 4 : progress < 85 ? 2 : 1),
+        95,
+      )
       setDetailProgress(progress)
-    }, 500)
+    }, 700)
     try {
       const result = await getDeviceProtocolNeighbors(item.device.id)
       const nextNeighbors = {
@@ -888,6 +920,7 @@ const DeviceOverview = () => {
   const handleDeviceRefresh = async (item: DeviceOverviewItem) => {
     setRefreshingDeviceId(item.device.id)
     try {
+      delete detailCacheRef.current[item.device.id]
       const result = await refreshMonitorDevice(item.device.id)
       message.success(result.message || '已触发后台采集')
       window.setTimeout(() => {
@@ -939,7 +972,8 @@ const DeviceOverview = () => {
 
   const bgpRemoteDeviceName = (record: ProtocolNeighbor) => {
     const key = formatShortInterfaceName(record.interface)
-    return lldpPeerMap.get(key)?.remoteSystem || '-'
+    const peer = lldpPeerMap.get(key)
+    return protocolNeighborDisplayName(peer) || '-'
   }
 
   const bgpRemotePortName = (record: ProtocolNeighbor) => {
@@ -1075,11 +1109,11 @@ const DeviceOverview = () => {
       dataIndex: 'remote_system',
       key: 'remote_system',
       width: 360,
-      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(formatDeviceOnlyName(a.remote_system), formatDeviceOnlyName(b.remote_system)),
-      ...neighborColumnSearch((record) => formatDeviceOnlyName(record.remote_system), '搜索对端设备'),
+      sorter: (a: ProtocolNeighbor, b: ProtocolNeighbor) => compareText(protocolNeighborDisplayName(a), protocolNeighborDisplayName(b)),
+      ...neighborColumnSearch((record) => protocolNeighborDisplayName(record), '搜索对端设备'),
       render: (_: any, record: ProtocolNeighbor) => (
-        <Tooltip title={formatDeviceOnlyName(record.remote_system)}>
-          <Text style={{ whiteSpace: 'nowrap', display: 'inline-block' }}>{formatDeviceOnlyName(record.remote_system)}</Text>
+        <Tooltip title={protocolNeighborDisplayName(record)}>
+          <Text style={{ whiteSpace: 'nowrap', display: 'inline-block' }}>{protocolNeighborDisplayName(record)}</Text>
         </Tooltip>
       ),
     },
@@ -1507,7 +1541,7 @@ const DeviceOverview = () => {
         {loading ? (
           <div style={{ marginTop: 12 }}>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              正在加载设备总览...
+              {getProgressHint(overviewProgress)}
             </Text>
             <Progress percent={overviewProgress} size="small" status="active" showInfo={false} style={{ marginTop: 6 }} />
           </div>
@@ -1544,7 +1578,7 @@ const DeviceOverview = () => {
       >
         {detailLoading ? (
           <div style={{ marginBottom: 12 }}>
-            <Text type="secondary">正在读取设备实时邻居信息，请稍候…</Text>
+            <Text type="secondary">{getProgressHint(detailProgress)}</Text>
             <Progress percent={detailProgress} size="small" status="active" showInfo={false} />
           </div>
         ) : null}

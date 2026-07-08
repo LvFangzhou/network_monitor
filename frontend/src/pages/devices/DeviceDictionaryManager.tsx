@@ -16,8 +16,10 @@ import {
 } from '../../api/devices'
 import type { DeviceRole, DeviceType, DeviceVendor } from '../../api/devices'
 import { useAuthStore } from '../../store/auth'
+import DatacenterList from '../datacenters/DatacenterList'
+import VendorList from '../resources/VendorList'
 
-type CatalogTab = 'deviceType' | 'deviceRole' | 'deviceVendor'
+type CatalogTab = 'deviceType' | 'deviceRole' | 'deviceVendor' | 'datacenter' | 'lineVendor'
 
 const DeviceDictionaryManager = () => {
   const [deviceTypeCatalogs, setDeviceTypeCatalogs] = useState<DeviceType[]>([])
@@ -49,6 +51,8 @@ const DeviceDictionaryManager = () => {
   useEffect(() => {
     fetchCatalogs()
   }, [])
+
+  const isDeviceCatalogTab = ['deviceType', 'deviceRole', 'deviceVendor'].includes(catalogTab)
 
   const getCatalogMeta = () => {
     if (catalogTab === 'deviceType') {
@@ -224,8 +228,18 @@ const DeviceDictionaryManager = () => {
               />
             ),
           },
+          {
+            key: 'lineVendor',
+            label: '供应商管理',
+            children: <VendorList embedded />,
+          },
+          {
+            key: 'datacenter',
+            label: '机房管理',
+            children: <DatacenterList embedded />,
+          },
         ]}
-        tabBarExtraContent={canModify ? (
+        tabBarExtraContent={canModify && isDeviceCatalogTab ? (
           <Tooltip title={`新增${getCatalogMeta().title}`}>
             <Button type="primary" onClick={() => openCatalogEditor()}>
               新增{getCatalogMeta().title}

@@ -163,6 +163,48 @@ class SNMPCollector(LoggerMixin):
         ],
     }
 
+
+
+    RUIJIE_PRIVATE_OIDS = {
+        # RUIJIE-SMI: enterprises.4881.1.1.10.2 = ruijieMgmt
+        # Source: RGOS 11.0(5)B9P62 / 12.5(1)B0605 private MIB package.
+        "cpu_usage_oids": [
+            "1.3.6.1.4.1.4881.1.1.10.2.36.1.1.2.0",  # ruijieCPUUtilization1Min
+            "1.3.6.1.4.1.4881.1.1.10.2.36.1.1.10.0", # ruijieCPUUtilizationCurrent
+        ],
+        "cpu_usage_table_oids": [
+            "1.3.6.1.4.1.4881.1.1.10.2.36.1.2.1.1.4",  # ruijieNodeCPUTotal1min
+            "1.3.6.1.4.1.4881.1.1.10.2.36.1.2.1.1.5",  # ruijieNodeCPUTotal5min
+        ],
+        "cpu_usage_aggregate": "max",
+        # Some RGOS 12.x devices expose ruijieMemoryPoolCurrentUtilization as an exact scalar-like
+        # object when walked, so collect it with GET first and keep node pool as an optional table.
+        "memory_usage_oids": [
+            "1.3.6.1.4.1.4881.1.1.10.2.35.1.1.1.1.3",  # ruijieMemoryPoolCurrentUtilization
+        ],
+        "memory_usage_table_oids": [
+            "1.3.6.1.4.1.4881.1.1.10.2.35.1.2.1.1.3",  # ruijieNodeMemoryPoolCurrentUtilization
+        ],
+        "memory_usage_aggregate": "max",
+        "temperature_oids": [
+            "1.3.6.1.4.1.4881.1.1.10.2.1.1.16.0",      # ruijieSystemTemperature
+            "1.3.6.1.4.1.4881.1.1.10.2.1.1.23.1.1.3",  # ruijieSystemTemperatureCurrent table
+        ],
+        "system_version_oid": "1.3.6.1.4.1.4881.1.1.10.2.1.1.2.0",
+        "system_model_oid": "1.3.6.1.4.1.4881.1.1.10.2.21.1.2.1.2.1",
+        "system_serial_oid": "1.3.6.1.4.1.4881.1.1.10.2.21.1.2.1.10.1",
+        "fan_state_oid": "1.3.6.1.4.1.4881.1.1.10.2.21.1.6.1.3",
+        "fan_name_oid": "1.3.6.1.4.1.4881.1.1.10.2.21.1.6.1.4",
+        "fan_ok_values": [1],
+        "power_state_oid": "1.3.6.1.4.1.4881.1.1.10.2.21.1.5.1.3",
+        "power_name_oid": "1.3.6.1.4.1.4881.1.1.10.2.21.1.5.1.4",
+        "power_ok_values": [4],
+        "bgp_state_oids": [
+            "1.3.6.1.2.1.15.3.1.2",
+            "1.3.6.1.4.1.4881.1.1.10.2.73.2.5.1.5",
+        ],
+    }
+
     DENSIVELO_PRIVATE_OIDS = {
         # S9867/DensiveloOS exposes Yillion device-management objects under:
         #   1.3.6.1.4.1.64812.8.35.18
@@ -174,9 +216,10 @@ class SNMPCollector(LoggerMixin):
         "system_model_oid": "1.3.6.1.4.1.64812.8.35.18.1.23.0",
         "system_serial_oid": "1.3.6.1.4.1.64812.8.35.18.1.21.0",
         # The documented yldcLswSysTemperature (.1.17.0) returns No Such Object
-        # on tested S9867-128DH devices; yldcLswSlotTemperature is documented as
-        # unsupported. Do not collect temperature here until a valid current-value
-        # OID is confirmed.
+        # on tested S9867-128DH devices. Real hotspot temperatures are exposed by
+        # the vendor environment table below; invalid sensors report 65535.
+        "temperature_oid": "1.3.6.1.4.1.64812.2.6.1.1.1.1.12",
+        "temperature_ignore_values": [65535],
         #
         # S9867 ports expose 64-bit IF-MIB HC counters. In high-frequency interface
         # sampling, avoid the extra 32-bit ifInOctets/ifOutOctets walks unless a
@@ -209,6 +252,8 @@ class SNMPCollector(LoggerMixin):
         ]).lower()
         if any(marker in identity for marker in ["hillstone", "sg-6000", "山石"]):
             defaults = self.HILLSTONE_PRIVATE_OIDS.copy()
+        elif any(marker in identity for marker in ["ruijie", "锐捷", "rgos"]):
+            defaults = self.RUIJIE_PRIVATE_OIDS.copy()
         elif any(marker in identity for marker in ["densivelo", "yillion", "deepcompute", "s9867"]):
             defaults = self.DENSIVELO_PRIVATE_OIDS.copy()
         elif (
@@ -771,6 +816,146 @@ class SNMPCollector(LoggerMixin):
             "buffer_usage_unit": "queue_length",
         }
 
+
+    def collect_lldp_neighbors(self, device: Any) -> List[Dict[str, Any]]:
+        """Collect LLDP neighbor mappings: local interface -> remote system/interface.
+
+        Uses standard LLDP-MIB. This is intentionally on-demand for detail views to avoid
+        adding load to the regular SNMP polling round.
+        """
+        local_port_id_map = self._walk_indexed_map(device, "1.0.8802.1.1.2.1.3.7.1.3", str)
+        local_port_desc_map = self._walk_indexed_map(device, "1.0.8802.1.1.2.1.3.7.1.4", str)
+        rem_chassis_map = self._walk_indexed_map(device, "1.0.8802.1.1.2.1.4.1.1.5", str)
+        rem_port_id_map = self._walk_indexed_map(device, "1.0.8802.1.1.2.1.4.1.1.7", str)
+        rem_port_desc_map = self._walk_indexed_map(device, "1.0.8802.1.1.2.1.4.1.1.8", str)
+        rem_sys_name_map = self._walk_indexed_map(device, "1.0.8802.1.1.2.1.4.1.1.9", str)
+        rem_sys_desc_map = self._walk_indexed_map(device, "1.0.8802.1.1.2.1.4.1.1.10", str)
+        rem_mgmt_addr_index_map = self._walk_indexed_map(device, "1.0.8802.1.1.2.1.4.2.1.4", str)
+
+        def local_port_num(index: str) -> str:
+            # lldpRemTable index is timeMark.localPortNum.remIndex
+            parts = str(index or "").split(".")
+            return parts[1] if len(parts) >= 3 else str(index or "")
+
+        def mgmt_for_neighbor(index: str) -> Optional[str]:
+            prefix = f"{index}."
+            for mgmt_index in rem_mgmt_addr_index_map.keys():
+                mgmt_index_text = str(mgmt_index)
+                if not mgmt_index_text.startswith(prefix):
+                    continue
+                # LLDP-MIB lldpRemManAddrTable indexes management address as:
+                # timeMark.localPortNum.remIndex.addrSubtype.addrLength.addrOctets...
+                # The object value itself is usually ifId, so the real address must be decoded from index.
+                suffix = mgmt_index_text[len(prefix):]
+                parts = [int(part) for part in suffix.split(".") if part.isdigit()]
+                if len(parts) >= 6 and parts[0] == 1 and parts[1] == 4:
+                    return ".".join(str(part) for part in parts[2:6])
+                if len(parts) >= 5 and parts[0] == 1:
+                    return ".".join(str(part) for part in parts[1:5])
+                if len(parts) >= 18 and parts[0] == 2 and parts[1] == 16:
+                    octets = parts[2:18]
+                    return ":".join(f"{octets[i]:02x}{octets[i + 1]:02x}" for i in range(0, 16, 2))
+            return None
+
+        rows: List[Dict[str, Any]] = []
+        for index in sorted(set(rem_port_id_map) | set(rem_sys_name_map) | set(rem_port_desc_map), key=str):
+            local_index = local_port_num(index)
+            local_port = local_port_desc_map.get(local_index) or local_port_id_map.get(local_index) or local_index
+            remote_port = rem_port_desc_map.get(index) or rem_port_id_map.get(index) or "-"
+            remote_system = rem_sys_name_map.get(index) or rem_chassis_map.get(index) or "-"
+            rows.append({
+                "protocol": "lldp",
+                "local_port": str(local_port),
+                "local_port_id": str(local_port_id_map.get(local_index) or local_index),
+                "local_port_num": str(local_index),
+                "remote_system": str(remote_system),
+                "remote_port": str(remote_port),
+                "remote_port_id": str(rem_port_id_map.get(index) or ""),
+                "remote_chassis_id": str(rem_chassis_map.get(index) or ""),
+                "remote_mgmt_addr": mgmt_for_neighbor(index),
+                "remote_sys_desc": str(rem_sys_desc_map.get(index) or ""),
+                "peer": str(remote_system),
+                "interface": str(local_port),
+                "index": str(index),
+                "state": "up",
+                "status": "up",
+                "source": "snmp",
+            })
+        return rows
+
+    def collect_bgp_peer_details(self, device: Any) -> List[Dict[str, Any]]:
+        """Collect BGP peer detail fields that are useful in the protocol drawer.
+
+        Standard BGP4-MIB exposes peer state, local address and remote AS. Interface is
+        not a direct BGP-MIB field, so we safely infer it by matching bgpPeerLocalAddr
+        against IP-MIB ipAdEntIfIndex. If the mapping is unavailable, interface remains
+        empty instead of guessing.
+        """
+        private_oids = self._get_private_oid_config(device)
+        bgp_state_oids = private_oids.get("bgp_state_oids") or ["1.3.6.1.2.1.15.3.1.2"]
+        if not isinstance(bgp_state_oids, list):
+            bgp_state_oids = [bgp_state_oids]
+
+        bgp_state_text = {
+            1: "idle",
+            2: "connect",
+            3: "active",
+            4: "opensent",
+            5: "openconfirm",
+            6: "established",
+        }
+        ip_to_ifindex = self._walk_indexed_map(device, "1.3.6.1.2.1.4.20.1.2", str)
+        if_name_map = self._walk_indexed_map(device, "1.3.6.1.2.1.31.1.1.1.1", str)
+        if_descr_map = self._walk_indexed_map(device, "1.3.6.1.2.1.2.2.1.2", str)
+
+        def interface_for_local_addr(local_addr: Optional[str]) -> Optional[str]:
+            if not local_addr:
+                return None
+            ifindex = ip_to_ifindex.get(str(local_addr))
+            if not ifindex:
+                return None
+            return if_name_map.get(str(ifindex)) or if_descr_map.get(str(ifindex)) or f"if{ifindex}"
+
+        def build_rows(context_name: Optional[str] = None) -> List[Dict[str, Any]]:
+            state_map: Dict[str, int] = {}
+            for oid in bgp_state_oids:
+                state_map.update(self._walk_indexed_map(device, str(oid), int, context_name=context_name))
+            local_addr_map = self._walk_indexed_map(device, "1.3.6.1.2.1.15.3.1.5", str, context_name=context_name)
+            remote_as_map = self._walk_indexed_map(device, "1.3.6.1.2.1.15.3.1.9", int, context_name=context_name)
+            rows: List[Dict[str, Any]] = []
+            for index in sorted(set(state_map) | set(local_addr_map) | set(remote_as_map), key=str):
+                peer = self._extract_peer_from_index(index)
+                state = state_map.get(index)
+                local_addr = local_addr_map.get(index)
+                interface_name = interface_for_local_addr(str(local_addr)) if local_addr else None
+                rows.append({
+                    "protocol": "bgp",
+                    "peer": peer,
+                    "neighbor": peer,
+                    "remote_as": remote_as_map.get(index),
+                    "local_addr": str(local_addr) if local_addr else None,
+                    "local_address": str(local_addr) if local_addr else None,
+                    "interface": interface_name,
+                    "instance": context_name,
+                    "state": bgp_state_text.get(state, str(state)) if state is not None else "-",
+                    "status": "up" if state == 6 else "down" if state is not None else "unknown",
+                    "source": "snmp",
+                })
+            return rows
+
+        rows = build_rows(None)
+        bgp_contexts = private_oids.get("bgp_contexts") or []
+        if isinstance(bgp_contexts, str):
+            bgp_contexts = [bgp_contexts]
+        context_rows: List[Dict[str, Any]] = []
+        for context_name in bgp_contexts:
+            context = str(context_name or "").strip()
+            if context:
+                context_rows.extend(build_rows(context))
+        if private_oids.get("prefer_bgp_contexts") and context_rows:
+            return context_rows
+        return rows + context_rows
+
     def collect_protocol_status(self, device: Any) -> Dict[str, Any]:
         """采集 BGP/OSPF/BFD 协议状态"""
         now = datetime.utcnow()
@@ -783,7 +968,11 @@ class SNMPCollector(LoggerMixin):
             bgp_state_oids = [bgp_state_oids]
         for oid in bgp_state_oids:
             bgp_state_map.update(self._walk_indexed_map(device, str(oid), int))
+        bgp_local_addr_map = self._walk_indexed_map(device, "1.3.6.1.2.1.15.3.1.5", str)
+        bgp_remote_as_map = self._walk_indexed_map(device, "1.3.6.1.2.1.15.3.1.9", int)
         bgp_context_maps: Dict[Tuple[str, str], int] = {}
+        bgp_context_local_addr_maps: Dict[Tuple[str, str], str] = {}
+        bgp_context_remote_as_maps: Dict[Tuple[str, str], int] = {}
         bgp_contexts = private_oids.get("bgp_contexts") or []
         if isinstance(bgp_contexts, str):
             bgp_contexts = [bgp_contexts]
@@ -794,6 +983,22 @@ class SNMPCollector(LoggerMixin):
             for oid in bgp_state_oids:
                 for index, state in self._walk_indexed_map(device, str(oid), int, context_name=context).items():
                     bgp_context_maps[(context, index)] = state
+            for index, local_addr in self._walk_indexed_map(device, "1.3.6.1.2.1.15.3.1.5", str, context_name=context).items():
+                bgp_context_local_addr_maps[(context, index)] = str(local_addr)
+            for index, remote_as in self._walk_indexed_map(device, "1.3.6.1.2.1.15.3.1.9", int, context_name=context).items():
+                bgp_context_remote_as_maps[(context, index)] = remote_as
+        ip_to_ifindex = self._walk_indexed_map(device, "1.3.6.1.2.1.4.20.1.2", str)
+        if_name_map = self._walk_indexed_map(device, "1.3.6.1.2.1.31.1.1.1.1", str)
+        if_descr_map = self._walk_indexed_map(device, "1.3.6.1.2.1.2.2.1.2", str)
+
+        def interface_for_local_addr(local_addr: Optional[str]) -> Optional[str]:
+            if not local_addr:
+                return None
+            ifindex = ip_to_ifindex.get(str(local_addr))
+            if not ifindex:
+                return None
+            return if_name_map.get(str(ifindex)) or if_descr_map.get(str(ifindex)) or f"if{ifindex}"
+
         bgp_state_text = {
             1: "idle",
             2: "connect",
@@ -813,6 +1018,9 @@ class SNMPCollector(LoggerMixin):
                         "device_name": device.name,
                         "protocol": "bgp",
                         "peer": peer,
+                        "local_addr": str(bgp_local_addr_map.get(index) or ""),
+                        "remote_as": str(bgp_remote_as_map.get(index) or ""),
+                        "interface": str(interface_for_local_addr(bgp_local_addr_map.get(index)) or ""),
                         "state_text": bgp_state_text.get(state, str(state)),
                     },
                     "fields": {
@@ -823,6 +1031,7 @@ class SNMPCollector(LoggerMixin):
                 })
         for (context_name, index), state in bgp_context_maps.items():
             peer = self._extract_peer_from_index(index)
+            local_addr = bgp_context_local_addr_maps.get((context_name, index))
             points.append({
                 "measurement": "protocol_status",
                 "tags": {
@@ -831,6 +1040,9 @@ class SNMPCollector(LoggerMixin):
                     "protocol": "bgp",
                     "peer": peer,
                     "instance": context_name,
+                    "local_addr": str(local_addr or ""),
+                    "remote_as": str(bgp_context_remote_as_maps.get((context_name, index)) or ""),
+                    "interface": str(interface_for_local_addr(local_addr) or ""),
                     "state_text": bgp_state_text.get(state, str(state)),
                 },
                 "fields": {
@@ -1601,25 +1813,29 @@ class SNMPCollector(LoggerMixin):
         if fan_state_oid or fan_speed_oid:
             state_map = self._walk_indexed_map(device, str(fan_state_oid), int) if fan_state_oid else {}
             speed_map = self._walk_indexed_map(device, str(fan_speed_oid), float) if fan_speed_oid else {}
+            name_map = self._walk_indexed_map(device, str(private_oids.get("fan_name_oid")), str) if private_oids.get("fan_name_oid") else {}
+            ok_values = set(private_oids.get("fan_ok_values") or [0])
             for index in sorted(set(state_map) | set(speed_map), key=str):
                 state = state_map.get(index)
                 rows.append({
                     "component_type": "fan",
-                    "component": str(index),
+                    "component": name_map.get(index) or str(index),
                     "state": float(state) if state is not None else None,
-                    "up": 1.0 if state == 0 else 0.0 if state is not None else None,
+                    "up": 1.0 if state in ok_values else 0.0 if state is not None else None,
                     "speed": self._normalize_numeric(speed_map.get(index)),
                     "present": 1.0,
                     "status_known": 1.0 if state is not None else 0.0,
                 })
         power_state_oid = private_oids.get("power_state_oid")
         if power_state_oid:
+            name_map = self._walk_indexed_map(device, str(private_oids.get("power_name_oid")), str) if private_oids.get("power_name_oid") else {}
+            ok_values = set(private_oids.get("power_ok_values") or [0])
             for index, state in self._walk_indexed_map(device, str(power_state_oid), int).items():
                 rows.append({
                     "component_type": "power",
-                    "component": str(index),
+                    "component": name_map.get(index) or str(index),
                     "state": float(state),
-                    "up": 1.0 if state == 0 else 0.0,
+                    "up": 1.0 if state in ok_values else 0.0,
                     "present": 1.0,
                     "status_known": 1.0,
                 })
@@ -2073,6 +2289,7 @@ class SNMPCollector(LoggerMixin):
                 (float(item["temperature"]) for item in temperatures if item.get("temperature") is not None),
                 default=None,
             ),
+            "temperature_details": temperatures,
             "storage_percent": max(
                 (float(item["usage_percent"]) for item in storage_rows if item.get("usage_percent") is not None),
                 default=None,

@@ -3,6 +3,7 @@
 """
 import httpx
 import json
+import re
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -149,6 +150,8 @@ class NotificationManager:
         return mapping.get(severity, mapping["P1"])
 
     def _build_card_rows_markdown(self, card_data: Optional[Dict[str, Any]]) -> str:
+        if card_data and card_data.get("notification_kind") == "config_backup":
+            return self._build_config_backup_markdown(card_data)
         rows = (card_data or {}).get("rows") or []
         lines = []
         is_operation = card_data and card_data.get("notification_kind") == "operation"
@@ -166,6 +169,8 @@ class NotificationManager:
         return "\n".join(lines)
 
     def _build_compact_rows_markdown(self, card_data: Optional[Dict[str, Any]]) -> str:
+        if card_data and card_data.get("notification_kind") == "config_backup":
+            return self._build_config_backup_markdown(card_data)
         rows = (card_data or {}).get("rows") or []
         lines = []
         is_operation = card_data and card_data.get("notification_kind") == "operation"
@@ -176,6 +181,59 @@ class NotificationManager:
                 if is_operation and label == "变更内容" and len(value) > 300:
                     value = value[:300] + "..."
                 lines.append(f"**{label}：**{value}")
+        return "\n".join(lines)
+
+    def _build_config_backup_markdown(self, card_data: Optional[Dict[str, Any]]) -> str:
+        summary = (card_data or {}).get("backup_summary") or {}
+        datacenters = (card_data or {}).get("datacenters") or []
+
+        total = int(summary.get("total") or 0)
+        success = int(summary.get("success") or 0)
+        failed = int(summary.get("failed") or 0)
+        changed = int(summary.get("changed") or 0)
+        saved = int(summary.get("saved") or 0)
+        save_failed = int(summary.get("save_failed") or 0)
+
+        status_line = "✅ 全部成功" if failed == 0 and save_failed == 0 else "⚠️ 存在失败/保存异常"
+        lines = [
+            f"**{status_line}**",
+            "",
+            "### 任务概览",
+            (
+                f"任务 ID：**{summary.get('job_id', '-')}**　"
+                f"触发：**{summary.get('trigger_type', '-')}**　"
+                f"耗时：**{summary.get('duration', '-')}**　"
+                f"总设备：**{total}**"
+            ),
+            "",
+            "### 结果总览",
+            f"备份：✅ 成功 **{success}**　❌ 失败 **{failed}**",
+            f"配置一致性：⚠️ 不一致 **{changed}**　🔄 已自动保存 **{saved}**　🛑 保存失败 **{save_failed}**",
+        ]
+
+        if datacenters:
+            lines.extend(["", "### 机房汇总"])
+            for item in datacenters:
+                dc_failed = int(item.get("failed") or 0)
+                dc_changed = int(item.get("changed") or 0)
+                dc_save_failed = int(item.get("save_failed") or 0)
+                prefix = "✅" if dc_failed == 0 and dc_changed == 0 and dc_save_failed == 0 else "⚠️"
+                owner = str(item.get("network_owner") or "").strip()
+                owner_emails = [str(email).strip() for email in (item.get("network_owner_emails") or []) if str(email).strip()]
+                contact_text = ""
+                if owner or owner_emails:
+                    contact_parts = []
+                    if owner:
+                        contact_parts.append(f"网络负责人 {owner}")
+                    if owner_emails:
+                        contact_parts.append(f"邮箱 {', '.join(owner_emails)}")
+                    contact_text = f" ｜ {' ｜ '.join(contact_parts)}"
+                lines.append(
+                    f"{prefix} **{item.get('name') or '未设置机房'}**："
+                    f"成功 {int(item.get('success') or 0)} / 失败 {dc_failed} / "
+                    f"不一致 {dc_changed} / 已保存 {int(item.get('saved') or 0)} / 保存失败 {dc_save_failed}"
+                    f"{contact_text}"
+                )
         return "\n".join(lines)
 
     def _wechat_markdown_title(self, title: str, card_data: Optional[Dict[str, Any]]) -> str:
@@ -199,6 +257,57 @@ class NotificationManager:
             color = "warning"
         return f"# <font color=\"{color}\">**{title}**</font>"
 
+    def _normalize_mention_targets(self, value: Any) -> List[str]:
+        if not value:
+            return []
+        if isinstance(value, str):
+            raw_items = re.split(r"[,，;；\s]+", value)
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = value
+        else:
+            raw_items = [value]
+        targets: List[str] = []
+        for item in raw_items:
+            raw_text = str(item).strip()
+            text = "@all" if raw_text.lower() == "@all" else raw_text.lstrip("@")
+            if text:
+                targets.append(text)
+        return list(dict.fromkeys(targets))
+
+    def _build_wechat_markdown_mentions(self, targets: List[str]) -> str:
+        mention_tokens: List[str] = []
+        for target in targets:
+            text = str(target).strip()
+            if not text:
+                continue
+            if text == "@all":
+                mention_tokens.append("<@all>")
+            elif text.startswith("<@") and text.endswith(">"):
+                mention_tokens.append(text)
+            else:
+                mention_tokens.append(f"<@{text}>")
+        return " ".join(dict.fromkeys(mention_tokens))
+
+    def _inline_wechat_mentions_into_handler(
+        self,
+        card_data: Optional[Dict[str, Any]],
+        markdown_mentions: str,
+    ) -> bool:
+        """把企业微信 Markdown @ 对象合并到“当前处理人”行，避免卡片底部单独多一行。"""
+        if not card_data or not markdown_mentions:
+            return False
+        rows = card_data.get("rows")
+        if not isinstance(rows, list):
+            return False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("label") or "").strip()
+            if label == "当前处理人":
+                row["value"] = markdown_mentions
+                return True
+        return False
+
     async def _send_wechat(
         self,
         config: Dict[str, Any],
@@ -212,15 +321,22 @@ class NotificationManager:
             logger.error("企业微信Webhook未配置")
             return False
 
+        mentioned_list = self._normalize_mention_targets(config.get("mentioned_list"))
+        mentioned_mobile_list = self._normalize_mention_targets(
+            config.get("mentioned_mobile_list") or config.get("mentioned_mobile_lists") or config.get("at_mobiles")
+        )
+        markdown_mentions = self._build_wechat_markdown_mentions([*mentioned_list, *mentioned_mobile_list])
+
+        mentions_inlined = self._inline_wechat_mentions_into_handler(card_data, markdown_mentions)
+
         markdown_content = f"{self._wechat_markdown_title(title, card_data)}\n\n"
         if card_data:
             markdown_content += self._build_card_rows_markdown(card_data) or content
         else:
             markdown_content += content
 
-        mentioned_list = config.get("mentioned_list", [])
-        if mentioned_list:
-            markdown_content += f"\n\n{' '.join([f'@{u}' for u in mentioned_list])}"
+        if markdown_mentions and not mentions_inlined:
+            markdown_content = f"{markdown_content}\n\n{markdown_mentions}"
 
         message = {
             "msgtype": "markdown",
@@ -267,13 +383,16 @@ class NotificationManager:
             markdown_lines = [
                 f"## <font color=\"{severity_style['hex']}\">{title}</font>",
             ]
-            for row in (card_data.get("rows") or []):
-                label = str(row.get("label") or "").strip()
-                value = str(row.get("value") or "").strip()
-                if label and value:
-                    if card_data.get("notification_kind") == "operation" and label == "变更内容" and len(value) > 300:
-                        value = value[:300] + "..."
-                    markdown_lines.append(f"**{label}：**{value}")
+            if card_data.get("notification_kind") == "config_backup":
+                markdown_lines.append(self._build_config_backup_markdown(card_data))
+            else:
+                for row in (card_data.get("rows") or []):
+                    label = str(row.get("label") or "").strip()
+                    value = str(row.get("value") or "").strip()
+                    if label and value:
+                        if card_data.get("notification_kind") == "operation" and label == "变更内容" and len(value) > 300:
+                            value = value[:300] + "..."
+                        markdown_lines.append(f"**{label}：**{value}")
             if card_data.get("detail_url"):
                 markdown_lines.append(f"[{detail_label}]({card_data['detail_url']})")
                 message = {

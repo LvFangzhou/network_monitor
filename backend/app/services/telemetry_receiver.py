@@ -16,6 +16,7 @@ import os
 import re
 import signal
 import time
+import threading
 from datetime import datetime, timezone
 from concurrent import futures
 from pathlib import Path
@@ -206,6 +207,7 @@ class TelemetryInfluxWriter:
         self._last_flush = time.time()
         self._resolver = DeviceResolver()
         self._written = 0
+        self._lock = threading.Lock()
 
     def _set_monitor_cache(self, kind: str, device_id: int, payload: Any, suffix: str = "") -> None:
         try:
@@ -216,9 +218,11 @@ class TelemetryInfluxWriter:
                 MONITOR_CACHE_TTL_SECONDS,
                 json.dumps(payload, ensure_ascii=False, default=str),
             )
-            # 设备总览使用全量快照缓存；Telemetry 新数据进来后清理快照，避免页面继续看旧值。
-            for key in redis_client.scan_iter("monitor:cache:overview_snapshot*"):
-                redis_client.delete(key)
+            if kind == "overview":
+                try:
+                    redis_client.incr("monitor:cache:overview_revision")
+                except Exception:
+                    pass
         except Exception as exc:
             LOGGER.warning("telemetry cache update failed kind=%s device_id=%s error=%s", kind, device_id, exc)
 
@@ -257,7 +261,8 @@ class TelemetryInfluxWriter:
         for item in interfaces:
             point = self._interface_point(device, item, received_at)
             if point:
-                self._points.append(point)
+                with self._lock:
+                    self._points.append(point)
                 added += 1
         self._maybe_flush()
         return added + cache_written
@@ -432,14 +437,15 @@ class TelemetryInfluxWriter:
 
     def _maybe_flush(self, force: bool = False) -> None:
         now = time.time()
-        if not force and len(self._points) < self.batch_size and now - self._last_flush < self.flush_interval:
-            return
-        if not self._points:
+        with self._lock:
+            if not force and len(self._points) < self.batch_size and now - self._last_flush < self.flush_interval:
+                return
+            if not self._points:
+                self._last_flush = now
+                return
+            points = self._points
+            self._points = []
             self._last_flush = now
-            return
-        points = self._points
-        self._points = []
-        self._last_flush = now
         try:
             from app.utils import influx_client
 
@@ -454,12 +460,25 @@ class TelemetryInfluxWriter:
     def flush(self) -> None:
         self._maybe_flush(force=True)
 
+    def flush_if_needed(self) -> None:
+        self._maybe_flush(force=False)
+
 
 class TelemetryRawRecorder:
-    def __init__(self, spool_dir: str | Path, max_saved_messages: int = 2000) -> None:
+    def __init__(
+        self,
+        spool_dir: str | Path,
+        max_saved_messages: int = 0,
+        record_messages: bool = False,
+        record_payloads: bool = False,
+        record_events: bool = True,
+    ) -> None:
         self.spool_dir = Path(spool_dir)
         self.spool_dir.mkdir(parents=True, exist_ok=True)
-        self.max_saved_messages = max_saved_messages
+        self.max_saved_messages = max(0, max_saved_messages)
+        self.record_messages = record_messages
+        self.record_payloads = record_payloads
+        self.record_events = record_events
         self._saved_messages = 0
         self._session_seq = 0
 
@@ -468,13 +487,17 @@ class TelemetryRawRecorder:
         return f"{int(time.time())}-{os.getpid()}-{self._session_seq}"
 
     def record_event(self, event: dict) -> None:
+        if not self.record_events:
+            return
+        if event.get("event") == "message" and not self.record_messages:
+            return
         day = time.strftime("%Y%m%d")
         path = self.spool_dir / f"telemetry-events-{day}.jsonl"
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     def record_payload(self, session_id: str, index: int, payload: bytes) -> None:
-        if self._saved_messages >= self.max_saved_messages:
+        if not self.record_payloads or self.max_saved_messages <= 0 or self._saved_messages >= self.max_saved_messages:
             return
         self._saved_messages += 1
         payload_dir = self.spool_dir / "payloads" / session_id
@@ -482,24 +505,65 @@ class TelemetryRawRecorder:
         (payload_dir / f"{index:06d}.bin").write_bytes(payload)
 
 
+def _protobuf_varint(value: int) -> bytes:
+    chunks = bytearray()
+    while True:
+        to_write = value & 0x7F
+        value >>= 7
+        if value:
+            chunks.append(to_write | 0x80)
+        else:
+            chunks.append(to_write)
+            break
+    return bytes(chunks)
+
+
+def _dialout_response_payload(response: str = "ok") -> bytes:
+    """Encode grpc_dialout.DialoutResponse without generated protobuf code.
+
+    H3C Comware dial-out defines:
+
+        message DialoutResponse { required string response = 1; }
+        rpc Dialout(stream DialoutMsg) returns (DialoutResponse);
+
+    The receiver only needs to acknowledge that the client-side stream was
+    consumed.  Keeping this tiny encoder avoids adding a generated-code build
+    step while still speaking the correct RPC shape.
+    """
+    data = response.encode("utf-8")
+    return b"\x0a" + _protobuf_varint(len(data)) + data
+
+
 class CatchAllTelemetryHandler(grpc.GenericRpcHandler):
     """Accept any gRPC method and treat requests as raw bytes."""
 
-    def __init__(self, recorder: TelemetryRawRecorder, writer: TelemetryInfluxWriter, log_every: int = 100) -> None:
+    def __init__(
+        self,
+        recorder: TelemetryRawRecorder,
+        writer: TelemetryInfluxWriter,
+        log_every: int = 100,
+        ack_every: int = 1,
+    ) -> None:
         self.recorder = recorder
         self.writer = writer
         self.log_every = max(1, log_every)
+        self.ack_every = max(0, ack_every)
+        self._active_lock = threading.Lock()
+        self._active_sessions: set[str] = set()
 
     def service(self, handler_call_details: grpc.HandlerCallDetails):
         method = handler_call_details.method
 
-        def stream_stream(request_iterator: Iterable[bytes], context: grpc.ServicerContext) -> Iterator[bytes]:
+        def stream_unary(request_iterator: Iterable[bytes], context: grpc.ServicerContext) -> bytes:
             peer = context.peer()
             session_id = self.recorder.next_session_id()
             started = time.time()
             count = 0
             total_bytes = 0
-            LOGGER.info("telemetry session opened peer=%s method=%s session=%s", peer, method, session_id)
+            with self._active_lock:
+                self._active_sessions.add(session_id)
+                active_count = len(self._active_sessions)
+            LOGGER.info("telemetry session opened peer=%s method=%s session=%s active=%s", peer, method, session_id, active_count)
             self.recorder.record_event(
                 {
                     "event": "session_open",
@@ -510,13 +574,49 @@ class CatchAllTelemetryHandler(grpc.GenericRpcHandler):
                     "metadata": list(context.invocation_metadata() or []),
                 }
             )
+            rpc_done_logged = threading.Event()
+
+            def on_rpc_done() -> None:
+                if rpc_done_logged.is_set():
+                    return
+                rpc_done_logged.set()
+                with self._active_lock:
+                    self._active_sessions.discard(session_id)
+                    active_count = len(self._active_sessions)
+                self.writer.flush_if_needed()
+                LOGGER.info(
+                    "telemetry rpc terminated peer=%s method=%s session=%s messages=%s bytes=%s active=%s",
+                    peer,
+                    method,
+                    session_id,
+                    count,
+                    total_bytes,
+                    active_count,
+                )
+                self.recorder.record_event(
+                    {
+                        "event": "session_terminated",
+                        "time": time.time(),
+                        "session_id": session_id,
+                        "peer": peer,
+                        "method": method,
+                        "messages": count,
+                        "bytes": total_bytes,
+                        "active": active_count,
+                    }
+                )
+
+            try:
+                context.add_callback(on_rpc_done)
+            except Exception:
+                LOGGER.debug("telemetry context callback unsupported peer=%s method=%s session=%s", peer, method, session_id)
 
             try:
                 for payload in request_iterator:
                     count += 1
                     total_bytes += len(payload)
-                    preview = _safe_preview(payload)
-                    if count <= 5 or count % self.log_every == 0:
+                    if count % self.log_every == 0:
+                        preview = _safe_preview(payload, max_bytes=160)
                         LOGGER.info(
                             "telemetry message peer=%s method=%s session=%s index=%s bytes=%s text_preview=%r",
                             peer,
@@ -535,23 +635,66 @@ class CatchAllTelemetryHandler(grpc.GenericRpcHandler):
                             count,
                             len(payload),
                         )
-                    self.recorder.record_event(
-                        {
-                            "event": "message",
-                            "time": time.time(),
-                            "session_id": session_id,
-                            "peer": peer,
-                            "method": method,
-                            "index": count,
-                            "preview": preview,
-                        }
-                    )
+                    if self.recorder.record_messages:
+                        self.recorder.record_event(
+                            {
+                                "event": "message",
+                                "time": time.time(),
+                                "session_id": session_id,
+                                "peer": peer,
+                                "method": method,
+                                "index": count,
+                                "preview": _safe_preview(payload, max_bytes=160),
+                            }
+                        )
                     self.recorder.record_payload(session_id, count, payload)
                     written_candidates = self.writer.handle_payload(payload, datetime.now(timezone.utc))
-                    if written_candidates and (count <= 5 or count % self.log_every == 0):
+                    if written_candidates and count % self.log_every == 0:
                         LOGGER.info("telemetry payload mapped to interface points session=%s index=%s points=%s", session_id, count, written_candidates)
-            except Exception as exc:  # pragma: no cover - runtime diagnostics only
-                LOGGER.exception("telemetry session error peer=%s method=%s session=%s error=%s", peer, method, session_id, exc)
+            except grpc.RpcError as exc:  # pragma: no cover - runtime diagnostics only
+                code = None
+                details = ""
+                try:
+                    code = exc.code()
+                    details = exc.details() or ""
+                except Exception:
+                    pass
+                LOGGER.info(
+                    "telemetry client closed stream peer=%s method=%s session=%s messages=%s bytes=%s code=%s details=%s",
+                    peer,
+                    method,
+                    session_id,
+                    count,
+                    total_bytes,
+                    code,
+                    details,
+                )
+                self.recorder.record_event(
+                    {
+                        "event": "session_client_closed",
+                        "time": time.time(),
+                        "session_id": session_id,
+                        "peer": peer,
+                        "method": method,
+                        "messages": count,
+                        "bytes": total_bytes,
+                        "code": str(code) if code is not None else "",
+                        "details": details,
+                    }
+                )
+            except BaseException as exc:  # pragma: no cover - runtime diagnostics only
+                if isinstance(exc, (GeneratorExit, KeyboardInterrupt, SystemExit)):
+                    log_method = LOGGER.info
+                else:
+                    log_method = LOGGER.exception
+                log_method(
+                    "telemetry session error peer=%s method=%s session=%s error_type=%s error=%r",
+                    peer,
+                    method,
+                    session_id,
+                    type(exc).__name__,
+                    exc,
+                )
                 self.recorder.record_event(
                     {
                         "event": "session_error",
@@ -559,22 +702,27 @@ class CatchAllTelemetryHandler(grpc.GenericRpcHandler):
                         "session_id": session_id,
                         "peer": peer,
                         "method": method,
-                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "error": repr(exc),
                     }
                 )
                 raise
             finally:
                 finished = time.time()
+                with self._active_lock:
+                    self._active_sessions.discard(session_id)
+                    active_count = len(self._active_sessions)
                 LOGGER.info(
-                    "telemetry session closed peer=%s method=%s session=%s messages=%s bytes=%s duration=%.3fs",
+                    "telemetry session closed peer=%s method=%s session=%s messages=%s bytes=%s duration=%.3fs active=%s",
                     peer,
                     method,
                     session_id,
                     count,
                     total_bytes,
                     finished - started,
+                    active_count,
                 )
-                self.writer.flush()
+                self.writer.flush_if_needed()
                 self.recorder.record_event(
                     {
                         "event": "session_close",
@@ -588,20 +736,44 @@ class CatchAllTelemetryHandler(grpc.GenericRpcHandler):
                     }
                 )
 
-            return iter(())
+            return _dialout_response_payload("ok")
 
-        return grpc.stream_stream_rpc_method_handler(
-            stream_stream,
+        return grpc.stream_unary_rpc_method_handler(
+            stream_unary,
             request_deserializer=lambda raw: raw,
             response_serializer=lambda raw: raw,
         )
 
 
-def serve(host: str, port: int, spool_dir: str, max_workers: int, log_every: int, write_influx: bool) -> None:
-    recorder = TelemetryRawRecorder(spool_dir=spool_dir)
+def serve(
+    host: str,
+    port: int,
+    spool_dir: str,
+    max_workers: int,
+    log_every: int,
+    write_influx: bool,
+    record_messages: bool,
+    record_payloads: bool,
+    record_events: bool,
+    max_saved_messages: int,
+    ack_every: int,
+) -> None:
+    recorder = TelemetryRawRecorder(
+        spool_dir=spool_dir,
+        max_saved_messages=max_saved_messages,
+        record_messages=record_messages,
+        record_payloads=record_payloads,
+        record_events=record_events,
+    )
     writer = TelemetryInfluxWriter(enabled=write_influx)
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
-    server.add_generic_rpc_handlers((CatchAllTelemetryHandler(recorder, writer=writer, log_every=log_every),))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=max_workers),
+        options=[
+            ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+            ("grpc.max_send_message_length", 4 * 1024 * 1024),
+        ],
+    )
+    server.add_generic_rpc_handlers((CatchAllTelemetryHandler(recorder, writer=writer, log_every=log_every, ack_every=ack_every),))
     bind_addr = f"{host}:{port}"
     bound_port = server.add_insecure_port(bind_addr)
     if bound_port == 0:
@@ -637,8 +809,25 @@ def main() -> None:
     parser.add_argument("--max-workers", type=int, default=int(os.getenv("TELEMETRY_RECEIVER_MAX_WORKERS", "16")))
     parser.add_argument("--log-every", type=int, default=int(os.getenv("TELEMETRY_RECEIVER_LOG_EVERY", "100")))
     parser.add_argument("--write-influx", action="store_true", default=os.getenv("TELEMETRY_RECEIVER_WRITE_INFLUX", "true").lower() in {"1", "true", "yes", "on"})
+    parser.add_argument("--record-messages", action="store_true", default=os.getenv("TELEMETRY_RECEIVER_RECORD_MESSAGES", "false").lower() in {"1", "true", "yes", "on"})
+    parser.add_argument("--record-payloads", action="store_true", default=os.getenv("TELEMETRY_RECEIVER_RECORD_PAYLOADS", "false").lower() in {"1", "true", "yes", "on"})
+    parser.add_argument("--record-events", action="store_true", default=os.getenv("TELEMETRY_RECEIVER_RECORD_EVENTS", "true").lower() in {"1", "true", "yes", "on"})
+    parser.add_argument("--max-saved-messages", type=int, default=int(os.getenv("TELEMETRY_RECEIVER_MAX_SAVED_MESSAGES", "0")))
+    parser.add_argument("--ack-every", type=int, default=int(os.getenv("TELEMETRY_RECEIVER_ACK_EVERY", "1")))
     args = parser.parse_args()
-    serve(args.host, args.port, args.spool_dir, args.max_workers, args.log_every, args.write_influx)
+    serve(
+        args.host,
+        args.port,
+        args.spool_dir,
+        args.max_workers,
+        args.log_every,
+        args.write_influx,
+        args.record_messages,
+        args.record_payloads,
+        args.record_events,
+        args.max_saved_messages,
+        args.ack_every,
+    )
 
 
 if __name__ == "__main__":

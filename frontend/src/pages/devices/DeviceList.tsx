@@ -38,7 +38,7 @@ const { Search } = Input
 const { Text } = Typography
 const { Option } = Select
 const DEVICE_LIST_STORAGE_KEY = 'resource-network-device-list-state'
-const DEVICE_LIST_STORAGE_VERSION = 7
+const DEVICE_LIST_STORAGE_VERSION = 8
 const COLUMN_FILTER_KEYS = ['name', 'ip_address', 'status', 'is_monitored', 'datacenter', 'model', 'device_type', 'serial_number'] as const
 type ColumnFilterKey = typeof COLUMN_FILTER_KEYS[number]
 type SortField = ColumnFilterKey
@@ -52,6 +52,7 @@ const DEFAULT_VISIBLE_COLUMNS = [
   'model',
   'device_type',
   'serial_number',
+  'created_at',
   'action',
 ]
 const DEFAULT_COLUMN_WIDTHS = {
@@ -65,9 +66,10 @@ const DEFAULT_COLUMN_WIDTHS = {
   vendor: 100,
   model: 150,
   serial_number: 180,
+  created_at: 170,
   action: 150,
 }
-const COLUMN_ORDER = ['name', 'ip_address', 'status', 'is_monitored', 'datacenter', 'device_role', 'model', 'device_type', 'vendor', 'serial_number', 'action']
+const COLUMN_ORDER = ['name', 'ip_address', 'status', 'is_monitored', 'datacenter', 'device_role', 'model', 'device_type', 'vendor', 'serial_number', 'created_at', 'action']
 const DEVICE_EXPORT_FIELDS = [
   { value: 'name', label: '设备名称' },
   { value: 'status', label: '运行状态' },
@@ -93,6 +95,16 @@ const TABLE_CELL_TEXT_STYLE: React.CSSProperties = {
   whiteSpace: 'nowrap',
   overflow: 'hidden',
   textOverflow: 'ellipsis',
+}
+
+const formatDateTimeText = (value?: string | null) => {
+  const text = String(value || '').trim()
+  if (!text) return '-'
+  const match = text.match(/^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2}:\d{2})/)
+  if (match) {
+    return `${match[1]} ${match[2]}`
+  }
+  return text.replace('T', ' ').replace(/\.\d+.*$/, '').replace(/(?:Z|[+-]\d{2}:?\d{2})$/, '') || '-'
 }
 
 const ipToParts = (value?: string | null) => {
@@ -998,6 +1010,21 @@ const DeviceList = () => {
       ),
     },
     {
+      title: '添加时间',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: columnWidths.created_at,
+      ellipsis: true,
+      render: (value: string) => {
+        const text = formatDateTimeText(value)
+        return (
+          <span title={text} style={TABLE_CELL_TEXT_STYLE}>
+            {text}
+          </span>
+        )
+      },
+    },
+    {
       title: '操作',
       key: 'action',
       width: columnWidths.action,
@@ -1041,6 +1068,7 @@ const DeviceList = () => {
     { key: 'device_type', label: '设备类型' },
     { key: 'vendor', label: '厂商' },
     { key: 'serial_number', label: '序列号' },
+    { key: 'created_at', label: '添加时间' },
     { key: 'action', label: '操作' },
   ]
   const columns = allColumns

@@ -7,6 +7,9 @@ export interface ConfigBackupJob {
   total_devices: number
   success_count: number
   failed_count: number
+  config_changed_count?: number
+  config_saved_count?: number
+  config_save_failed_count?: number
   summary?: string | null
   error_message?: string | null
   started_by?: string | null
@@ -29,6 +32,15 @@ export interface ConfigBackupResult {
   command?: string | null
   config_hash?: string | null
   line_count?: number | null
+  startup_command?: string | null
+  startup_config_content?: string | null
+  startup_config_hash?: string | null
+  startup_line_count?: number | null
+  config_sync_status?: 'matched' | 'changed_saved' | 'changed_save_failed' | 'check_failed' | 'unsupported' | null
+  config_sync_diff?: string | null
+  config_save_command?: string | null
+  config_save_status?: 'success' | 'failed' | null
+  config_save_message?: string | null
   error_message?: string | null
   started_at?: string | null
   finished_at?: string | null

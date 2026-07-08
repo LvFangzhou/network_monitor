@@ -6,6 +6,16 @@ import { getDevice } from '../../api/devices'
 import type { Device } from '../../api/devices'
 import { useAuthStore } from '../../store/auth'
 
+const formatDateTimeText = (value?: string | null) => {
+  const text = String(value || '').trim()
+  if (!text) return '-'
+  const match = text.match(/^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2}:\d{2})/)
+  if (match) {
+    return `${match[1]} ${match[2]}`
+  }
+  return text.replace('T', ' ').replace(/\.\d+.*$/, '').replace(/(?:Z|[+-]\d{2}:?\d{2})$/, '') || '-'
+}
+
 const statusMap: Record<string, { color: string; label: string }> = {
   active: { color: 'success', label: '上线' },
   inactive: { color: 'default', label: '离线' },
@@ -98,11 +108,13 @@ const DeviceDetail = () => {
         <Descriptions.Item label="厂商">{device.vendor || '-'}</Descriptions.Item>
         <Descriptions.Item label="型号">{device.model || '-'}</Descriptions.Item>
         <Descriptions.Item label="序列号">{device.serial_number || '-'}</Descriptions.Item>
-        <Descriptions.Item label="创建时间">{device.created_at || '-'}</Descriptions.Item>
+        <Descriptions.Item label="创建时间">{formatDateTimeText(device.created_at)}</Descriptions.Item>
         <Descriptions.Item label="机房位置">{device.datacenter?.location || '-'}</Descriptions.Item>
         <Descriptions.Item label="负责人">{device.datacenter?.contact_person || '-'}</Descriptions.Item>
         <Descriptions.Item label="负责人电话">{device.datacenter?.contact_phone || '-'}</Descriptions.Item>
         <Descriptions.Item label="负责人邮箱">{device.datacenter?.contact_email || '-'}</Descriptions.Item>
+        <Descriptions.Item label="网络负责人">{device.datacenter?.network_owner || '-'}</Descriptions.Item>
+        <Descriptions.Item label="网络负责人邮箱">{device.datacenter?.network_owner_email || '-'}</Descriptions.Item>
         <Descriptions.Item label="建设时间">
           {device.datacenter?.build_date ? new Date(device.datacenter.build_date).toLocaleDateString() : '-'}
         </Descriptions.Item>
