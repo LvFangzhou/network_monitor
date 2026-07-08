@@ -548,8 +548,8 @@ services:
     build: ./backend
     image: network_monitor-backend:latest
     container_name: nm-celery-worker-snmp
-    command: celery -A app.tasks worker -l info -Q snmp_realtime -n worker-snmp@%h --pool=threads -c 24 --prefetch-multiplier=1 -Ofair
-    cpu_shares: 4096
+    command: celery -A app.tasks worker -l info -Q snmp_realtime -n worker-snmp@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
+    cpu_shares: 2048
     environment:
       - DEBUG=false
       - SECRET_KEY=your-secret-key-change-in-production
@@ -592,7 +592,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '6'
+          cpus: '3'
           memory: 2G
 
   # Celery Worker 线路绑定端口 10 秒级采集
@@ -652,6 +652,8 @@ services:
 
   # Telemetry gRPC Dial-out 接收探针
   telemetry-receiver:
+    profiles:
+      - telemetry
     build: ./backend
     image: network_monitor-backend:latest
     container_name: nm-telemetry-receiver
@@ -672,7 +674,7 @@ services:
       - LOG_LEVEL=INFO
       - TELEMETRY_RECEIVER_PORT=50051
       - TELEMETRY_RECEIVER_SPOOL_DIR=/app/data/telemetry
-      - TELEMETRY_RECEIVER_MAX_WORKERS=256
+      - TELEMETRY_RECEIVER_MAX_WORKERS=64
       - TELEMETRY_RECEIVER_LOG_EVERY=5000
       - TELEMETRY_RECEIVER_WRITE_INFLUX=true
       - TELEMETRY_RECEIVER_RECORD_MESSAGES=false
@@ -696,7 +698,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '8'
+          cpus: '3'
           memory: 8G
 
   # 前端 Web 应用
