@@ -78,11 +78,10 @@ const TacacsManager = lazyWithReload(loadTacacsManager)
 const ConfigBackups = lazyWithReload(loadConfigBackups)
 
 const preloadRouteModules = () => {
+  // 首屏优先展示当前页面；图表/历史类页面体积较大，不在刷新后立刻抢网络资源。
   void Promise.allSettled([
     loadDashboard(),
     loadDeviceList(),
-    loadAlertHistory(),
-    loadMetrics(),
   ])
 }
 
@@ -221,10 +220,22 @@ function App() {
 
   useEffect(() => {
     initAuth()
-    const timer = window.setTimeout(() => {
-      preloadRouteModules()
-    }, 300)
-    return () => window.clearTimeout(timer)
+    const schedulePreload = () => window.setTimeout(preloadRouteModules, 8000)
+    let timer: number | undefined
+    let idleId: number | undefined
+    if ('requestIdleCallback' in window) {
+      idleId = window.requestIdleCallback(() => {
+        timer = schedulePreload()
+      }, { timeout: 10000 })
+    } else {
+      timer = schedulePreload()
+    }
+    return () => {
+      if (typeof timer === 'number') window.clearTimeout(timer)
+      if (typeof idleId === 'number' && 'cancelIdleCallback' in window) {
+        window.cancelIdleCallback(idleId)
+      }
+    }
   }, [initAuth])
 
   return (
