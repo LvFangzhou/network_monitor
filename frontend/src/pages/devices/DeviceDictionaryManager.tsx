@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Button, Card, Form, Input, Modal, Popconfirm, Space, Switch, Table, Tabs, Tooltip, message } from 'antd'
+import { Suspense, lazy, useEffect, useState } from 'react'
+import { Button, Card, Form, Input, Modal, Popconfirm, Space, Spin, Switch, Table, Tabs, Tooltip, message } from 'antd'
 import {
   getDeviceTypesList,
   createDeviceType,
@@ -16,10 +16,17 @@ import {
 } from '../../api/devices'
 import type { DeviceRole, DeviceType, DeviceVendor } from '../../api/devices'
 import { useAuthStore } from '../../store/auth'
-import DatacenterList from '../datacenters/DatacenterList'
-import VendorList from '../resources/VendorList'
+
+const DatacenterList = lazy(() => import('../datacenters/DatacenterList'))
+const VendorList = lazy(() => import('../resources/VendorList'))
 
 type CatalogTab = 'deviceType' | 'deviceRole' | 'deviceVendor' | 'datacenter' | 'lineVendor'
+
+const TabFallback = () => (
+  <div style={{ padding: 24, textAlign: 'center' }}>
+    <Spin />
+  </div>
+)
 
 const DeviceDictionaryManager = () => {
   const [deviceTypeCatalogs, setDeviceTypeCatalogs] = useState<DeviceType[]>([])
@@ -231,12 +238,20 @@ const DeviceDictionaryManager = () => {
           {
             key: 'lineVendor',
             label: '供应商管理',
-            children: <VendorList embedded />,
+            children: catalogTab === 'lineVendor' ? (
+              <Suspense fallback={<TabFallback />}>
+                <VendorList embedded />
+              </Suspense>
+            ) : null,
           },
           {
             key: 'datacenter',
             label: '机房管理',
-            children: <DatacenterList embedded />,
+            children: catalogTab === 'datacenter' ? (
+              <Suspense fallback={<TabFallback />}>
+                <DatacenterList embedded />
+              </Suspense>
+            ) : null,
           },
         ]}
         tabBarExtraContent={canModify && isDeviceCatalogTab ? (

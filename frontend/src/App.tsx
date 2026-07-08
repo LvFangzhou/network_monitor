@@ -77,14 +77,6 @@ const Settings = lazyWithReload(loadSettings)
 const TacacsManager = lazyWithReload(loadTacacsManager)
 const ConfigBackups = lazyWithReload(loadConfigBackups)
 
-const preloadRouteModules = () => {
-  // 首屏优先展示当前页面；图表/历史类页面体积较大，不在刷新后立刻抢网络资源。
-  void Promise.allSettled([
-    loadDashboard(),
-    loadDeviceList(),
-  ])
-}
-
 const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/port-query', '/ip-flow-query', '/module-info-query', '/lossless-info-query', '/config-backups']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/port-query']
 const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
@@ -220,22 +212,6 @@ function App() {
 
   useEffect(() => {
     initAuth()
-    const schedulePreload = () => window.setTimeout(preloadRouteModules, 8000)
-    let timer: number | undefined
-    let idleId: number | undefined
-    if ('requestIdleCallback' in window) {
-      idleId = window.requestIdleCallback(() => {
-        timer = schedulePreload()
-      }, { timeout: 10000 })
-    } else {
-      timer = schedulePreload()
-    }
-    return () => {
-      if (typeof timer === 'number') window.clearTimeout(timer)
-      if (typeof idleId === 'number' && 'cancelIdleCallback' in window) {
-        window.cancelIdleCallback(idleId)
-      }
-    }
   }, [initAuth])
 
   return (
