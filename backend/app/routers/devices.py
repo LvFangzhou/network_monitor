@@ -320,17 +320,20 @@ def _best_lldp_remote_mgmt_ip(neighbor: Dict[str, Any]) -> str:
 
 
 def _best_lldp_remote_interface(neighbor: Dict[str, Any]) -> str:
-    value = str(neighbor.get("remote_port") or neighbor.get("remote_interface") or neighbor.get("remote_port_id") or "").strip()
-    if not value or value == "-":
-        return ""
-    match = re.search(
-        r"((?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet|400GE|100GE|25GE|10GE|XGE|GE)\d+(?:/\d+)+(?:[:/]\d+)?)$",
-        value,
+    # LLDP remote_port_desc 经常是人为描述（如 M2M27U3940-9820-AGG01-100G19），
+    # 不能直接当成“对端接口”。优先使用 remote_port_id；只有字段本身是接口格式时才展示。
+    interface_pattern = re.compile(
+        r"^((?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet|400GE|200GE|100GE|100G|50GE|25GE|10GE|HGE|XGE|GE|MGE)\d+(?:/\d+)+(?:[:/]\d+)?)$",
         flags=re.IGNORECASE,
     )
-    if match:
-        return match.group(1)
-    return re.sub(r"\s+Interface$", "", value, flags=re.IGNORECASE).strip()
+    for field in ("remote_port_id", "remote_interface", "remote_port"):
+        value = re.sub(r"\s+Interface$", "", str(neighbor.get(field) or "").strip(), flags=re.IGNORECASE).strip()
+        if not value or value == "-" or _looks_like_mac(value):
+            continue
+        match = interface_pattern.match(value)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def _extract_device_name_from_lldp_sys_desc(value: Any) -> str:
