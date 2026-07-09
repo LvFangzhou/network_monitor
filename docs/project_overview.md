@@ -320,7 +320,7 @@ network_monitor/
 | 6379 | TCP | Redis |
 | 5672 | TCP | RabbitMQ |
 | 15672 | HTTP | RabbitMQ 管理页面 |
-| 5514 | UDP | Syslog 接收 |
+| 514 | UDP | Syslog 接收 |
 | 2055 | UDP | NetFlow 接收 |
 | 6343 | UDP | sFlow 接收 |
 

@@ -178,7 +178,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "127.0.0.1:8000:8000"
-      - "5514:5514/udp"
+      - "514:514/udp"
       - "162:1162/udp"
       - "2055:2055/udp"
       - "6343:6343/udp"

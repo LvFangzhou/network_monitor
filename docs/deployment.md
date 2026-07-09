@@ -21,7 +21,7 @@
 | 8443 | TCP | Web 前端 HTTPS |
 | 8000 | TCP | 后端 API |
 | 49 | TCP/UDP | TACACS+，由 host network 暴露 |
-| 5514 | UDP | Syslog |
+| 514 | UDP | Syslog |
 | 2055 | UDP | NetFlow |
 | 6343 | UDP | sFlow |
 | 5432 | TCP | PostgreSQL，可按需关闭外部访问 |
@@ -380,7 +380,7 @@ docker compose logs --tail=200 服务名
 端口被占用：
 
 ```bash
-sudo ss -lntup | grep -E '8080|8443|8000|49|2055|6343|5514'
+sudo ss -lntup | grep -E '8080|8443|8000|49|2055|6343|514'
 ```
 
 SNMP 无数据：

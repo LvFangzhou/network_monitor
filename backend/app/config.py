@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     # Syslog 配置
     SYSLOG_ENABLED: bool = True
     SYSLOG_LISTEN_HOST: str = "0.0.0.0"
-    SYSLOG_LISTEN_PORT: int = 5514
+    SYSLOG_LISTEN_PORT: int = 514
 
     # SNMP Trap 配置。容器内监听 1162，compose 默认映射宿主机 UDP/162。
     SNMP_TRAP_ENABLED: bool = True
