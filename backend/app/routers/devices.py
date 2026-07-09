@@ -15,8 +15,9 @@ from pathlib import Path
 import ipaddress
 
 from app.database import get_db
-from app.models import AlertHistory, ConfigBackupResult, Device, DeviceGroup, SyslogEvent, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
+from app.models import AlertHistory, ConfigBackupResult, Device, DeviceGroup, SyslogEvent, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor, User
 from app.collectors.snmp_collector import SNMPCollector
+from app.routers.auth import get_current_active_user
 from app.utils.interface_scope import alert_target_interface_is_monitored
 from app.utils.redis_client import redis_client
 from app.utils import influx_client
@@ -947,6 +948,69 @@ async def list_devices(
     return {
         "total": total,
         "items": [device.to_dict() for device in devices]
+    }
+
+
+def _device_lookup_payload(device: Device) -> Dict[str, Any]:
+    datacenter = device.datacenter_ref
+    return {
+        "id": device.id,
+        "name": device.name,
+        "hostname": device.hostname,
+        "ip_address": device.ip_address,
+        "datacenter": {
+            "id": datacenter.id,
+            "name": datacenter.name,
+            "code": datacenter.code,
+            "location": datacenter.location,
+        } if datacenter else None,
+        "datacenter_name": datacenter.name if datacenter else None,
+        "vendor": device.vendor,
+        "model": device.model,
+        "device_type": device.device_type,
+        "device_role": device.device_role,
+        "status": device.normalized_status,
+        "is_monitored": bool(device.is_monitored),
+        "monitor_source": device.monitor_source,
+        "network_owner": device.network_owner,
+        "ops_owner": device.ops_owner,
+        "business_type": device.business_type,
+        "created_at": device.created_at.strftime("%Y-%m-%d %H:%M:%S") if device.created_at else None,
+        "updated_at": device.updated_at.strftime("%Y-%m-%d %H:%M:%S") if device.updated_at else None,
+    }
+
+
+@router.get("/lookup", response_model=dict)
+async def lookup_devices(
+    keyword: str = Query(..., min_length=1, description="设备名称/IP/机房/型号等关键字"),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """轻量设备查询接口：给命令行/外部工具快速查询设备管理 IP 和机房等基础信息。"""
+    value = keyword.strip()
+    query = db.query(Device).options(joinedload(Device.datacenter_ref))
+    query = query.filter(
+        (Device.name.ilike(f"%{value}%")) |
+        (Device.hostname.ilike(f"%{value}%")) |
+        (Device.ip_address.ilike(f"%{value}%")) |
+        (Device.vendor.ilike(f"%{value}%")) |
+        (Device.model.ilike(f"%{value}%")) |
+        (Device.device_role.ilike(f"%{value}%")) |
+        (Device.device_type.ilike(f"%{value}%")) |
+        Device.datacenter_ref.has(
+            Datacenter.name.ilike(f"%{value}%") |
+            Datacenter.code.ilike(f"%{value}%") |
+            Datacenter.location.ilike(f"%{value}%")
+        )
+    )
+    total = query.count()
+    devices = query.order_by(Device.name.asc(), Device.id.asc()).limit(limit).all()
+    return {
+        "keyword": value,
+        "total": total,
+        "limit": limit,
+        "items": [_device_lookup_payload(device) for device in devices],
     }
 
 
