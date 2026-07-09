@@ -2,10 +2,10 @@
 Public quality probe periodic tasks.
 """
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
 
 from celery import shared_task
-from sqlalchemy import or_
 
 from app.core import get_logger
 from app.database import SessionLocal
@@ -16,7 +16,8 @@ from app.utils.quality_probe import run_quality_ping, write_quality_probe_result
 
 logger = get_logger(__name__)
 QUALITY_PROBE_LOCK_KEY = "quality_probe:collect:lock"
-QUALITY_PROBE_LOCK_TTL_SECONDS = 55
+QUALITY_PROBE_LOCK_TTL_SECONDS = 15
+QUALITY_PROBE_MAX_WORKERS = 20
 
 
 def _seconds_since(value: datetime | None) -> float:
@@ -45,15 +46,46 @@ def collect_quality_probes(self) -> Dict[str, Any]:
         targets = (
             db.query(QualityProbeTarget)
             .filter(QualityProbeTarget.is_active == True)  # noqa: E712
-            .filter(or_(QualityProbeTarget.last_probe_at.is_(None), QualityProbeTarget.interval_seconds.is_(None), QualityProbeTarget.interval_seconds >= 10))
             .order_by(QualityProbeTarget.id.asc())
             .all()
         )
+        due_targets: List[QualityProbeTarget] = []
         for target in targets:
-            interval = max(int(target.interval_seconds or 60), 10)
+            interval = max(int(target.interval_seconds or 60), 1)
             if _seconds_since(target.last_probe_at) < interval:
                 continue
-            result = run_quality_ping(target.target, target.packet_count or 5, target.timeout_ms or 1000)
+            due_targets.append(target)
+
+        if not due_targets:
+            return {"status": "ok", "collected": 0, "failed": 0, "items": []}
+
+        probe_results: Dict[int, Dict[str, Any]] = {}
+        max_workers = max(1, min(QUALITY_PROBE_MAX_WORKERS, len(due_targets)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(run_quality_ping, target.target, target.packet_count or 1, target.timeout_ms or 1000): target.id
+                for target in due_targets
+            }
+            for future in as_completed(futures):
+                target_id = futures[future]
+                try:
+                    probe_results[target_id] = future.result()
+                except Exception as e:
+                    probe_results[target_id] = {
+                        "success": False,
+                        "avg_latency_ms": None,
+                        "min_latency_ms": None,
+                        "max_latency_ms": None,
+                        "jitter_ms": None,
+                        "packet_loss_percent": 100.0,
+                        "availability_percent": 0.0,
+                        "received": 0,
+                        "sent": 0,
+                        "error": str(e),
+                    }
+
+        for target in due_targets:
+            result = probe_results.get(target.id) or {}
             target.last_probe_at = datetime.now(timezone.utc)
             target.last_success = bool(result.get("success"))
             target.last_avg_latency_ms = result.get("avg_latency_ms")

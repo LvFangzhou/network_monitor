@@ -367,6 +367,10 @@ export interface DeviceHardwareRow {
   speed?: number | string | null
   present?: number | string | null
   status_known?: number | string | null
+  power_input?: number | string | null
+  rx_power?: number | string | null
+  tx_power?: number | string | null
+  temperature?: number | string | null
 }
 
 export interface DeviceTacacsRow {

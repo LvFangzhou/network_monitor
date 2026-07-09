@@ -21,6 +21,7 @@ from app.routers.auth import get_current_active_user
 from app.utils.interface_scope import alert_target_interface_is_monitored
 from app.utils.redis_client import redis_client
 from app.utils import influx_client
+from app.utils.asternos_exporter_client import asternos_exporter_client
 from app.schemas import (
     DeviceCreate, DeviceUpdate, DeviceResponse,
     DeviceGroupCreate, DeviceGroupUpdate, DeviceGroupResponse,
@@ -203,9 +204,17 @@ def _parse_interface_config_fields(config_text: str) -> Dict[str, Dict[str, Any]
         if link_type_match:
             bucket["link_type"] = link_type_match.group(1).upper()
             continue
+        switchport_mode_match = re.match(r"^switchport\s+mode\s+(access|trunk)", stripped, re.IGNORECASE)
+        if switchport_mode_match:
+            bucket["link_type"] = switchport_mode_match.group(1).upper()
+            continue
         access_vlan_match = re.match(r"^port\s+access\s+vlan\s+(.+)$", stripped, re.IGNORECASE)
         if access_vlan_match:
             bucket["access_vlan"] = access_vlan_match.group(1).strip()
+            continue
+        switchport_access_match = re.match(r"^switchport\s+access\s+vlan\s+(.+)$", stripped, re.IGNORECASE)
+        if switchport_access_match:
+            bucket["access_vlan"] = switchport_access_match.group(1).strip()
             continue
         trunk_permit_match = re.match(r"^(undo\s+)?port\s+trunk\s+permit\s+vlan\s+(.+)$", stripped, re.IGNORECASE)
         if trunk_permit_match:
@@ -215,9 +224,28 @@ def _parse_interface_config_fields(config_text: str) -> Dict[str, Dict[str, Any]
             else:
                 bucket.setdefault("trunk_permit_vlans", []).append(vlans)
             continue
+        switchport_trunk_allowed_match = re.match(
+            r"^switchport\s+trunk\s+allowed\s+vlan(?:\s+(?:add|remove|except|only))?\s+(.+)$",
+            stripped,
+            re.IGNORECASE,
+        )
+        if switchport_trunk_allowed_match:
+            bucket.setdefault("trunk_permit_vlans", []).append(switchport_trunk_allowed_match.group(1).strip())
+            bucket.setdefault("link_type", "TRUNK")
+            continue
         trunk_pvid_match = re.match(r"^port\s+trunk\s+pvid\s+vlan\s+(.+)$", stripped, re.IGNORECASE)
         if trunk_pvid_match:
             bucket["trunk_pvid"] = trunk_pvid_match.group(1).strip()
+            continue
+        switchport_native_match = re.match(r"^switchport\s+trunk\s+native\s+vlan\s+(.+)$", stripped, re.IGNORECASE)
+        if switchport_native_match:
+            bucket["trunk_pvid"] = switchport_native_match.group(1).strip()
+            bucket.setdefault("link_type", "TRUNK")
+            continue
+        encapsulation_match = re.match(r"^encapsulation\s+dot1[qQ]\s+(.+)$", stripped, re.IGNORECASE)
+        if encapsulation_match:
+            bucket["access_vlan"] = encapsulation_match.group(1).strip()
+            bucket.setdefault("link_type", "ACCESS")
             continue
     for bucket in fields.values():
         vlan_info = _format_interface_vlan_info(bucket)
@@ -513,6 +541,123 @@ def _infer_tacacs_operation(command: str, raw: str) -> str:
 
 def _flux_escape(value: str) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _safe_float_value(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _normalize_percent_value(value: Any) -> Optional[float]:
+    num = _safe_float_value(value)
+    if num is None:
+        return None
+    # AsterNOS 有些版本返回 0~1，有些返回 0~100，这里统一成百分比。
+    if 0 <= num <= 1:
+        num *= 100
+    return round(num, 2)
+
+
+def _max_metric_row_value(rows: List[Dict[str, Any]]) -> Optional[float]:
+    values = [_safe_float_value(row.get("value")) for row in rows or []]
+    values = [value for value in values if value is not None]
+    return round(max(values), 2) if values else None
+
+
+def _metric_label(row: Dict[str, Any], *keys: str) -> str:
+    labels = row.get("metric", {}) or {}
+    for key in keys:
+        value = str(labels.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _build_asternos_hardware_items(metrics: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    now = datetime.utcnow().isoformat()
+    items: List[Dict[str, Any]] = []
+
+    for position, row in enumerate(asternos_exporter_client._rows(metrics, "device_fan_operational_status"), start=1):
+        value = _safe_float_value(row.get("value"))
+        component = _metric_label(row, "name", "slot", "fan") or f"fan{position}"
+        items.append({
+            "component_type": "fan",
+            "component": component,
+            "state": value,
+            "up": 1 if value is not None and value >= 1 else 0 if value is not None else None,
+            "present": 1,
+            "status_known": 1 if value is not None else 0,
+            "time": now,
+        })
+
+    for position, row in enumerate(asternos_exporter_client._rows(metrics, "psu_power_input"), start=1):
+        value = _safe_float_value(row.get("value"))
+        component = _metric_label(row, "name", "slot", "psu", "power") or f"power{position}"
+        items.append({
+            "component_type": "power",
+            "component": component,
+            "state": value,
+            "up": 1 if value is not None and value > 0 else 0 if value is not None else None,
+            "present": 1 if value is not None else None,
+            "status_known": 1 if value is not None else 0,
+            "power_input": value,
+            "time": now,
+        })
+
+    modules: Dict[str, Dict[str, Any]] = {}
+    for field, metric_base in {
+        "rx_power": "dom_optic_rx_power",
+        "tx_power": "dom_optic_tx_power",
+        "temperature": "dom_optic_tempt",
+    }.items():
+        for row in asternos_exporter_client._rows(metrics, metric_base):
+            component = _metric_label(row, "interface", "device", "name", "port")
+            if not component:
+                continue
+            item = modules.setdefault(component, {
+                "component_type": "module",
+                "component": component,
+                "up": 1,
+                "present": 1,
+                "status_known": 1,
+                "time": now,
+            })
+            item[field] = _safe_float_value(row.get("value"))
+    items.extend(modules.values())
+    return items
+
+
+def _latest_optical_module_items(device_id: int) -> List[Dict[str, Any]]:
+    flux = f'''
+from(bucket: "{influx_client.bucket}")
+  |> range(start: -7d)
+  |> filter(fn: (r) => r._measurement == "optical_monitoring")
+  |> filter(fn: (r) => r.device_id == "{device_id}")
+  |> last()
+  |> yield(name: "result")
+'''
+    rows = influx_client.query(flux)
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        component = str(row.get("interface_name") or row.get("interface_index") or "").strip()
+        if not component:
+            continue
+        item = grouped.setdefault(component, {
+            "component_type": "module",
+            "component": component,
+            "up": 1,
+            "present": 1,
+            "status_known": 1,
+            "time": row.get("time"),
+        })
+        field = str(row.get("field") or "")
+        if field in {"rx_power", "tx_power"}:
+            item[field] = row.get("value")
+    return list(grouped.values())
 
 
 def _trigger_monitor_refresh_for_device(device: Device) -> None:
@@ -1392,6 +1537,7 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
+    monitor_source = resolve_monitor_source_by_vendor(device.vendor, device.monitor_source)
 
     cached = _load_monitor_cache("interfaces", device.id)
     interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
@@ -1399,7 +1545,23 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
     if not interfaces:
         # 优先用后台快照；快照缺失时做一次限时 SNMP 轻量补采，避免详情页长期空白。
         # 大端口设备 SNMP walk 可能较慢，所以必须设置超时，超时后仍返回页面而不是一直转圈。
-        if getattr(device, "snmp_version", None):
+        if monitor_source == "asternos_exporter":
+            try:
+                interfaces = await asyncio.wait_for(
+                    asternos_exporter_client.list_interfaces(device),
+                    timeout=10,
+                )
+                source = "exporter_live"
+            except Exception:
+                logger.warning("设备详情AsterNOS接口实时补采失败 device_id=%s ip=%s", device.id, device.ip_address, exc_info=True)
+                return {
+                    "device": device.to_dict(),
+                    "items": [],
+                    "total": 0,
+                    "source": "exporter_miss",
+                    "message": "AsterNOS Exporter 接口数据暂不可用，请确认 exporter 是否可达或稍后刷新",
+                }
+        elif getattr(device, "snmp_version", None):
             try:
                 interfaces = await asyncio.wait_for(
                     asyncio.to_thread(SNMPCollector().list_interfaces, device),
@@ -1503,7 +1665,10 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
         missing_mtu_count = sum(1 for item in items if item.get("mtu") in (None, ""))
         missing_type_count = sum(1 for item in items if not item.get("logical_type"))
         if missing_mtu_count >= max(3, int(len(items) * 0.8)) or missing_type_count >= max(3, int(len(items) * 0.8)):
-            message = "当前接口数据来自旧快照，MTU/逻辑类型等新增字段会在下一轮 SNMP 接口采集后自动补齐"
+            if monitor_source == "asternos_exporter":
+                message = "当前接口数据来自旧快照，MTU/逻辑类型等字段会在下一轮 AsterNOS Exporter 采集后自动补齐"
+            else:
+                message = "当前接口数据来自旧快照，MTU/逻辑类型等新增字段会在下一轮 SNMP 接口采集后自动补齐"
     return {"device": device.to_dict(), "items": items, "total": len(items), "source": source, "message": message}
 
 
@@ -1585,10 +1750,31 @@ async def get_device_detail_performance(
     device_id: int,
     range: str = Query("-24h"),
     interval: str = Query("5m"),
+    db: Session = Depends(get_db),
 ):
     """设备详情：CPU/内存/温度趋势。"""
     safe_range = range if re.fullmatch(r"-?\d+[smhdw]", range or "") else "-24h"
     safe_interval = interval if re.fullmatch(r"\d+[smhdw]", interval or "") else "5m"
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if resolve_monitor_source_by_vendor(device.vendor, device.monitor_source) == "asternos_exporter":
+        try:
+            metrics = await asternos_exporter_client.scrape(device)
+            now = datetime.utcnow().isoformat()
+            cpu = _normalize_percent_value(asternos_exporter_client._first(metrics, "device_cpu_usage"))
+            memory = _normalize_percent_value(asternos_exporter_client._first(metrics, "device_memory_usage"))
+            temperature = _max_metric_row_value(asternos_exporter_client._rows(metrics, "device_sensor_tempt"))
+            series = [
+                {"name": "cpu", "measurement": "asternos_exporter", "field": "device_cpu_usage", "data": [{"time": now, "value": cpu}] if cpu is not None else []},
+                {"name": "memory", "measurement": "asternos_exporter", "field": "device_memory_usage", "data": [{"time": now, "value": memory}] if memory is not None else []},
+                {"name": "temperature", "measurement": "asternos_exporter", "field": "device_sensor_tempt", "data": [{"time": now, "value": temperature}] if temperature is not None else []},
+            ]
+            return {"device_id": device_id, "range": safe_range, "interval": safe_interval, "series": series, "source": "asternos_exporter_live"}
+        except Exception as exc:
+            logger.warning("设备详情AsterNOS性能读取失败", device_id=device_id, ip=device.ip_address, error=str(exc))
+            return {"device_id": device_id, "range": safe_range, "interval": safe_interval, "series": [], "source": "asternos_exporter_live", "message": str(exc)}
+
     series_config = [
         ("cpu", "snmp_metrics", "usage", {"metric_type": "cpu"}),
         ("memory", "snmp_metrics", "usage_percent", {"metric_type": "memory"}),
@@ -1617,8 +1803,20 @@ from(bucket: "{influx_client.bucket}")
 
 
 @router.get("/{device_id}/detail/hardware", response_model=dict)
-async def get_device_detail_hardware(device_id: int):
+async def get_device_detail_hardware(device_id: int, db: Session = Depends(get_db)):
     """设备详情：硬件状态。"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if resolve_monitor_source_by_vendor(device.vendor, device.monitor_source) == "asternos_exporter":
+        try:
+            metrics = await asternos_exporter_client.scrape(device)
+            items = _build_asternos_hardware_items(metrics)
+            return {"device_id": device_id, "items": items, "total": len(items), "source": "asternos_exporter_live"}
+        except Exception as exc:
+            logger.warning("设备详情AsterNOS硬件读取失败", device_id=device_id, ip=device.ip_address, error=str(exc))
+            return {"device_id": device_id, "items": [], "total": 0, "source": "asternos_exporter_live", "message": str(exc)}
+
     flux = f'''
 from(bucket: "{influx_client.bucket}")
   |> range(start: -7d)
@@ -1637,7 +1835,8 @@ from(bucket: "{influx_client.bucket}")
             "time": row.get("time"),
         })
         item[str(row.get("field"))] = row.get("value")
-    return {"device_id": device_id, "items": list(grouped.values()), "total": len(grouped)}
+    items = list(grouped.values()) + _latest_optical_module_items(device_id)
+    return {"device_id": device_id, "items": items, "total": len(items), "source": "snmp"}
 
 
 @router.get("/{device_id}/detail/tacacs", response_model=dict)

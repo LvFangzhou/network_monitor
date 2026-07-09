@@ -141,6 +141,14 @@ const hardwareStatusTag = (row: DeviceHardwareRow) => {
   return statusTag(String(row.up) === '1' ? 'normal' : 'down')
 }
 
+const formatOptionalNumber = (value?: number | string | null, unit = '') => {
+  if (value === undefined || value === null || value === '') return '-'
+  const num = Number(value)
+  if (!Number.isFinite(num)) return String(value)
+  const text = Number.isInteger(num) ? String(num) : num.toFixed(2)
+  return `${text}${unit}`
+}
+
 const DeviceDetail = () => {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -562,22 +570,56 @@ const HardwareTab = ({ deviceId }: { deviceId: number }) => {
       .then((result) => setRows(result.items || []))
       .finally(() => setLoading(false))
   }, [deviceId])
+
+  const groupedRows = useMemo(() => {
+    const byType = (type: string) => rows.filter((row) => String(row.component_type || '').toLowerCase() === type)
+    return {
+      power: byType('power'),
+      fan: byType('fan'),
+      module: byType('module'),
+    }
+  }, [rows])
+
+  const baseColumns = [
+    { title: '名称', dataIndex: 'component', ellipsis: true },
+    { title: '状态', dataIndex: 'up', width: 110, render: (_: any, row: DeviceHardwareRow) => hardwareStatusTag(row) },
+    { title: '在位', dataIndex: 'present', width: 90, render: (value: any) => value === undefined || value === null ? '-' : String(value) },
+    { title: '原始状态', dataIndex: 'state', width: 110, render: (value: any) => formatOptionalNumber(value) },
+    { title: '采集时间', dataIndex: 'time', width: 170, render: formatDateTimeText },
+  ]
+
+  const renderHardwareTable = (
+    title: string,
+    dataSource: DeviceHardwareRow[],
+    extraColumns: any[] = [],
+  ) => (
+    <Card size="small" title={`${title}（${dataSource.length}）`}>
+      <Table<DeviceHardwareRow>
+        loading={loading}
+        rowKey={(row) => `${row.component_type}-${row.component}`}
+        dataSource={dataSource}
+        size="small"
+        pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100] }}
+        columns={[baseColumns[0], ...extraColumns, ...baseColumns.slice(1)]}
+        locale={{ emptyText: '暂无数据' }}
+      />
+    </Card>
+  )
+
   return (
-    <Table<DeviceHardwareRow>
-      loading={loading}
-      rowKey={(row) => `${row.component_type}-${row.component}`}
-      dataSource={rows}
-      size="small"
-      pagination={{ pageSize: 20, showSizeChanger: true }}
-      columns={[
-        { title: '硬件类型', dataIndex: 'component_type', width: 140 },
-        { title: '模块/名称', dataIndex: 'component' },
-        { title: '状态', dataIndex: 'up', width: 120, render: (_, row) => hardwareStatusTag(row) },
-        { title: '在位', dataIndex: 'present', width: 100 },
-        { title: '速率', dataIndex: 'speed', width: 120 },
-        { title: '采集时间', dataIndex: 'time', width: 180, render: formatDateTimeText },
-      ]}
-    />
+    <Space direction="vertical" style={{ width: '100%' }} size="middle">
+      {renderHardwareTable('电源', groupedRows.power, [
+        { title: '输入功率', dataIndex: 'power_input', width: 120, render: (value: any) => formatOptionalNumber(value, ' W') },
+      ])}
+      {renderHardwareTable('风扇', groupedRows.fan, [
+        { title: '转速', dataIndex: 'speed', width: 120, render: (value: any) => formatOptionalNumber(value) },
+      ])}
+      {renderHardwareTable('模块', groupedRows.module, [
+        { title: 'RX功率', dataIndex: 'rx_power', width: 120, render: (value: any) => formatOptionalNumber(value, ' dBm') },
+        { title: 'TX功率', dataIndex: 'tx_power', width: 120, render: (value: any) => formatOptionalNumber(value, ' dBm') },
+        { title: '温度', dataIndex: 'temperature', width: 110, render: (value: any) => formatOptionalNumber(value, '℃') },
+      ])}
+    </Space>
   )
 }
 

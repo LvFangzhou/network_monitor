@@ -12,7 +12,9 @@ import math
 import os
 import platform
 import re
+import shutil
 import socket
+import subprocess
 import time
 
 import psutil
@@ -122,6 +124,41 @@ def _safe_flux_duration(value: str, default: str = "-24h") -> str:
 def _safe_flux_interval(value: str, default: str = "1m") -> str:
     text = str(value or default).strip()
     return text if re.fullmatch(r"\d+[smhdw]", text) else default
+
+
+def _run_mtr_or_trace(target: str) -> Dict[str, Any]:
+    target_text = str(target or "").strip()
+    if not target_text or not re.fullmatch(r"[A-Za-z0-9_.:-]+", target_text):
+        return {"command": "", "output": "目标地址不合法", "tool": "none"}
+
+    candidates = []
+    if shutil.which("mtr"):
+        candidates.append(("mtr", ["mtr", "-r", "-n", "-c", "5", "-w", target_text]))
+    if shutil.which("traceroute"):
+        candidates.append(("traceroute", ["traceroute", "-n", "-m", "20", "-w", "2", target_text]))
+    if shutil.which("ping"):
+        candidates.append(("ping", ["ping", "-c", "5", "-W", "2", target_text]))
+
+    if not candidates:
+        return {"command": "", "output": "服务器未安装 mtr/traceroute/ping 工具", "tool": "none"}
+
+    for tool, command in candidates:
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=25,
+                check=False,
+            )
+            output = (completed.stdout or "").strip()
+            if output:
+                return {"command": " ".join(command), "output": output, "tool": tool}
+        except Exception as e:
+            last_error = str(e)
+            continue
+    return {"command": "", "output": f"MTR/Trace 执行失败: {last_error if 'last_error' in locals() else 'unknown'}", "tool": "none"}
 
 
 def _normalize_vendor_text(value: Optional[str]) -> str:
@@ -3934,6 +3971,20 @@ async def test_quality_probe_target(target_id: int, db: Session = Depends(get_db
     return {"target": _quality_target_payload(db_target), "result": result}
 
 
+@router.post("/quality/probe-targets/{target_id}/mtr")
+async def run_quality_probe_mtr(target_id: int, db: Session = Depends(get_db)):
+    """对质量探测目标执行一次 MTR/Traceroute。"""
+    db_target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
+    if not db_target:
+        raise HTTPException(status_code=404, detail="质量探测目标不存在")
+    result = await asyncio.to_thread(_run_mtr_or_trace, db_target.target)
+    return {
+        "target": _quality_target_payload(db_target),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        **result,
+    }
+
+
 @router.get("/quality/probe-targets/{target_id}/history")
 async def get_quality_probe_history(
     target_id: int,
@@ -3954,7 +4005,7 @@ async def get_quality_probe_history(
       |> filter(fn: (r) => r._measurement == "quality_probe")
       |> filter(fn: (r) => r.target_id == {escaped_id})
       |> filter(fn: (r) => r._field == "avg_latency_ms" or r._field == "min_latency_ms" or r._field == "max_latency_ms" or r._field == "jitter_ms" or r._field == "packet_loss_percent" or r._field == "availability_percent")
-      |> aggregateWindow(every: {safe_interval}, fn: mean, createEmpty: false)
+      |> aggregateWindow(every: {safe_interval}, fn: last, createEmpty: false)
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> sort(columns: ["_time"])
     '''

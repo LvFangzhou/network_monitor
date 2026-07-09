@@ -729,6 +729,18 @@ export const testQualityProbeTarget = async (
   }
 }
 
+export const runQualityProbeMtr = async (
+  id: number
+): Promise<{ target: QualityProbeTarget; generated_at: string; command: string; output: string; tool: string }> => {
+  return await request.post(`/metrics/quality/probe-targets/${id}/mtr`) as {
+    target: QualityProbeTarget
+    generated_at: string
+    command: string
+    output: string
+    tool: string
+  }
+}
+
 export const getQualityProbeHistory = async (
   id: number,
   params: { range: string; interval: string }

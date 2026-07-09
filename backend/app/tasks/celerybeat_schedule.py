@@ -202,12 +202,12 @@ beat_schedule = {
             'expires': 240.0,
         },
     },
-    # 公网质量探测 - 每10秒调度一次，到期目标按各自采样间隔执行，历史保存到 InfluxDB
-    'collect-quality-probes-every-10s': {
+    # 公网质量探测 - 每1秒调度一次，到期目标按各自采样间隔执行，历史保存到 InfluxDB
+    'collect-quality-probes-every-1s': {
         'task': 'app.tasks.quality_tasks.collect_quality_probes',
-        'schedule': 10.0,
+        'schedule': 1.0,
         'options': {
-            'expires': 50.0,
+            'expires': 5.0,
         },
     },
 }

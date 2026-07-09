@@ -250,7 +250,7 @@ class QualityProbeTargetBase(BaseModel):
     target: str = Field(..., min_length=1, max_length=255)
     datacenter_id: Optional[int] = None
     operator_name: Optional[str] = Field(None, max_length=50)
-    interval_seconds: int = Field(default=60, ge=10, le=3600)
+    interval_seconds: int = Field(default=60, ge=1, le=3600)
     packet_count: int = Field(default=5, ge=1, le=20)
     timeout_ms: int = Field(default=1000, ge=200, le=10000)
     latency_threshold_ms: int = Field(default=100, ge=1, le=10000)
@@ -269,7 +269,7 @@ class QualityProbeTargetUpdate(BaseModel):
     target: Optional[str] = Field(None, min_length=1, max_length=255)
     datacenter_id: Optional[int] = None
     operator_name: Optional[str] = Field(None, max_length=50)
-    interval_seconds: Optional[int] = Field(None, ge=10, le=3600)
+    interval_seconds: Optional[int] = Field(None, ge=1, le=3600)
     packet_count: Optional[int] = Field(None, ge=1, le=20)
     timeout_ms: Optional[int] = Field(None, ge=200, le=10000)
     latency_threshold_ms: Optional[int] = Field(None, ge=1, le=10000)
