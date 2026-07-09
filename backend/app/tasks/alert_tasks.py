@@ -159,6 +159,9 @@ INTERFACE_METRIC_TYPES = {
 DEFAULT_SKIPPED_INTERFACE_MARKERS = (
     "loopback",
     "null",
+    "m-gigabitethernet",
+    "mgigabitethernet",
+    "mge",
     "vlanif",
     "vlan-interface",
     "vlan interface",
@@ -1111,6 +1114,8 @@ def _run_alert_checks(
     db = SessionLocal()
     try:
         _resolve_alerts_for_disabled_rules(db)
+        if not metric_types or metric_types & INTERFACE_METRIC_TYPES:
+            resolve_interface_alerts_quick()
         query = db.query(AlertRule).filter(AlertRule.enabled == 1)
         if metric_types:
             query = query.filter(AlertRule.metric_type.in_(list(metric_types)))

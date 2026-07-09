@@ -45,9 +45,14 @@ def _interface_aliases(interface_name: Optional[str], interface_index: Optional[
             aliases.add(base_port)
             for candidate in {port_with_channel, base_port}:
                 tail_parts = candidate.split("/")
-                if len(tail_parts) >= 2:
+                if len(tail_parts) == 2:
                     aliases.add("/".join(tail_parts[-2:]))
-                aliases.add(tail_parts[-1])
+                # Do not add only the last numeric segment for multi-part
+                # interface names.  A management port such as
+                # M-GigabitEthernet0/0/1 would otherwise match an include
+                # range like 1/0/1-1/0/4 through the ambiguous alias "1".
+                if len(tail_parts) == 1:
+                    aliases.add(tail_parts[-1])
     if not raw_name and interface_index is not None and str(interface_index).strip():
         # Only fall back to raw interface index when the interface name is unavailable.
         # If a name exists, the index may be an SNMP ifIndex and can accidentally
@@ -105,9 +110,13 @@ def _patterns_to_aliases(text: Optional[str]) -> Set[str]:
             if slash_tail:
                 result.add(slash_tail.group(1))
                 parts = slash_tail.group(1).split("/")
-                if len(parts) >= 2:
+                if len(parts) == 2:
                     result.add("/".join(parts[-2:]))
-                result.add(parts[-1])
+                # Keep range matching precise for chassis/slot/port style
+                # names.  Matching only by the final port number causes
+                # unrelated ports such as 0/0/1 and 1/0/1 to collide.
+                if len(parts) == 1:
+                    result.add(parts[-1])
     return {item for item in result if item}
 
 
