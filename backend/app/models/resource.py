@@ -1,7 +1,7 @@
 """
 资源管理相关模型
 """
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, JSON
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -334,6 +334,61 @@ class IPAddressRecord(Base):
             "circuit_id": self.circuit_id,
             "circuit_name": self.circuit_ref.name if self.circuit_ref else None,
             "description": self.description,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class QualityProbeTarget(Base):
+    """公网质量探测目标"""
+    __tablename__ = "quality_probe_targets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    target = Column(String(255), nullable=False)
+    datacenter_id = Column(Integer, ForeignKey("datacenters.id"), nullable=True)
+    operator_name = Column(String(50))
+    interval_seconds = Column(Integer, default=60)
+    packet_count = Column(Integer, default=5)
+    timeout_ms = Column(Integer, default=1000)
+    latency_threshold_ms = Column(Integer, default=100)
+    loss_threshold_percent = Column(Integer, default=1)
+    jitter_threshold_ms = Column(Integer, default=30)
+    description = Column(Text)
+    is_active = Column(Boolean, default=True)
+    last_probe_at = Column(DateTime(timezone=True))
+    last_success = Column(Boolean)
+    last_avg_latency_ms = Column(Float)
+    last_packet_loss_percent = Column(Float)
+    last_jitter_ms = Column(Float)
+    last_error = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    datacenter_ref = relationship("Datacenter")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "target": self.target,
+            "datacenter_id": self.datacenter_id,
+            "datacenter_name": self.datacenter_ref.name if self.datacenter_ref else None,
+            "operator_name": self.operator_name,
+            "interval_seconds": self.interval_seconds,
+            "packet_count": self.packet_count,
+            "timeout_ms": self.timeout_ms,
+            "latency_threshold_ms": self.latency_threshold_ms,
+            "loss_threshold_percent": self.loss_threshold_percent,
+            "jitter_threshold_ms": self.jitter_threshold_ms,
+            "description": self.description,
+            "is_active": self.is_active,
+            "last_probe_at": self.last_probe_at.isoformat() if self.last_probe_at else None,
+            "last_success": self.last_success,
+            "last_avg_latency_ms": self.last_avg_latency_ms,
+            "last_packet_loss_percent": self.last_packet_loss_percent,
+            "last_jitter_ms": self.last_jitter_ms,
+            "last_error": self.last_error,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

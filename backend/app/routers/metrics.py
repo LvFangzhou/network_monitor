@@ -21,8 +21,9 @@ from app.utils import influx_client
 from app.utils.asternos_exporter_client import asternos_exporter_client
 from app.utils import redis_client
 from app.schemas import MetricQuery, MetricResponse, DashboardStats
+from app.schemas.resource import QualityProbeTargetCreate, QualityProbeTargetUpdate
 from app.database import get_db
-from app.models import Device, AlertHistory, AlertRule, Circuit, Customer, Datacenter
+from app.models import Device, AlertHistory, AlertRule, Circuit, Customer, Datacenter, QualityProbeTarget
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 from app.core import get_logger
@@ -32,6 +33,13 @@ from app.services.flow_listener import flow_listener
 from app.utils.snmp_system_info import extract_snmp_model
 from app.utils.controller_client import ControllerClient
 from app.utils.controller_settings import find_controller_settings
+
+try:
+    from ping3 import ping
+    PING3_AVAILABLE = True
+except ImportError:
+    ping = None
+    PING3_AVAILABLE = False
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -106,6 +114,104 @@ QUEUE_MONITOR_COLORS = [
     "#1677ff",
     "#a0d911",
 ]
+
+
+def _quality_target_payload(target: QualityProbeTarget) -> Dict[str, Any]:
+    return target.to_dict()
+
+
+def _run_quality_ping(target_host: str, packet_count: int = 5, timeout_ms: int = 1000) -> Dict[str, Any]:
+    """执行一次质量探测。返回延迟、丢包、抖动；ping3 不可用时给出明确错误。"""
+    host = str(target_host or "").strip()
+    if not host:
+        return {
+            "success": False,
+            "avg_latency_ms": None,
+            "min_latency_ms": None,
+            "max_latency_ms": None,
+            "jitter_ms": None,
+            "packet_loss_percent": 100.0,
+            "received": 0,
+            "sent": 0,
+            "error": "目标地址为空",
+        }
+    if not PING3_AVAILABLE or ping is None:
+        return {
+            "success": False,
+            "avg_latency_ms": None,
+            "min_latency_ms": None,
+            "max_latency_ms": None,
+            "jitter_ms": None,
+            "packet_loss_percent": 100.0,
+            "received": 0,
+            "sent": packet_count,
+            "error": "服务器缺少 ping3 依赖，无法执行 ICMP 探测",
+        }
+
+    sent = max(1, min(int(packet_count or 5), 20))
+    timeout_seconds = max(0.2, min(float(timeout_ms or 1000) / 1000.0, 10.0))
+    latencies: List[float] = []
+    errors: List[str] = []
+    for _ in range(sent):
+        try:
+            result = ping(host, timeout=timeout_seconds, unit="ms")
+            if result is not None and result is not False:
+                latencies.append(float(result))
+        except Exception as e:
+            errors.append(str(e))
+        time.sleep(0.05)
+
+    received = len(latencies)
+    packet_loss = round((sent - received) * 100.0 / sent, 2)
+    avg_latency = round(sum(latencies) / received, 2) if received else None
+    min_latency = round(min(latencies), 2) if received else None
+    max_latency = round(max(latencies), 2) if received else None
+    jitter = None
+    if len(latencies) >= 2:
+        diffs = [abs(latencies[index] - latencies[index - 1]) for index in range(1, len(latencies))]
+        jitter = round(sum(diffs) / len(diffs), 2)
+    elif len(latencies) == 1:
+        jitter = 0.0
+
+    return {
+        "success": received > 0,
+        "avg_latency_ms": avg_latency,
+        "min_latency_ms": min_latency,
+        "max_latency_ms": max_latency,
+        "jitter_ms": jitter,
+        "packet_loss_percent": packet_loss,
+        "received": received,
+        "sent": sent,
+        "error": None if received > 0 else (errors[-1] if errors else "目标无响应"),
+    }
+
+
+def _write_quality_probe_result(target: QualityProbeTarget, result: Dict[str, Any]) -> None:
+    try:
+        influx_client.write_point(
+            "quality_probe",
+            tags={
+                "target_id": str(target.id),
+                "target": target.target,
+                "name": target.name,
+                "datacenter": target.datacenter_ref.name if target.datacenter_ref else "",
+                "operator": target.operator_name or "",
+            },
+            fields={
+                "success": bool(result.get("success")),
+                "avg_latency_ms": result.get("avg_latency_ms"),
+                "min_latency_ms": result.get("min_latency_ms"),
+                "max_latency_ms": result.get("max_latency_ms"),
+                "jitter_ms": result.get("jitter_ms"),
+                "packet_loss_percent": result.get("packet_loss_percent"),
+                "received": result.get("received"),
+                "sent": result.get("sent"),
+            },
+            timestamp=datetime.now(timezone.utc),
+            sync=False,
+        )
+    except Exception as e:
+        logger.warning("写入质量探测结果失败", target_id=target.id, error=str(e))
 
 
 
@@ -3825,6 +3931,99 @@ async def get_server_resources():
     except Exception as e:
         logger.error("获取服务器资源失败", error=str(e))
         raise HTTPException(status_code=500, detail=f"获取服务器资源失败: {str(e)}")
+
+
+@router.get("/quality/probe-targets")
+async def list_quality_probe_targets(
+    search: Optional[str] = Query(None, description="目标名称/IP/运营商/机房搜索"),
+    active: Optional[bool] = Query(None, description="是否只看启用目标"),
+    db: Session = Depends(get_db),
+):
+    """列出公网质量探测目标"""
+    query = db.query(QualityProbeTarget).outerjoin(Datacenter, QualityProbeTarget.datacenter_id == Datacenter.id)
+    if active is not None:
+        query = query.filter(QualityProbeTarget.is_active == active)
+    if search:
+        keyword = f"%{search.strip()}%"
+        query = query.filter(or_(
+            QualityProbeTarget.name.ilike(keyword),
+            QualityProbeTarget.target.ilike(keyword),
+            QualityProbeTarget.operator_name.ilike(keyword),
+            Datacenter.name.ilike(keyword),
+        ))
+    items = query.order_by(QualityProbeTarget.id.desc()).all()
+    return {"total": len(items), "items": [_quality_target_payload(item) for item in items]}
+
+
+@router.post("/quality/probe-targets")
+async def create_quality_probe_target(
+    payload: QualityProbeTargetCreate,
+    db: Session = Depends(get_db),
+):
+    """新增公网质量探测目标"""
+    data = payload.model_dump()
+    data["target"] = data["target"].strip()
+    data["name"] = data["name"].strip()
+    db_target = QualityProbeTarget(**data)
+    db.add(db_target)
+    db.commit()
+    db.refresh(db_target)
+    return _quality_target_payload(db_target)
+
+
+@router.put("/quality/probe-targets/{target_id}")
+async def update_quality_probe_target(
+    target_id: int,
+    payload: QualityProbeTargetUpdate,
+    db: Session = Depends(get_db),
+):
+    """更新公网质量探测目标"""
+    db_target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
+    if not db_target:
+        raise HTTPException(status_code=404, detail="质量探测目标不存在")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        if isinstance(value, str):
+            value = value.strip()
+        setattr(db_target, key, value)
+    db.commit()
+    db.refresh(db_target)
+    return _quality_target_payload(db_target)
+
+
+@router.delete("/quality/probe-targets/{target_id}")
+async def delete_quality_probe_target(target_id: int, db: Session = Depends(get_db)):
+    """删除公网质量探测目标"""
+    db_target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
+    if not db_target:
+        raise HTTPException(status_code=404, detail="质量探测目标不存在")
+    db.delete(db_target)
+    db.commit()
+    return {"message": "删除成功"}
+
+
+@router.post("/quality/probe-targets/{target_id}/test")
+async def test_quality_probe_target(target_id: int, db: Session = Depends(get_db)):
+    """立即执行一次公网质量探测"""
+    db_target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
+    if not db_target:
+        raise HTTPException(status_code=404, detail="质量探测目标不存在")
+
+    result = await asyncio.to_thread(
+        _run_quality_ping,
+        db_target.target,
+        db_target.packet_count or 5,
+        db_target.timeout_ms or 1000,
+    )
+    db_target.last_probe_at = datetime.now(timezone.utc)
+    db_target.last_success = bool(result.get("success"))
+    db_target.last_avg_latency_ms = result.get("avg_latency_ms")
+    db_target.last_packet_loss_percent = result.get("packet_loss_percent")
+    db_target.last_jitter_ms = result.get("jitter_ms")
+    db_target.last_error = result.get("error")
+    db.commit()
+    db.refresh(db_target)
+    _write_quality_probe_result(db_target, result)
+    return {"target": _quality_target_payload(db_target), "result": result}
 
 
 @router.get("/measurements")

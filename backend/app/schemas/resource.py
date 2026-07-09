@@ -243,3 +243,53 @@ class IPAddressRecordResponse(IPAddressRecordBase):
 
     class Config:
         from_attributes = True
+
+
+class QualityProbeTargetBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    target: str = Field(..., min_length=1, max_length=255)
+    datacenter_id: Optional[int] = None
+    operator_name: Optional[str] = Field(None, max_length=50)
+    interval_seconds: int = Field(default=60, ge=10, le=3600)
+    packet_count: int = Field(default=5, ge=1, le=20)
+    timeout_ms: int = Field(default=1000, ge=200, le=10000)
+    latency_threshold_ms: int = Field(default=100, ge=1, le=10000)
+    loss_threshold_percent: int = Field(default=1, ge=0, le=100)
+    jitter_threshold_ms: int = Field(default=30, ge=0, le=10000)
+    description: Optional[str] = None
+    is_active: bool = True
+
+
+class QualityProbeTargetCreate(QualityProbeTargetBase):
+    pass
+
+
+class QualityProbeTargetUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    target: Optional[str] = Field(None, min_length=1, max_length=255)
+    datacenter_id: Optional[int] = None
+    operator_name: Optional[str] = Field(None, max_length=50)
+    interval_seconds: Optional[int] = Field(None, ge=10, le=3600)
+    packet_count: Optional[int] = Field(None, ge=1, le=20)
+    timeout_ms: Optional[int] = Field(None, ge=200, le=10000)
+    latency_threshold_ms: Optional[int] = Field(None, ge=1, le=10000)
+    loss_threshold_percent: Optional[int] = Field(None, ge=0, le=100)
+    jitter_threshold_ms: Optional[int] = Field(None, ge=0, le=10000)
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class QualityProbeTargetResponse(QualityProbeTargetBase):
+    id: int
+    datacenter_name: Optional[str] = None
+    last_probe_at: Optional[datetime] = None
+    last_success: Optional[bool] = None
+    last_avg_latency_ms: Optional[float] = None
+    last_packet_loss_percent: Optional[float] = None
+    last_jitter_ms: Optional[float] = None
+    last_error: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True

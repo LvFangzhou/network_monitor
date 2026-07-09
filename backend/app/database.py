@@ -252,6 +252,16 @@ def ensure_compatible_schema() -> None:
                 "WHERE ip_address ~ '^((25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$'"
             ))
 
+        if "quality_probe_targets" in table_names:
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_active "
+                "ON quality_probe_targets (is_active, id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_datacenter "
+                "ON quality_probe_targets (datacenter_id)"
+            ))
+
         if "alert_histories" in table_names:
             connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_alert_histories_status_started "

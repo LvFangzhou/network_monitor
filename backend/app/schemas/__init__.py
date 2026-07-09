@@ -23,7 +23,8 @@ from app.schemas.resource import (
     CustomerCreate, CustomerUpdate, CustomerResponse,
     VendorCreate, VendorUpdate, VendorResponse,
     CircuitCreate, CircuitUpdate, CircuitResponse,
-    IPAddressRecordCreate, IPAddressRecordUpdate, IPAddressRecordResponse
+    IPAddressRecordCreate, IPAddressRecordUpdate, IPAddressRecordResponse,
+    QualityProbeTargetCreate, QualityProbeTargetUpdate, QualityProbeTargetResponse
 )
 
 __all__ = [
@@ -45,5 +46,6 @@ __all__ = [
     "CustomerCreate", "CustomerUpdate", "CustomerResponse",
     "VendorCreate", "VendorUpdate", "VendorResponse",
     "CircuitCreate", "CircuitUpdate", "CircuitResponse",
-    "IPAddressRecordCreate", "IPAddressRecordUpdate", "IPAddressRecordResponse"
+    "IPAddressRecordCreate", "IPAddressRecordUpdate", "IPAddressRecordResponse",
+    "QualityProbeTargetCreate", "QualityProbeTargetUpdate", "QualityProbeTargetResponse"
 ]

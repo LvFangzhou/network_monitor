@@ -647,3 +647,73 @@ export const queryMetrics = async (params: {
 }): Promise<{ data: MetricPoint[]; total: number }> => {
   return await request.get('/metrics/query', { params }) as { data: MetricPoint[]; total: number }
 }
+
+export interface QualityProbeTarget {
+  id: number
+  name: string
+  target: string
+  datacenter_id?: number | null
+  datacenter_name?: string | null
+  operator_name?: string | null
+  interval_seconds: number
+  packet_count: number
+  timeout_ms: number
+  latency_threshold_ms: number
+  loss_threshold_percent: number
+  jitter_threshold_ms: number
+  description?: string | null
+  is_active: boolean
+  last_probe_at?: string | null
+  last_success?: boolean | null
+  last_avg_latency_ms?: number | null
+  last_packet_loss_percent?: number | null
+  last_jitter_ms?: number | null
+  last_error?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface QualityProbeResult {
+  success: boolean
+  avg_latency_ms?: number | null
+  min_latency_ms?: number | null
+  max_latency_ms?: number | null
+  jitter_ms?: number | null
+  packet_loss_percent?: number | null
+  received: number
+  sent: number
+  error?: string | null
+}
+
+export const getQualityProbeTargets = async (params?: {
+  search?: string
+  active?: boolean
+}): Promise<{ total: number; items: QualityProbeTarget[] }> => {
+  return await request.get('/metrics/quality/probe-targets', { params }) as { total: number; items: QualityProbeTarget[] }
+}
+
+export const createQualityProbeTarget = async (
+  data: Partial<QualityProbeTarget>
+): Promise<QualityProbeTarget> => {
+  return await request.post('/metrics/quality/probe-targets', data) as QualityProbeTarget
+}
+
+export const updateQualityProbeTarget = async (
+  id: number,
+  data: Partial<QualityProbeTarget>
+): Promise<QualityProbeTarget> => {
+  return await request.put(`/metrics/quality/probe-targets/${id}`, data) as QualityProbeTarget
+}
+
+export const deleteQualityProbeTarget = async (id: number): Promise<void> => {
+  await request.delete(`/metrics/quality/probe-targets/${id}`)
+}
+
+export const testQualityProbeTarget = async (
+  id: number
+): Promise<{ target: QualityProbeTarget; result: QualityProbeResult }> => {
+  return await request.post(`/metrics/quality/probe-targets/${id}/test`) as {
+    target: QualityProbeTarget
+    result: QualityProbeResult
+  }
+}
