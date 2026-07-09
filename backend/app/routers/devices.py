@@ -1600,7 +1600,7 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
         _cached_lldp_rows(cached_lldp),
         _cached_lldp_rows(cached_protocol),
     )
-    if interfaces and not _lldp_rows_have_useful_neighbor(lldp_rows):
+    if monitor_source != "asternos_exporter" and interfaces and not _lldp_rows_have_useful_neighbor(lldp_rows):
         collected_lldp_rows = await _collect_lldp_rows_for_device_detail(device)
         if collected_lldp_rows:
             lldp_rows = _merge_lldp_rows_for_device_detail(lldp_rows, collected_lldp_rows)

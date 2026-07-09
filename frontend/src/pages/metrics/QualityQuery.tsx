@@ -2,11 +2,13 @@ import { type Key, useEffect, useMemo, useState } from 'react'
 import {
   Button,
   Card,
+  Checkbox,
   Form,
   Input,
   InputNumber,
   Modal,
   Popconfirm,
+  Popover,
   Select,
   Space,
   Switch,
@@ -15,7 +17,7 @@ import {
   Typography,
   message,
 } from 'antd'
-import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons'
+import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, SettingOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from 'recharts'
 import {
@@ -55,6 +57,30 @@ const rangeOptions = [
   { label: '7天', value: '-7d', interval: '15m' },
   { label: '30天', value: '-30d', interval: '1h' },
   { label: '365天', value: '-365d', interval: '1d' },
+]
+
+const qualityColumnOptions = [
+  { label: '机房', value: 'datacenter' },
+  { label: '运营商', value: 'operator' },
+  { label: '启用', value: 'enabled' },
+  { label: '状态', value: 'probe_status' },
+  { label: '延迟', value: 'latency' },
+  { label: '丢包', value: 'loss' },
+  { label: '抖动', value: 'jitter' },
+  { label: '阈值', value: 'threshold' },
+  { label: '采样', value: 'sampling' },
+  { label: '最近测试时间', value: 'last_probe_at' },
+]
+
+const defaultVisibleColumns = [
+  'datacenter',
+  'operator',
+  'enabled',
+  'probe_status',
+  'latency',
+  'loss',
+  'jitter',
+  'last_probe_at',
 ]
 
 const formatChartTime = (value: string | number, rangeValue: string) => {
@@ -158,17 +184,17 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
             />
             <YAxis
               yAxisId="ms"
-              width={72}
+              width={82}
               tick={{ fontSize: 11 }}
-              label={{ value: 'ms', angle: -90, position: 'insideLeft' }}
+              tickFormatter={(value) => `${value} ms`}
             />
             <YAxis
               yAxisId="percent"
               orientation="right"
-              width={72}
+              width={82}
               tick={{ fontSize: 11 }}
               domain={[0, 100]}
-              label={{ value: '%', angle: 90, position: 'insideRight' }}
+              tickFormatter={(value) => `${value}%`}
             />
             <ChartTooltip
               labelFormatter={(value) => formatTime(new Date(Number(value)).toISOString())}
@@ -209,6 +235,7 @@ const QualityQuery = () => {
   const [mtrTitle, setMtrTitle] = useState('')
   const [mtrCommand, setMtrCommand] = useState('')
   const [mtrOutput, setMtrOutput] = useState('')
+  const [visibleColumnKeys, setVisibleColumnKeys] = useState<string[]>(defaultVisibleColumns)
 
   const fetchItems = async (silent = false) => {
     if (!silent) setLoading(true)
@@ -346,8 +373,18 @@ const QualityQuery = () => {
     }
   }
 
-  const columns: ColumnsType<QualityProbeTarget> = [
+  const formatMetricTag = (
+    value: number | null | undefined,
+    unit: string,
+    color: string = 'blue',
+  ) => {
+    if (value === null || value === undefined) return <Text type="secondary">-</Text>
+    return <Tag color={color}>{value} {unit}</Tag>
+  }
+
+  const columnDefinitions: ColumnsType<QualityProbeTarget> = [
     {
+      key: 'name',
       title: '探测名称',
       dataIndex: 'name',
       width: 180,
@@ -359,39 +396,61 @@ const QualityQuery = () => {
         </Space>
       ),
     },
-    { title: '机房', dataIndex: 'datacenter_name', width: 150, render: (value) => value || '-' },
-    { title: '运营商', dataIndex: 'operator_name', width: 110, render: (value) => value || '-' },
+    { key: 'datacenter', title: '机房', dataIndex: 'datacenter_name', width: 150, render: (value) => value || '-' },
+    { key: 'operator', title: '运营商', dataIndex: 'operator_name', width: 110, render: (value) => value || '-' },
     {
-      title: '状态',
+      key: 'enabled',
+      title: '启用',
       dataIndex: 'is_active',
       width: 90,
       render: (value: boolean) => <Tag color={value ? 'green' : 'default'}>{value ? '启用' : '停用'}</Tag>,
     },
     {
-      title: '最近结果',
-      width: 240,
+      key: 'probe_status',
+      title: '状态',
+      width: 100,
       render: (_, record) => {
-        if (record.last_success === null || record.last_success === undefined) return <Text type="secondary">未测试</Text>
+        if (record.last_success === null || record.last_success === undefined) return <Tag>未测试</Tag>
         return (
-          <Space direction="vertical" size={2}>
-            <Space size={6} wrap>
-              <Tag color={record.last_success ? 'green' : 'red'}>{record.last_success ? '正常' : '异常'}</Tag>
-              <Tag color={latencyColor(record.last_avg_latency_ms, record.latency_threshold_ms)}>
-                延迟 {record.last_avg_latency_ms ?? '-'} ms
-              </Tag>
-              <Tag color={(record.last_packet_loss_percent || 0) > record.loss_threshold_percent ? 'red' : 'green'}>
-                丢包 {record.last_packet_loss_percent ?? '-'}%
-              </Tag>
-              <Tag color={(record.last_jitter_ms || 0) > record.jitter_threshold_ms ? 'orange' : 'blue'}>
-                抖动 {record.last_jitter_ms ?? '-'} ms
-              </Tag>
-            </Space>
+          <Space direction="vertical" size={0}>
+            <Tag color={record.last_success ? 'green' : 'red'}>{record.last_success ? '正常' : '异常'}</Tag>
             {record.last_error ? <Text type="secondary" style={{ fontSize: 12 }}>{record.last_error}</Text> : null}
           </Space>
         )
       },
     },
     {
+      key: 'latency',
+      title: '延迟',
+      width: 100,
+      render: (_, record) => formatMetricTag(
+        record.last_avg_latency_ms,
+        'ms',
+        latencyColor(record.last_avg_latency_ms, record.latency_threshold_ms)
+      ),
+    },
+    {
+      key: 'loss',
+      title: '丢包',
+      width: 90,
+      render: (_, record) => formatMetricTag(
+        record.last_packet_loss_percent,
+        '%',
+        (record.last_packet_loss_percent || 0) > record.loss_threshold_percent ? 'red' : 'green'
+      ),
+    },
+    {
+      key: 'jitter',
+      title: '抖动',
+      width: 90,
+      render: (_, record) => formatMetricTag(
+        record.last_jitter_ms,
+        'ms',
+        (record.last_jitter_ms || 0) > record.jitter_threshold_ms ? 'orange' : 'blue'
+      ),
+    },
+    {
+      key: 'threshold',
       title: '阈值',
       width: 170,
       render: (_, record) => (
@@ -401,17 +460,20 @@ const QualityQuery = () => {
       ),
     },
     {
+      key: 'sampling',
       title: '采样',
       width: 140,
       render: (_, record) => `${record.interval_seconds}s / ${record.packet_count}包 / ${record.timeout_ms}ms`,
     },
     {
+      key: 'last_probe_at',
       title: '最近测试时间',
       dataIndex: 'last_probe_at',
       width: 170,
       render: formatTime,
     },
     {
+      key: 'action',
       title: '操作',
       width: 230,
       fixed: 'right',
@@ -435,6 +497,26 @@ const QualityQuery = () => {
     },
   ]
 
+  const columns = columnDefinitions.filter((column) => {
+    const key = String(column.key || '')
+    return key === 'name' || key === 'action' || visibleColumnKeys.includes(key)
+  })
+
+  const columnPopover = (
+    <div style={{ width: 180 }}>
+      <Checkbox.Group
+        value={visibleColumnKeys}
+        onChange={(values) => setVisibleColumnKeys(values.map(String))}
+      >
+        <Space direction="vertical">
+          {qualityColumnOptions.map((item) => (
+            <Checkbox key={item.value} value={item.value}>{item.label}</Checkbox>
+          ))}
+        </Space>
+      </Checkbox.Group>
+    </div>
+  )
+
   return (
     <Space direction="vertical" size="middle" style={{ width: '100%' }}>
       <div style={{ color: '#8c8c8c', fontSize: 13 }}>监控中心 / 质量查询</div>
@@ -450,6 +532,9 @@ const QualityQuery = () => {
         extra={(
           <Space wrap>
             <Button icon={<ReloadOutlined />} loading={loading} onClick={() => fetchItems()}>刷新</Button>
+            <Popover content={columnPopover} trigger="click" placement="bottomRight">
+              <Button icon={<SettingOutlined />}>列展示</Button>
+            </Popover>
             <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新增目标</Button>
           </Space>
         )}
