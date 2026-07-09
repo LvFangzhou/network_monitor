@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Button, Card, Col, DatePicker, Descriptions, Empty, Input, InputNumber, Row, Select, Space, Spin, Table, Tabs, Tag, message } from 'antd'
+import { Alert, Button, Card, Col, DatePicker, Descriptions, Empty, Input, InputNumber, Row, Select, Space, Spin, Table, Tabs, Tag, message } from 'antd'
 import { ArrowLeftOutlined, DownloadOutlined, EditOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from 'recharts'
 import dayjs from 'dayjs'
@@ -66,6 +66,12 @@ const statusTag = (value?: string) => {
   const normalized = String(value || '').toLowerCase()
   const color = normalized === 'up' || normalized === '1' || normalized === 'normal' ? 'success' : normalized === 'down' || normalized === '0' ? 'error' : 'default'
   return <Tag color={color}>{value || '-'}</Tag>
+}
+
+const hardwareStatusTag = (row: DeviceHardwareRow) => {
+  const known = row.status_known !== undefined && row.status_known !== null ? String(row.status_known) !== '0' : row.up !== undefined && row.up !== null
+  if (!known) return <Tag color="default">未知</Tag>
+  return statusTag(String(row.up) === '1' ? 'normal' : 'down')
 }
 
 const DeviceDetail = () => {
@@ -155,12 +161,14 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
   const [loading, setLoading] = useState(false)
   const [rows, setRows] = useState<DeviceConnectionRow[]>([])
   const [keyword, setKeyword] = useState('')
+  const [notice, setNotice] = useState('')
 
   const fetchRows = async () => {
     setLoading(true)
     try {
       const result = await getDeviceConnections(deviceId)
       setRows(result.items || [])
+      setNotice(result.message || '')
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '读取连接信息失败')
     } finally {
@@ -182,6 +190,7 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
         <Input allowClear prefix={<SearchOutlined />} placeholder="搜索接口/描述/对端" value={keyword} onChange={(event) => setKeyword(event.target.value)} style={{ width: 260 }} />
         <Button icon={<ReloadOutlined />} onClick={fetchRows}>刷新</Button>
       </Space>
+      {notice ? <Alert type="info" showIcon message={notice} /> : null}
       <Table<DeviceConnectionRow>
         loading={loading}
         rowKey={(row) => row.index || row.name}
@@ -190,8 +199,18 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
         scroll={{ x: 1500 }}
         pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100] }}
         columns={[
-          { title: '本地接口名称', dataIndex: 'name', width: 180, fixed: 'left' },
-          { title: '逻辑接口', dataIndex: 'logical_type', width: 110 },
+          {
+            title: '本地接口名称',
+            dataIndex: 'name',
+            width: 210,
+            fixed: 'left',
+            render: (value, row) => (
+              <Space direction="vertical" size={0}>
+                <span>{value || '-'}</span>
+                {row.logical_type ? <span style={{ color: '#8c8c8c', fontSize: 12 }}>{row.logical_type}</span> : null}
+              </Space>
+            ),
+          },
           { title: '描述', dataIndex: 'description', width: 260, ellipsis: true },
           { title: '速率', dataIndex: 'speed_bps', width: 120, render: formatBps },
           { title: 'MTU', dataIndex: 'mtu', width: 90 },
@@ -230,7 +249,7 @@ const TrafficTab = ({ deviceId }: { deviceId: number }) => {
   const selected = useMemo(() => {
     const key = keyword.trim().toLowerCase()
     return interfaces
-      .filter((item) => !key || [item.name, item.description, item.remote_device].some((value) => String(value || '').toLowerCase().includes(key)))
+      .filter((item) => !key || String(item.name || '').toLowerCase().includes(key))
       .sort((a, b) => (String(a.oper_status).toLowerCase() === 'up' ? 0 : 1) - (String(b.oper_status).toLowerCase() === 'up' ? 0 : 1))
       .slice(0, limit)
   }, [interfaces, keyword, limit])
@@ -249,7 +268,7 @@ const TrafficTab = ({ deviceId }: { deviceId: number }) => {
   return (
     <Space direction="vertical" style={{ width: '100%' }} size={12}>
       <Space wrap>
-        <Input allowClear prefix={<SearchOutlined />} placeholder="筛选接口/描述/对端" value={keyword} onChange={(event) => setKeyword(event.target.value)} style={{ width: 260 }} />
+        <Input allowClear prefix={<SearchOutlined />} placeholder="筛选接口" value={keyword} onChange={(event) => setKeyword(event.target.value)} style={{ width: 220 }} />
         <span>展示接口数</span>
         <InputNumber min={2} max={24} value={limit} onChange={(value) => setLimit(Number(value || 6))} />
       </Space>
@@ -261,15 +280,20 @@ const TrafficTab = ({ deviceId }: { deviceId: number }) => {
               in_bps: Number(point.in_bps || 0),
               out_bps: Number(point.out_bps || 0),
             }))
+            const title = `${item.name}${item.description ? ` / ${item.description}` : ''}`
             return (
-              <Col span={12} key={item.index}>
-                <Card size="small" title={`${item.name}${item.description ? ` / ${item.description}` : ''}`}>
+              <Col xs={24} xl={12} key={item.index}>
+                <Card
+                  size="small"
+                  title={<div title={title} style={{ maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{title}</div>}
+                  styles={{ header: { minWidth: 0 }, body: { overflow: 'hidden' } }}
+                >
                   {data.length ? (
                     <ResponsiveContainer width="100%" height={220}>
-                      <LineChart data={data} margin={{ top: 8, right: 20, left: 0, bottom: 8 }}>
+                      <LineChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 8 }}>
                         <CartesianGrid strokeDasharray="3 3" />
                         <XAxis dataKey="time" minTickGap={28} />
-                        <YAxis tickFormatter={formatBps} width={70} />
+                        <YAxis tickFormatter={formatBps} width={76} />
                         <ChartTooltip formatter={(value) => formatBps(Number(value))} />
                         <Line type="monotone" dataKey="in_bps" name="In" stroke="#52c41a" dot={false} strokeWidth={1.8} />
                         <Line type="monotone" dataKey="out_bps" name="Out" stroke="#1677ff" dot={false} strokeWidth={1.8} />
@@ -435,7 +459,7 @@ const HardwareTab = ({ deviceId }: { deviceId: number }) => {
       columns={[
         { title: '硬件类型', dataIndex: 'component_type', width: 140 },
         { title: '模块/名称', dataIndex: 'component' },
-        { title: '状态', dataIndex: 'up', width: 120, render: (value) => statusTag(String(value) === '1' ? 'normal' : 'down') },
+        { title: '状态', dataIndex: 'up', width: 120, render: (_, row) => hardwareStatusTag(row) },
         { title: '在位', dataIndex: 'present', width: 100 },
         { title: '速率', dataIndex: 'speed', width: 120 },
         { title: '采集时间', dataIndex: 'time', width: 180, render: formatDateTimeText },

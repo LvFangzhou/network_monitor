@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 from pydantic import BaseModel
+import asyncio
 import re
 import json
 from pathlib import Path
@@ -113,6 +114,73 @@ def _extract_tacacs_command(raw_command: str) -> str:
     arg_match = re.search(r"\bcmd-arg=(.*?)(?=\s+(?:err_msg|start_time)=|$)", rest)
     cmd_arg = arg_match.group(1).strip() if arg_match else ""
     return f"{command} {cmd_arg}".strip() if cmd_arg else command
+
+
+def _normalize_interface_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    replacements = {
+        "hundredgige": "hge",
+        "hundred-gigabitethernet": "hge",
+        "hundredgigabitethernet": "hge",
+        "fourhundredgige": "400g",
+        "fourhundredgigabitethernet": "400g",
+        "fourhundred-gigabitethernet": "400g",
+        "ten-gigabitethernet": "tengige",
+        "tengigabitethernet": "tengige",
+        "gigabitethernet": "ge",
+        "m-gigabitethernet": "mge",
+    }
+    normalized = re.sub(r"\s+", "", text)
+    for src, dst in replacements.items():
+        normalized = normalized.replace(src, dst)
+    return re.sub(r"[^a-z0-9/._-]", "", normalized)
+
+
+def _latest_device_config_text(db: Session, device_id: int) -> str:
+    result = (
+        db.query(ConfigBackupResult.config_content)
+        .filter(
+            ConfigBackupResult.device_id == device_id,
+            ConfigBackupResult.status == "success",
+            ConfigBackupResult.config_content.isnot(None),
+        )
+        .order_by(ConfigBackupResult.finished_at.desc().nullslast(), ConfigBackupResult.id.desc())
+        .first()
+    )
+    return str(result[0] or "") if result else ""
+
+
+def _parse_interface_config_fields(config_text: str) -> Dict[str, Dict[str, str]]:
+    """从最新配置备份里提取接口描述/IP，作为 SNMP/LLDP 字段缺失时的兜底。"""
+    fields: Dict[str, Dict[str, str]] = {}
+    current_name = ""
+    for raw_line in (config_text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = re.match(r"^(?:interface|Interface)\s+(.+)$", stripped, re.IGNORECASE)
+        if match:
+            current_name = match.group(1).strip()
+            if current_name:
+                fields.setdefault(_normalize_interface_key(current_name), {"name": current_name})
+            continue
+        if not current_name:
+            continue
+        key = _normalize_interface_key(current_name)
+        bucket = fields.setdefault(key, {"name": current_name})
+        desc_match = re.match(r"^(?:description|port\s+description)\s+(.+)$", stripped, re.IGNORECASE)
+        if desc_match and not bucket.get("description"):
+            bucket["description"] = desc_match.group(1).strip()
+            continue
+        ip_match = re.match(r"^ip\s+address\s+(\d+\.\d+\.\d+\.\d+)(?:\s+(\d+\.\d+\.\d+\.\d+)|/(\d+))?", stripped, re.IGNORECASE)
+        if ip_match and not bucket.get("ip_address"):
+            ip_addr = ip_match.group(1)
+            mask_or_prefix = ip_match.group(2) or (f"/{ip_match.group(3)}" if ip_match.group(3) else "")
+            bucket["ip_address"] = f"{ip_addr} {mask_or_prefix}".strip()
+    return fields
 
 
 def _infer_tacacs_operation(command: str, raw: str) -> str:
@@ -951,9 +1019,32 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
     interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
     source = "cache"
     if not interfaces:
-        # 设备详情页不能被实时 SNMP 全量接口 walk 卡住。这里仅使用后台采集快照；
-        # 若快照暂未生成，由 SNMP/Exporter 采集任务在后台补齐。
-        return {"device": device.to_dict(), "items": [], "total": 0, "source": "cache_miss"}
+        # 优先用后台快照；快照缺失时做一次限时 SNMP 轻量补采，避免详情页长期空白。
+        # 大端口设备 SNMP walk 可能较慢，所以必须设置超时，超时后仍返回页面而不是一直转圈。
+        if getattr(device, "snmp_version", None):
+            try:
+                interfaces = await asyncio.wait_for(
+                    asyncio.to_thread(SNMPCollector().list_interfaces, device),
+                    timeout=15,
+                )
+                source = "snmp_live"
+            except Exception:
+                logger.warning("设备详情接口实时补采失败 device_id=%s ip=%s", device.id, device.ip_address, exc_info=True)
+                return {
+                    "device": device.to_dict(),
+                    "items": [],
+                    "total": 0,
+                    "source": "cache_miss",
+                    "message": "后台接口快照暂未生成，实时补采超时或失败，请稍后刷新或触发设备采集",
+                }
+        else:
+            return {
+                "device": device.to_dict(),
+                "items": [],
+                "total": 0,
+                "source": "cache_miss",
+                "message": "设备未配置 SNMP/Exporter 接口采集参数",
+            }
 
     cached_lldp = _load_monitor_cache("lldp_neighbors_v2", device.id) or _load_monitor_cache("protocol_neighbors", device.id)
     if isinstance(cached_lldp, dict) and isinstance(cached_lldp.get("neighbors"), dict):
@@ -963,34 +1054,64 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
     else:
         lldp_rows = []
 
-    lldp_by_index = {str(item.get("local_index") or item.get("interface_index") or ""): item for item in lldp_rows}
-    lldp_by_name = {str(item.get("local_port") or item.get("interface") or "").strip(): item for item in lldp_rows if item.get("local_port") or item.get("interface")}
+    lldp_by_index = {
+        str(item.get("local_index") or item.get("local_port_num") or item.get("interface_index") or ""): item
+        for item in lldp_rows
+    }
+    lldp_by_name: Dict[str, Dict[str, Any]] = {}
+    for item in lldp_rows:
+        for key in [item.get("local_port"), item.get("interface"), item.get("local_port_id")]:
+            normalized = _normalize_interface_key(key)
+            if normalized:
+                lldp_by_name.setdefault(normalized, item)
+
+    config_fields = _parse_interface_config_fields(_latest_device_config_text(db, device.id))
 
     items = []
     for iface in interfaces or []:
         index = str(iface.get("index") or iface.get("interface_index") or "")
         name = str(iface.get("name") or iface.get("interface_name") or iface.get("alias") or "")
-        neighbor = lldp_by_index.get(index) or lldp_by_name.get(name) or {}
+        neighbor = lldp_by_index.get(index) or lldp_by_name.get(_normalize_interface_key(name)) or {}
+        config_item = config_fields.get(_normalize_interface_key(name)) or {}
+        description = (
+            iface.get("alias")
+            or config_item.get("description")
+            or iface.get("description")
+            or ""
+        )
+        ip_address = iface.get("ip_address") or iface.get("interface_ip") or config_item.get("ip_address") or ""
         items.append({
             "index": index,
             "name": name,
-            "logical_type": iface.get("type") or iface.get("interface_type") or "",
-            "description": iface.get("description") or iface.get("alias") or "",
+            "logical_type": iface.get("logical_type") or iface.get("type") or iface.get("interface_type") or "",
+            "description": description,
             "speed_bps": iface.get("speed_bps"),
             "mtu": iface.get("mtu"),
-            "ip_address": iface.get("ip_address") or iface.get("interface_ip") or "",
+            "ip_address": ip_address,
             "oper_status": iface.get("oper_status") or "",
             "admin_status": iface.get("admin_status") or "",
             "remote_device": neighbor.get("remote_system") or neighbor.get("remote_device") or "",
             "remote_interface": neighbor.get("remote_port") or neighbor.get("remote_interface") or "",
-            "remote_management_ip": neighbor.get("remote_management_address") or neighbor.get("remote_management_ip") or neighbor.get("management_address") or "",
+            "remote_management_ip": (
+                neighbor.get("remote_mgmt_addr")
+                or neighbor.get("remote_management_address")
+                or neighbor.get("remote_management_ip")
+                or neighbor.get("management_address")
+                or ""
+            ),
         })
 
     def _sort_key(item: Dict[str, Any]):
         return (0 if str(item.get("oper_status")).lower() == "up" else 1, item.get("name") or "")
 
     items.sort(key=_sort_key)
-    return {"device": device.to_dict(), "items": items, "total": len(items), "source": source}
+    message = None
+    if source == "cache" and items:
+        missing_mtu_count = sum(1 for item in items if item.get("mtu") in (None, ""))
+        missing_type_count = sum(1 for item in items if not item.get("logical_type"))
+        if missing_mtu_count >= max(3, int(len(items) * 0.8)) or missing_type_count >= max(3, int(len(items) * 0.8)):
+            message = "当前接口数据来自旧快照，MTU/逻辑类型等新增字段会在下一轮 SNMP 接口采集后自动补齐"
+    return {"device": device.to_dict(), "items": items, "total": len(items), "source": source, "message": message}
 
 
 @router.get("/{device_id}/detail/syslog", response_model=dict)

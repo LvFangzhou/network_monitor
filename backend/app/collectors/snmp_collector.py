@@ -637,11 +637,14 @@ class SNMPCollector(LoggerMixin):
         walk_jobs = {
             "if_name_map": ("1.3.6.1.2.1.31.1.1.1.1", str),
             "if_descr_map": ("1.3.6.1.2.1.2.2.1.2", str),
+            "if_type_map": ("1.3.6.1.2.1.2.2.1.3", int),
+            "if_mtu_map": ("1.3.6.1.2.1.2.2.1.4", int),
             "if_alias_map": ("1.3.6.1.2.1.31.1.1.1.18", str),
             "admin_status_map": ("1.3.6.1.2.1.2.2.1.7", int),
             "oper_status_map": ("1.3.6.1.2.1.2.2.1.8", int),
             "high_speed_map": ("1.3.6.1.2.1.31.1.1.1.15", int),
             "speed_map": ("1.3.6.1.2.1.2.2.1.5", int),
+            "ip_ifindex_map": ("1.3.6.1.2.1.4.20.1.2", str),
         }
         with ThreadPoolExecutor(max_workers=len(walk_jobs)) as executor:
             futures = {
@@ -652,11 +655,20 @@ class SNMPCollector(LoggerMixin):
 
         if_name_map = walk_results["if_name_map"]
         if_descr_map = walk_results["if_descr_map"]
+        if_type_map = walk_results["if_type_map"]
+        if_mtu_map = walk_results["if_mtu_map"]
         if_alias_map = walk_results["if_alias_map"]
         admin_status_map = walk_results["admin_status_map"]
         oper_status_map = walk_results["oper_status_map"]
         high_speed_map = walk_results["high_speed_map"]
         speed_map = walk_results["speed_map"]
+        ip_ifindex_map = walk_results["ip_ifindex_map"]
+
+        ifindex_ip_map: Dict[str, List[str]] = {}
+        for ip_addr, ifindex in ip_ifindex_map.items():
+            if not ip_addr or not ifindex:
+                continue
+            ifindex_ip_map.setdefault(str(ifindex), []).append(str(ip_addr))
 
         status_map = {
             1: "up",
@@ -666,6 +678,14 @@ class SNMPCollector(LoggerMixin):
             5: "dormant",
             6: "notPresent",
             7: "lowerLayerDown",
+        }
+        if_type_map_text = {
+            6: "ethernet",
+            24: "loopback",
+            53: "virtual",
+            135: "vlan",
+            136: "l3vlan",
+            161: "aggregation",
         }
 
         indexes = sorted(
@@ -678,6 +698,7 @@ class SNMPCollector(LoggerMixin):
             name = if_name_map.get(index) or if_descr_map.get(index) or f"if{index}"
             descr = if_descr_map.get(index) or name
             alias = if_alias_map.get(index) or ""
+            if_type = if_type_map.get(index)
             high_speed = high_speed_map.get(index)
             speed = speed_map.get(index)
             if high_speed and high_speed > 0:
@@ -692,6 +713,10 @@ class SNMPCollector(LoggerMixin):
                 "name": name,
                 "description": descr,
                 "alias": alias,
+                "type": if_type_map_text.get(if_type, str(if_type) if if_type is not None else ""),
+                "interface_type": if_type_map_text.get(if_type, str(if_type) if if_type is not None else ""),
+                "mtu": if_mtu_map.get(index),
+                "ip_address": ", ".join(ifindex_ip_map.get(str(index), [])),
                 "admin_status": status_map.get(admin_status_map.get(index), "unknown"),
                 "oper_status": status_map.get(oper_status_map.get(index), "unknown"),
                 "speed_bps": speed_bps,
