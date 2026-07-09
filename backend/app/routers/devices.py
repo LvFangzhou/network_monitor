@@ -5,16 +5,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import case, cast, func, or_
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.orm import Session, joinedload
-from typing import List, Optional
-from datetime import datetime
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 import re
+import json
+from pathlib import Path
 
 from app.database import get_db
-from app.models import AlertHistory, Device, DeviceGroup, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
+from app.models import AlertHistory, ConfigBackupResult, Device, DeviceGroup, SyslogEvent, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
 from app.collectors.snmp_collector import SNMPCollector
 from app.utils.interface_scope import alert_target_interface_is_monitored
 from app.utils.redis_client import redis_client
+from app.utils import influx_client
 from app.schemas import (
     DeviceCreate, DeviceUpdate, DeviceResponse,
     DeviceGroupCreate, DeviceGroupUpdate, DeviceGroupResponse,
@@ -34,6 +37,12 @@ ACTIVE_ALERT_STATUSES = ("firing", "acknowledged", "ignored", "snoozed")
 DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX = "monitor:cache:overview_snapshot"
 DEVICE_OVERVIEW_LAST_SUCCESS_CACHE_PREFIX = "monitor:cache:last_success_overview_snapshot"
 DEVICE_OVERVIEW_REVISION_KEY = "monitor:cache:overview_revision"
+TACACS_LOG_FILE = Path("/app/data/tacacs/logs/tacacs.log")
+TACACS_LOG_PATTERN = re.compile(r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
+TACACS_MONTH_MAP = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
 
 
 def _invalidate_device_overview_response_cache() -> None:
@@ -58,6 +67,69 @@ def _bump_device_overview_revision() -> None:
         redis_client.incr(DEVICE_OVERVIEW_REVISION_KEY)
     except Exception:
         logger.warning("递增设备总览版本失败", exc_info=True)
+
+
+def _monitor_cache_key(kind: str, device_id: int, suffix: str = "") -> str:
+    return f"monitor:cache:{kind}:{device_id}{suffix}"
+
+
+def _load_monitor_cache(kind: str, device_id: int, suffix: str = "") -> Optional[Dict[str, Any]]:
+    raw = redis_client.get(_monitor_cache_key(kind, device_id, suffix))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _parse_time_filter(value: Optional[str]) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _format_tacacs_time(raw_time: str) -> Optional[str]:
+    try:
+        month_text, day, time_text = raw_time.split()
+        hour, minute, second = [int(item) for item in time_text.split(":")]
+        parsed = datetime(datetime.now().year, TACACS_MONTH_MAP[month_text], int(day), hour, minute, second)
+        return (parsed + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _extract_tacacs_command(raw_command: str) -> str:
+    text = (raw_command or "").strip()
+    if not text:
+        return ""
+    marker_match = re.search(r"\s+(cmd-arg|err_msg|start_time)=", text)
+    command = text[:marker_match.start()].strip() if marker_match else text
+    rest = text[marker_match.start():] if marker_match else ""
+    arg_match = re.search(r"\bcmd-arg=(.*?)(?=\s+(?:err_msg|start_time)=|$)", rest)
+    cmd_arg = arg_match.group(1).strip() if arg_match else ""
+    return f"{command} {cmd_arg}".strip() if cmd_arg else command
+
+
+def _infer_tacacs_operation(command: str, raw: str) -> str:
+    text = f"{command} {raw}".lower()
+    if "login" in text:
+        return "登录"
+    if "logout" in text:
+        return "退出"
+    if command.startswith(("display", "show", "dis ")):
+        return "查询操作"
+    if command.startswith(("save", "write", "configure", "system-view", "interface", "undo", "set ")):
+        return "配置操作"
+    return "审计类操作"
+
+
+def _flux_escape(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _trigger_monitor_refresh_for_device(device: Device) -> None:
@@ -866,6 +938,254 @@ async def delete_device_type(device_type_id: int, db: Session = Depends(get_db))
     db.delete(device_type)
     db.commit()
     return {"message": "设备类型已删除"}
+
+
+@router.get("/{device_id}/detail/connections", response_model=dict)
+async def get_device_detail_connections(device_id: int, db: Session = Depends(get_db)):
+    """设备详情：接口连接关系。"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+
+    cached = _load_monitor_cache("interfaces", device.id)
+    interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
+    source = "cache"
+    if not interfaces:
+        # 设备详情页不能被实时 SNMP 全量接口 walk 卡住。这里仅使用后台采集快照；
+        # 若快照暂未生成，由 SNMP/Exporter 采集任务在后台补齐。
+        return {"device": device.to_dict(), "items": [], "total": 0, "source": "cache_miss"}
+
+    cached_lldp = _load_monitor_cache("lldp_neighbors_v2", device.id) or _load_monitor_cache("protocol_neighbors", device.id)
+    if isinstance(cached_lldp, dict) and isinstance(cached_lldp.get("neighbors"), dict):
+        lldp_rows = cached_lldp.get("neighbors", {}).get("lldp") or []
+    elif isinstance(cached_lldp, dict) and isinstance(cached_lldp.get("neighbors"), list):
+        lldp_rows = cached_lldp.get("neighbors") or []
+    else:
+        lldp_rows = []
+
+    lldp_by_index = {str(item.get("local_index") or item.get("interface_index") or ""): item for item in lldp_rows}
+    lldp_by_name = {str(item.get("local_port") or item.get("interface") or "").strip(): item for item in lldp_rows if item.get("local_port") or item.get("interface")}
+
+    items = []
+    for iface in interfaces or []:
+        index = str(iface.get("index") or iface.get("interface_index") or "")
+        name = str(iface.get("name") or iface.get("interface_name") or iface.get("alias") or "")
+        neighbor = lldp_by_index.get(index) or lldp_by_name.get(name) or {}
+        items.append({
+            "index": index,
+            "name": name,
+            "logical_type": iface.get("type") or iface.get("interface_type") or "",
+            "description": iface.get("description") or iface.get("alias") or "",
+            "speed_bps": iface.get("speed_bps"),
+            "mtu": iface.get("mtu"),
+            "ip_address": iface.get("ip_address") or iface.get("interface_ip") or "",
+            "oper_status": iface.get("oper_status") or "",
+            "admin_status": iface.get("admin_status") or "",
+            "remote_device": neighbor.get("remote_system") or neighbor.get("remote_device") or "",
+            "remote_interface": neighbor.get("remote_port") or neighbor.get("remote_interface") or "",
+            "remote_management_ip": neighbor.get("remote_management_address") or neighbor.get("remote_management_ip") or neighbor.get("management_address") or "",
+        })
+
+    def _sort_key(item: Dict[str, Any]):
+        return (0 if str(item.get("oper_status")).lower() == "up" else 1, item.get("name") or "")
+
+    items.sort(key=_sort_key)
+    return {"device": device.to_dict(), "items": items, "total": len(items), "source": source}
+
+
+@router.get("/{device_id}/detail/syslog", response_model=dict)
+async def get_device_detail_syslog(
+    device_id: int,
+    db: Session = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=200),
+    search: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+):
+    """设备详情：Syslog日志。"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    query = db.query(SyslogEvent).filter(or_(SyslogEvent.device_id == device.id, SyslogEvent.source_ip == device.ip_address))
+    if search:
+        keyword = f"%{search.strip()}%"
+        query = query.filter(or_(SyslogEvent.message.ilike(keyword), SyslogEvent.raw_message.ilike(keyword)))
+    start_dt = _parse_time_filter(start_time)
+    end_dt = _parse_time_filter(end_time)
+    if start_dt:
+        query = query.filter(SyslogEvent.created_at >= start_dt)
+    if end_dt:
+        query = query.filter(SyslogEvent.created_at <= end_dt)
+    total = query.count()
+    rows = query.order_by(SyslogEvent.created_at.desc()).offset(skip).limit(limit).all()
+    return {
+        "total": total,
+        "items": [{
+            "id": item.id,
+            "time": item.created_at.isoformat() if item.created_at else None,
+            "severity": item.severity,
+            "level": item.severity,
+            "message": item.message,
+            "raw_message": item.raw_message,
+            "source_ip": item.source_ip,
+            "source_host": item.source_host,
+        } for item in rows],
+    }
+
+
+@router.get("/{device_id}/detail/config-backups", response_model=dict)
+async def get_device_detail_config_backups(
+    device_id: int,
+    db: Session = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """设备详情：本设备配置备份列表。"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    query = db.query(ConfigBackupResult).filter(ConfigBackupResult.device_id == device.id)
+    total = query.count()
+    rows = query.order_by(ConfigBackupResult.finished_at.desc().nullslast(), ConfigBackupResult.id.desc()).offset(skip).limit(limit).all()
+    return {
+        "total": total,
+        "items": [{
+            "id": item.id,
+            "job_id": item.job_id,
+            "device_name": item.device_name,
+            "device_ip": item.device_ip,
+            "datacenter_name": item.datacenter_name,
+            "vendor": item.vendor,
+            "model": item.model,
+            "status": item.status,
+            "config_name": f"configuration_{item.device_ip}_{(item.finished_at or item.started_at or datetime.now()).strftime('%Y-%m-%d_%H%M%S')}.txt",
+            "line_count": item.line_count,
+            "finished_at": item.finished_at.isoformat() if item.finished_at else None,
+        } for item in rows],
+    }
+
+
+@router.get("/{device_id}/detail/performance", response_model=dict)
+async def get_device_detail_performance(
+    device_id: int,
+    range: str = Query("-24h"),
+    interval: str = Query("5m"),
+):
+    """设备详情：CPU/内存/温度趋势。"""
+    safe_range = range if re.fullmatch(r"-?\d+[smhdw]", range or "") else "-24h"
+    safe_interval = interval if re.fullmatch(r"\d+[smhdw]", interval or "") else "5m"
+    series_config = [
+        ("cpu", "snmp_metrics", "usage", {"metric_type": "cpu"}),
+        ("memory", "snmp_metrics", "usage_percent", {"metric_type": "memory"}),
+        ("temperature", "snmp_temperature", "temperature", {}),
+    ]
+    series = []
+    for name, measurement, field, tags in series_config:
+        tag_filter = "".join([f'  |> filter(fn: (r) => r.{key} == "{_flux_escape(value)}")\n' for key, value in tags.items()])
+        flux = f'''
+from(bucket: "{influx_client.bucket}")
+  |> range(start: {safe_range})
+  |> filter(fn: (r) => r._measurement == "{measurement}")
+  |> filter(fn: (r) => r.device_id == "{device_id}")
+  |> filter(fn: (r) => r._field == "{field}")
+{tag_filter}  |> aggregateWindow(every: {safe_interval}, fn: mean, createEmpty: false)
+  |> yield(name: "result")
+'''
+        data = influx_client.query(flux)
+        series.append({
+            "name": name,
+            "measurement": measurement,
+            "field": field,
+            "data": [{"time": row.get("time"), "value": row.get("value")} for row in data],
+        })
+    return {"device_id": device_id, "range": safe_range, "interval": safe_interval, "series": series}
+
+
+@router.get("/{device_id}/detail/hardware", response_model=dict)
+async def get_device_detail_hardware(device_id: int):
+    """设备详情：硬件状态。"""
+    flux = f'''
+from(bucket: "{influx_client.bucket}")
+  |> range(start: -7d)
+  |> filter(fn: (r) => r._measurement == "snmp_hardware")
+  |> filter(fn: (r) => r.device_id == "{device_id}")
+  |> last()
+  |> yield(name: "result")
+'''
+    rows = influx_client.query(flux)
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = f"{row.get('component_type') or ''}:{row.get('component') or ''}"
+        item = grouped.setdefault(key, {
+            "component_type": row.get("component_type"),
+            "component": row.get("component"),
+            "time": row.get("time"),
+        })
+        item[str(row.get("field"))] = row.get("value")
+    return {"device_id": device_id, "items": list(grouped.values()), "total": len(grouped)}
+
+
+@router.get("/{device_id}/detail/tacacs", response_model=dict)
+async def get_device_detail_tacacs(
+    device_id: int,
+    db: Session = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=200),
+    search: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    username: Optional[str] = None,
+    command: Optional[str] = None,
+):
+    """设备详情：Tacacs命令日志。"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if not TACACS_LOG_FILE.exists():
+        return {"total": 0, "items": []}
+    keyword = (search or "").strip().lower()
+    username_value = (username or "").strip().lower()
+    command_value = (command or "").strip().lower()
+    start_value = (start_time or "").strip()
+    end_value = (end_time or "").strip()
+    total = 0
+    items: List[Dict[str, Any]] = []
+    for line in reversed(TACACS_LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()):
+        match = TACACS_LOG_PATTERN.search(line)
+        if not match:
+            continue
+        if match.group(2) != device.ip_address:
+            continue
+        command_text = _extract_tacacs_command(match.group(6))
+        parsed_time = _format_tacacs_time(match.group(1)) or match.group(1)
+        item = {
+            "time": parsed_time,
+            "device_ip": match.group(2),
+            "username": match.group(3),
+            "tty": match.group(4),
+            "client_ip": match.group(5),
+            "login_time": parsed_time,
+            "operation_type": _infer_tacacs_operation(command_text, line),
+            "command": command_text,
+            "raw": line,
+        }
+        if start_value and str(parsed_time) < start_value:
+            continue
+        if end_value and str(parsed_time) > end_value:
+            continue
+        if username_value and username_value not in item["username"].lower():
+            continue
+        if command_value and command_value not in item["command"].lower():
+            continue
+        if keyword and keyword not in " ".join(str(value).lower() for value in item.values()):
+            continue
+        total += 1
+        if total <= skip:
+            continue
+        if len(items) < limit:
+            items.append(item)
+    return {"total": total, "items": items}
 
 
 @router.get("/{device_id}", response_model=dict)

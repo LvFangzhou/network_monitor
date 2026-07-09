@@ -311,6 +311,114 @@ export const testDeviceConnection = async (
   return await request.post(`/devices/${id}/test-connection`, { type }) as ConnectionTestResult
 }
 
+export interface DeviceConnectionRow {
+  index: string
+  name: string
+  logical_type?: string
+  description?: string
+  speed_bps?: number | null
+  mtu?: number | null
+  ip_address?: string
+  oper_status?: string
+  admin_status?: string
+  remote_device?: string
+  remote_interface?: string
+  remote_management_ip?: string
+}
+
+export interface DeviceLogRow {
+  id?: number
+  time?: string
+  severity?: number | string | null
+  level?: number | string | null
+  message?: string
+  raw_message?: string
+  source_ip?: string
+  source_host?: string
+}
+
+export interface DeviceConfigBackupRow {
+  id: number
+  job_id: number
+  device_name: string
+  device_ip: string
+  datacenter_name?: string | null
+  vendor?: string | null
+  model?: string | null
+  status: string
+  config_name: string
+  line_count?: number | null
+  finished_at?: string | null
+}
+
+export interface DevicePerformanceSeries {
+  name: string
+  measurement: string
+  field: string
+  data: Array<{ time?: string; value?: number | null }>
+}
+
+export interface DeviceHardwareRow {
+  component_type?: string
+  component?: string
+  time?: string
+  state?: number | string | null
+  up?: number | string | null
+  speed?: number | string | null
+  present?: number | string | null
+  status_known?: number | string | null
+}
+
+export interface DeviceTacacsRow {
+  time?: string
+  device_ip?: string
+  username?: string
+  tty?: string
+  client_ip?: string
+  login_time?: string
+  operation_type?: string
+  command?: string
+  raw?: string
+}
+
+export const getDeviceConnections = async (id: number): Promise<{ total: number; items: DeviceConnectionRow[]; source?: string }> => {
+  return await request.get(`/devices/${id}/detail/connections`) as { total: number; items: DeviceConnectionRow[]; source?: string }
+}
+
+export const getDeviceSyslog = async (id: number, params?: {
+  skip?: number
+  limit?: number
+  search?: string
+  start_time?: string
+  end_time?: string
+}): Promise<{ total: number; items: DeviceLogRow[] }> => {
+  return await request.get(`/devices/${id}/detail/syslog`, { params }) as { total: number; items: DeviceLogRow[] }
+}
+
+export const getDeviceConfigBackups = async (id: number, params?: { skip?: number; limit?: number }): Promise<{ total: number; items: DeviceConfigBackupRow[] }> => {
+  return await request.get(`/devices/${id}/detail/config-backups`, { params }) as { total: number; items: DeviceConfigBackupRow[] }
+}
+
+export const getDevicePerformance = async (id: number, params?: { range?: string; interval?: string }): Promise<{ series: DevicePerformanceSeries[]; range: string; interval: string }> => {
+  return await request.get(`/devices/${id}/detail/performance`, { params }) as { series: DevicePerformanceSeries[]; range: string; interval: string }
+}
+
+export const getDeviceHardware = async (id: number): Promise<{ total: number; items: DeviceHardwareRow[] }> => {
+  return await request.get(`/devices/${id}/detail/hardware`) as { total: number; items: DeviceHardwareRow[] }
+}
+
+export const getDeviceTacacs = async (id: number, params?: {
+  skip?: number
+  limit?: number
+  search?: string
+  start_time?: string
+  end_time?: string
+  username?: string
+  command?: string
+}): Promise<{ total: number; items: DeviceTacacsRow[] }> => {
+  return await request.get(`/devices/${id}/detail/tacacs`, { params }) as { total: number; items: DeviceTacacsRow[] }
+}
+
 export const importDevices = async (file: File): Promise<{ imported: number; failed: number; errors: string[] }> => {
   const formData = new FormData()
   formData.append('file', file)
