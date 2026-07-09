@@ -229,6 +229,7 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
   const [rows, setRows] = useState<DeviceConnectionRow[]>([])
   const [keyword, setKeyword] = useState('')
   const [notice, setNotice] = useState('')
+  const [pagination, setPagination] = useState({ current: 1, pageSize: 20 })
 
   const fetchRows = async () => {
     setLoading(true)
@@ -251,6 +252,10 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
     return rows.filter((item) => Object.values(item).some((value) => String(value ?? '').toLowerCase().includes(key)))
   }, [rows, keyword])
 
+  useEffect(() => {
+    setPagination((prev) => ({ ...prev, current: 1 }))
+  }, [deviceId, keyword])
+
   return (
     <Space direction="vertical" style={{ width: '100%' }} size={12}>
       <Space>
@@ -264,7 +269,15 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
         dataSource={filtered}
         size="small"
         scroll={{ x: 1500 }}
-        pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100] }}
+        pagination={{
+          current: pagination.current,
+          pageSize: pagination.pageSize,
+          showSizeChanger: true,
+          pageSizeOptions: ['10', '20', '50', '100'],
+          showTotal: (total) => `共 ${total} 条`,
+          onChange: (current, pageSize) => setPagination({ current, pageSize }),
+          onShowSizeChange: (_, pageSize) => setPagination({ current: 1, pageSize }),
+        }}
         columns={[
           {
             title: '本地接口名称',
