@@ -1371,8 +1371,15 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
         devices = db.query(Device).all()
 
     applicable_vendors = _rule_applicable_vendors(rule)
-    if applicable_vendors:
-        devices = [device for device in devices if _vendor_matches_any(device.vendor, applicable_vendors)]
+    if not applicable_vendors:
+        logger.warning(
+            "跳过未配置适用厂商的告警规则",
+            rule_id=rule.id,
+            rule_name=rule.name,
+            metric_type=rule.metric_type,
+        )
+        return False
+    devices = [device for device in devices if _vendor_matches_any(device.vendor, applicable_vendors)]
 
     if rule.metric_type == "device_reachability":
         devices = [

@@ -30,7 +30,7 @@ import {
   type AlertRuleStatusResponse,
   type AlertRulePayload,
 } from '../../api/alerts'
-import { getDevices, type Device } from '../../api/devices'
+import { getDeviceVendorsList, getDevices, type Device } from '../../api/devices'
 import { useAuthStore } from '../../store/auth'
 
 const metricOptions = [
@@ -115,7 +115,7 @@ const detectWebhookChannel = (url?: string) => {
 
 const normalizeSeverityValue = (value?: string | null) => severityLabels[value || ''] || 'P1'
 
-const vendorOptions = [
+const fallbackVendorOptions = [
   { value: 'H3C', label: 'H3C / 华三' },
   { value: 'Ruijie', label: '锐捷 / Ruijie' },
   { value: 'Asteros', label: 'Asteros / 星融元' },
@@ -137,6 +137,7 @@ const AlertRules = () => {
   const [severityFilter, setSeverityFilter] = useState<string | null>(null)
   const [enabledFilter, setEnabledFilter] = useState<boolean | null>(null)
   const [vendorFilter, setVendorFilter] = useState<string | null>(null)
+  const [vendorOptions, setVendorOptions] = useState(fallbackVendorOptions)
   const [loading, setLoading] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [editingRule, setEditingRule] = useState<AlertRule | null>(null)
@@ -235,6 +236,25 @@ const AlertRules = () => {
 
   useEffect(() => {
     fetchRules(1, pageSize, searchText, severityFilter, enabledFilter)
+    getDeviceVendorsList()
+      .then((items) => {
+        const options = items
+          .filter((item) => item.is_active !== false)
+          .flatMap((item) => {
+            const value = item.name || item.display_name
+            if (!value) return []
+            return [{
+              value,
+              label: item.display_name && item.display_name !== item.name
+                ? `${item.display_name} / ${item.name}`
+                : value,
+            }]
+          })
+        if (options.length) {
+          setVendorOptions(options)
+        }
+      })
+      .catch(() => undefined)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -305,7 +325,7 @@ const AlertRules = () => {
       device_ids: [],
       mention_users_text: '',
       extra_config_text: '',
-      applicable_vendors: [],
+      applicable_vendors: vendorFilter ? [vendorFilter] : [],
       notification_channels: [],
     })
     setDetectedWebhookLabel('未填写')
@@ -573,7 +593,7 @@ const AlertRules = () => {
             title: '适用厂商',
             render: (_: unknown, record: AlertRule) => {
               const label = formatApplicableVendors(record)
-              return label === '全部厂商' ? <Tag>全部厂商</Tag> : <Tag color="blue">{label}</Tag>
+              return label === '全部厂商' ? <Tag color="red">未配置</Tag> : <Tag color="blue">{label}</Tag>
             },
           },
           {
@@ -760,9 +780,10 @@ const AlertRules = () => {
           <Form.Item
             name="applicable_vendors"
             label="适用厂商"
-            extra="不选择表示所有厂商；选择后，新设备会按录入厂商自动匹配对应厂商规则。"
+            extra="必须选择厂商；新设备加入监控后，会按录入厂商自动匹配对应厂商规则。"
+            rules={[{ required: true, message: '请选择适用厂商' }]}
           >
-            <Select mode="multiple" allowClear options={vendorOptions} placeholder="例如：锐捷 / Ruijie" />
+            <Select mode="multiple" allowClear options={vendorOptions} placeholder="例如：H3C / Ruijie" />
           </Form.Item>
           <Form.Item
             noStyle

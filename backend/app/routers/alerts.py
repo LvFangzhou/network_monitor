@@ -196,6 +196,23 @@ def _rule_applicable_vendors(rule: AlertRule) -> List[str]:
     extra_config = rule.extra_config or {}
     return _normalize_vendor_list(extra_config.get("applicable_vendors") or extra_config.get("vendors"))
 
+def _rule_matches_vendor_filter(rule: AlertRule, vendor: Optional[str]) -> bool:
+    if not vendor:
+        return True
+    applicable_vendors = _rule_applicable_vendors(rule)
+    if not applicable_vendors:
+        return False
+    return _vendor_matches_any(vendor, applicable_vendors)
+
+def _validated_rule_extra_config(extra_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    config = dict(extra_config or {})
+    applicable_vendors = _normalize_vendor_list(config.get("applicable_vendors") or config.get("vendors"))
+    if not applicable_vendors:
+        raise HTTPException(status_code=400, detail="告警规则必须选择适用厂商，不能再使用全部厂商规则。")
+    config["applicable_vendors"] = applicable_vendors
+    config.pop("vendors", None)
+    return config
+
 def _get_silence_match_rule_filters(
     db: Session,
     silence: AlertSilence,
@@ -766,8 +783,9 @@ def _get_rule_applicable_devices(db: Session, rule: AlertRule) -> List[Device]:
         devices = db.query(Device).all()
 
     applicable_vendors = _rule_applicable_vendors(rule)
-    if applicable_vendors:
-        devices = [device for device in devices if _vendor_matches_any(device.vendor, applicable_vendors)]
+    if not applicable_vendors:
+        return []
+    devices = [device for device in devices if _vendor_matches_any(device.vendor, applicable_vendors)]
 
     if rule.metric_type == "device_reachability":
         return [
@@ -874,7 +892,7 @@ async def list_alert_rules(
         query = query.filter(AlertRule.name.ilike(f"%{search}%"))
     all_rules = query.order_by(AlertRule.id.asc()).all()
     if vendor:
-        all_rules = [rule for rule in all_rules if _vendor_matches_any(vendor, _rule_applicable_vendors(rule))]
+        all_rules = [rule for rule in all_rules if _rule_matches_vendor_filter(rule, vendor)]
 
     total = len(all_rules)
     rules = all_rules[skip:skip + limit]
@@ -1089,6 +1107,7 @@ async def create_alert_rule(
 ):
     """创建告警规则"""
     _validate_rule_logic(rule.metric_type, rule.condition, rule.threshold)
+    extra_config = _validated_rule_extra_config(rule.extra_config)
     db_rule = AlertRule(
         name=rule.name,
         description=rule.description,
@@ -1104,7 +1123,7 @@ async def create_alert_rule(
         enabled=1 if rule.enabled else 0,
         device_group_id=rule.device_group_id,
         device_ids=rule.device_ids,
-        extra_config=rule.extra_config or {},
+        extra_config=extra_config,
         notification_channels=_serialize_notification_channels(rule.notification_channels)
     )
     
@@ -1146,6 +1165,8 @@ async def update_alert_rule(
         update_data["enabled"] = 1 if update_data["enabled"] else 0
     if "severity" in update_data and update_data["severity"] is not None:
         update_data["severity"] = _normalize_severity(update_data["severity"])
+    if "extra_config" in update_data:
+        update_data["extra_config"] = _validated_rule_extra_config(update_data.get("extra_config"))
     
     for key, value in update_data.items():
         if value is not None and hasattr(db_rule, key):
