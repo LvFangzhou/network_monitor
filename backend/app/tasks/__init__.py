@@ -39,6 +39,7 @@ celery_app.conf.update(
         "app.tasks.snmp_tasks.collect_all_asternos_interface_realtime": {"queue": "asternos_realtime"},
         "app.tasks.snmp_tasks.collect_all_asternos_exporter": {"queue": "asternos"},
         "app.tasks.snmp_tasks.collect_asternos_for_device": {"queue": "asternos"},
+        "app.tasks.alert_tasks.check_reachability_alerts": {"queue": "alerts_health"},
         "app.tasks.alert_tasks.check_protocol_alerts": {"queue": "alerts_protocol"},
         "app.tasks.alert_tasks.check_device_health_alerts": {"queue": "alerts_health"},
         "app.tasks.alert_tasks.check_alerts": {"queue": "alerts_general"},

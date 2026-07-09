@@ -28,11 +28,13 @@ logger = get_logger(__name__)
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 CHECK_ALERTS_LOCK_KEY = "alerts:check_alerts:lock"
 FAST_CHECK_ALERTS_LOCK_KEY = "alerts:check_fast_alerts:lock"
+REACHABILITY_CHECK_ALERTS_LOCK_KEY = "alerts:check_reachability_alerts:lock"
 PROTOCOL_CHECK_ALERTS_LOCK_KEY = "alerts:check_protocol_alerts:lock"
 DEVICE_HEALTH_CHECK_ALERTS_LOCK_KEY = "alerts:check_device_health_alerts:lock"
 INTERFACE_ALERT_RECOVERY_LOCK_KEY = "alerts:resolve_interface_alerts_quick:lock"
 CHECK_ALERTS_LOCK_TTL_SECONDS = 900
 FAST_CHECK_ALERTS_LOCK_TTL_SECONDS = 300
+REACHABILITY_CHECK_ALERTS_LOCK_TTL_SECONDS = 180
 PROTOCOL_CHECK_ALERTS_LOCK_TTL_SECONDS = 180
 DEVICE_HEALTH_CHECK_ALERTS_LOCK_TTL_SECONDS = 120
 INTERFACE_ALERT_RECOVERY_LOCK_TTL_SECONDS = 45
@@ -276,6 +278,13 @@ METRIC_VALUE_LABELS = {
 
 FAST_ALERT_METRIC_TYPES = {
     "interface_admin_up_oper_down",
+}
+
+REACHABILITY_ALERT_METRIC_TYPES = {
+    "device_reachability",
+    "snmp_reachability",
+    "exporter_reachability",
+    "telemetry_reachability",
 }
 
 DEVICE_HEALTH_ALERT_METRIC_TYPES = {
@@ -1220,6 +1229,19 @@ def check_protocol_alerts():
 
 
 @shared_task
+def check_reachability_alerts():
+    """
+    独立检查设备可达性告警，避免 Ping/SNMP/Exporter/Telemetry 不可达被全量慢规则延迟。
+    """
+    return _run_alert_checks(
+        lock_key=REACHABILITY_CHECK_ALERTS_LOCK_KEY,
+        lock_ttl_seconds=REACHABILITY_CHECK_ALERTS_LOCK_TTL_SECONDS,
+        metric_types=REACHABILITY_ALERT_METRIC_TYPES,
+        task_label="可达性告警检查",
+    )
+
+
+@shared_task
 def check_device_health_alerts():
     """
     独立检查设备基础健康告警，避免CPU/内存/温度恢复被全量慢规则延迟。
@@ -1241,7 +1263,7 @@ def check_alerts():
     return _run_alert_checks(
         lock_key=CHECK_ALERTS_LOCK_KEY,
         lock_ttl_seconds=CHECK_ALERTS_LOCK_TTL_SECONDS,
-        exclude_metric_types=FAST_ALERT_METRIC_TYPES | PROTOCOL_METRIC_TYPES | DEVICE_HEALTH_ALERT_METRIC_TYPES,
+        exclude_metric_types=FAST_ALERT_METRIC_TYPES | REACHABILITY_ALERT_METRIC_TYPES | PROTOCOL_METRIC_TYPES | DEVICE_HEALTH_ALERT_METRIC_TYPES,
         task_label="常规告警检查",
     )
 

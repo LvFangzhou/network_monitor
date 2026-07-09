@@ -110,6 +110,15 @@ beat_schedule = {
         }
     },
 
+    # 设备可达性告警检查 - 每60秒执行一次，不被全量慢规则拖住
+    'check-reachability-alerts-every-60s': {
+        'task': 'app.tasks.alert_tasks.check_reachability_alerts',
+        'schedule': 60.0,
+        'options': {
+            'expires': 50.0,
+        }
+    },
+
     # 设备基础健康告警检查 - 每60秒执行一次，避免CPU/内存/温度恢复被全量慢规则拖住
     'check-device-health-alerts-every-60s': {
         'task': 'app.tasks.alert_tasks.check_device_health_alerts',
