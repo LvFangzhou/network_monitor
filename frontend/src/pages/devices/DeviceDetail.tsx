@@ -77,6 +77,53 @@ const normalizeChartTime = (value?: string) => {
   return dayjs(value).isValid() ? dayjs(value).format('MM-DD HH:mm') : String(value)
 }
 
+const normalizeInterfaceKey = (value?: string | null) => {
+  let text = String(value || '').trim().toLowerCase().replace(/\s+/g, '')
+  const replacements: Record<string, string> = {
+    fourhundredgigabitethernet: '400g',
+    fourhundredgige: '400g',
+    fourhundredge: '400g',
+    'fourhundred-gigabitethernet': '400g',
+    '400ge': '400g',
+    hundredgigabitethernet: 'hge',
+    hundredgige: 'hge',
+    hundredge: 'hge',
+    'hundred-gigabitethernet': 'hge',
+    '100ge': 'hge',
+    'ten-gigabitethernet': 'tengige',
+    tengigabitethernet: 'tengige',
+    tengige: 'tengige',
+    xgigabitethernet: 'tengige',
+    xge: 'tengige',
+    te: 'tengige',
+  }
+  Object.entries(replacements).forEach(([from, to]) => {
+    text = text.split(from).join(to)
+  })
+  return text.replace(/[^a-z0-9/._-]/g, '')
+}
+
+const shortInterfaceName = (value?: string | null) => {
+  const text = String(value || '').trim()
+  return text
+    .replace(/^FourHundredGigabitEthernet/i, '400GE')
+    .replace(/^FourHundredGigE/i, '400GE')
+    .replace(/^FourHundredGE/i, '400GE')
+    .replace(/^HundredGigabitEthernet/i, '100GE')
+    .replace(/^HundredGigE/i, '100GE')
+    .replace(/^HundredGE/i, '100GE')
+    .replace(/^Ten-GigabitEthernet/i, '10GE')
+    .replace(/^TenGigabitEthernet/i, '10GE')
+    .replace(/^XGigabitEthernet/i, '10GE')
+}
+
+const buildInterfaceTitle = (item: DeviceConnectionRow) => {
+  const name = shortInterfaceName(item.name || item.description || '-')
+  const desc = String(item.description || '').trim()
+  if (!desc || normalizeInterfaceKey(desc) === normalizeInterfaceKey(item.name)) return name
+  return `${name} / ${desc}`
+}
+
 const isAsterNOSVendor = (vendor?: string) => {
   const value = (vendor || '').toLowerCase()
   return value.includes('asternos') || value.includes('asterfusion') || value.includes('asteros') || value.includes('星融元')
@@ -238,9 +285,10 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
           {
             title: '接口IP',
             dataIndex: 'ip_address',
-            width: 180,
+            width: 320,
             sorter: textSorter<DeviceConnectionRow>('ip_address'),
-            render: (value) => <span style={{ whiteSpace: 'nowrap' }}>{value || '-'}</span>,
+            ellipsis: true,
+            render: (value) => <span title={value || ''} style={{ whiteSpace: 'nowrap' }}>{value || '-'}</span>,
           },
           { title: '接口状态', dataIndex: 'oper_status', width: 100, render: statusTag, sorter: textSorter<DeviceConnectionRow>('oper_status') },
           { title: '接口管理状态', dataIndex: 'admin_status', width: 120, render: statusTag, sorter: textSorter<DeviceConnectionRow>('admin_status') },
@@ -323,7 +371,7 @@ const TrafficTab = ({ deviceId }: { deviceId: number }) => {
                 in_bps: Number(point.in_bps || 0),
                 out_bps: Number(point.out_bps || 0),
               }))
-              const title = `${item.name}${item.description ? ` / ${item.description}` : ''}`
+              const title = buildInterfaceTitle(item)
               return (
                 <Col xs={24} xl={12} key={item.index}>
                   <Card
@@ -333,10 +381,10 @@ const TrafficTab = ({ deviceId }: { deviceId: number }) => {
                   >
                     {data.length ? (
                       <ResponsiveContainer width="100%" height={220}>
-                        <LineChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 8 }}>
+                        <LineChart data={data} margin={{ top: 12, right: 18, left: 18, bottom: 8 }}>
                           <CartesianGrid strokeDasharray="3 3" />
-                          <XAxis dataKey="time" minTickGap={28} />
-                          <YAxis tickFormatter={formatBps} width={76} />
+                          <XAxis dataKey="time" minTickGap={28} tick={{ fontSize: 11 }} />
+                          <YAxis tickFormatter={formatBps} width={86} tick={{ fontSize: 11 }} />
                           <ChartTooltip formatter={(value) => formatBps(Number(value))} />
                           <Line type="monotone" dataKey="in_bps" name="In" stroke="#52c41a" dot={false} strokeWidth={1.8} />
                           <Line type="monotone" dataKey="out_bps" name="Out" stroke="#1677ff" dot={false} strokeWidth={1.8} />

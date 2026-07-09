@@ -122,14 +122,22 @@ def _normalize_interface_key(value: Any) -> str:
     if not text:
         return ""
     replacements = {
+        "fourhundredge": "400g",
+        "400ge": "400g",
         "hundredgige": "hge",
         "hundred-gigabitethernet": "hge",
         "hundredgigabitethernet": "hge",
+        "hundredge": "hge",
+        "100ge": "hge",
         "fourhundredgige": "400g",
         "fourhundredgigabitethernet": "400g",
         "fourhundred-gigabitethernet": "400g",
         "ten-gigabitethernet": "tengige",
         "tengigabitethernet": "tengige",
+        "tengige": "tengige",
+        "xgigabitethernet": "tengige",
+        "xge": "tengige",
+        "te": "tengige",
         "gigabitethernet": "ge",
         "m-gigabitethernet": "mge",
     }
@@ -153,9 +161,9 @@ def _latest_device_config_text(db: Session, device_id: int) -> str:
     return str(result[0] or "") if result else ""
 
 
-def _parse_interface_config_fields(config_text: str) -> Dict[str, Dict[str, str]]:
+def _parse_interface_config_fields(config_text: str) -> Dict[str, Dict[str, Any]]:
     """从最新配置备份里提取接口描述/IP，作为 SNMP/LLDP 字段缺失时的兜底。"""
-    fields: Dict[str, Dict[str, str]] = {}
+    fields: Dict[str, Dict[str, Any]] = {}
     current_name = ""
     for raw_line in (config_text or "").splitlines():
         line = raw_line.rstrip()
@@ -185,7 +193,54 @@ def _parse_interface_config_fields(config_text: str) -> Dict[str, Dict[str, str]
         mtu_match = re.match(r"^(?:mtu|Maximum\s+frame\s+length:)\s+(\d+)", stripped, re.IGNORECASE)
         if mtu_match and not bucket.get("mtu"):
             bucket["mtu"] = mtu_match.group(1)
+            continue
+        jumbo_match = re.match(r"^(?:jumboframe\s+enable|jumbo-frame\s+enable|port\s+jumboframe\s+enable)(?:\s+(\d+))?", stripped, re.IGNORECASE)
+        if jumbo_match and jumbo_match.group(1) and not bucket.get("mtu"):
+            bucket["mtu"] = jumbo_match.group(1)
+            continue
+        link_type_match = re.match(r"^port\s+link-type\s+(access|trunk|hybrid)", stripped, re.IGNORECASE)
+        if link_type_match:
+            bucket["link_type"] = link_type_match.group(1).upper()
+            continue
+        access_vlan_match = re.match(r"^port\s+access\s+vlan\s+(.+)$", stripped, re.IGNORECASE)
+        if access_vlan_match:
+            bucket["access_vlan"] = access_vlan_match.group(1).strip()
+            continue
+        trunk_permit_match = re.match(r"^(undo\s+)?port\s+trunk\s+permit\s+vlan\s+(.+)$", stripped, re.IGNORECASE)
+        if trunk_permit_match:
+            vlans = str(trunk_permit_match.group(2) or "").strip()
+            if trunk_permit_match.group(1):
+                bucket.setdefault("trunk_deny_vlans", []).append(vlans)
+            else:
+                bucket.setdefault("trunk_permit_vlans", []).append(vlans)
+            continue
+        trunk_pvid_match = re.match(r"^port\s+trunk\s+pvid\s+vlan\s+(.+)$", stripped, re.IGNORECASE)
+        if trunk_pvid_match:
+            bucket["trunk_pvid"] = trunk_pvid_match.group(1).strip()
+            continue
+    for bucket in fields.values():
+        vlan_info = _format_interface_vlan_info(bucket)
+        if vlan_info:
+            bucket["vlan_info"] = vlan_info
     return fields
+
+
+def _format_interface_vlan_info(bucket: Dict[str, Any]) -> str:
+    link_type = str(bucket.get("link_type") or "").strip().upper()
+    parts: List[str] = []
+    if link_type:
+        parts.append(link_type.title())
+    if bucket.get("access_vlan"):
+        parts.append(f"access vlan {bucket['access_vlan']}")
+    permit_vlans = [str(item).strip() for item in bucket.get("trunk_permit_vlans") or [] if str(item).strip()]
+    if permit_vlans:
+        parts.append(f"permit vlan {'; '.join(permit_vlans)}")
+    deny_vlans = [str(item).strip() for item in bucket.get("trunk_deny_vlans") or [] if str(item).strip()]
+    if deny_vlans:
+        parts.append(f"undo permit vlan {'; '.join(deny_vlans)}")
+    if bucket.get("trunk_pvid"):
+        parts.append(f"pvid {bucket['trunk_pvid']}")
+    return " / ".join(parts)
 
 
 def _mask_to_prefix(mask_or_prefix: str) -> str:
@@ -226,6 +281,11 @@ def _best_interface_ip(snapshot_ip: Any, config_ip: Any) -> str:
     return snapshot_text or config_text
 
 
+def _best_interface_layer3_or_l2(snapshot_ip: Any, config_ip: Any, vlan_info: Any) -> str:
+    ip_text = _best_interface_ip(snapshot_ip, config_ip)
+    return ip_text or str(vlan_info or "").strip()
+
+
 def _is_default_interface_description(name: str, description: Any) -> bool:
     text = str(description or "").strip()
     if not text:
@@ -236,7 +296,202 @@ def _is_default_interface_description(name: str, description: Any) -> bool:
         normalized_name,
         f"{normalized_name}interface",
     }
-    return normalized_text in default_values
+    return normalized_text in default_values or _normalize_interface_key(text) == _normalize_interface_key(name)
+
+
+def _best_lldp_remote_device(neighbor: Dict[str, Any]) -> str:
+    for field in ("remote_display_name", "remote_system", "remote_device", "peer", "remote_chassis_id"):
+        value = str(neighbor.get(field) or "").strip()
+        if value and value != "-" and not _looks_like_mac(value):
+            return value
+    for field in ("remote_display_name", "remote_system", "remote_device", "peer", "remote_chassis_id"):
+        value = str(neighbor.get(field) or "").strip()
+        if value and value != "-":
+            return value
+    return ""
+
+
+def _best_lldp_remote_mgmt_ip(neighbor: Dict[str, Any]) -> str:
+    for field in ("remote_mgmt_addr", "remote_management_address", "remote_management_ip", "management_address"):
+        value = str(neighbor.get(field) or "").strip()
+        if value and value != "-":
+            return value
+    return ""
+
+
+def _best_lldp_remote_interface(neighbor: Dict[str, Any]) -> str:
+    value = str(neighbor.get("remote_port") or neighbor.get("remote_interface") or neighbor.get("remote_port_id") or "").strip()
+    if not value or value == "-":
+        return ""
+    match = re.search(
+        r"((?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet|400GE|100GE|25GE|10GE|XGE|GE)\d+(?:/\d+)+(?:[:/]\d+)?)$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1)
+    return re.sub(r"\s+Interface$", "", value, flags=re.IGNORECASE).strip()
+
+
+def _extract_device_name_from_lldp_sys_desc(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for line in [item.strip() for item in text.splitlines() if item.strip()]:
+        if re.search(r"[A-Za-z0-9]+.*-(?:Leaf|Spine|EX|CSW|DWW|Stor|GW|TOR|SW)", line, flags=re.IGNORECASE):
+            return line
+    return ""
+
+
+def _normalize_neighbor_device_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^to-", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"-(?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet|400GE|100GE|XGE|GE)\d+(?:/\d+)+(?:[:/]\d+)?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text.strip().lower()
+
+
+def _lldp_row_local_keys(row: Dict[str, Any]) -> List[str]:
+    keys: List[str] = []
+    for field in ("local_index", "local_port_num", "interface_index", "index"):
+        value = str(row.get(field) or "").strip()
+        if value and value not in keys:
+            keys.append(f"idx:{value}")
+    for field in ("local_port", "interface", "local_port_id"):
+        key = _normalize_interface_key(row.get(field))
+        if key and f"if:{key}" not in keys:
+            keys.append(f"if:{key}")
+    return keys
+
+
+def _lldp_row_quality(row: Dict[str, Any]) -> int:
+    score = 0
+    remote = _best_lldp_remote_device(row)
+    if remote and not _looks_like_mac(remote):
+        score += 10
+    if _best_lldp_remote_mgmt_ip(row):
+        score += 3
+    if row.get("remote_port") or row.get("remote_interface"):
+        score += 2
+    if str(row.get("source") or "").startswith("cli") or "cli" in str(row.get("source") or ""):
+        score += 4
+    return score
+
+
+def _merge_lldp_rows_for_device_detail(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for rows in groups:
+        for raw in rows or []:
+            row = {**raw}
+            keys = _lldp_row_local_keys(row)
+            existing = next((by_key[key] for key in keys if key in by_key), None)
+            if not existing:
+                merged.append(row)
+                for key in keys:
+                    by_key[key] = row
+                continue
+            if _lldp_row_quality(row) > _lldp_row_quality(existing):
+                for field, value in row.items():
+                    if value not in (None, "", "-"):
+                        existing[field] = value
+            else:
+                for field, value in row.items():
+                    if field not in existing or existing.get(field) in (None, "", "-"):
+                        existing[field] = value
+            better_remote = _best_lldp_remote_device(row)
+            current_remote = _best_lldp_remote_device(existing)
+            if better_remote and (not current_remote or _looks_like_mac(current_remote)):
+                existing["remote_system"] = better_remote
+                existing["remote_display_name"] = better_remote
+                existing["peer"] = better_remote
+            if _best_lldp_remote_mgmt_ip(row) and not _best_lldp_remote_mgmt_ip(existing):
+                existing["remote_mgmt_addr"] = _best_lldp_remote_mgmt_ip(row)
+    return merged
+
+
+def _lldp_rows_have_useful_neighbor(rows: List[Dict[str, Any]]) -> bool:
+    for row in rows or []:
+        remote = _best_lldp_remote_device(row)
+        if remote and not _looks_like_mac(remote):
+            return True
+        if row.get("remote_port") or row.get("remote_interface"):
+            return True
+    return False
+
+
+async def _collect_lldp_rows_for_device_detail(device: Device) -> List[Dict[str, Any]]:
+    try:
+        from app.routers.metrics import _collect_lldp_neighbors_from_cli, _merge_lldp_snmp_and_cli, _store_monitor_cache
+
+        snmp_task = asyncio.to_thread(SNMPCollector().collect_lldp_neighbors, device)
+        cli_task = asyncio.to_thread(_collect_lldp_neighbors_from_cli, device)
+        snmp_rows, cli_rows = await asyncio.gather(snmp_task, cli_task)
+        rows = _merge_lldp_snmp_and_cli(snmp_rows or [], cli_rows or [])
+        _store_monitor_cache("lldp_neighbors_v2", device.id, {
+            "neighbors": rows,
+            "collected_at": datetime.utcnow().isoformat(),
+        }, ttl_seconds=1800)
+        return rows
+    except Exception as exc:
+        logger.warning("设备详情LLDP补采失败", device_id=device.id, device_ip=device.ip_address, error=str(exc))
+        return []
+
+
+def _looks_like_mac(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(re.fullmatch(r"(?:[0-9A-Fa-f]{2}[\s:-]?){5}[0-9A-Fa-f]{2}|[0-9A-Fa-f]{4}(?:[.-][0-9A-Fa-f]{4}){2}", text))
+
+
+def _enrich_lldp_rows_with_cmdb(db: Session, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return rows
+    devices = db.query(Device.name, Device.hostname, Device.ip_address).all()
+    by_name: Dict[str, Dict[str, str]] = {}
+    by_ip: Dict[str, Dict[str, str]] = {}
+    by_tail: Dict[str, Dict[str, str]] = {}
+    for name, hostname, ip_address in devices:
+        display = str(name or hostname or ip_address or "").strip()
+        ip_text = str(ip_address or "").strip()
+        item = {"name": display, "ip": ip_text}
+        for raw in (name, hostname):
+            normalized = _normalize_neighbor_device_name(raw)
+            if normalized and normalized not in by_name:
+                by_name[normalized] = item
+        if ip_text:
+            by_ip[ip_text] = item
+            tail = ip_text.split(".")[-1]
+            by_tail.setdefault(tail, item)
+
+    enriched: List[Dict[str, Any]] = []
+    for raw in rows:
+        row = {**raw}
+        sys_desc_name = _extract_device_name_from_lldp_sys_desc(row.get("remote_sys_desc"))
+        remote_system = str(sys_desc_name or row.get("remote_display_name") or row.get("remote_system") or row.get("remote_device") or row.get("peer") or "").strip()
+        remote_mgmt = _best_lldp_remote_mgmt_ip(row)
+        normalized = _normalize_neighbor_device_name(remote_system)
+        matched_by_name = by_name.get(normalized)
+        matched = matched_by_name or by_ip.get(remote_mgmt)
+        if not matched and remote_mgmt.startswith("10.239.5."):
+            matched = by_tail.get(remote_mgmt.split(".")[-1])
+        if matched and matched.get("name"):
+            row["remote_system"] = matched["name"]
+            row["remote_display_name"] = matched["name"]
+            row["peer"] = matched["name"]
+            if matched.get("ip") and (matched_by_name or not remote_mgmt or remote_mgmt.startswith("10.239.5.")):
+                row["remote_mgmt_addr"] = matched["ip"]
+        elif row.get("remote_display_name"):
+            row["remote_system"] = row.get("remote_display_name")
+        elif remote_system and not _looks_like_mac(remote_system):
+            row["remote_display_name"] = remote_system
+        enriched.append(row)
+    return enriched
 
 
 def _infer_tacacs_operation(command: str, raw: str) -> str:
@@ -1102,13 +1357,25 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
                 "message": "设备未配置 SNMP/Exporter 接口采集参数",
             }
 
-    cached_lldp = _load_monitor_cache("lldp_neighbors_v2", device.id) or _load_monitor_cache("protocol_neighbors", device.id)
-    if isinstance(cached_lldp, dict) and isinstance(cached_lldp.get("neighbors"), dict):
-        lldp_rows = cached_lldp.get("neighbors", {}).get("lldp") or []
-    elif isinstance(cached_lldp, dict) and isinstance(cached_lldp.get("neighbors"), list):
-        lldp_rows = cached_lldp.get("neighbors") or []
-    else:
-        lldp_rows = []
+    cached_lldp = _load_monitor_cache("lldp_neighbors_v2", device.id)
+    cached_protocol = _load_monitor_cache("protocol_neighbors", device.id)
+
+    def _cached_lldp_rows(cached: Any) -> List[Dict[str, Any]]:
+        if isinstance(cached, dict) and isinstance(cached.get("neighbors"), dict):
+            return cached.get("neighbors", {}).get("lldp") or []
+        if isinstance(cached, dict) and isinstance(cached.get("neighbors"), list):
+            return cached.get("neighbors") or []
+        return []
+
+    lldp_rows = _merge_lldp_rows_for_device_detail(
+        _cached_lldp_rows(cached_lldp),
+        _cached_lldp_rows(cached_protocol),
+    )
+    if interfaces and not _lldp_rows_have_useful_neighbor(lldp_rows):
+        collected_lldp_rows = await _collect_lldp_rows_for_device_detail(device)
+        if collected_lldp_rows:
+            lldp_rows = _merge_lldp_rows_for_device_detail(lldp_rows, collected_lldp_rows)
+    lldp_rows = _enrich_lldp_rows_with_cmdb(db, lldp_rows)
 
     lldp_by_index = {
         str(item.get("local_index") or item.get("local_port_num") or item.get("interface_index") or ""): item
@@ -1130,10 +1397,14 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
         neighbor = lldp_by_index.get(index) or lldp_by_name.get(_normalize_interface_key(name)) or {}
         config_item = config_fields.get(_normalize_interface_key(name)) or {}
         alias = iface.get("alias")
-        description = alias if not _is_default_interface_description(name, alias) else ""
+        description = config_item.get("description") or ""
         if not description:
-            description = config_item.get("description") or ""
-        ip_address = _best_interface_ip(iface.get("ip_address") or iface.get("interface_ip"), config_item.get("ip_address"))
+            description = alias if not _is_default_interface_description(name, alias) else ""
+        ip_address = _best_interface_layer3_or_l2(
+            iface.get("ip_address") or iface.get("interface_ip"),
+            config_item.get("ip_address"),
+            config_item.get("vlan_info"),
+        )
         mtu = iface.get("mtu") or config_item.get("mtu")
         items.append({
             "index": index,
@@ -1145,8 +1416,8 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
             "ip_address": ip_address,
             "oper_status": iface.get("oper_status") or "",
             "admin_status": iface.get("admin_status") or "",
-            "remote_device": neighbor.get("remote_system") or neighbor.get("remote_device") or "",
-            "remote_interface": neighbor.get("remote_port") or neighbor.get("remote_interface") or "",
+            "remote_device": _best_lldp_remote_device(neighbor),
+            "remote_interface": _best_lldp_remote_interface(neighbor),
             "remote_management_ip": (
                 neighbor.get("remote_mgmt_addr")
                 or neighbor.get("remote_management_address")
