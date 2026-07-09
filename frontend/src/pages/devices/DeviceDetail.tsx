@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { type UIEvent, useEffect, useMemo, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Alert, Button, Card, Col, DatePicker, Descriptions, Empty, Input, InputNumber, Row, Select, Space, Spin, Table, Tabs, Tag, message } from 'antd'
+import { Alert, Button, Card, Col, DatePicker, Descriptions, Empty, Input, Row, Select, Space, Spin, Table, Tabs, Tag, message } from 'antd'
 import { ArrowLeftOutlined, DownloadOutlined, EditOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from 'recharts'
 import dayjs from 'dayjs'
@@ -50,6 +50,26 @@ const formatBps = (value?: number | null) => {
   if (num >= 1e6) return `${(num / 1e6).toFixed(2)} Mbps`
   if (num >= 1e3) return `${(num / 1e3).toFixed(2)} Kbps`
   return `${num.toFixed(0)} bps`
+}
+
+const textSorter = <T extends Record<string, any>>(field: keyof T) => (a: T, b: T) =>
+  String(a[field] ?? '').localeCompare(String(b[field] ?? ''), 'zh-Hans-CN', { numeric: true })
+
+const numberSorter = <T extends Record<string, any>>(field: keyof T) => (a: T, b: T) =>
+  Number(a[field] ?? 0) - Number(b[field] ?? 0)
+
+const performanceMeta = (name?: string) => {
+  const normalized = String(name || '').toLowerCase()
+  if (normalized === 'cpu') return { title: 'CPU使用率', unit: '%' }
+  if (normalized === 'memory') return { title: '内存使用率', unit: '%' }
+  if (normalized.includes('temp') || normalized.includes('temperature') || normalized.includes('温度')) return { title: '温度', unit: '℃' }
+  return { title: name || '性能指标', unit: '' }
+}
+
+const formatMetricValue = (value: any, unit = '') => {
+  const num = Number(value || 0)
+  const text = Number.isInteger(num) ? String(num) : num.toFixed(2)
+  return `${text}${unit}`
 }
 
 const normalizeChartTime = (value?: string) => {
@@ -204,6 +224,7 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
             dataIndex: 'name',
             width: 210,
             fixed: 'left',
+            sorter: textSorter<DeviceConnectionRow>('name'),
             render: (value, row) => (
               <Space direction="vertical" size={0}>
                 <span>{value || '-'}</span>
@@ -211,20 +232,21 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
               </Space>
             ),
           },
-          { title: '描述', dataIndex: 'description', width: 260, ellipsis: true },
-          { title: '速率', dataIndex: 'speed_bps', width: 120, render: formatBps },
-          { title: 'MTU', dataIndex: 'mtu', width: 90 },
+          { title: '描述', dataIndex: 'description', width: 260, ellipsis: true, sorter: textSorter<DeviceConnectionRow>('description') },
+          { title: '速率', dataIndex: 'speed_bps', width: 120, render: formatBps, sorter: numberSorter<DeviceConnectionRow>('speed_bps') },
+          { title: 'MTU', dataIndex: 'mtu', width: 90, sorter: numberSorter<DeviceConnectionRow>('mtu') },
           {
             title: '接口IP',
             dataIndex: 'ip_address',
             width: 180,
+            sorter: textSorter<DeviceConnectionRow>('ip_address'),
             render: (value) => <span style={{ whiteSpace: 'nowrap' }}>{value || '-'}</span>,
           },
-          { title: '接口状态', dataIndex: 'oper_status', width: 100, render: statusTag },
-          { title: '接口管理状态', dataIndex: 'admin_status', width: 120, render: statusTag },
-          { title: '对端设备', dataIndex: 'remote_device', width: 240, ellipsis: true },
-          { title: '对端接口', dataIndex: 'remote_interface', width: 160 },
-          { title: '对端管理IP', dataIndex: 'remote_management_ip', width: 150 },
+          { title: '接口状态', dataIndex: 'oper_status', width: 100, render: statusTag, sorter: textSorter<DeviceConnectionRow>('oper_status') },
+          { title: '接口管理状态', dataIndex: 'admin_status', width: 120, render: statusTag, sorter: textSorter<DeviceConnectionRow>('admin_status') },
+          { title: '对端设备', dataIndex: 'remote_device', width: 240, ellipsis: true, sorter: textSorter<DeviceConnectionRow>('remote_device') },
+          { title: '对端接口', dataIndex: 'remote_interface', width: 160, sorter: textSorter<DeviceConnectionRow>('remote_interface') },
+          { title: '对端管理IP', dataIndex: 'remote_management_ip', width: 150, sorter: textSorter<DeviceConnectionRow>('remote_management_ip') },
         ]}
       />
     </Space>
@@ -235,7 +257,7 @@ const TrafficTab = ({ deviceId }: { deviceId: number }) => {
   const [loading, setLoading] = useState(false)
   const [interfaces, setInterfaces] = useState<DeviceConnectionRow[]>([])
   const [keyword, setKeyword] = useState('')
-  const [limit, setLimit] = useState(6)
+  const [visibleCount, setVisibleCount] = useState(6)
   const [histories, setHistories] = useState<Record<string, MonitorHistoryPoint[]>>({})
 
   useEffect(() => {
@@ -251,13 +273,29 @@ const TrafficTab = ({ deviceId }: { deviceId: number }) => {
     load()
   }, [deviceId])
 
-  const selected = useMemo(() => {
+  const filteredInterfaces = useMemo(() => {
     const key = keyword.trim().toLowerCase()
     return interfaces
       .filter((item) => !key || String(item.name || '').toLowerCase().includes(key))
       .sort((a, b) => (String(a.oper_status).toLowerCase() === 'up' ? 0 : 1) - (String(b.oper_status).toLowerCase() === 'up' ? 0 : 1))
-      .slice(0, limit)
-  }, [interfaces, keyword, limit])
+  }, [interfaces, keyword])
+
+  const selected = useMemo(() => filteredInterfaces.slice(0, visibleCount), [filteredInterfaces, visibleCount])
+
+  useEffect(() => {
+    setVisibleCount(6)
+  }, [deviceId, keyword])
+
+  const loadMoreTrafficCards = () => {
+    setVisibleCount((prev) => Math.min(prev + 6, filteredInterfaces.length))
+  }
+
+  const handleTrafficScroll = (event: UIEvent<HTMLDivElement>) => {
+    const target = event.currentTarget
+    if (target.scrollTop + target.clientHeight >= target.scrollHeight - 120 && selected.length < filteredInterfaces.length) {
+      loadMoreTrafficCards()
+    }
+  }
 
   useEffect(() => {
     selected.forEach((item) => {
@@ -274,42 +312,48 @@ const TrafficTab = ({ deviceId }: { deviceId: number }) => {
     <Space direction="vertical" style={{ width: '100%' }} size={12}>
       <Space wrap>
         <Input allowClear prefix={<SearchOutlined />} placeholder="筛选接口" value={keyword} onChange={(event) => setKeyword(event.target.value)} style={{ width: 220 }} />
-        <span>展示接口数</span>
-        <InputNumber min={2} max={24} value={limit} onChange={(value) => setLimit(Number(value || 6))} />
+        <span style={{ color: '#8c8c8c' }}>已展示 {selected.length}/{filteredInterfaces.length} 个接口，向下滚动自动加载更多</span>
       </Space>
       <Spin spinning={loading}>
-        <Row gutter={[16, 16]}>
-          {selected.map((item) => {
-            const data = (histories[item.index] || []).map((point) => ({
-              time: normalizeChartTime(point._time),
-              in_bps: Number(point.in_bps || 0),
-              out_bps: Number(point.out_bps || 0),
-            }))
-            const title = `${item.name}${item.description ? ` / ${item.description}` : ''}`
-            return (
-              <Col xs={24} xl={12} key={item.index}>
-                <Card
-                  size="small"
-                  title={<div title={title} style={{ maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{title}</div>}
-                  styles={{ header: { minWidth: 0 }, body: { overflow: 'hidden' } }}
-                >
-                  {data.length ? (
-                    <ResponsiveContainer width="100%" height={220}>
-                      <LineChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 8 }}>
-                        <CartesianGrid strokeDasharray="3 3" />
-                        <XAxis dataKey="time" minTickGap={28} />
-                        <YAxis tickFormatter={formatBps} width={76} />
-                        <ChartTooltip formatter={(value) => formatBps(Number(value))} />
-                        <Line type="monotone" dataKey="in_bps" name="In" stroke="#52c41a" dot={false} strokeWidth={1.8} />
-                        <Line type="monotone" dataKey="out_bps" name="Out" stroke="#1677ff" dot={false} strokeWidth={1.8} />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无流量数据" />}
-                </Card>
-              </Col>
-            )
-          })}
-        </Row>
+        <div onScroll={handleTrafficScroll} style={{ maxHeight: 'calc(100vh - 300px)', overflowY: 'auto', overflowX: 'hidden', paddingRight: 4 }}>
+          <Row gutter={[16, 16]}>
+            {selected.map((item) => {
+              const data = (histories[item.index] || []).map((point) => ({
+                time: normalizeChartTime(point._time),
+                in_bps: Number(point.in_bps || 0),
+                out_bps: Number(point.out_bps || 0),
+              }))
+              const title = `${item.name}${item.description ? ` / ${item.description}` : ''}`
+              return (
+                <Col xs={24} xl={12} key={item.index}>
+                  <Card
+                    size="small"
+                    title={<div title={title} style={{ maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{title}</div>}
+                    styles={{ header: { minWidth: 0 }, body: { overflow: 'hidden' } }}
+                  >
+                    {data.length ? (
+                      <ResponsiveContainer width="100%" height={220}>
+                        <LineChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 8 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="time" minTickGap={28} />
+                          <YAxis tickFormatter={formatBps} width={76} />
+                          <ChartTooltip formatter={(value) => formatBps(Number(value))} />
+                          <Line type="monotone" dataKey="in_bps" name="In" stroke="#52c41a" dot={false} strokeWidth={1.8} />
+                          <Line type="monotone" dataKey="out_bps" name="Out" stroke="#1677ff" dot={false} strokeWidth={1.8} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无流量数据" />}
+                  </Card>
+                </Col>
+              )
+            })}
+          </Row>
+          {selected.length < filteredInterfaces.length ? (
+            <div style={{ textAlign: 'center', padding: '12px 0' }}>
+              <Button onClick={loadMoreTrafficCards}>加载更多接口</Button>
+            </div>
+          ) : null}
+        </div>
       </Spin>
     </Space>
   )
@@ -423,23 +467,26 @@ const PerformanceTab = ({ deviceId }: { deviceId: number }) => {
   return (
     <Spin spinning={loading}>
       <Row gutter={[16, 16]}>
-        {series.map((item) => (
+        {series.map((item) => {
+          const meta = performanceMeta(item.name)
+          return (
           <Col span={24} key={item.name}>
-            <Card size="small" title={item.name === 'cpu' ? 'CPU使用率' : item.name === 'memory' ? '内存使用率' : '温度'}>
+            <Card size="small" title={meta.title}>
               {(item.data || []).length ? (
                 <ResponsiveContainer width="100%" height={260}>
                   <LineChart data={(item.data || []).map((point: any) => ({ time: normalizeChartTime(point.time), value: Number(point.value || 0) }))}>
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="time" minTickGap={28} />
-                    <YAxis />
-                    <ChartTooltip />
+                    <YAxis tickFormatter={(value) => formatMetricValue(value, meta.unit)} />
+                    <ChartTooltip formatter={(value) => formatMetricValue(value, meta.unit)} />
                     <Line type="monotone" dataKey="value" stroke="#f5222d" dot={false} strokeWidth={1.8} />
                   </LineChart>
                 </ResponsiveContainer>
               ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无性能数据" />}
             </Card>
           </Col>
-        ))}
+          )
+        })}
       </Row>
     </Spin>
   )
