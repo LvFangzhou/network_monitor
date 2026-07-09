@@ -87,13 +87,21 @@ def normalize_allowed_menus(allowed_menus: Optional[list[str]], is_superuser: bo
     if is_superuser:
         return DEFAULT_MENU_PERMISSIONS.copy()
     normalized = list(allowed_menus or ["/dashboard", "/devices", "/port-query", "/ip-flow-query", "/quality-query", "/traffic-query", "/device-overview"])
+    has_monitor_center_access = any(path in normalized for path in [
+        "/metrics",
+        "/device-overview",
+        "/port-query",
+        "/ip-flow-query",
+        "/module-info-query",
+        "/lossless-info-query",
+    ])
     if "/metrics" in normalized and "/port-query" not in normalized:
         normalized.append("/port-query")
     if "/metrics" in normalized and "/device-overview" not in normalized:
         normalized.append("/device-overview")
-    if "/metrics" in normalized and "/quality-query" not in normalized:
+    if has_monitor_center_access and "/quality-query" not in normalized:
         normalized.append("/quality-query")
-    if "/metrics" in normalized and "/traffic-query" not in normalized:
+    if has_monitor_center_access and "/traffic-query" not in normalized:
         normalized.append("/traffic-query")
     if "/metrics" in normalized and "/config-backups" not in normalized:
         normalized.append("/config-backups")
