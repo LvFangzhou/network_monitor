@@ -22,11 +22,17 @@ RFC5424_RE = re.compile(
 )
 
 
+def _sanitize_text_for_postgres(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    return value.replace("\x00", "")
+
+
 class _SyslogProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
         source_ip, _ = addr
         try:
-            raw = data.decode("utf-8", errors="replace").strip()
+            raw = _sanitize_text_for_postgres(data.decode("utf-8", errors="replace")).strip()
             if not raw:
                 return
             _persist_syslog_event(source_ip, raw)
@@ -56,6 +62,10 @@ def _parse_syslog_message(raw: str) -> tuple[Optional[int], Optional[int], Optio
 
 def _persist_syslog_event(source_ip: str, raw_message: str) -> None:
     facility, severity, source_host, app_name, message = _parse_syslog_message(raw_message)
+    source_host = _sanitize_text_for_postgres(source_host)
+    app_name = _sanitize_text_for_postgres(app_name)
+    message = _sanitize_text_for_postgres(message) or raw_message
+    raw_message = _sanitize_text_for_postgres(raw_message) or message
     db = SessionLocal()
     try:
         device = db.query(Device).filter(Device.ip_address == source_ip).first()
