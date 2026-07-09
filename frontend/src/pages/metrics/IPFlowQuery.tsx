@@ -288,7 +288,7 @@ export default function IPFlowQuery() {
         interface_index: analyzerInterfaceIndex,
         range: selectedRange.value,
         interval: selectedRange.interval,
-        limit: 10,
+        limit: 20,
         ip: targetIp || undefined,
       })
       setTopIps(result.top_ips || [])
@@ -401,6 +401,24 @@ export default function IPFlowQuery() {
     }
   }, [analyzerSeries, topIps, visibleTopIps, rangeValue])
 
+  const inboundTopIps = useMemo(
+    () => [...topIps]
+      .filter((item) => Number(item.in_bps || 0) > 0)
+      .sort((a, b) => Number(b.in_bps || 0) - Number(a.in_bps || 0))
+      .slice(0, 10)
+      .map((item, index) => ({ ...item, direction_rank: index + 1 })),
+    [topIps]
+  )
+
+  const outboundTopIps = useMemo(
+    () => [...topIps]
+      .filter((item) => Number(item.out_bps || 0) > 0)
+      .sort((a, b) => Number(b.out_bps || 0) - Number(a.out_bps || 0))
+      .slice(0, 10)
+      .map((item, index) => ({ ...item, direction_rank: index + 1 })),
+    [topIps]
+  )
+
   const lineColors = ['#52c41a', '#f4d000', '#1677ff', '#fa8c16', '#722ed1', '#13c2c2', '#eb2f96', '#a0d911', '#fa541c', '#2f54eb']
 
   const getOperatorColor = (operator?: string | null) => {
@@ -496,6 +514,56 @@ export default function IPFlowQuery() {
         <Empty description={currentIp ? '当前时间范围内暂无IP流量数据' : '请输入IP地址查询流量'} style={{ padding: '72px 0' }} />
       )}
     </Spin>
+  )
+
+  const renderTopIpTable = (
+    title: string,
+    dataSource: InterfaceTopIpItem[],
+    valueKey: 'in_bps' | 'out_bps',
+    color: string
+  ) => (
+    <Table
+      size="small"
+      rowKey={(record) => `${valueKey}-${record.ip}`}
+      dataSource={dataSource}
+      pagination={false}
+      scroll={{ y: 168 }}
+      title={() => (
+        <Space size={8} wrap>
+          <span style={{ width: 10, height: 10, borderRadius: 10, background: color, display: 'inline-block' }} />
+          <Text strong>{title}</Text>
+          <Text type="secondary">点击 IP 可筛选折线</Text>
+        </Space>
+      )}
+      onRow={(record) => ({
+        onClick: () => {
+          setVisibleTopIps((prev) =>
+            prev.includes(record.ip)
+              ? prev.filter((item) => item !== record.ip)
+              : [...prev, record.ip]
+          )
+        },
+        style: {
+          cursor: 'pointer',
+          background: visibleTopIps.includes(record.ip) ? token.colorPrimaryBg : undefined,
+        },
+      })}
+      columns={[
+        { title: '排名', key: 'rank', width: 54, render: (_: unknown, record: InterfaceTopIpItem) => record.direction_rank || '-' },
+        {
+          title: 'IP地址',
+          dataIndex: 'ip',
+          key: 'ip',
+          width: 134,
+          render: (value: string) => (
+            <Text strong={visibleTopIps.includes(value)} style={{ color: visibleTopIps.includes(value) ? token.colorPrimary : undefined }}>
+              {value}
+            </Text>
+          ),
+        },
+        { title: title.replace('Top10', ''), dataIndex: valueKey, key: valueKey, align: 'right', render: (value: number) => <Text strong>{formatBps(value)}</Text> },
+      ]}
+    />
   )
 
   return (
@@ -658,7 +726,7 @@ export default function IPFlowQuery() {
         </div>
 
         <Spin spinning={analyzerLoading}>
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 420px', gap: 16, alignItems: 'stretch' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 520px', gap: 16, alignItems: 'stretch' }}>
             <div
               style={{
                 height: 360,
@@ -715,49 +783,16 @@ export default function IPFlowQuery() {
                 <Empty description="选择 Agent 和接口后点击分析Top10" style={{ paddingTop: 105 }} />
               )}
             </div>
-            <Table
-              size="small"
-              rowKey="ip"
-              dataSource={topIps}
-              pagination={false}
-              scroll={{ y: 315 }}
-              title={() => (
-                <Space size={8} wrap>
-                  <Text type="secondary">点击 IP 可只看该 IP；再次点击取消。未选择时显示全部。</Text>
-                  {visibleTopIps.length ? (
-                    <Button size="small" onClick={() => setVisibleTopIps([])}>显示全部</Button>
-                  ) : null}
-                </Space>
-              )}
-              onRow={(record) => ({
-                onClick: () => {
-                  setVisibleTopIps((prev) =>
-                    prev.includes(record.ip)
-                      ? prev.filter((item) => item !== record.ip)
-                      : [...prev, record.ip]
-                  )
-                },
-                style: {
-                  cursor: 'pointer',
-                  background: visibleTopIps.includes(record.ip) ? token.colorPrimaryBg : undefined,
-                },
-              })}
-              columns={[
-                { title: '排名', key: 'rank', width: 58, render: (_: unknown, record: InterfaceTopIpItem, index: number) => record.rank || index + 1 },
-                {
-                  title: 'IP地址',
-                  dataIndex: 'ip',
-                  key: 'ip',
-                  width: 138,
-                  render: (value: string) => (
-                    <Text strong={visibleTopIps.includes(value)} style={{ color: visibleTopIps.includes(value) ? token.colorPrimary : undefined }}>
-                      {value}
-                    </Text>
-                  ),
-                },
-                { title: '总平均', dataIndex: 'total_bps', key: 'total_bps', align: 'right', render: (value: number) => <Text strong>{formatBps(value)}</Text> },
-              ]}
-            />
+            <div style={{ display: 'grid', gap: 10 }}>
+              <Space size={8} wrap>
+                {visibleTopIps.length ? (
+                  <Button size="small" onClick={() => setVisibleTopIps([])}>显示全部</Button>
+                ) : null}
+                <Text type="secondary">未选择时显示全部 Top IP 折线；选择后只保留被选 IP。</Text>
+              </Space>
+              {renderTopIpTable('入向 Top10', inboundTopIps.length ? inboundTopIps : topIps.slice(0, 10), 'in_bps', '#70d34f')}
+              {renderTopIpTable('出向 Top10', outboundTopIps.length ? outboundTopIps : topIps.slice(0, 10), 'out_bps', '#f4d000')}
+            </div>
           </div>
         </Spin>
       </Card>

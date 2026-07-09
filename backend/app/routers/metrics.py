@@ -3023,11 +3023,18 @@ async def get_interface_ip_series(
       |> filter(fn: (r) => r._measurement == "sflow_interface_ip_traffic")
       |> filter(fn: (r) => r.agent_ip == {_flux_string(agent_value)})
       |> filter(fn: (r) => r.interface_index == {_flux_string(interface_index)})
-      |> filter(fn: (r) => r._field == "total_bps")
+      |> filter(fn: (r) => r._field == "in_bps" or r._field == "out_bps" or r._field == "total_bps")
       |> aggregateWindow(every: {interval_value}, fn: mean, createEmpty: false)
-      |> group(columns: ["ip"])
+      |> group(columns: ["ip", "_field"])
       |> mean()
-      |> keep(columns: ["ip", "_value"])
+      |> pivot(rowKey: ["ip"], columnKey: ["_field"], valueColumn: "_value")
+      |> map(fn: (r) => ({{
+          r with
+          in_bps: if exists r.in_bps then r.in_bps else 0.0,
+          out_bps: if exists r.out_bps then r.out_bps else 0.0,
+          total_bps: if exists r.total_bps then r.total_bps else 0.0
+      }}))
+      |> keep(columns: ["ip", "in_bps", "out_bps", "total_bps"])
     '''
     all_top_rows = []
     for row in influx_client.query(top_flux):
@@ -3036,9 +3043,9 @@ async def get_interface_ip_series(
             continue
         all_top_rows.append({
             "ip": str(ip_text),
-            "in_bps": 0.0,
-            "out_bps": 0.0,
-            "total_bps": float(row.get("_value") or row.get("value") or 0),
+            "in_bps": float(row.get("in_bps") or 0),
+            "out_bps": float(row.get("out_bps") or 0),
+            "total_bps": float(row.get("total_bps") or 0),
         })
     all_top_rows = sorted(all_top_rows, key=lambda item: float(item.get("total_bps") or 0), reverse=True)
     for index, item in enumerate(all_top_rows, start=1):
@@ -3051,7 +3058,14 @@ async def get_interface_ip_series(
                 selected_rank = int(item.get("rank") or 0)
                 selected_row = item
                 break
-    top_rows = [selected_row] if selected_row else all_top_rows[:limit]
+    if selected_row:
+        top_rows = [selected_row]
+    else:
+        top_by_total = all_top_rows[:limit]
+        top_by_in = sorted(all_top_rows, key=lambda item: float(item.get("in_bps") or 0), reverse=True)[:limit]
+        top_by_out = sorted(all_top_rows, key=lambda item: float(item.get("out_bps") or 0), reverse=True)[:limit]
+        top_rows_map = {str(item.get("ip")): item for item in [*top_by_total, *top_by_in, *top_by_out] if item.get("ip")}
+        top_rows = list(top_rows_map.values())
     selected_ips = [target_ip] if target_ip else [str(item.get("ip")) for item in top_rows if item.get("ip")]
     selected_ips = [item for item in dict.fromkeys(selected_ips) if item]
     if not selected_ips:
