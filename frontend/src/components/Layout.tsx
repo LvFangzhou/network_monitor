@@ -47,7 +47,7 @@ const Layout = () => {
     allowedMenus.includes('*') ||
     allowedMenus.includes(path) ||
     (path.startsWith('/tacacs/') && allowedMenus.includes('/tacacs')) ||
-    ((path === '/port-query' || path === '/device-overview' || path === '/module-info-query' || path === '/lossless-info-query' || path === '/config-backups') && allowedMenus.includes('/metrics'))
+    ((path === '/port-query' || path === '/device-overview' || path === '/quality-query' || path === '/traffic-query' || path === '/module-info-query' || path === '/lossless-info-query' || path === '/config-backups') && allowedMenus.includes('/metrics'))
 
   const selectedMenuKey = location.pathname === '/metrics' ? '/port-query' : location.pathname
 
@@ -118,7 +118,9 @@ const Layout = () => {
       children: [
         { key: '/device-overview', label: '设备总览' },
         { key: '/port-query', label: '端口查询' },
-        { key: '/ip-flow-query', label: 'IP流量查询' },
+        { key: '/ip-flow-query', label: 'IP查询' },
+        { key: '/quality-query', label: '质量查询' },
+        { key: '/traffic-query', label: '流量查询' },
         { key: '/module-info-query', label: '模块信息查询' },
         { key: '/lossless-info-query', label: '无损信息查询' },
       ],

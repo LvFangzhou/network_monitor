@@ -46,6 +46,8 @@ const loadAlertSilences = () => import('./pages/alerts/AlertSilences')
 const loadMetrics = () => import('./pages/metrics/Metrics')
 const loadDeviceOverview = () => import('./pages/metrics/DeviceOverview')
 const loadIPFlowQuery = () => import('./pages/metrics/IPFlowQuery')
+const loadQualityQuery = () => import('./pages/metrics/QualityQuery')
+const loadTrafficQuery = () => import('./pages/metrics/TrafficQuery')
 const loadModuleInfoQuery = () => import('./pages/metrics/ModuleInfoQuery')
 const loadLosslessInfoQuery = () => import('./pages/metrics/LosslessInfoQuery')
 const loadSettings = () => import('./pages/Settings')
@@ -71,18 +73,22 @@ const AlertSilences = lazyWithReload(loadAlertSilences)
 const Metrics = lazyWithReload(loadMetrics)
 const DeviceOverview = lazyWithReload(loadDeviceOverview)
 const IPFlowQuery = lazyWithReload(loadIPFlowQuery)
+const QualityQuery = lazyWithReload(loadQualityQuery)
+const TrafficQuery = lazyWithReload(loadTrafficQuery)
 const ModuleInfoQuery = lazyWithReload(loadModuleInfoQuery)
 const LosslessInfoQuery = lazyWithReload(loadLosslessInfoQuery)
 const Settings = lazyWithReload(loadSettings)
 const TacacsManager = lazyWithReload(loadTacacsManager)
 const ConfigBackups = lazyWithReload(loadConfigBackups)
 
-const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/port-query', '/ip-flow-query', '/module-info-query', '/lossless-info-query', '/config-backups']
+const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/port-query', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/port-query']
 const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
 const ROUTE_ALIASES: Record<string, string[]> = {
   '/port-query': ['/metrics'],
   '/device-overview': ['/metrics'],
+  '/quality-query': ['/metrics'],
+  '/traffic-query': ['/metrics'],
   '/module-info-query': ['/metrics'],
   '/lossless-info-query': ['/metrics'],
 }
@@ -249,6 +255,8 @@ function App() {
             <Route path="alerts/silences" element={<MenuRoute menuPath="/alerts/silences"><AlertSilences /></MenuRoute>} />
             <Route path="port-query" element={<MenuRoute menuPath="/port-query"><Metrics /></MenuRoute>} />
             <Route path="ip-flow-query" element={<MenuRoute menuPath="/ip-flow-query"><IPFlowQuery /></MenuRoute>} />
+            <Route path="quality-query" element={<MenuRoute menuPath="/quality-query"><QualityQuery /></MenuRoute>} />
+            <Route path="traffic-query" element={<MenuRoute menuPath="/traffic-query"><TrafficQuery /></MenuRoute>} />
             <Route path="device-overview" element={<MenuRoute menuPath="/device-overview"><DeviceOverview /></MenuRoute>} />
             <Route path="module-info-query" element={<MenuRoute menuPath="/module-info-query"><ModuleInfoQuery /></MenuRoute>} />
             <Route path="lossless-info-query" element={<MenuRoute menuPath="/lossless-info-query"><LosslessInfoQuery /></MenuRoute>} />

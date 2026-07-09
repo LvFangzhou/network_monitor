@@ -61,7 +61,9 @@ MENU_OPTIONS = [
     {"label": "告警日志", "value": "/alerts/audit"},
     {"label": "告警屏蔽", "value": "/alerts/silences"},
     {"label": "端口查询", "value": "/port-query"},
-    {"label": "IP流量查询", "value": "/ip-flow-query"},
+    {"label": "IP查询", "value": "/ip-flow-query"},
+    {"label": "质量查询", "value": "/quality-query"},
+    {"label": "流量查询", "value": "/traffic-query"},
     {"label": "设备总览", "value": "/device-overview"},
     {"label": "模块信息查询", "value": "/module-info-query"},
     {"label": "无损信息查询", "value": "/lossless-info-query"},
@@ -84,11 +86,15 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 def normalize_allowed_menus(allowed_menus: Optional[list[str]], is_superuser: bool = False) -> list[str]:
     if is_superuser:
         return DEFAULT_MENU_PERMISSIONS.copy()
-    normalized = list(allowed_menus or ["/dashboard", "/devices", "/port-query", "/ip-flow-query", "/device-overview"])
+    normalized = list(allowed_menus or ["/dashboard", "/devices", "/port-query", "/ip-flow-query", "/quality-query", "/traffic-query", "/device-overview"])
     if "/metrics" in normalized and "/port-query" not in normalized:
         normalized.append("/port-query")
     if "/metrics" in normalized and "/device-overview" not in normalized:
         normalized.append("/device-overview")
+    if "/metrics" in normalized and "/quality-query" not in normalized:
+        normalized.append("/quality-query")
+    if "/metrics" in normalized and "/traffic-query" not in normalized:
+        normalized.append("/traffic-query")
     if "/metrics" in normalized and "/config-backups" not in normalized:
         normalized.append("/config-backups")
     if "/metrics" in normalized and "/module-info-query" not in normalized:
