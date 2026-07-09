@@ -1177,6 +1177,10 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
         db.close()
 
 
-@celery_app.task(name="app.tasks.config_backup_tasks.run_scheduled_config_backup")
+@celery_app.task(
+    name="app.tasks.config_backup_tasks.run_scheduled_config_backup",
+    time_limit=7200,
+    soft_time_limit=6900,
+)
 def run_scheduled_config_backup() -> Dict[str, Any]:
     return run_config_backup(trigger_type="scheduled", actor="system")
