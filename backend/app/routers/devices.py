@@ -12,6 +12,7 @@ import asyncio
 import re
 import json
 from pathlib import Path
+import ipaddress
 
 from app.database import get_db
 from app.models import AlertHistory, ConfigBackupResult, Device, DeviceGroup, SyslogEvent, Tag, Datacenter, DeviceType, DeviceRole, DeviceVendor
@@ -179,8 +180,63 @@ def _parse_interface_config_fields(config_text: str) -> Dict[str, Dict[str, str]
         if ip_match and not bucket.get("ip_address"):
             ip_addr = ip_match.group(1)
             mask_or_prefix = ip_match.group(2) or (f"/{ip_match.group(3)}" if ip_match.group(3) else "")
-            bucket["ip_address"] = f"{ip_addr} {mask_or_prefix}".strip()
+            bucket["ip_address"] = _format_interface_ip(ip_addr, mask_or_prefix)
+            continue
+        mtu_match = re.match(r"^(?:mtu|Maximum\s+frame\s+length:)\s+(\d+)", stripped, re.IGNORECASE)
+        if mtu_match and not bucket.get("mtu"):
+            bucket["mtu"] = mtu_match.group(1)
     return fields
+
+
+def _mask_to_prefix(mask_or_prefix: str) -> str:
+    text = str(mask_or_prefix or "").strip()
+    if not text:
+        return ""
+    if text.startswith("/"):
+        return text
+    if text.isdigit():
+        return f"/{text}"
+    try:
+        return f"/{ipaddress.IPv4Network(f'0.0.0.0/{text}').prefixlen}"
+    except Exception:
+        return text
+
+
+def _format_interface_ip(ip_addr: Any, mask_or_prefix: Any = "") -> str:
+    ip_text = str(ip_addr or "").strip()
+    if not ip_text:
+        return ""
+    if "," in ip_text:
+        return ", ".join(filter(None, (_format_interface_ip(part.strip()) for part in ip_text.split(","))))
+    if " " in ip_text and "/" not in ip_text:
+        parts = ip_text.split()
+        if len(parts) >= 2:
+            return _format_interface_ip(parts[0], parts[1])
+    if "/" in ip_text:
+        return ip_text
+    prefix = _mask_to_prefix(str(mask_or_prefix or ""))
+    return f"{ip_text}{prefix}" if prefix.startswith("/") else ip_text
+
+
+def _best_interface_ip(snapshot_ip: Any, config_ip: Any) -> str:
+    snapshot_text = _format_interface_ip(snapshot_ip)
+    config_text = _format_interface_ip(config_ip)
+    if snapshot_text and "/" not in snapshot_text and config_text:
+        return config_text
+    return snapshot_text or config_text
+
+
+def _is_default_interface_description(name: str, description: Any) -> bool:
+    text = str(description or "").strip()
+    if not text:
+        return True
+    normalized_text = re.sub(r"\s+", "", text).lower()
+    normalized_name = re.sub(r"\s+", "", str(name or "")).lower()
+    default_values = {
+        normalized_name,
+        f"{normalized_name}interface",
+    }
+    return normalized_text in default_values
 
 
 def _infer_tacacs_operation(command: str, raw: str) -> str:
@@ -1073,20 +1129,19 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
         name = str(iface.get("name") or iface.get("interface_name") or iface.get("alias") or "")
         neighbor = lldp_by_index.get(index) or lldp_by_name.get(_normalize_interface_key(name)) or {}
         config_item = config_fields.get(_normalize_interface_key(name)) or {}
-        description = (
-            iface.get("alias")
-            or config_item.get("description")
-            or iface.get("description")
-            or ""
-        )
-        ip_address = iface.get("ip_address") or iface.get("interface_ip") or config_item.get("ip_address") or ""
+        alias = iface.get("alias")
+        description = alias if not _is_default_interface_description(name, alias) else ""
+        if not description:
+            description = config_item.get("description") or ""
+        ip_address = _best_interface_ip(iface.get("ip_address") or iface.get("interface_ip"), config_item.get("ip_address"))
+        mtu = iface.get("mtu") or config_item.get("mtu")
         items.append({
             "index": index,
             "name": name,
             "logical_type": iface.get("logical_type") or iface.get("type") or iface.get("interface_type") or "",
             "description": description,
             "speed_bps": iface.get("speed_bps"),
-            "mtu": iface.get("mtu"),
+            "mtu": mtu,
             "ip_address": ip_address,
             "oper_status": iface.get("oper_status") or "",
             "admin_status": iface.get("admin_status") or "",

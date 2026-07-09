@@ -214,7 +214,12 @@ const ConnectionsTab = ({ deviceId }: { deviceId: number }) => {
           { title: '描述', dataIndex: 'description', width: 260, ellipsis: true },
           { title: '速率', dataIndex: 'speed_bps', width: 120, render: formatBps },
           { title: 'MTU', dataIndex: 'mtu', width: 90 },
-          { title: '接口IP', dataIndex: 'ip_address', width: 150 },
+          {
+            title: '接口IP',
+            dataIndex: 'ip_address',
+            width: 180,
+            render: (value) => <span style={{ whiteSpace: 'nowrap' }}>{value || '-'}</span>,
+          },
           { title: '接口状态', dataIndex: 'oper_status', width: 100, render: statusTag },
           { title: '接口管理状态', dataIndex: 'admin_status', width: 120, render: statusTag },
           { title: '对端设备', dataIndex: 'remote_device', width: 240, ellipsis: true },

@@ -10,6 +10,7 @@ import time
 import re
 import subprocess
 import json
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor
 from app.config import settings
 from app.utils import influx_client, redis_client
@@ -645,6 +646,7 @@ class SNMPCollector(LoggerMixin):
             "high_speed_map": ("1.3.6.1.2.1.31.1.1.1.15", int),
             "speed_map": ("1.3.6.1.2.1.2.2.1.5", int),
             "ip_ifindex_map": ("1.3.6.1.2.1.4.20.1.2", str),
+            "ip_netmask_map": ("1.3.6.1.2.1.4.20.1.3", str),
         }
         with ThreadPoolExecutor(max_workers=len(walk_jobs)) as executor:
             futures = {
@@ -663,12 +665,14 @@ class SNMPCollector(LoggerMixin):
         high_speed_map = walk_results["high_speed_map"]
         speed_map = walk_results["speed_map"]
         ip_ifindex_map = walk_results["ip_ifindex_map"]
+        ip_netmask_map = walk_results["ip_netmask_map"]
 
         ifindex_ip_map: Dict[str, List[str]] = {}
         for ip_addr, ifindex in ip_ifindex_map.items():
             if not ip_addr or not ifindex:
                 continue
-            ifindex_ip_map.setdefault(str(ifindex), []).append(str(ip_addr))
+            mask = ip_netmask_map.get(str(ip_addr)) or ""
+            ifindex_ip_map.setdefault(str(ifindex), []).append(self._format_interface_ip(str(ip_addr), str(mask)))
 
         status_map = {
             1: "up",
@@ -723,6 +727,21 @@ class SNMPCollector(LoggerMixin):
             })
 
         return interfaces
+
+    def _format_interface_ip(self, ip_addr: str, mask: str = "") -> str:
+        ip_text = str(ip_addr or "").strip()
+        if not ip_text:
+            return ""
+        if "/" in ip_text:
+            return ip_text
+        mask_text = str(mask or "").strip()
+        if not mask_text:
+            return ip_text
+        try:
+            prefix = ipaddress.IPv4Network(f"0.0.0.0/{mask_text}").prefixlen
+            return f"{ip_text}/{prefix}"
+        except Exception:
+            return ip_text
 
     def get_interface_snapshot(self, device: Any, interface_index: int) -> Dict[str, Any]:
         """获取单个接口当前SNMP快照"""
