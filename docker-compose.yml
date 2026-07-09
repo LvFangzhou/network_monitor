@@ -143,7 +143,7 @@ services:
       - INFLUXDB_TOKEN=network-monitor-token
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_RETENTION_DAYS=365
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -213,7 +213,7 @@ services:
       - INFLUXDB_TOKEN=network-monitor-token
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_RETENTION_DAYS=365
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -263,7 +263,7 @@ services:
       - INFLUXDB_TOKEN=network-monitor-token
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_RETENTION_DAYS=365
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -330,7 +330,7 @@ services:
       - INFLUXDB_TOKEN=network-monitor-token
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_RETENTION_DAYS=365
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -450,7 +450,7 @@ services:
       - INFLUXDB_TOKEN=network-monitor-token
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_RETENTION_DAYS=365
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -506,7 +506,7 @@ services:
       - INFLUXDB_TOKEN=network-monitor-token
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_RETENTION_DAYS=365
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -562,7 +562,7 @@ services:
       - INFLUXDB_TOKEN=network-monitor-token
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_RETENTION_DAYS=365
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -614,7 +614,7 @@ services:
       - INFLUXDB_TOKEN=network-monitor-token
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_RETENTION_DAYS=365
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -670,7 +670,7 @@ services:
       - INFLUXDB_TOKEN=network-monitor-token
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=30
+      - INFLUXDB_RETENTION_DAYS=365
       - LOG_LEVEL=INFO
       - TELEMETRY_RECEIVER_PORT=50051
       - TELEMETRY_RECEIVER_SPOOL_DIR=/app/data/telemetry

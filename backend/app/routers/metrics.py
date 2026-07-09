@@ -33,13 +33,7 @@ from app.services.flow_listener import flow_listener
 from app.utils.snmp_system_info import extract_snmp_model
 from app.utils.controller_client import ControllerClient
 from app.utils.controller_settings import find_controller_settings
-
-try:
-    from ping3 import ping
-    PING3_AVAILABLE = True
-except ImportError:
-    ping = None
-    PING3_AVAILABLE = False
+from app.utils.quality_probe import run_quality_ping, write_quality_probe_result
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -120,100 +114,14 @@ def _quality_target_payload(target: QualityProbeTarget) -> Dict[str, Any]:
     return target.to_dict()
 
 
-def _run_quality_ping(target_host: str, packet_count: int = 5, timeout_ms: int = 1000) -> Dict[str, Any]:
-    """执行一次质量探测。返回延迟、丢包、抖动；ping3 不可用时给出明确错误。"""
-    host = str(target_host or "").strip()
-    if not host:
-        return {
-            "success": False,
-            "avg_latency_ms": None,
-            "min_latency_ms": None,
-            "max_latency_ms": None,
-            "jitter_ms": None,
-            "packet_loss_percent": 100.0,
-            "received": 0,
-            "sent": 0,
-            "error": "目标地址为空",
-        }
-    if not PING3_AVAILABLE or ping is None:
-        return {
-            "success": False,
-            "avg_latency_ms": None,
-            "min_latency_ms": None,
-            "max_latency_ms": None,
-            "jitter_ms": None,
-            "packet_loss_percent": 100.0,
-            "received": 0,
-            "sent": packet_count,
-            "error": "服务器缺少 ping3 依赖，无法执行 ICMP 探测",
-        }
-
-    sent = max(1, min(int(packet_count or 5), 20))
-    timeout_seconds = max(0.2, min(float(timeout_ms or 1000) / 1000.0, 10.0))
-    latencies: List[float] = []
-    errors: List[str] = []
-    for _ in range(sent):
-        try:
-            result = ping(host, timeout=timeout_seconds, unit="ms")
-            if result is not None and result is not False:
-                latencies.append(float(result))
-        except Exception as e:
-            errors.append(str(e))
-        time.sleep(0.05)
-
-    received = len(latencies)
-    packet_loss = round((sent - received) * 100.0 / sent, 2)
-    avg_latency = round(sum(latencies) / received, 2) if received else None
-    min_latency = round(min(latencies), 2) if received else None
-    max_latency = round(max(latencies), 2) if received else None
-    jitter = None
-    if len(latencies) >= 2:
-        diffs = [abs(latencies[index] - latencies[index - 1]) for index in range(1, len(latencies))]
-        jitter = round(sum(diffs) / len(diffs), 2)
-    elif len(latencies) == 1:
-        jitter = 0.0
-
-    return {
-        "success": received > 0,
-        "avg_latency_ms": avg_latency,
-        "min_latency_ms": min_latency,
-        "max_latency_ms": max_latency,
-        "jitter_ms": jitter,
-        "packet_loss_percent": packet_loss,
-        "received": received,
-        "sent": sent,
-        "error": None if received > 0 else (errors[-1] if errors else "目标无响应"),
-    }
+def _safe_flux_duration(value: str, default: str = "-24h") -> str:
+    text = str(value or default).strip()
+    return text if re.fullmatch(r"-?\d+[smhdw]", text) else default
 
 
-def _write_quality_probe_result(target: QualityProbeTarget, result: Dict[str, Any]) -> None:
-    try:
-        influx_client.write_point(
-            "quality_probe",
-            tags={
-                "target_id": str(target.id),
-                "target": target.target,
-                "name": target.name,
-                "datacenter": target.datacenter_ref.name if target.datacenter_ref else "",
-                "operator": target.operator_name or "",
-            },
-            fields={
-                "success": bool(result.get("success")),
-                "avg_latency_ms": result.get("avg_latency_ms"),
-                "min_latency_ms": result.get("min_latency_ms"),
-                "max_latency_ms": result.get("max_latency_ms"),
-                "jitter_ms": result.get("jitter_ms"),
-                "packet_loss_percent": result.get("packet_loss_percent"),
-                "received": result.get("received"),
-                "sent": result.get("sent"),
-            },
-            timestamp=datetime.now(timezone.utc),
-            sync=False,
-        )
-    except Exception as e:
-        logger.warning("写入质量探测结果失败", target_id=target.id, error=str(e))
-
-
+def _safe_flux_interval(value: str, default: str = "1m") -> str:
+    text = str(value or default).strip()
+    return text if re.fullmatch(r"\d+[smhdw]", text) else default
 
 
 def _normalize_vendor_text(value: Optional[str]) -> str:
@@ -4009,7 +3917,7 @@ async def test_quality_probe_target(target_id: int, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail="质量探测目标不存在")
 
     result = await asyncio.to_thread(
-        _run_quality_ping,
+        run_quality_ping,
         db_target.target,
         db_target.packet_count or 5,
         db_target.timeout_ms or 1000,
@@ -4022,8 +3930,55 @@ async def test_quality_probe_target(target_id: int, db: Session = Depends(get_db
     db_target.last_error = result.get("error")
     db.commit()
     db.refresh(db_target)
-    _write_quality_probe_result(db_target, result)
+    write_quality_probe_result(db_target, result)
     return {"target": _quality_target_payload(db_target), "result": result}
+
+
+@router.get("/quality/probe-targets/{target_id}/history")
+async def get_quality_probe_history(
+    target_id: int,
+    range: str = Query("-24h", description="查询范围，例如 -1h/-6h/-24h/-7d/-30d/-365d"),
+    interval: str = Query("1m", description="聚合间隔，例如 30s/1m/5m/1h"),
+    db: Session = Depends(get_db),
+):
+    """查询公网质量探测历史曲线"""
+    db_target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
+    if not db_target:
+        raise HTTPException(status_code=404, detail="质量探测目标不存在")
+    safe_range = _safe_flux_duration(range, "-24h")
+    safe_interval = _safe_flux_interval(interval, "1m")
+    escaped_id = _flux_string(target_id)
+    flux = f'''
+    from(bucket: "{influx_client.bucket}")
+      |> range(start: {safe_range})
+      |> filter(fn: (r) => r._measurement == "quality_probe")
+      |> filter(fn: (r) => r.target_id == {escaped_id})
+      |> filter(fn: (r) => r._field == "avg_latency_ms" or r._field == "min_latency_ms" or r._field == "max_latency_ms" or r._field == "jitter_ms" or r._field == "packet_loss_percent" or r._field == "availability_percent")
+      |> aggregateWindow(every: {safe_interval}, fn: mean, createEmpty: false)
+      |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> sort(columns: ["_time"])
+    '''
+    rows = influx_client.query(flux)
+    data = []
+    for row in rows:
+        item = {
+            "_time": row.get("_time") or row.get("time"),
+            "avg_latency_ms": row.get("avg_latency_ms"),
+            "min_latency_ms": row.get("min_latency_ms"),
+            "max_latency_ms": row.get("max_latency_ms"),
+            "jitter_ms": row.get("jitter_ms"),
+            "packet_loss_percent": row.get("packet_loss_percent"),
+            "availability_percent": row.get("availability_percent"),
+        }
+        if item["_time"] is not None:
+            data.append(item)
+    return {
+        "target": _quality_target_payload(db_target),
+        "range": safe_range,
+        "interval": safe_interval,
+        "data": data,
+        "total": len(data),
+    }
 
 
 @router.get("/measurements")

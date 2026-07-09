@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     INFLUXDB_TOKEN: str = "network-monitor-token"
     INFLUXDB_ORG: str = "network-monitor"
     INFLUXDB_BUCKET: str = "network_metrics"
-    INFLUXDB_RETENTION_DAYS: int = 30
+    INFLUXDB_RETENTION_DAYS: int = 365
     INFLUXDB_DATA_PATH: str = "/host-data/influxdb"
     
     # Redis配置

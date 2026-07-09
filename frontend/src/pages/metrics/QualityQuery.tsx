@@ -17,12 +17,15 @@ import {
 } from 'antd'
 import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
+import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from 'recharts'
 import {
   createQualityProbeTarget,
   deleteQualityProbeTarget,
+  getQualityProbeHistory,
   getQualityProbeTargets,
   testQualityProbeTarget,
   updateQualityProbeTarget,
+  type QualityProbeHistoryPoint,
   type QualityProbeTarget,
 } from '../../api/metrics'
 import { getDatacenters, type Datacenter } from '../../api/devices'
@@ -43,6 +46,24 @@ const latencyColor = (value?: number | null, threshold?: number | null) => {
   return 'green'
 }
 
+const rangeOptions = [
+  { label: '1小时', value: '-1h', interval: '30s' },
+  { label: '6小时', value: '-6h', interval: '1m' },
+  { label: '24小时', value: '-24h', interval: '5m' },
+  { label: '7天', value: '-7d', interval: '30m' },
+  { label: '30天', value: '-30d', interval: '2h' },
+  { label: '365天', value: '-365d', interval: '1d' },
+]
+
+const formatChartTime = (value: string | number, rangeValue: string) => {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value)
+  if (rangeValue === '-1h' || rangeValue === '-6h' || rangeValue === '-24h') {
+    return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+  }
+  return `${date.getMonth() + 1}-${date.getDate()}`
+}
+
 const QualityQuery = () => {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
@@ -54,6 +75,10 @@ const QualityQuery = () => {
   const [activeFilter, setActiveFilter] = useState<string>('all')
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState<QualityProbeTarget | null>(null)
+  const [selectedTargetId, setSelectedTargetId] = useState<number | undefined>()
+  const [rangeValue, setRangeValue] = useState('-24h')
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyData, setHistoryData] = useState<QualityProbeHistoryPoint[]>([])
 
   const fetchItems = async () => {
     setLoading(true)
@@ -62,7 +87,11 @@ const QualityQuery = () => {
         search: keyword.trim() || undefined,
         active: activeFilter === 'all' ? undefined : activeFilter === 'active',
       })
-      setItems(response.items || [])
+      const nextItems = response.items || []
+      setItems(nextItems)
+      if (!selectedTargetId && nextItems.length) {
+        setSelectedTargetId(nextItems[0].id)
+      }
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '获取质量探测目标失败')
       setItems([])
@@ -86,6 +115,31 @@ const QualityQuery = () => {
   useEffect(() => {
     void fetchItems()
   }, [activeFilter])
+
+  const fetchHistory = async () => {
+    if (!selectedTargetId) {
+      setHistoryData([])
+      return
+    }
+    const option = rangeOptions.find((item) => item.value === rangeValue) || rangeOptions[2]
+    setHistoryLoading(true)
+    try {
+      const response = await getQualityProbeHistory(selectedTargetId, {
+        range: option.value,
+        interval: option.interval,
+      })
+      setHistoryData(response.data || [])
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '获取质量探测曲线失败')
+      setHistoryData([])
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void fetchHistory()
+  }, [selectedTargetId, rangeValue])
 
   const datacenterOptions = useMemo(
     () => datacenters.filter((item) => item.is_active !== false).map((item) => ({ label: item.name, value: item.id })),
@@ -129,6 +183,7 @@ const QualityQuery = () => {
       setModalOpen(false)
       setEditing(null)
       await fetchItems()
+      await fetchHistory()
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '保存失败')
     } finally {
@@ -141,6 +196,10 @@ const QualityQuery = () => {
       await deleteQualityProbeTarget(record.id)
       message.success('已删除')
       await fetchItems()
+      if (selectedTargetId === record.id) {
+        setSelectedTargetId(undefined)
+        setHistoryData([])
+      }
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '删除失败')
     }
@@ -157,6 +216,9 @@ const QualityQuery = () => {
         message.warning(result.error || '测试未收到响应')
       }
       await fetchItems()
+      if (selectedTargetId === record.id) {
+        await fetchHistory()
+      }
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '测试失败')
     } finally {
@@ -244,6 +306,7 @@ const QualityQuery = () => {
             立即测试
           </Button>
           <Button type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>编辑</Button>
+          <Button type="link" onClick={() => setSelectedTargetId(record.id)}>查看曲线</Button>
           <Popconfirm title="确认删除这个探测目标？" onConfirm={() => handleDelete(record)}>
             <Button type="link" danger icon={<DeleteOutlined />}>删除</Button>
           </Popconfirm>
@@ -305,8 +368,88 @@ const QualityQuery = () => {
               defaultPageSize: 20,
               showTotal: (total) => `共 ${total} 个探测目标`,
             }}
+            onRow={(record) => ({
+              onDoubleClick: () => setSelectedTargetId(record.id),
+            })}
           />
         </Space>
+      </Card>
+
+      <Card
+        title="历史质量曲线"
+        extra={(
+          <Space wrap>
+            <Select
+              value={selectedTargetId}
+              style={{ width: 320 }}
+              placeholder="选择探测目标"
+              options={items.map((item) => ({
+                label: `${item.name} / ${item.target}`,
+                value: item.id,
+              }))}
+              onChange={setSelectedTargetId}
+            />
+            <Select
+              value={rangeValue}
+              style={{ width: 120 }}
+              options={rangeOptions.map((item) => ({ label: item.label, value: item.value }))}
+              onChange={setRangeValue}
+            />
+            <Button icon={<ReloadOutlined />} loading={historyLoading} onClick={fetchHistory}>刷新曲线</Button>
+          </Space>
+        )}
+      >
+        {selectedTargetId ? (
+          <Space direction="vertical" size="small" style={{ width: '100%' }}>
+            <Text type="secondary">
+              后台会按探测目标的采样间隔持续采集，历史数据按当前时间范围聚合展示；365天视图默认按天聚合。
+            </Text>
+            <div style={{ height: 360, width: '100%' }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={historyData} margin={{ top: 16, right: 36, left: 8, bottom: 16 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis
+                    dataKey="_time"
+                    tick={{ fontSize: 11 }}
+                    minTickGap={28}
+                    tickFormatter={(value) => formatChartTime(value, rangeValue)}
+                  />
+                  <YAxis
+                    yAxisId="ms"
+                    width={72}
+                    tick={{ fontSize: 11 }}
+                    label={{ value: 'ms', angle: -90, position: 'insideLeft' }}
+                  />
+                  <YAxis
+                    yAxisId="percent"
+                    orientation="right"
+                    width={72}
+                    tick={{ fontSize: 11 }}
+                    domain={[0, 100]}
+                    label={{ value: '%', angle: 90, position: 'insideRight' }}
+                  />
+                  <ChartTooltip
+                    labelFormatter={(value) => formatTime(String(value))}
+                    formatter={(value: any, name: string) => {
+                      const unit = name.includes('丢包') || name.includes('可用率') ? '%' : 'ms'
+                      return [`${Number(value).toFixed(2)} ${unit}`, name]
+                    }}
+                  />
+                  <Legend />
+                  <Line yAxisId="ms" type="monotone" dataKey="avg_latency_ms" name="平均延迟" stroke="#1677ff" dot={false} strokeWidth={2} connectNulls />
+                  <Line yAxisId="ms" type="monotone" dataKey="jitter_ms" name="抖动" stroke="#fa8c16" dot={false} strokeWidth={2} connectNulls />
+                  <Line yAxisId="percent" type="monotone" dataKey="packet_loss_percent" name="丢包率" stroke="#f5222d" dot={false} strokeWidth={2} connectNulls />
+                  <Line yAxisId="percent" type="monotone" dataKey="availability_percent" name="可用率" stroke="#52c41a" dot={false} strokeWidth={2} connectNulls />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            {!historyLoading && !historyData.length ? (
+              <Text type="secondary">当前时间范围内还没有历史数据。新增目标后，后台任务会自动采集；也可以先点“立即测试”生成一个点。</Text>
+            ) : null}
+          </Space>
+        ) : (
+          <Text type="secondary">请先新增或选择一个探测目标。</Text>
+        )}
       </Card>
 
       <Modal

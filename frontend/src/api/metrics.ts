@@ -680,9 +680,20 @@ export interface QualityProbeResult {
   max_latency_ms?: number | null
   jitter_ms?: number | null
   packet_loss_percent?: number | null
+  availability_percent?: number | null
   received: number
   sent: number
   error?: string | null
+}
+
+export interface QualityProbeHistoryPoint {
+  _time?: string
+  avg_latency_ms?: number | null
+  min_latency_ms?: number | null
+  max_latency_ms?: number | null
+  jitter_ms?: number | null
+  packet_loss_percent?: number | null
+  availability_percent?: number | null
 }
 
 export const getQualityProbeTargets = async (params?: {
@@ -715,5 +726,24 @@ export const testQualityProbeTarget = async (
   return await request.post(`/metrics/quality/probe-targets/${id}/test`) as {
     target: QualityProbeTarget
     result: QualityProbeResult
+  }
+}
+
+export const getQualityProbeHistory = async (
+  id: number,
+  params: { range: string; interval: string }
+): Promise<{
+  target: QualityProbeTarget
+  range: string
+  interval: string
+  data: QualityProbeHistoryPoint[]
+  total: number
+}> => {
+  return await request.get(`/metrics/quality/probe-targets/${id}/history`, { params }) as {
+    target: QualityProbeTarget
+    range: string
+    interval: string
+    data: QualityProbeHistoryPoint[]
+    total: number
   }
 }

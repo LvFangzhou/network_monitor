@@ -16,6 +16,7 @@ celery_app = Celery(
         "app.tasks.system_tasks",
         "app.tasks.config_backup_tasks",
         "app.tasks.menu_cache_tasks",
+        "app.tasks.quality_tasks",
     ]
 )
 
@@ -54,6 +55,7 @@ celery_app.conf.update(
         "app.tasks.system_tasks.check_influxdb_storage_health": {"queue": "system"},
         "app.tasks.menu_cache_tasks.prewarm_fast_menu_caches": {"queue": "system"},
         "app.tasks.menu_cache_tasks.prewarm_device_overview_cache": {"queue": "system"},
+        "app.tasks.quality_tasks.collect_quality_probes": {"queue": "system"},
         "app.tasks.config_backup_tasks.run_config_backup": {"queue": "config_backup"},
         "app.tasks.config_backup_tasks.run_scheduled_config_backup": {"queue": "config_backup"},
     },
