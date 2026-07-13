@@ -71,6 +71,7 @@ DEVICE_DETAIL_PREWARM_INTERVAL_SECONDS = 600
 DEVICE_DETAIL_PREWARM_BATCH_COUNT = 10
 DEVICE_DETAIL_PREWARM_MAX_WORKERS = 4
 DEVICE_DETAIL_PREWARM_LOCK_TTL_SECONDS = 180
+DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS = 30 * 60
 ASTERNOS_COUNTER_METRICS = [
     {
         "field": "queue_egress_dropped_pkts_delta",
@@ -276,6 +277,16 @@ def _monitor_cache_key(kind: str, device_id: int, suffix: str = "") -> str:
     return f"monitor:cache:{kind}:{device_id}{suffix}"
 
 
+def _load_monitor_cache(kind: str, device_id: int, suffix: str = "") -> Optional[Any]:
+    raw = redis_client.get(_monitor_cache_key(kind, device_id, suffix))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
 def _asternos_lock_key(device_id: int) -> str:
     return f"asternos_collect:lock:{device_id}"
 
@@ -410,6 +421,64 @@ def _ensure_alert_rule(db, payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"name": payload["name"], "created": created}
 
 
+def _looks_like_mac(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(re.fullmatch(r"(?:[0-9A-Fa-f]{2}[-:.]?){5}[0-9A-Fa-f]{2}|[0-9A-Fa-f]{4}(?:[.-][0-9A-Fa-f]{4}){2}", text))
+
+
+def _extract_cached_lldp_rows(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    neighbors = payload.get("neighbors")
+    if isinstance(neighbors, list):
+        return [row for row in neighbors if isinstance(row, dict)]
+    if isinstance(neighbors, dict):
+        rows = neighbors.get("lldp") or []
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    return []
+
+
+def _lldp_rows_have_useful_neighbor(rows: List[Dict[str, Any]]) -> bool:
+    for row in rows or []:
+        remote = str(row.get("remote_display_name") or row.get("remote_system") or row.get("peer") or "").strip()
+        remote_port = str(row.get("remote_port") or row.get("remote_port_id") or row.get("remote_interface") or "").strip()
+        remote_mgmt = str(row.get("remote_mgmt_addr") or row.get("remote_management_ip") or row.get("management_address") or "").strip()
+        if remote and remote not in {"-", "--"} and not _looks_like_mac(remote):
+            return True
+        if remote_port and remote_port not in {"-", "--"} and not _looks_like_mac(remote_port):
+            return True
+        if remote_mgmt and remote_mgmt not in {"0.0.0.0", "-", "--"}:
+            return True
+    return False
+
+
+def _prewarm_lldp_neighbors(device: Device, db) -> Dict[str, Any]:
+    cached_rows = _extract_cached_lldp_rows(_load_monitor_cache("lldp_neighbors_v2", device.id))
+    if _lldp_rows_have_useful_neighbor(cached_rows):
+        return {"lldp_cached": True, "lldp_neighbors": len(cached_rows)}
+
+    from app.routers.metrics import _apply_lldp_device_ip_fallback, _collect_lldp_neighbors_from_cli, _merge_lldp_snmp_and_cli
+
+    snmp_rows = snmp_collector.collect_lldp_neighbors(device)
+    cli_rows = _collect_lldp_neighbors_from_cli(device)
+    rows = _merge_lldp_snmp_and_cli(snmp_rows or [], cli_rows or [])
+    should_close_db = False
+    if db is None:
+        db = SessionLocal()
+        should_close_db = True
+    try:
+        rows = _apply_lldp_device_ip_fallback(db, rows)
+    finally:
+        if should_close_db:
+            db.close()
+    _set_monitor_cache("lldp_neighbors_v2", device.id, {
+        "neighbors": rows,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "source": "prewarm_snmp_cli",
+    })
+    return {"lldp_cached": False, "lldp_neighbors": len(rows)}
+
+
 def _prewarm_device_detail_snapshot(device: Device) -> Dict[str, Any]:
     monitor_source = str(device.monitor_source or "snmp")
     collected_at = datetime.now(timezone.utc).isoformat()
@@ -447,7 +516,13 @@ def _prewarm_device_detail_snapshot(device: Device) -> Dict[str, Any]:
 
     interfaces = snmp_collector.list_interfaces(device)
     _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at, "source": "prewarm_snmp"})
-    return {"device_id": device.id, "source": "snmp", "interfaces": len(interfaces)}
+    result = {"device_id": device.id, "source": "snmp", "interfaces": len(interfaces)}
+    try:
+        result.update(_prewarm_lldp_neighbors(device, None))
+    except Exception as exc:
+        logger.warning("设备详情LLDP预热失败", device_id=device.id, ip_address=device.ip_address, error=str(exc))
+        result["lldp_error"] = str(exc)
+    return result
 
 
 @shared_task(name="app.tasks.snmp_tasks.ensure_qos_discard_rules")
@@ -540,6 +615,8 @@ def _release_icmp_reachability_lock(token: Optional[str] = None) -> None:
 def _monitor_cache_ttl_seconds(kind: str) -> int:
     if kind in {"overview", "interfaces", "protocol_neighbors"}:
         return MONITOR_CACHE_TTL_SECONDS
+    if kind == "lldp_neighbors_v2":
+        return DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS
     return 180
 
 
