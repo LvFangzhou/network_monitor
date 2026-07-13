@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.config import settings
 from app.models import User
-from app.routers.auth import get_current_active_user
+from app.routers.auth import check_permission, get_current_active_user
 from app.utils import notification_manager
 
 router = APIRouter()
@@ -196,6 +196,27 @@ def _save_settings(payload: Dict[str, Any]) -> None:
     )
 
 
+def _require_tacacs_admin(current_user: User) -> None:
+    if not current_user.is_superuser:
+        check_permission(current_user, "system:settings")
+
+
+def _mask_secret(value: Any) -> Any:
+    return "******" if str(value or "").strip() else value
+
+
+def _masked_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = json.loads(json.dumps(payload, ensure_ascii=False))
+    data["key"] = _mask_secret(data.get("key"))
+    for user in data.get("users") or []:
+        if isinstance(user, dict):
+            user["password"] = _mask_secret(user.get("password"))
+    for channel in data.get("notification_channels") or []:
+        if isinstance(channel, dict):
+            channel["webhook"] = _mask_secret(channel.get("webhook"))
+    return data
+
+
 def _restart_docker_container(container_name: str) -> None:
     if not Path(DOCKER_SOCKET).exists():
         raise HTTPException(status_code=500, detail="API容器未挂载Docker Socket，无法重启Tacacs容器")
@@ -225,15 +246,15 @@ def _restart_docker_container(container_name: str) -> None:
 
 @router.get("/config", response_model=dict)
 async def get_tacacs_config(current_user: User = Depends(get_current_active_user)):
+    _require_tacacs_admin(current_user)
     _ensure_data_dir()
     settings = _load_settings()
     _ensure_config_file(settings)
-    content = TACACS_CONFIG_FILE.read_text(encoding="utf-8")
     return {
         "path": str(TACACS_CONFIG_FILE),
         "exists": TACACS_CONFIG_FILE.exists(),
-        "content": content,
-        "settings": settings,
+        "content": "# 配置内容包含 Tacacs key 和用户密码，已在接口返回中隐藏。",
+        "settings": _masked_settings(settings),
     }
 
 
@@ -242,14 +263,39 @@ async def save_tacacs_config(
     payload: Dict[str, Any],
     current_user: User = Depends(get_current_active_user),
 ):
+    _require_tacacs_admin(current_user)
     _ensure_data_dir()
-    settings = {**_default_settings(), **payload}
+    existing_settings = _load_settings()
+    settings = {**_default_settings(), **existing_settings, **payload}
+    if settings.get("key") in {None, "", "******"}:
+        settings["key"] = existing_settings.get("key") or _default_settings().get("key")
+    existing_users = {
+        str(user.get("username") or ""): user
+        for user in existing_settings.get("users") or []
+        if isinstance(user, dict) and str(user.get("username") or "")
+    }
+    for user in settings.get("users") or []:
+        if not isinstance(user, dict):
+            continue
+        username = str(user.get("username") or "")
+        if user.get("password") in {None, "", "******"} and username in existing_users:
+            user["password"] = existing_users[username].get("password")
+    existing_channels = [
+        channel
+        for channel in existing_settings.get("notification_channels") or []
+        if isinstance(channel, dict)
+    ]
+    for index, channel in enumerate(settings.get("notification_channels") or []):
+        if not isinstance(channel, dict):
+            continue
+        if channel.get("webhook") in {None, "", "******"} and index < len(existing_channels):
+            channel["webhook"] = existing_channels[index].get("webhook")
     content = _render_config(settings)
     _save_settings(settings)
     if TACACS_CONFIG_FILE.exists() and TACACS_CONFIG_FILE.is_dir():
         TACACS_CONFIG_FILE.rmdir()
     TACACS_CONFIG_FILE.write_text(content, encoding="utf-8")
-    return {"path": str(TACACS_CONFIG_FILE), "content": content, "settings": settings}
+    return {"path": str(TACACS_CONFIG_FILE), "content": "# 配置已保存，敏感内容不在接口返回。", "settings": _masked_settings(settings)}
 
 
 @router.post("/notifications", response_model=dict)
@@ -257,6 +303,7 @@ async def save_tacacs_notifications(
     payload: Dict[str, Any],
     current_user: User = Depends(get_current_active_user),
 ):
+    _require_tacacs_admin(current_user)
     raw_channels = payload.get("notification_channels") or []
     if not isinstance(raw_channels, list):
         raise HTTPException(status_code=400, detail="机器人通知配置格式不正确")
@@ -276,12 +323,13 @@ async def save_tacacs_notifications(
     _save_settings(settings)
     return {
         "message": "机器人通知已保存",
-        "settings": settings,
+        "settings": _masked_settings(settings),
     }
 
 
 @router.post("/restart", response_model=dict)
 async def restart_tacacs_container(current_user: User = Depends(get_current_active_user)):
+    _require_tacacs_admin(current_user)
     _restart_docker_container(TACACS_CONTAINER_NAME)
     return {"message": "Tacacs容器重启已触发", "container": TACACS_CONTAINER_NAME}
 
@@ -291,6 +339,7 @@ async def test_tacacs_notification(
     payload: Dict[str, Any],
     current_user: User = Depends(get_current_active_user),
 ):
+    _require_tacacs_admin(current_user)
     webhook_url = str(payload.get("url") or payload.get("webhook") or "").strip()
     if not webhook_url:
         raise HTTPException(status_code=400, detail="Webhook 地址不能为空")
@@ -347,6 +396,7 @@ async def list_tacacs_logs(
     username: Optional[str] = None,
     command: Optional[str] = None,
 ):
+    _require_tacacs_admin(current_user)
     _ensure_data_dir()
     if not TACACS_LOG_FILE.exists():
         return {"total": 0, "items": [], "path": str(TACACS_LOG_FILE)}

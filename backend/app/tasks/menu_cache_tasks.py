@@ -14,6 +14,7 @@ from typing import Iterable, List
 import httpx
 from celery import shared_task
 
+from app.config import settings
 from app.core import get_logger
 from app.database import SessionLocal
 from app.models.resource import Circuit
@@ -28,7 +29,8 @@ PREWARM_LOCK_TTL_SECONDS = 55
 def _prewarm_endpoint(path: str, *, timeout: float = 30.0) -> dict:
     url = f"{API_BASE_URL}{path}"
     started_at = time.time()
-    response = httpx.get(url, timeout=timeout)
+    headers = {"X-Internal-Token": settings.INTERNAL_API_TOKEN} if settings.INTERNAL_API_TOKEN else {}
+    response = httpx.get(url, timeout=timeout, headers=headers)
     elapsed = round(time.time() - started_at, 3)
     response.raise_for_status()
     return {

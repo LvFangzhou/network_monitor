@@ -1,7 +1,7 @@
 """
 认证授权路由
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
@@ -235,23 +235,17 @@ async def login(
     user = db.query(User).filter(User.username == form_data.username).first()
 
     authenticated_user: Optional[User] = None
-    login_error_detail = "用户名或密码错误"
-
     if user:
         if not user.is_active:
             raise HTTPException(status_code=400, detail="账号已停用，请联系管理员")
 
         if verify_password(form_data.password, user.hashed_password):
             authenticated_user = user
-        else:
-            login_error_detail = "密码错误"
-    else:
-        login_error_detail = "用户不存在"
 
     if not authenticated_user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=login_error_detail,
+            detail="用户名或密码错误",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
@@ -346,8 +340,17 @@ async def change_password(
 
 
 @router.post("/init")
-async def init_auth(db: Session = Depends(get_db)):
+async def init_auth(
+    db: Session = Depends(get_db),
+    x_init_token: Optional[str] = Header(default=None, alias="X-Init-Token"),
+):
     """初始化认证数据（创建默认权限、角色和管理员）"""
+    if not settings.ENABLE_AUTH_INIT:
+        raise HTTPException(status_code=404, detail="初始化接口已关闭")
+    expected_token = (settings.AUTH_INIT_TOKEN or "").strip()
+    if expected_token and x_init_token != expected_token:
+        raise HTTPException(status_code=403, detail="初始化令牌无效")
+
     # 创建权限
     for perm_data in DEFAULT_PERMISSIONS:
         existing = db.query(Permission).filter(Permission.code == perm_data["code"]).first()
@@ -383,13 +386,7 @@ async def init_auth(db: Session = Depends(get_db)):
         db.commit()
         
         logger.info("默认管理员创建成功", username="admin")
-        return {
-            "message": "初始化完成",
-            "admin_user": {
-                "username": "admin",
-                "password": "admin123"
-            }
-        }
+        return {"message": "初始化完成，请立即登录后修改默认管理员密码"}
     
     return {"message": "认证数据已初始化"}
 

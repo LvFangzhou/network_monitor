@@ -45,6 +45,8 @@ SENSITIVE_AUDIT_KEYS = {
     "token",
     "access_token",
     "authorization",
+    "community",
+    "webhook",
     "bind_password",
     "secret",
     "key",
@@ -207,19 +209,78 @@ app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     description="企业级网络运营与监控系统",
-    docs_url=settings.DOCS_URL,
-    redoc_url=settings.REDOC_URL,
+    docs_url=settings.DOCS_URL if settings.ENABLE_API_DOCS else None,
+    redoc_url=settings.REDOC_URL if settings.ENABLE_API_DOCS else None,
+    openapi_url=f"{settings.API_PREFIX}/openapi.json" if settings.ENABLE_API_DOCS else None,
     lifespan=lifespan
 )
 
 # CORS配置
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _is_public_api_path(path: str) -> bool:
+    public_paths = {
+        f"{settings.API_PREFIX}/auth/login",
+        f"{settings.API_PREFIX}/auth/init",
+    }
+    return path in public_paths
+
+
+def _is_internal_request(request: Request) -> bool:
+    token = (settings.INTERNAL_API_TOKEN or "").strip()
+    if not token:
+        return False
+    return request.headers.get("X-Internal-Token") == token
+
+
+def _authenticate_api_request(request: Request) -> tuple[int | None, str | None] | None:
+    if _is_internal_request(request):
+        return None, "internal-service"
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        user_id = payload.get("sub")
+        if not user_id:
+            return None
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.id == int(user_id)).first()
+            if not user or not user.is_active:
+                return None
+            return user.id, user.username
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+
+@app.middleware("http")
+async def enforce_api_authentication(request: Request, call_next):
+    if request.method == "OPTIONS" or not request.url.path.startswith(settings.API_PREFIX):
+        return await call_next(request)
+    if _is_public_api_path(request.url.path):
+        return await call_next(request)
+    identity = _authenticate_api_request(request)
+    if identity is None:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "请先登录后再访问"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    request.state.auth_user_id = identity[0]
+    request.state.auth_username = identity[1]
+    request.state.internal_request = identity[1] == "internal-service"
+    return await call_next(request)
 
 
 @app.middleware("http")

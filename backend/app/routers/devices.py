@@ -2178,12 +2178,15 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
         snmp = update_data.pop("snmp")
         db_device.snmp_version = snmp.get("version", db_device.snmp_version)
         db_device.snmp_port = snmp.get("port", db_device.snmp_port)
-        db_device.snmp_community = snmp.get("community", db_device.snmp_community)
+        if snmp.get("community") not in {None, "", "******"}:
+            db_device.snmp_community = snmp.get("community")
         db_device.snmp_username = snmp.get("username", db_device.snmp_username)
         db_device.snmp_auth_protocol = snmp.get("auth_protocol", db_device.snmp_auth_protocol)
-        db_device.snmp_auth_password = snmp.get("auth_password", db_device.snmp_auth_password)
+        if snmp.get("auth_password") not in {None, "", "******"}:
+            db_device.snmp_auth_password = snmp.get("auth_password")
         db_device.snmp_priv_protocol = snmp.get("priv_protocol", db_device.snmp_priv_protocol)
-        db_device.snmp_priv_password = snmp.get("priv_password", db_device.snmp_priv_password)
+        if snmp.get("priv_password") not in {None, "", "******"}:
+            db_device.snmp_priv_password = snmp.get("priv_password")
         db_device.snmp_security_level = snmp.get("security_level", db_device.snmp_security_level)
     
     # 处理gNMI配置
@@ -2192,7 +2195,8 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
         db_device.gnmi_enabled = 1 if gnmi.get("enabled") else 0
         db_device.gnmi_port = gnmi.get("port", db_device.gnmi_port)
         db_device.gnmi_username = gnmi.get("username", db_device.gnmi_username)
-        db_device.gnmi_password = gnmi.get("password", db_device.gnmi_password)
+        if gnmi.get("password") not in {None, "", "******"}:
+            db_device.gnmi_password = gnmi.get("password")
         db_device.gnmi_tls_enabled = 1 if gnmi.get("tls_enabled") else 0
         db_device.gnmi_tls_cert = gnmi.get("tls_cert", db_device.gnmi_tls_cert)
         db_device.gnmi_skip_verify = 1 if gnmi.get("skip_verify") else 0
@@ -2203,8 +2207,10 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
         ssh = update_data.pop("ssh")
         db_device.ssh_port = ssh.get("port", db_device.ssh_port)
         db_device.ssh_username = ssh.get("username", db_device.ssh_username)
-        db_device.ssh_password = ssh.get("password", db_device.ssh_password)
-        db_device.ssh_key = ssh.get("key", db_device.ssh_key)
+        if ssh.get("password") not in {None, "", "******"}:
+            db_device.ssh_password = ssh.get("password")
+        if ssh.get("key") not in {None, "", "******"}:
+            db_device.ssh_key = ssh.get("key")
     
     # 处理标签
     if "tags" in update_data and update_data["tags"] is not None:

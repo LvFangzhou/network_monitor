@@ -286,6 +286,9 @@ class Device(Base):
             if any(marker in vendor_value for marker in ["asternos", "asterfusion", "asteros", "星融元"])
             else "snmp"
         )
+        def secret_configured(value):
+            return bool(str(value or "").strip())
+
         return {
             "id": self.id,
             "name": self.name,
@@ -315,19 +318,23 @@ class Device(Base):
             "snmp": {
                 "version": self.snmp_version,
                 "port": self.snmp_port,
-                "community": self.snmp_community,
+                "community": "******" if secret_configured(self.snmp_community) else None,
+                "community_configured": secret_configured(self.snmp_community),
                 "username": self.snmp_username,
                 "auth_protocol": self.snmp_auth_protocol,
-                "auth_password": self.snmp_auth_password,
+                "auth_password": "******" if secret_configured(self.snmp_auth_password) else None,
+                "auth_password_configured": secret_configured(self.snmp_auth_password),
                 "priv_protocol": self.snmp_priv_protocol,
-                "priv_password": self.snmp_priv_password,
+                "priv_password": "******" if secret_configured(self.snmp_priv_password) else None,
+                "priv_password_configured": secret_configured(self.snmp_priv_password),
                 "security_level": self.snmp_security_level,
             },
             "gnmi": {
                 "enabled": bool(self.gnmi_enabled),
                 "port": self.gnmi_port,
                 "username": self.gnmi_username,
-                "password": self.gnmi_password,
+                "password": "******" if secret_configured(self.gnmi_password) else None,
+                "password_configured": secret_configured(self.gnmi_password),
                 "tls_enabled": bool(self.gnmi_tls_enabled),
                 "tls_cert": self.gnmi_tls_cert,
                 "skip_verify": bool(self.gnmi_skip_verify),
@@ -336,8 +343,10 @@ class Device(Base):
             "ssh": {
                 "port": self.ssh_port,
                 "username": self.ssh_username,
-                "password": self.ssh_password,
-                "key": self.ssh_key,
+                "password": "******" if secret_configured(self.ssh_password) else None,
+                "password_configured": secret_configured(self.ssh_password),
+                "key": "******" if secret_configured(self.ssh_key) else None,
+                "key_configured": secret_configured(self.ssh_key),
             },
             "ssh_port": self.ssh_port,
             "ssh_username": self.ssh_username,

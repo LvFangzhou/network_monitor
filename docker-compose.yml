@@ -133,14 +133,19 @@ services:
     container_name: nm-api
     environment:
       - DEBUG=false
-      - SECRET_KEY=your-secret-key-change-in-production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - ENABLE_AUTH_INIT=${ENABLE_AUTH_INIT:-false}
+      - AUTH_INIT_TOKEN=${AUTH_INIT_TOKEN:-}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=365
@@ -160,8 +165,8 @@ services:
       - REDIS_PORT=6379
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=guest
-      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
@@ -203,14 +208,19 @@ services:
     command: celery -A app.tasks beat -l info
     environment:
       - DEBUG=false
-      - SECRET_KEY=your-secret-key-change-in-production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - ENABLE_AUTH_INIT=${ENABLE_AUTH_INIT:-false}
+      - AUTH_INIT_TOKEN=${AUTH_INIT_TOKEN:-}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=365
@@ -222,8 +232,8 @@ services:
       - REDIS_PORT=6379
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=guest
-      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
@@ -253,14 +263,19 @@ services:
     command: celery -A app.tasks worker -l info -Q celery,default,tacacs -n worker-background@%h --pool=prefork -c 3 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=450000
     environment:
       - DEBUG=false
-      - SECRET_KEY=your-secret-key-change-in-production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - ENABLE_AUTH_INIT=${ENABLE_AUTH_INIT:-false}
+      - AUTH_INIT_TOKEN=${AUTH_INIT_TOKEN:-}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=365
@@ -272,8 +287,8 @@ services:
       - REDIS_PORT=6379
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=guest
-      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
@@ -320,14 +335,19 @@ services:
     cpu_shares: 512
     environment:
       - DEBUG=false
-      - SECRET_KEY=your-secret-key-change-in-production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - ENABLE_AUTH_INIT=${ENABLE_AUTH_INIT:-false}
+      - AUTH_INIT_TOKEN=${AUTH_INIT_TOKEN:-}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=365
@@ -339,8 +359,8 @@ services:
       - REDIS_PORT=6379
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=guest
-      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - CONFIG_BACKUP_CONCURRENCY=40
       - CONFIG_BACKUP_WAIT_TIMEOUT_SECONDS=1
       - LOG_LEVEL=INFO
@@ -440,14 +460,19 @@ services:
     cpu_shares: 4096
     environment:
       - DEBUG=false
-      - SECRET_KEY=your-secret-key-change-in-production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - ENABLE_AUTH_INIT=${ENABLE_AUTH_INIT:-false}
+      - AUTH_INIT_TOKEN=${AUTH_INIT_TOKEN:-}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=365
@@ -459,8 +484,8 @@ services:
       - REDIS_PORT=6379
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=guest
-      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
@@ -496,14 +521,19 @@ services:
     cpu_shares: 4096
     environment:
       - DEBUG=false
-      - SECRET_KEY=your-secret-key-change-in-production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - ENABLE_AUTH_INIT=${ENABLE_AUTH_INIT:-false}
+      - AUTH_INIT_TOKEN=${AUTH_INIT_TOKEN:-}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=365
@@ -515,8 +545,8 @@ services:
       - REDIS_PORT=6379
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=guest
-      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
@@ -552,14 +582,19 @@ services:
     cpu_shares: 2048
     environment:
       - DEBUG=false
-      - SECRET_KEY=your-secret-key-change-in-production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - ENABLE_AUTH_INIT=${ENABLE_AUTH_INIT:-false}
+      - AUTH_INIT_TOKEN=${AUTH_INIT_TOKEN:-}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=365
@@ -571,8 +606,8 @@ services:
       - REDIS_PORT=6379
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=guest
-      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_MAX_DEVICES_PER_TICK=80
@@ -604,14 +639,19 @@ services:
     cpu_shares: 12288
     environment:
       - DEBUG=false
-      - SECRET_KEY=your-secret-key-change-in-production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - ENABLE_AUTH_INIT=${ENABLE_AUTH_INIT:-false}
+      - AUTH_INIT_TOKEN=${AUTH_INIT_TOKEN:-}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=365
@@ -623,8 +663,8 @@ services:
       - REDIS_PORT=6379
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=guest
-      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
@@ -660,14 +700,19 @@ services:
     command: python -m app.services.telemetry_receiver --host 0.0.0.0 --port 50051
     environment:
       - DEBUG=false
-      - SECRET_KEY=your-secret-key-change-in-production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - ENABLE_AUTH_INIT=${ENABLE_AUTH_INIT:-false}
+      - AUTH_INIT_TOKEN=${AUTH_INIT_TOKEN:-}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=network-monitor-token
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
       - INFLUXDB_RETENTION_DAYS=365

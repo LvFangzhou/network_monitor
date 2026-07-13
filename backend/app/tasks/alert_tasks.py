@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from urllib.error import URLError
 from celery import shared_task
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -1340,10 +1341,12 @@ def prewarm_alert_rule_status_cache(limit: int = 100, batch_size: int = 2, max_r
                 max_runtime_seconds=int(max_runtime_seconds),
             )
             try:
-                with urllib.request.urlopen(url, timeout=max(int(max_runtime_seconds) + 1, 3)) as response:
+                headers = {"X-Internal-Token": settings.INTERNAL_API_TOKEN} if settings.INTERNAL_API_TOKEN else {}
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=max(int(max_runtime_seconds) + 1, 3)) as response:
                     response.read(256)
                 warmed += 1
-            except Exception as exc:
+            except (Exception, URLError) as exc:
                 failed += 1
                 logger.warning("预热告警规则状态缓存失败", rule_id=rule_id, error=str(exc))
 

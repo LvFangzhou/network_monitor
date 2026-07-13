@@ -18,8 +18,21 @@ class Settings(BaseSettings):
     API_PREFIX: str = "/api/v1"
     DOCS_URL: str = "/docs"
     REDOC_URL: str = "/redoc"
+    ENABLE_API_DOCS: bool = False
+    ENABLE_AUTH_INIT: bool = False
+    AUTH_INIT_TOKEN: Optional[str] = None
+    INTERNAL_API_TOKEN: Optional[str] = None
+    BACKEND_CORS_ORIGINS: str = ""
     FRONTEND_PUBLIC_URL: str = "http://172.18.17.250:8080"
     TACACS_WEBHOOK_URL: str = ""
+
+    @property
+    def CORS_ORIGINS(self) -> list[str]:
+        origins = [item.strip() for item in (self.BACKEND_CORS_ORIGINS or "").split(",") if item.strip()]
+        if origins:
+            return origins
+        fallback = (self.FRONTEND_PUBLIC_URL or "").strip()
+        return [fallback] if fallback else []
     
     # PostgreSQL配置
     POSTGRES_HOST: str = "localhost"
