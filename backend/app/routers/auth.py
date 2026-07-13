@@ -4,7 +4,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
 import bcrypt
 from typing import Optional
@@ -123,7 +123,7 @@ def _last_seen_key(user_id: int) -> str:
 def _touch_online_user(user: User) -> None:
     try:
         redis_client.setex(_online_key(user.id), ONLINE_USER_TTL_SECONDS, "1")
-        redis_client.set(_last_seen_key(user.id), str(datetime.utcnow().timestamp()))
+        redis_client.set(_last_seen_key(user.id), str(datetime.now(timezone.utc).timestamp()))
     except Exception as exc:
         logger.warning("更新用户在线状态失败", username=user.username, error=str(exc))
 
@@ -145,7 +145,7 @@ def _last_offline_at(user_id: int, online: bool) -> Optional[str]:
             return None
         if isinstance(value, bytes):
             value = value.decode("utf-8", errors="ignore")
-        offline_at = datetime.utcfromtimestamp(float(value) + ONLINE_USER_TTL_SECONDS)
+        offline_at = datetime.fromtimestamp(float(value) + ONLINE_USER_TTL_SECONDS, timezone.utc)
         return offline_at.isoformat()
     except Exception as exc:
         logger.warning("读取用户最后离线时间失败", user_id=user_id, error=str(exc))

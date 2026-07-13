@@ -286,6 +286,7 @@ class QualityProbeTargetResponse(QualityProbeTargetBase):
     last_success: Optional[bool] = None
     last_avg_latency_ms: Optional[float] = None
     last_packet_loss_percent: Optional[float] = None
+    last_availability_percent: Optional[float] = None
     last_jitter_ms: Optional[float] = None
     last_error: Optional[str] = None
     created_at: Optional[datetime] = None

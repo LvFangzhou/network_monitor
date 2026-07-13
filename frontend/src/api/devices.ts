@@ -385,8 +385,8 @@ export interface DeviceTacacsRow {
   raw?: string
 }
 
-export const getDeviceConnections = async (id: number): Promise<{ total: number; items: DeviceConnectionRow[]; source?: string; message?: string }> => {
-  return await request.get(`/devices/${id}/detail/connections`) as { total: number; items: DeviceConnectionRow[]; source?: string; message?: string }
+export const getDeviceConnections = async (id: number, params?: { force_refresh?: boolean }): Promise<{ total: number; items: DeviceConnectionRow[]; source?: string; message?: string }> => {
+  return await request.get(`/devices/${id}/detail/connections`, { params }) as { total: number; items: DeviceConnectionRow[]; source?: string; message?: string }
 }
 
 export const getDeviceSyslog = async (id: number, params?: {
@@ -403,7 +403,7 @@ export const getDeviceConfigBackups = async (id: number, params?: { skip?: numbe
   return await request.get(`/devices/${id}/detail/config-backups`, { params }) as { total: number; items: DeviceConfigBackupRow[] }
 }
 
-export const getDevicePerformance = async (id: number, params?: { range?: string; interval?: string }): Promise<{ series: DevicePerformanceSeries[]; range: string; interval: string }> => {
+export const getDevicePerformance = async (id: number, params?: { range?: string; interval?: string; start?: string; end?: string; start_ts?: number; end_ts?: number }): Promise<{ series: DevicePerformanceSeries[]; range: string; interval: string }> => {
   return await request.get(`/devices/${id}/detail/performance`, { params }) as { series: DevicePerformanceSeries[]; range: string; interval: string }
 }
 

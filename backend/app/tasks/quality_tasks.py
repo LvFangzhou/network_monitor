@@ -11,7 +11,7 @@ from app.core import get_logger
 from app.database import SessionLocal
 from app.models import QualityProbeTarget
 from app.utils import redis_client
-from app.utils.quality_probe import run_quality_ping, write_quality_probe_result
+from app.utils.quality_probe import apply_quality_loss_window, run_quality_ping, write_quality_probe_result
 
 
 logger = get_logger(__name__)
@@ -85,7 +85,7 @@ def collect_quality_probes(self) -> Dict[str, Any]:
                     }
 
         for target in due_targets:
-            result = probe_results.get(target.id) or {}
+            result = apply_quality_loss_window(target.id, probe_results.get(target.id) or {})
             target.last_probe_at = datetime.now(timezone.utc)
             target.last_success = bool(result.get("success"))
             target.last_avg_latency_ms = result.get("avg_latency_ms")

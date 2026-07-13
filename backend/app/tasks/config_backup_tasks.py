@@ -302,6 +302,47 @@ def _output_returned_to_prompt(output: str) -> bool:
     return any(_looks_like_prompt_line(line) for line in lines[-8:])
 
 
+def _is_config_capture_noise_line(line: str, command: Optional[str] = None) -> bool:
+    """过滤采集配置时由终端控制/关分页命令产生的噪音。
+
+    这类内容不是设备配置本身，例如：
+    - <H3C>screen-length 0 temporary / terminal length 0
+    - % Unrecognized command found at '^' position.
+    - Asteros/Ruijie 的 `hostname# show startup-config` 命令回显
+    如果不清理，会导致 running/startup 明明一致却被 diff 标记为不一致。
+    """
+    stripped = (line or "").strip()
+    if not stripped:
+        return True
+    lower = stripped.lower()
+    if stripped == "^" or re.fullmatch(r"\^+", stripped):
+        return True
+    if re.search(r"unrecognized\s+command|unknown\s+command|invalid\s+input|incomplete\s+command", lower):
+        return True
+
+    command_patterns = [
+        r"screen-length\s+0\s+temporary",
+        r"terminal\s+length\s+0",
+        r"terminal\s+pager\s+0",
+        r"no\s+page",
+        r"display\s+current-configuration",
+        r"dis\s+current-configuration",
+        r"display\s+saved-configuration",
+        r"show\s+running-config",
+        r"show\s+startup-config",
+        r"show\s+configuration\s+running",
+        r"show\s+configuration\s+startup",
+    ]
+    if command:
+        command_patterns.append(re.escape(command.strip()))
+    command_union = "(?:" + "|".join(command_patterns) + ")"
+    prompt_prefix = r"(?:<[^<>]{1,200}>|[A-Za-z0-9_.:/-]{1,200}#|\[[^\]]{1,200}\])\s*"
+    return bool(
+        re.fullmatch(command_union, lower, re.IGNORECASE)
+        or re.fullmatch(prompt_prefix + command_union, stripped, re.IGNORECASE)
+    )
+
+
 def _clean_config_output(output: str, command: str) -> str:
     text = _strip_terminal_control(output)
     text = text.replace("--More--", "").replace("---- More ----", "")
@@ -326,6 +367,8 @@ def _clean_config_output(output: str, command: str) -> str:
     for line in cleaned:
         if not line.strip():
             # 配置文件里空行基本没有语义，删除多余空行，保留 # / ! 这类厂商自己的段落分隔符。
+            continue
+        if _is_config_capture_noise_line(line, command):
             continue
         if _looks_like_prompt_line(line):
             continue
@@ -391,6 +434,10 @@ def _normalize_config_for_compare(config: str, device: Optional[Device] = None) 
         r"^\s*display\s+.*configuration\s*$",
         r"^\s*show\s+.*config\s*$",
         r"^.*[#>]\s*(?:display|dis|show)\s+.*config(?:uration)?\s*$",
+        r"^.*[#>]\s*(?:screen-length\s+0\s+temporary|terminal\s+length\s+0|terminal\s+pager\s+0)\s*$",
+        r"^\s*(?:screen-length\s+0\s+temporary|terminal\s+length\s+0|terminal\s+pager\s+0)\s*$",
+        r"^\s*\^+\s*$",
+        r"^\s*%\s*(?:unrecognized|unknown|invalid|incomplete)\s+command.*",
     ]
     compiled = [re.compile(pattern, re.IGNORECASE) for pattern in volatile_patterns]
     for raw_line in (config or "").splitlines():
@@ -400,6 +447,8 @@ def _normalize_config_for_compare(config: str, device: Optional[Device] = None) 
             continue
         if stripped in {"#", "!", "return", "end"}:
             # 段落分隔符不影响配置语义，跳过后能减少无意义 diff。
+            continue
+        if _is_config_capture_noise_line(stripped):
             continue
         lower_stripped = stripped.lower()
         if lower_stripped in {"exit", "exit-vrf"}:

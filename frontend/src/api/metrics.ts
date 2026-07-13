@@ -248,6 +248,83 @@ export const getMonitorInterfaceHistory = async (
   }
 }
 
+export const getTrafficSummaryHistory = async (
+  params: { line_type: 'internet' | 'private_line'; datacenter_id?: number; range: string; interval: string; start_ts?: number; end_ts?: number; fresh?: boolean }
+): Promise<{
+  line_type: 'internet' | 'private_line'
+  datacenter_id?: number | null
+  range: string
+  interval: string
+  rate_window?: string
+  data: MonitorHistoryPoint[]
+  total: number
+  target_count: number
+  skipped_target_count: number
+  cached?: boolean
+  generated_at?: string
+}> => {
+  return await request.get('/metrics/traffic/summary', { params }) as {
+    line_type: 'internet' | 'private_line'
+    datacenter_id?: number | null
+    range: string
+    interval: string
+    rate_window?: string
+    data: MonitorHistoryPoint[]
+    total: number
+    target_count: number
+    skipped_target_count: number
+    cached?: boolean
+    generated_at?: string
+  }
+}
+
+export const getCircuitTrafficHistory = async (
+  circuitId: number,
+  params: { range: string; interval: string; start_ts?: number; end_ts?: number; fresh?: boolean }
+): Promise<{
+  circuit: Record<string, any>
+  range: string
+  interval: string
+  rate_window?: string
+  aggregate: MonitorHistoryPoint[]
+  data?: MonitorHistoryPoint[]
+  targets: Array<{
+    device_id: number
+    device_name?: string
+    device_ip?: string
+    port_name?: string
+    side?: string
+    interface: MonitorInterface
+    data: MonitorHistoryPoint[]
+  }>
+  target_count: number
+  skipped_target_count: number
+  cached?: boolean
+  generated_at?: string
+}> => {
+  return await request.get(`/metrics/traffic/circuits/${circuitId}/history`, { params }) as {
+    circuit: Record<string, any>
+    range: string
+    interval: string
+    rate_window?: string
+    aggregate: MonitorHistoryPoint[]
+    data?: MonitorHistoryPoint[]
+    targets: Array<{
+      device_id: number
+      device_name?: string
+      device_ip?: string
+      port_name?: string
+      side?: string
+      interface: MonitorInterface
+      data: MonitorHistoryPoint[]
+    }>
+    target_count: number
+    skipped_target_count: number
+    cached?: boolean
+    generated_at?: string
+  }
+}
+
 export const getMonitorInterfaceQueueHistory = async (
   deviceId: number,
   interfaceIndex: number,
@@ -411,6 +488,10 @@ export const getIpFlowTraffic = async (params: {
   ip: string
   range: string
   interval: string
+  start?: string
+  end?: string
+  start_ts?: number
+  end_ts?: number
 }): Promise<IpFlowTraffic> => {
   return await request.get('/metrics/flow/ip-traffic', { params }) as IpFlowTraffic
 }
@@ -429,6 +510,10 @@ export const getInterfaceTopIps = async (params: {
   range: string
   interval: string
   limit?: number
+  start?: string
+  end?: string
+  start_ts?: number
+  end_ts?: number
 }): Promise<{
   agent_ip: string
   interface_index: number
@@ -502,6 +587,10 @@ export interface SflowAgentOption {
 
 export const getSflowAgents = async (params?: {
   range?: string
+  start?: string
+  end?: string
+  start_ts?: number
+  end_ts?: number
 }): Promise<{
   range: string
   items: SflowAgentOption[]
@@ -517,6 +606,10 @@ export const getSflowAgents = async (params?: {
 export const getSflowInterfaces = async (params: {
   agent_ip: string
   range?: string
+  start?: string
+  end?: string
+  start_ts?: number
+  end_ts?: number
 }): Promise<{
   agent_ip: string
   range: string
@@ -547,6 +640,10 @@ export const getInterfaceIpSeries = async (params: {
   interval: string
   limit?: number
   ip?: string
+  start?: string
+  end?: string
+  start_ts?: number
+  end_ts?: number
 }): Promise<{
   agent_ip: string
   interface_index: number
@@ -667,6 +764,7 @@ export interface QualityProbeTarget {
   last_success?: boolean | null
   last_avg_latency_ms?: number | null
   last_packet_loss_percent?: number | null
+  last_availability_percent?: number | null
   last_jitter_ms?: number | null
   last_error?: string | null
   created_at?: string | null
@@ -743,7 +841,7 @@ export const runQualityProbeMtr = async (
 
 export const getQualityProbeHistory = async (
   id: number,
-  params: { range: string; interval: string }
+  params: { range: string; interval: string; start?: string; end?: string; start_ts?: number; end_ts?: number }
 ): Promise<{
   target: QualityProbeTarget
   range: string

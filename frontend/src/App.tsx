@@ -81,6 +81,22 @@ const Settings = lazyWithReload(loadSettings)
 const TacacsManager = lazyWithReload(loadTacacsManager)
 const ConfigBackups = lazyWithReload(loadConfigBackups)
 
+const preloadHighFrequencyRoutes = () => {
+  const preload = () => {
+    void loadDeviceList()
+    void loadDeviceDetail()
+    void loadDeviceOverview()
+    void loadMetrics()
+    void loadConfigBackups()
+  }
+  const requestIdle = (window as any).requestIdleCallback
+  if (typeof requestIdle === 'function') {
+    requestIdle(preload, { timeout: 2500 })
+    return
+  }
+  window.setTimeout(preload, 1200)
+}
+
 const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/port-query', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/port-query']
 const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
@@ -215,10 +231,17 @@ class RouteErrorBoundary extends React.Component<{ children: React.ReactNode }, 
 
 function App() {
   const { initAuth } = useAuthStore()
+  const token = useAuthStore((state) => state.token)
 
   useEffect(() => {
     initAuth()
   }, [initAuth])
+
+  useEffect(() => {
+    if (!token) return undefined
+    const timer = window.setTimeout(preloadHighFrequencyRoutes, 800)
+    return () => window.clearTimeout(timer)
+  }, [token])
 
   return (
     <BrowserRouter>

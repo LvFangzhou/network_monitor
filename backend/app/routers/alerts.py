@@ -211,6 +211,14 @@ def _validated_rule_extra_config(extra_config: Optional[Dict[str, Any]]) -> Dict
         raise HTTPException(status_code=400, detail="告警规则必须选择适用厂商，不能再使用全部厂商规则。")
     config["applicable_vendors"] = applicable_vendors
     config.pop("vendors", None)
+    model_regex = str(config.get("model_regex") or "").strip()
+    exclude_model_regex = str(config.get("exclude_model_regex") or "").strip()
+    for pattern_value, field_name in ((model_regex, "model_regex"), (exclude_model_regex, "exclude_model_regex")):
+        if pattern_value:
+            try:
+                re.compile(pattern_value)
+            except re.error as exc:
+                raise HTTPException(status_code=400, detail=f"{field_name} 正则无效: {exc}") from exc
     return config
 
 def _get_silence_match_rule_filters(
@@ -1223,8 +1231,8 @@ async def test_notification(
     success = await notification_manager.send_notification(
         channel_type,
         config,
-        "网络监控测试消息",
-        "网络监控测试消息\n这是一条测试告警消息，用于验证机器人 webhook 是否配置正确。",
+        "并行网络运营平台测试消息",
+        "并行网络运营平台测试消息\n这是一条测试告警消息，用于验证机器人 webhook 是否配置正确。",
         {
             "severity": "P1",
             "title": "P1-故障通知@测试对象",

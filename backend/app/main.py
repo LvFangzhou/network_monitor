@@ -206,7 +206,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="企业级网络设备监控系统",
+    description="企业级网络运营与监控系统",
     docs_url=settings.DOCS_URL,
     redoc_url=settings.REDOC_URL,
     lifespan=lifespan

@@ -874,7 +874,7 @@ async def list_customer_audits(
 async def list_vendors(
     db: Session = Depends(get_db),
     skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=1000),
     search: Optional[str] = None,
 ):
     query = db.query(Vendor)
@@ -932,11 +932,13 @@ async def delete_vendor(vendor_id: int, db: Session = Depends(get_db)):
 async def list_circuits(
     db: Session = Depends(get_db),
     skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=1000),
     datacenter_id: Optional[int] = None,
     line_type: Optional[str] = None,
     access_mode: Optional[str] = None,
     customer_id: Optional[int] = None,
+    vendor_id: Optional[int] = None,
+    status: Optional[str] = None,
     search: Optional[str] = None,
 ):
     query = db.query(Circuit).options(
@@ -954,6 +956,10 @@ async def list_circuits(
         query = query.filter(Circuit.access_mode == access_mode)
     if customer_id:
         query = query.filter(Circuit.customer_id == customer_id)
+    if vendor_id:
+        query = query.filter(Circuit.vendor_id == vendor_id)
+    if status:
+        query = query.filter(Circuit.status == status)
     search_text = normalize_search_text(search)
     search_ip = parse_search_ip(search)
     filtered_items = [item for item in query.order_by(Circuit.id.desc()).all() if circuit_matches_search(item, search_text, search_ip)]

@@ -202,6 +202,27 @@ beat_schedule = {
             'expires': 240.0,
         },
     },
+    'prewarm-traffic-query-cache-every-60s': {
+        'task': 'app.tasks.menu_cache_tasks.prewarm_traffic_query_cache',
+        'schedule': 60.0,
+        'options': {
+            'expires': 50.0,
+        },
+    },
+    'prewarm-device-detail-caches-every-60s': {
+        'task': 'app.tasks.snmp_tasks.prewarm_device_detail_caches',
+        'schedule': 60.0,
+        'options': {
+            'expires': 50.0,
+        },
+    },
+    'ensure-qos-discard-rules-every-10m': {
+        'task': 'app.tasks.snmp_tasks.ensure_qos_discard_rules',
+        'schedule': 600.0,
+        'options': {
+            'expires': 300.0,
+        },
+    },
     # 公网质量探测 - 每1秒调度一次，到期目标按各自采样间隔执行，历史保存到 InfluxDB
     'collect-quality-probes-every-1s': {
         'task': 'app.tasks.quality_tasks.collect_quality_probes',

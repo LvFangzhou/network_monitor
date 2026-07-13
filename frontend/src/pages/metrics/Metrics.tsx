@@ -3,6 +3,7 @@ import {
   AutoComplete,
   Button,
   Card,
+  DatePicker,
   Empty,
   InputNumber,
   Radio,
@@ -43,6 +44,7 @@ import {
 import { useThemeStore } from '../../store/theme'
 
 const { Text } = Typography
+const { RangePicker } = DatePicker
 
 type MonitorGroupKey = 'traffic' | 'utilization' | 'discards' | 'errors' | 'buffer' | 'queueDropGrowth' | 'pfcGrowth' | 'ecnGrowth'
 
@@ -124,6 +126,7 @@ const RANGE_OPTIONS = [
   { value: '-24h', label: '过去24小时' },
   { value: '-3d', label: '过去3天' },
   { value: '-7d', label: '过去7天' },
+  { value: 'custom', label: '自定义时间' },
 ]
 
 const isValidRangeValue = (value?: string) => RANGE_OPTIONS.some((item) => item.value === value)
@@ -415,7 +418,27 @@ const getRangeWindowMs = (rangeValue: string) => {
   if (rangeValue === '-24h') return 24 * 60 * 60 * 1000
   if (rangeValue === '-3d') return 3 * 24 * 60 * 60 * 1000
   if (rangeValue === '-7d') return 7 * 24 * 60 * 60 * 1000
+  if (rangeValue === 'custom') return 365 * 24 * 60 * 60 * 1000
   return HISTORY_CACHE_RETENTION_MS
+}
+
+const buildAbsoluteRangeParams = (customRange?: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null) => {
+  if (!customRange?.[0] || !customRange?.[1]) return {}
+  return {
+    start_ts: customRange[0].valueOf(),
+    end_ts: customRange[1].valueOf(),
+  }
+}
+
+const getCustomRangeInterval = (customRange?: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null) => {
+  if (!customRange?.[0] || !customRange?.[1]) return '1m'
+  const seconds = Math.max(1, customRange[1].diff(customRange[0], 'second'))
+  if (seconds <= 30 * 60) return '10s'
+  if (seconds <= 2 * 60 * 60) return '30s'
+  if (seconds <= 12 * 60 * 60) return '1m'
+  if (seconds <= 3 * 24 * 60 * 60) return '5m'
+  if (seconds <= 7 * 24 * 60 * 60) return '15m'
+  return '1h'
 }
 
 const getRangeValueForWindowMs = (windowMs: number) => {
@@ -716,6 +739,11 @@ const Metrics = () => {
   const [selectedMonitorKey, setSelectedMonitorKey] = useState<MonitorGroupKey>(persistedState?.selectedMonitorKey || 'traffic')
   const [monitorSearchKeyword, setMonitorSearchKeyword] = useState(persistedState?.monitorSearchKeyword || '')
   const [rangeValue, setRangeValue] = useState(isValidRangeValue(persistedState?.rangeValue) ? persistedState.rangeValue : '-10m')
+  const [customRange, setCustomRange] = useState<[dayjs.Dayjs | null, dayjs.Dayjs | null] | null>(() => {
+    const start = persistedState?.customRangeStart ? dayjs(persistedState.customRangeStart) : null
+    const end = persistedState?.customRangeEnd ? dayjs(persistedState.customRangeEnd) : null
+    return start?.isValid() && end?.isValid() ? [start, end] : [dayjs().subtract(1, 'hour'), dayjs()]
+  })
   const [refreshValue, setRefreshValue] = useState(persistedState?.refreshValue || 10)
   const [chartsPerRow, setChartsPerRow] = useState(() => {
     const value = Number(persistedState?.chartsPerRow || 2)
@@ -744,13 +772,15 @@ const Metrics = () => {
   const queueSeriesMapRef = useRef<Record<string, MonitorDynamicSeries[]>>({})
   const historyFetchedAtRef = useRef<Record<string, number>>({})
   const historyPendingRef = useRef<Partial<Record<string, Promise<readonly [string, string, ChartPoint[], MonitorDynamicSeries[]?]>>>>({})
+  const historyRequestSeqRef = useRef(0)
 
   const selectedRange = useMemo(
     () => {
       const range = RANGE_OPTIONS.find((item) => item.value === rangeValue) || RANGE_OPTIONS[0]
-      return { ...range, interval: getAdaptiveInterval(range.value), rateWindow: getAdaptiveRateWindow(range.value) }
+      const interval = range.value === 'custom' ? getCustomRangeInterval(customRange) : getAdaptiveInterval(range.value)
+      return { ...range, interval, rateWindow: getAdaptiveRateWindow(range.value === 'custom' ? '-1h' : range.value) }
     },
-    [rangeValue]
+    [rangeValue, customRange]
   )
   const selectedMonitorGroup = useMemo(
     () => MONITOR_GROUPS.find((item) => item.key === selectedMonitorKey) || MONITOR_GROUPS[0],
@@ -905,18 +935,39 @@ const Metrics = () => {
     }
   }
 
-  const loadHistoryForTargets = async (targets: SelectedTarget[], nextRange = rangeValue, options?: { silent?: boolean; force?: boolean }) => {
+  const loadHistoryForTargets = async (
+    targets: SelectedTarget[],
+    nextRange = rangeValue,
+    options?: {
+      silent?: boolean
+      force?: boolean
+      customRangeOverride?: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null
+    }
+  ) => {
+    const requestSeq = historyRequestSeqRef.current + 1
+    historyRequestSeqRef.current = requestSeq
     if (!targets.length) {
       setHistoryMap({})
       return
     }
     const rangeConfig = RANGE_OPTIONS.find((item) => item.value === nextRange) || RANGE_OPTIONS[0]
-    const interval = getAdaptiveInterval(rangeConfig.value)
-    const rateWindow = getAdaptiveRateWindow(rangeConfig.value)
+    const isCustomRange = rangeConfig.value === 'custom'
+    const effectiveCustomRange = options?.customRangeOverride ?? customRange
+    const absoluteParams = isCustomRange ? buildAbsoluteRangeParams(effectiveCustomRange) : {}
+    if (isCustomRange && (!absoluteParams.start_ts || !absoluteParams.end_ts)) {
+      message.warning('请选择自定义开始和结束时间')
+      return
+    }
+    const interval = isCustomRange ? getCustomRangeInterval(effectiveCustomRange) : getAdaptiveInterval(rangeConfig.value)
+    const rateWindow = getAdaptiveRateWindow(isCustomRange ? '-1h' : rangeConfig.value)
+    const rangeRequestValue = isCustomRange ? '-1h' : rangeConfig.value
+    const rangeCacheValue = isCustomRange && absoluteParams.start_ts && absoluteParams.end_ts
+      ? `custom:${absoluteParams.start_ts}:${absoluteParams.end_ts}`
+      : rangeConfig.value
     const now = Date.now()
     const cacheEntries = targets.map((target) => ({
       target,
-      cacheKey: historyCacheKey(target.key, rangeConfig.value, interval, selectedMonitorKey),
+      cacheKey: historyCacheKey(target.key, rangeCacheValue, interval, selectedMonitorKey),
       fallbackKey: target.key,
     }))
     const hasVisibleCache = cacheEntries.some(({ cacheKey, fallbackKey }) => {
@@ -942,14 +993,15 @@ const Metrics = () => {
           const pending = isQueueDetailGroup(selectedMonitorKey)
             ? getMonitorInterfaceQueueHistory(target.device.id, target.interface.index, {
                 group: selectedMonitorKey,
-                range: rangeConfig.value,
+                range: rangeRequestValue,
                 interval,
               }).then((history) => [cacheKey, fallbackKey, history.data.map(toChartPoint), history.series] as const)
             : getMonitorInterfaceHistory(target.device.id, target.interface.index, {
-                range: rangeConfig.value,
+                range: rangeRequestValue,
                 interval,
                 rate_window: rateWindow,
                 group: selectedMonitorKey,
+                ...absoluteParams,
               }).then((history) => [cacheKey, fallbackKey, history.data.map(toChartPoint)] as const)
 
           historyPendingRef.current[cacheKey] = pending
@@ -960,6 +1012,7 @@ const Metrics = () => {
           }
         })
       )
+      if (historyRequestSeqRef.current !== requestSeq) return
       setHistoryMap((prev) => {
         const next = { ...prev }
         const updatedAt = Date.now()
@@ -981,9 +1034,10 @@ const Metrics = () => {
         return next
       })
     } catch (error: any) {
+      if (historyRequestSeqRef.current !== requestSeq) return
       message.error(error?.response?.data?.detail || '读取历史监控数据失败')
     } finally {
-      if (!options?.silent) {
+      if (historyRequestSeqRef.current === requestSeq && !options?.silent) {
         setLoadingChart(false)
       }
     }
@@ -1180,7 +1234,7 @@ const Metrics = () => {
   useEffect(() => {
     if (!selectedTargets.length) return
     loadHistoryForTargets(selectedTargets, rangeValue)
-  }, [rangeValue])
+  }, [rangeValue, customRange])
 
   useEffect(() => {
     if (!selectedTargets.length) return
@@ -1195,7 +1249,7 @@ const Metrics = () => {
       loadHistoryForTargets(selectedTargets, rangeValue, { silent: true, force: true })
     }, refreshValue * 1000)
     return () => window.clearInterval(timer)
-  }, [selectedTargets, refreshValue, rangeValue, selectedMonitorKey])
+  }, [selectedTargets, refreshValue, rangeValue, selectedMonitorKey, customRange])
 
   useEffect(() => {
     persistHistoryMap(historyMap)
@@ -1215,6 +1269,8 @@ const Metrics = () => {
         selectedMonitorKey,
         monitorSearchKeyword,
         rangeValue,
+        customRangeStart: customRange?.[0]?.toISOString(),
+        customRangeEnd: customRange?.[1]?.toISOString(),
         refreshValue,
         chartsPerRow,
         sourceCircuitContext,
@@ -1230,6 +1286,7 @@ const Metrics = () => {
     selectedMonitorKey,
     monitorSearchKeyword,
     rangeValue,
+    customRange,
     refreshValue,
     chartsPerRow,
     sourceCircuitContext,
@@ -1237,7 +1294,13 @@ const Metrics = () => {
 
   const chartCards = useMemo(() => {
     const now = Date.now()
-    const rangeStart = now - getRangeWindowMs(rangeValue)
+    const customStart = customRange?.[0]?.valueOf()
+    const customEnd = customRange?.[1]?.valueOf()
+    const rangeStart = rangeValue === 'custom' && customStart ? customStart : now - getRangeWindowMs(rangeValue)
+    const rangeEnd = rangeValue === 'custom' && customEnd ? customEnd : now
+    const rangeCacheValue = rangeValue === 'custom' && customStart && customEnd
+      ? `custom:${customStart}:${customEnd}`
+      : rangeValue
     return selectedTargets.map((target) => {
       const zoomRange = zoomRanges[target.key]
       const effectiveRangeValue = zoomRange?.start && zoomRange?.end
@@ -1248,7 +1311,7 @@ const Metrics = () => {
         : selectedRange.interval
       const currentHistoryKey = zoomRange?.start && zoomRange?.end && !isQueueDetailGroup(selectedMonitorKey)
         ? zoomHistoryCacheKey(target.key, zoomRange.start, zoomRange.end, effectiveInterval, selectedMonitorKey)
-        : historyCacheKey(target.key, rangeValue, selectedRange.interval, selectedMonitorKey)
+        : historyCacheKey(target.key, rangeCacheValue, selectedRange.interval, selectedMonitorKey)
       const gapThresholdMs = getGapThresholdMs(effectiveRangeValue, effectiveInterval, refreshValue)
       const series = isQueueDetailGroup(selectedMonitorKey)
         ? (queueSeriesMap[currentHistoryKey] || [])
@@ -1262,7 +1325,7 @@ const Metrics = () => {
         : rawData
       const xDomain: [number, number] = zoomRange?.start && zoomRange?.end
         ? [zoomRange.start, zoomRange.end]
-        : alignTimeDomainToMinute(rangeStart, now)
+        : alignTimeDomainToMinute(rangeStart, rangeEnd)
       const data = resampleChartData(zoomedData, series, gapThresholdMs, selectedMonitorGroup.unit)
       const pointCount = data.filter((point) => hasSeriesValue(point, series)).length
       const dotStride = getChartDotStride(effectiveRangeValue, pointCount)
@@ -1302,7 +1365,7 @@ const Metrics = () => {
         sampleIntervalLabel,
       }
     })
-  }, [historyMap, queueSeriesMap, selectedTargets, selectedMonitorGroup, selectedMonitorKey, selectedRange.interval, refreshValue, rangeValue, zoomRanges, dragSelections])
+  }, [historyMap, queueSeriesMap, selectedTargets, selectedMonitorGroup, selectedMonitorKey, selectedRange.interval, refreshValue, rangeValue, customRange, zoomRanges, dragSelections])
 
   return (
     <Space direction="vertical" size="middle" style={{ width: '100%' }}>
@@ -1489,6 +1552,23 @@ const Metrics = () => {
             options={RANGE_OPTIONS.map((item) => ({ value: item.value, label: item.label }))}
             style={{ width: 220 }}
           />
+          {rangeValue === 'custom' && (
+            <RangePicker
+              showTime
+              value={customRange as any}
+              allowClear={false}
+              onChange={(value) => {
+                const nextCustomRange = value as [dayjs.Dayjs | null, dayjs.Dayjs | null] | null
+                setCustomRange(nextCustomRange)
+                setZoomRanges({})
+                setDragSelections({})
+                if (selectedTargets.length) {
+                  loadHistoryForTargets(selectedTargets, 'custom', { customRangeOverride: nextCustomRange })
+                }
+              }}
+              style={{ width: 380 }}
+            />
+          )}
           <Select
             value={refreshValue}
             onChange={setRefreshValue}

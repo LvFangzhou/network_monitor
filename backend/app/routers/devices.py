@@ -6,7 +6,7 @@ from sqlalchemy import case, cast, func, or_
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.orm import Session, joinedload
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 import asyncio
 import re
@@ -87,6 +87,14 @@ def _load_monitor_cache(kind: str, device_id: int, suffix: str = "") -> Optional
         return None
 
 
+def _set_monitor_cache(kind: str, device_id: int, payload: Any, suffix: str = "", ttl_seconds: int = 1800) -> None:
+    redis_client.setex(
+        _monitor_cache_key(kind, device_id, suffix),
+        ttl_seconds,
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
+
+
 def _parse_time_filter(value: Optional[str]) -> Optional[datetime]:
     text = str(value or "").strip()
     if not text:
@@ -123,28 +131,32 @@ def _normalize_interface_key(value: Any) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return ""
+    normalized = re.sub(r"\s+", "", text)
     replacements = {
+        "fourhundred-gigabitethernet": "400g",
+        "fourhundredgigabitethernet": "400g",
+        "fourhundredgige": "400g",
         "fourhundredge": "400g",
+        "fhgigabitethernet": "400g",
         "400ge": "400g",
-        "hundredgige": "hge",
         "hundred-gigabitethernet": "hge",
         "hundredgigabitethernet": "hge",
+        "hundredgige": "hge",
         "hundredge": "hge",
         "100ge": "hge",
-        "fourhundredgige": "400g",
-        "fourhundredgigabitethernet": "400g",
-        "fourhundred-gigabitethernet": "400g",
         "ten-gigabitethernet": "tengige",
         "tengigabitethernet": "tengige",
-        "tengige": "tengige",
         "xgigabitethernet": "tengige",
-        "xge": "tengige",
-        "te": "tengige",
-        "gigabitethernet": "ge",
+        "tengige": "tengige",
         "m-gigabitethernet": "mge",
+        "gigabitethernet": "ge",
+        "xge": "tengige",
+        "fh": "400g",
+        "te": "tengige",
     }
-    normalized = re.sub(r"\s+", "", text)
-    for src, dst in replacements.items():
+    # 必须先替换长前缀，再替换短前缀。否则 FourHundredGigE 会先命中
+    # HundredGigE，导致 FourHundredGigE1/0/1 和 400GE1/0/1 不能被识别为同一接口。
+    for src, dst in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
         normalized = normalized.replace(src, dst)
     return re.sub(r"[^a-z0-9/._-]", "", normalized)
 
@@ -328,12 +340,30 @@ def _is_default_interface_description(name: str, description: Any) -> bool:
     return normalized_text in default_values or _normalize_interface_key(text) == _normalize_interface_key(name)
 
 
+def _clean_interface_description(name: str, description: Any) -> str:
+    """Return only real operator-configured interface descriptions.
+
+    Some vendors expose the interface name or "<interface> Interface" through ifAlias/ifDescr.
+    That is useful as an identifier, but showing it in the description column looks like a
+    fabricated description. Keep this field empty unless it carries distinct text.
+    """
+    text = str(description or "").strip()
+    if not text:
+        return ""
+    if _is_default_interface_description(name, text):
+        return ""
+    without_suffix = re.sub(r"\s+Interface$", "", text, flags=re.IGNORECASE).strip()
+    if without_suffix != text and _is_default_interface_description(name, without_suffix):
+        return ""
+    return text
+
+
 def _best_lldp_remote_device(neighbor: Dict[str, Any]) -> str:
-    for field in ("remote_display_name", "remote_system", "remote_device", "peer", "remote_chassis_id"):
+    for field in ("remote_system", "remote_display_name", "remote_device", "peer", "remote_chassis_id"):
         value = str(neighbor.get(field) or "").strip()
         if value and value != "-" and not _looks_like_mac(value):
             return value
-    for field in ("remote_display_name", "remote_system", "remote_device", "peer", "remote_chassis_id"):
+    for field in ("remote_system", "remote_display_name", "remote_device", "peer", "remote_chassis_id"):
         value = str(neighbor.get(field) or "").strip()
         if value and value != "-":
             return value
@@ -352,7 +382,7 @@ def _best_lldp_remote_interface(neighbor: Dict[str, Any]) -> str:
     # LLDP remote_port_desc 经常是人为描述（如 M2M27U3940-9820-AGG01-100G19），
     # 不能直接当成“对端接口”。优先使用 remote_port_id；只有字段本身是接口格式时才展示。
     interface_pattern = re.compile(
-        r"^((?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet|400GE|200GE|100GE|100G|50GE|25GE|10GE|HGE|XGE|GE|MGE)\d+(?:/\d+)+(?:[:/]\d+)?)$",
+        r"^((?:FourHundredGigE|FourHundredGigabitEthernet|FHGigabitEthernet|FH|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet|400GE|200GE|100GE|100G|50GE|25GE|10GE|HGE|XGE|GE|MGE)\s*\d+(?:/\d+)+(?:[:/]\d+)?)$",
         flags=re.IGNORECASE,
     )
     for field in ("remote_port_id", "remote_interface", "remote_port"):
@@ -363,6 +393,26 @@ def _best_lldp_remote_interface(neighbor: Dict[str, Any]) -> str:
         if match:
             return match.group(1)
     return ""
+
+
+def _parse_neighbor_from_to_description(value: Any) -> Dict[str, str]:
+    """从标准接口描述 to-对端设备-对端接口 中提取连接关系。"""
+    text = str(value or "").strip()
+    if not text.lower().startswith("to-"):
+        return {}
+    interface_pattern = (
+        r"(?:FourHundredGigE|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|"
+        r"Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|"
+        r"XGigabitEthernet|400GE|200GE|100GE|100G|50GE|25GE|10GE|HGE|XGE|GE|MGE)"
+        r"\d+(?:/\d+)+(?:[:/]\d+)?"
+    )
+    match = re.match(rf"^to-(?P<device>.+)-(?P<interface>{interface_pattern})$", text, flags=re.IGNORECASE)
+    if not match:
+        return {}
+    return {
+        "remote_device": match.group("device").strip(),
+        "remote_interface": match.group("interface").strip(),
+    }
 
 
 def _extract_device_name_from_lldp_sys_desc(value: Any) -> str:
@@ -397,6 +447,26 @@ def _lldp_row_local_keys(row: Dict[str, Any]) -> List[str]:
             keys.append(f"idx:{value}")
     for field in ("local_port", "interface", "local_port_id"):
         key = _normalize_interface_key(row.get(field))
+        if key and f"if:{key}" not in keys:
+            keys.append(f"if:{key}")
+    return keys
+
+
+def _lldp_row_precise_local_keys(row: Dict[str, Any]) -> List[str]:
+    """仅使用 LLDP 真实本端端口生成匹配键，避免 local_port 描述导致接口串联。"""
+    keys: List[str] = []
+    for field in ("local_index", "local_port_num", "interface_index", "index"):
+        value = str(row.get(field) or "").strip()
+        if value and f"idx:{value}" not in keys:
+            keys.append(f"idx:{value}")
+    for field in ("local_port_id", "interface"):
+        key = _normalize_interface_key(row.get(field))
+        if key and f"if:{key}" not in keys:
+            keys.append(f"if:{key}")
+    # CLI 的 display lldp neighbor-information list 输出里 local_port 就是真实本端接口；
+    # SNMP 的 local_port 有时来自端口描述，因此只有 CLI 行才允许用 local_port 兜底。
+    if "cli" in str(row.get("source") or "").lower():
+        key = _normalize_interface_key(row.get("local_port"))
         if key and f"if:{key}" not in keys:
             keys.append(f"if:{key}")
     return keys
@@ -505,7 +575,7 @@ def _enrich_lldp_rows_with_cmdb(db: Session, rows: List[Dict[str, Any]]) -> List
     for raw in rows:
         row = {**raw}
         sys_desc_name = _extract_device_name_from_lldp_sys_desc(row.get("remote_sys_desc"))
-        remote_system = str(sys_desc_name or row.get("remote_display_name") or row.get("remote_system") or row.get("remote_device") or row.get("peer") or "").strip()
+        remote_system = str(sys_desc_name or row.get("remote_system") or row.get("remote_display_name") or row.get("remote_device") or row.get("peer") or "").strip()
         remote_mgmt = _best_lldp_remote_mgmt_ip(row)
         normalized = _normalize_neighbor_device_name(remote_system)
         matched_by_name = by_name.get(normalized)
@@ -541,6 +611,25 @@ def _infer_tacacs_operation(command: str, raw: str) -> str:
 
 def _flux_escape(value: str) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _parse_query_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _flux_time(value: datetime) -> str:
+    return f'time(v: "{value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}")'
 
 
 def _safe_float_value(value: Any) -> Optional[float]:
@@ -1532,7 +1621,11 @@ async def delete_device_type(device_type_id: int, db: Session = Depends(get_db))
 
 
 @router.get("/{device_id}/detail/connections", response_model=dict)
-async def get_device_detail_connections(device_id: int, db: Session = Depends(get_db)):
+async def get_device_detail_connections(
+    device_id: int,
+    db: Session = Depends(get_db),
+    force_refresh: bool = Query(False, description="是否绕过缓存实时刷新接口连接信息"),
+):
     """设备详情：接口连接关系。"""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
@@ -1540,8 +1633,10 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
     monitor_source = resolve_monitor_source_by_vendor(device.vendor, device.monitor_source)
 
     cached = _load_monitor_cache("interfaces", device.id)
-    interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
+    cached_interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
+    interfaces = [] if force_refresh else cached_interfaces
     source = "cache"
+    live_error = ""
     if not interfaces:
         # 优先用后台快照；快照缺失时做一次限时 SNMP 轻量补采，避免详情页长期空白。
         # 大端口设备 SNMP walk 可能较慢，所以必须设置超时，超时后仍返回页面而不是一直转圈。
@@ -1552,15 +1647,22 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
                     timeout=10,
                 )
                 source = "exporter_live"
-            except Exception:
+                if interfaces:
+                    _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": datetime.utcnow().isoformat(), "source": "exporter_live"})
+            except Exception as exc:
                 logger.warning("设备详情AsterNOS接口实时补采失败 device_id=%s ip=%s", device.id, device.ip_address, exc_info=True)
-                return {
-                    "device": device.to_dict(),
-                    "items": [],
-                    "total": 0,
-                    "source": "exporter_miss",
-                    "message": "AsterNOS Exporter 接口数据暂不可用，请确认 exporter 是否可达或稍后刷新",
-                }
+                live_error = str(exc)
+                if force_refresh and cached_interfaces:
+                    interfaces = cached_interfaces
+                    source = "cache"
+                else:
+                    return {
+                        "device": device.to_dict(),
+                        "items": [],
+                        "total": 0,
+                        "source": "exporter_miss",
+                        "message": "AsterNOS Exporter 接口数据暂不可用，请确认 exporter 是否可达或稍后刷新",
+                    }
         elif getattr(device, "snmp_version", None):
             try:
                 interfaces = await asyncio.wait_for(
@@ -1568,23 +1670,35 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
                     timeout=15,
                 )
                 source = "snmp_live"
-            except Exception:
+                if interfaces:
+                    _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": datetime.utcnow().isoformat(), "source": "snmp_live"})
+            except Exception as exc:
                 logger.warning("设备详情接口实时补采失败 device_id=%s ip=%s", device.id, device.ip_address, exc_info=True)
+                live_error = str(exc)
+                if force_refresh and cached_interfaces:
+                    interfaces = cached_interfaces
+                    source = "cache"
+                else:
+                    return {
+                        "device": device.to_dict(),
+                        "items": [],
+                        "total": 0,
+                        "source": "cache_miss",
+                        "message": "后台接口快照暂未生成，实时补采超时或失败，请稍后刷新或触发设备采集",
+                    }
+        else:
+            if force_refresh and cached_interfaces:
+                interfaces = cached_interfaces
+                source = "cache"
+                live_error = "设备未配置 SNMP/Exporter 接口采集参数，已回退旧缓存"
+            else:
                 return {
                     "device": device.to_dict(),
                     "items": [],
                     "total": 0,
                     "source": "cache_miss",
-                    "message": "后台接口快照暂未生成，实时补采超时或失败，请稍后刷新或触发设备采集",
+                    "message": "设备未配置 SNMP/Exporter 接口采集参数",
                 }
-        else:
-            return {
-                "device": device.to_dict(),
-                "items": [],
-                "total": 0,
-                "source": "cache_miss",
-                "message": "设备未配置 SNMP/Exporter 接口采集参数",
-            }
 
     cached_lldp = _load_monitor_cache("lldp_neighbors_v2", device.id)
     cached_protocol = _load_monitor_cache("protocol_neighbors", device.id)
@@ -1600,22 +1714,26 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
         _cached_lldp_rows(cached_lldp),
         _cached_lldp_rows(cached_protocol),
     )
-    if monitor_source != "asternos_exporter" and interfaces and not _lldp_rows_have_useful_neighbor(lldp_rows):
+    if monitor_source != "asternos_exporter" and interfaces and force_refresh:
         collected_lldp_rows = await _collect_lldp_rows_for_device_detail(device)
         if collected_lldp_rows:
-            lldp_rows = _merge_lldp_rows_for_device_detail(lldp_rows, collected_lldp_rows)
+            # 手动刷新时用户期待看到本次设备实时返回的信息。旧 LLDP 缓存如果曾经因为
+            # local_port 描述或 ifIndex 错配产生串联，继续参与合并会把准确的实时结果覆盖掉。
+            lldp_rows = collected_lldp_rows if force_refresh else _merge_lldp_rows_for_device_detail(lldp_rows, collected_lldp_rows)
     lldp_rows = _enrich_lldp_rows_with_cmdb(db, lldp_rows)
 
-    lldp_by_index = {
-        str(item.get("local_index") or item.get("local_port_num") or item.get("interface_index") or ""): item
-        for item in lldp_rows
-    }
+    lldp_by_index: Dict[str, Dict[str, Any]] = {}
+    for item in lldp_rows:
+        local_index = str(item.get("local_index") or item.get("local_port_num") or item.get("interface_index") or "").strip()
+        # 有些 LLDP 缓存行没有 local_index，如果把空字符串放进索引表，后面所有没有 ifIndex
+        # 的接口都会误命中同一个邻居，导致“对端设备/接口/管理IP”整列看起来都一样。
+        if local_index:
+            lldp_by_index.setdefault(local_index, item)
     lldp_by_name: Dict[str, Dict[str, Any]] = {}
     for item in lldp_rows:
-        for key in [item.get("local_port"), item.get("interface"), item.get("local_port_id")]:
-            normalized = _normalize_interface_key(key)
-            if normalized:
-                lldp_by_name.setdefault(normalized, item)
+        for precise_key in _lldp_row_precise_local_keys(item):
+            if precise_key.startswith("if:"):
+                lldp_by_name.setdefault(precise_key[3:], item)
 
     config_fields = _parse_interface_config_fields(_latest_device_config_text(db, device.id))
 
@@ -1623,12 +1741,16 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
     for iface in interfaces or []:
         index = str(iface.get("index") or iface.get("interface_index") or "")
         name = str(iface.get("name") or iface.get("interface_name") or iface.get("alias") or "")
-        neighbor = lldp_by_index.get(index) or lldp_by_name.get(_normalize_interface_key(name)) or {}
+        neighbor = (lldp_by_index.get(index) if index else None) or lldp_by_name.get(_normalize_interface_key(name)) or {}
         config_item = config_fields.get(_normalize_interface_key(name)) or {}
         alias = iface.get("alias")
-        description = config_item.get("description") or ""
+        description = _clean_interface_description(name, config_item.get("description"))
         if not description:
-            description = alias if not _is_default_interface_description(name, alias) else ""
+            description = _clean_interface_description(name, alias)
+        parsed_description_neighbor = _parse_neighbor_from_to_description(description)
+        lldp_remote_device = _best_lldp_remote_device(neighbor)
+        lldp_remote_interface = _best_lldp_remote_interface(neighbor)
+        lldp_remote_mgmt_ip = _best_lldp_remote_mgmt_ip(neighbor)
         ip_address = _best_interface_layer3_or_l2(
             iface.get("ip_address") or iface.get("interface_ip"),
             config_item.get("ip_address"),
@@ -1645,15 +1767,9 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
             "ip_address": ip_address,
             "oper_status": iface.get("oper_status") or "",
             "admin_status": iface.get("admin_status") or "",
-            "remote_device": _best_lldp_remote_device(neighbor),
-            "remote_interface": _best_lldp_remote_interface(neighbor),
-            "remote_management_ip": (
-                neighbor.get("remote_mgmt_addr")
-                or neighbor.get("remote_management_address")
-                or neighbor.get("remote_management_ip")
-                or neighbor.get("management_address")
-                or ""
-            ),
+            "remote_device": lldp_remote_device or parsed_description_neighbor.get("remote_device") or "",
+            "remote_interface": lldp_remote_interface or parsed_description_neighbor.get("remote_interface") or "",
+            "remote_management_ip": lldp_remote_mgmt_ip,
         })
 
     def _sort_key(item: Dict[str, Any]):
@@ -1661,10 +1777,12 @@ async def get_device_detail_connections(device_id: int, db: Session = Depends(ge
 
     items.sort(key=_sort_key)
     message = None
+    if force_refresh and live_error and source == "cache":
+        message = "实时刷新失败，已回退展示最近一次接口快照"
     if source == "cache" and items:
         missing_mtu_count = sum(1 for item in items if item.get("mtu") in (None, ""))
         missing_type_count = sum(1 for item in items if not item.get("logical_type"))
-        if missing_mtu_count >= max(3, int(len(items) * 0.8)) or missing_type_count >= max(3, int(len(items) * 0.8)):
+        if not message and (missing_mtu_count >= max(3, int(len(items) * 0.8)) or missing_type_count >= max(3, int(len(items) * 0.8))):
             if monitor_source == "asternos_exporter":
                 message = "当前接口数据来自旧快照，MTU/逻辑类型等字段会在下一轮 AsterNOS Exporter 采集后自动补齐"
             else:
@@ -1750,11 +1868,21 @@ async def get_device_detail_performance(
     device_id: int,
     range: str = Query("-24h"),
     interval: str = Query("5m"),
+    start: Optional[str] = Query(None, description="绝对开始时间"),
+    end: Optional[str] = Query(None, description="绝对结束时间"),
+    start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
+    end_ts: Optional[float] = Query(None, description="绝对结束时间戳毫秒"),
     db: Session = Depends(get_db),
 ):
     """设备详情：CPU/内存/温度趋势。"""
     safe_range = range if re.fullmatch(r"-?\d+[smhdw]", range or "") else "-24h"
     safe_interval = interval if re.fullmatch(r"\d+[smhdw]", interval or "") else "5m"
+    start_time = datetime.fromtimestamp(start_ts / 1000, timezone.utc) if start_ts else _parse_query_datetime(start)
+    end_time = datetime.fromtimestamp(end_ts / 1000, timezone.utc) if end_ts else (_parse_query_datetime(end) or datetime.now(timezone.utc))
+    use_absolute_range = bool(start_time and start_time < end_time)
+    range_clause = f'start: {safe_range}'
+    if use_absolute_range and start_time:
+        range_clause = f'start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}'
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
@@ -1785,7 +1913,7 @@ async def get_device_detail_performance(
         tag_filter = "".join([f'  |> filter(fn: (r) => r.{key} == "{_flux_escape(value)}")\n' for key, value in tags.items()])
         flux = f'''
 from(bucket: "{influx_client.bucket}")
-  |> range(start: {safe_range})
+  |> range({range_clause})
   |> filter(fn: (r) => r._measurement == "{measurement}")
   |> filter(fn: (r) => r.device_id == "{device_id}")
   |> filter(fn: (r) => r._field == "{field}")

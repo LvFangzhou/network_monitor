@@ -16,7 +16,12 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import ConfigBackupJob, ConfigBackupResult, Datacenter, Device, User
 from app.routers.auth import get_current_active_user
-from app.tasks.config_backup_tasks import run_config_backup
+from app.tasks.config_backup_tasks import (
+    _clean_config_output,
+    _config_diff_summary,
+    _normalize_config_for_compare,
+    run_config_backup,
+)
 from app.utils import notification_manager
 from app.utils import redis_client
 from app.utils.config_backup_settings import (
@@ -54,6 +59,28 @@ def _job_to_dict(job: ConfigBackupJob, include_results: bool = False) -> Dict[st
 
 
 def _result_to_dict(result: ConfigBackupResult, include_content: bool = False) -> Dict[str, Any]:
+    config_content = result.config_content
+    startup_config_content = getattr(result, "startup_config_content", None)
+    config_sync_status = getattr(result, "config_sync_status", None)
+    config_sync_diff = getattr(result, "config_sync_diff", None)
+
+    if include_content:
+        # 兼容历史任务：早期采集结果里可能混入 screen-length/terminal length
+        # 这类关分页命令的回显和报错。详情页返回前再清洗一次，避免旧数据继续误报差异。
+        device = result.device or Device(vendor=result.vendor, model=result.model)
+        if config_content and result.command:
+            config_content = _clean_config_output(config_content, result.command)
+        if startup_config_content and getattr(result, "startup_command", None):
+            startup_config_content = _clean_config_output(startup_config_content, result.startup_command)
+        if config_content and startup_config_content:
+            running_normalized = _normalize_config_for_compare(config_content, device)
+            startup_normalized = _normalize_config_for_compare(startup_config_content, device)
+            if running_normalized == startup_normalized:
+                config_sync_status = "matched"
+                config_sync_diff = None
+            elif config_sync_status not in {"check_failed", "unsupported"}:
+                config_sync_diff = _config_diff_summary(config_content, startup_config_content, device=device)
+
     data = {
         "id": result.id,
         "job_id": result.job_id,
@@ -71,8 +98,8 @@ def _result_to_dict(result: ConfigBackupResult, include_content: bool = False) -
         "startup_command": getattr(result, "startup_command", None),
         "startup_config_hash": getattr(result, "startup_config_hash", None),
         "startup_line_count": getattr(result, "startup_line_count", 0) or 0,
-        "config_sync_status": getattr(result, "config_sync_status", None),
-        "config_sync_diff": getattr(result, "config_sync_diff", None),
+        "config_sync_status": config_sync_status,
+        "config_sync_diff": config_sync_diff,
         "config_save_command": getattr(result, "config_save_command", None),
         "config_save_status": getattr(result, "config_save_status", None),
         "config_save_message": getattr(result, "config_save_message", None),
@@ -81,8 +108,8 @@ def _result_to_dict(result: ConfigBackupResult, include_content: bool = False) -
         "finished_at": result.finished_at.isoformat() if result.finished_at else None,
     }
     if include_content:
-        data["config_content"] = result.config_content
-        data["startup_config_content"] = getattr(result, "startup_config_content", None)
+        data["config_content"] = config_content
+        data["startup_config_content"] = startup_config_content
     return data
 
 

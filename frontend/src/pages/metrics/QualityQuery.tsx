@@ -1,8 +1,9 @@
-import { type Key, useEffect, useMemo, useState } from 'react'
+import { type Key, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Button,
   Card,
   Checkbox,
+  DatePicker,
   Form,
   Input,
   InputNumber,
@@ -19,6 +20,7 @@ import {
 } from 'antd'
 import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, SettingOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
+import dayjs from 'dayjs'
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from 'recharts'
 import {
   createQualityProbeTarget,
@@ -34,6 +36,7 @@ import {
 import { getDatacenters, type Datacenter } from '../../api/devices'
 
 const { Text, Title } = Typography
+const { RangePicker } = DatePicker
 
 const formatTime = (value?: string | null) => {
   if (!value) return '-'
@@ -57,6 +60,7 @@ const rangeOptions = [
   { label: '7天', value: '-7d', interval: '15m' },
   { label: '30天', value: '-30d', interval: '1h' },
   { label: '365天', value: '-365d', interval: '1d' },
+  { label: '自定义时间', value: 'custom', interval: '1m' },
 ]
 
 const qualityColumnOptions = [
@@ -66,6 +70,7 @@ const qualityColumnOptions = [
   { label: '状态', value: 'probe_status' },
   { label: '延迟', value: 'latency' },
   { label: '丢包', value: 'loss' },
+  { label: '可用率', value: 'availability' },
   { label: '抖动', value: 'jitter' },
   { label: '阈值', value: 'threshold' },
   { label: '采样', value: 'sampling' },
@@ -79,6 +84,7 @@ const defaultVisibleColumns = [
   'probe_status',
   'latency',
   'loss',
+  'availability',
   'jitter',
   'last_probe_at',
 ]
@@ -105,37 +111,76 @@ const chartTickCount = (rangeValue: string) => {
   return 13
 }
 
+const getCustomInterval = (customRange?: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null) => {
+  if (!customRange?.[0] || !customRange?.[1]) return '1m'
+  const seconds = Math.max(1, customRange[1].diff(customRange[0], 'second'))
+  if (seconds <= 30 * 60) return '1s'
+  if (seconds <= 2 * 60 * 60) return '5s'
+  if (seconds <= 12 * 60 * 60) return '30s'
+  if (seconds <= 3 * 24 * 60 * 60) return '2m'
+  if (seconds <= 7 * 24 * 60 * 60) return '15m'
+  if (seconds <= 30 * 24 * 60 * 60) return '1h'
+  return '1d'
+}
+
+const buildQualityHistoryParams = (rangeValue: string, customRange?: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null) => {
+  const option = rangeOptions.find((item) => item.value === rangeValue) || rangeOptions[1]
+  if (rangeValue === 'custom' && customRange?.[0] && customRange?.[1]) {
+    return {
+      range: '-24h',
+      interval: getCustomInterval(customRange),
+      start_ts: customRange[0].valueOf(),
+      end_ts: customRange[1].valueOf(),
+    }
+  }
+  return { range: option.value === 'custom' ? '-24h' : option.value, interval: option.interval }
+}
+
 const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
   const [rangeValue, setRangeValue] = useState('-1h')
+  const [customRange, setCustomRange] = useState<[dayjs.Dayjs | null, dayjs.Dayjs | null] | null>([dayjs().subtract(1, 'hour'), dayjs()])
   const [historyLoading, setHistoryLoading] = useState(false)
   const [historyData, setHistoryData] = useState<QualityProbeHistoryPoint[]>([])
+  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [refreshCountdown, setRefreshCountdown] = useState(10)
+  const historyRequestSeqRef = useRef(0)
 
-  const fetchHistory = async (silent = false) => {
-    const option = rangeOptions.find((item) => item.value === rangeValue) || rangeOptions[1]
+  const fetchHistory = useCallback(async (silent = false) => {
+    const requestSeq = historyRequestSeqRef.current + 1
+    historyRequestSeqRef.current = requestSeq
+    const params = buildQualityHistoryParams(rangeValue, customRange)
     if (!silent) setHistoryLoading(true)
     try {
-      const response = await getQualityProbeHistory(target.id, {
-        range: option.value,
-        interval: option.interval,
-      })
+      const response = await getQualityProbeHistory(target.id, params)
+      if (historyRequestSeqRef.current !== requestSeq) return
       setHistoryData(response.data || [])
     } catch (error: any) {
+      if (historyRequestSeqRef.current !== requestSeq) return
       if (!silent) message.error(error?.response?.data?.detail || '获取延迟变化曲线失败')
       setHistoryData([])
     } finally {
-      if (!silent) setHistoryLoading(false)
+      if (historyRequestSeqRef.current === requestSeq && !silent) setHistoryLoading(false)
     }
-  }
+  }, [rangeValue, customRange, target.id])
 
   useEffect(() => {
     void fetchHistory()
-    const refreshMs = Math.max(1000, Math.min(Number(target.interval_seconds || 5) * 1000, 10000))
+    setRefreshCountdown(10)
+  }, [fetchHistory])
+
+  useEffect(() => {
+    if (!autoRefresh) return undefined
     const timer = window.setInterval(() => {
-      void fetchHistory(true)
-    }, refreshMs)
+      setRefreshCountdown((value) => {
+        if (value <= 1) {
+          void fetchHistory(true)
+          return 10
+        }
+        return value - 1
+      })
+    }, 1000)
     return () => window.clearInterval(timer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [target.id, target.interval_seconds, rangeValue])
+  }, [autoRefresh, fetchHistory])
 
   const chartData = useMemo(
     () => historyData
@@ -160,13 +205,43 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
             options={rangeOptions.map((item) => ({ label: item.label, value: item.value }))}
             onChange={setRangeValue}
           />
-          <Button icon={<ReloadOutlined />} loading={historyLoading} onClick={() => fetchHistory()}>刷新</Button>
+          {rangeValue === 'custom' && (
+            <RangePicker
+              showTime
+              value={customRange as any}
+              allowClear={false}
+              onChange={(value) => setCustomRange(value as [dayjs.Dayjs | null, dayjs.Dayjs | null] | null)}
+              style={{ width: 360 }}
+            />
+          )}
+          <Switch
+            checked={autoRefresh}
+            checkedChildren="自动"
+            unCheckedChildren="手动"
+            onChange={(checked) => {
+              setAutoRefresh(checked)
+              setRefreshCountdown(10)
+            }}
+          />
+          <Text type="secondary" style={{ width: 92, textAlign: 'right' }}>
+            {autoRefresh ? `${refreshCountdown}s 后刷新` : '手动刷新'}
+          </Text>
+          <Button
+            icon={<ReloadOutlined />}
+            loading={historyLoading}
+            onClick={() => {
+              setRefreshCountdown(10)
+              void fetchHistory()
+            }}
+          >
+            刷新
+          </Button>
         </Space>
       )}
       styles={{ body: { paddingTop: 8 } }}
     >
       <Text type="secondary" style={{ fontSize: 12 }}>
-        曲线会自动刷新；短时间范围使用更细 X 轴刻度。1 秒采样时建议每次包数设置为 1 或 2。
+        展开某条线路后才加载曲线，并默认 10 秒自动刷新；未展开的线路不会请求历史曲线。丢包率/可用率按滚动窗口内发送和收到包数汇总计算，避免单包丢失时在 0% 和 100% 之间跳变。
       </Text>
       <div style={{ height: 320, width: '100%', marginTop: 8 }}>
         <ResponsiveContainer width="100%" height="100%">
@@ -204,10 +279,10 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
               }}
             />
             <Legend />
-            <Line yAxisId="ms" type="monotone" dataKey="avg_latency_ms" name="延迟" stroke="#1677ff" dot={false} strokeWidth={2} connectNulls />
-            <Line yAxisId="ms" type="monotone" dataKey="jitter_ms" name="抖动" stroke="#fa8c16" dot={false} strokeWidth={2} connectNulls />
-            <Line yAxisId="percent" type="monotone" dataKey="packet_loss_percent" name="丢包率" stroke="#f5222d" dot={false} strokeWidth={2} connectNulls />
-            <Line yAxisId="percent" type="monotone" dataKey="availability_percent" name="可用率" stroke="#52c41a" dot={false} strokeWidth={2} connectNulls />
+            <Line yAxisId="ms" type="monotone" dataKey="avg_latency_ms" name="延迟" stroke="#1677ff" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+            <Line yAxisId="ms" type="monotone" dataKey="jitter_ms" name="抖动" stroke="#fa8c16" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+            <Line yAxisId="percent" type="monotone" dataKey="packet_loss_percent" name="丢包率" stroke="#f5222d" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+            <Line yAxisId="percent" type="monotone" dataKey="availability_percent" name="可用率" stroke="#52c41a" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -273,7 +348,7 @@ const QualityQuery = () => {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void fetchItems(true)
-    }, 5000)
+    }, 10000)
     return () => window.clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeFilter, keyword])
@@ -440,6 +515,19 @@ const QualityQuery = () => {
       ),
     },
     {
+      key: 'availability',
+      title: '可用率',
+      width: 100,
+      render: (_, record) => {
+        const value = record.last_availability_percent ?? (
+          record.last_packet_loss_percent === null || record.last_packet_loss_percent === undefined
+            ? null
+            : Math.max(0, Math.round((100 - record.last_packet_loss_percent) * 100) / 100)
+        )
+        return formatMetricTag(value, '%', value !== null && value < 100 - record.loss_threshold_percent ? 'orange' : 'green')
+      },
+    },
+    {
       key: 'jitter',
       title: '抖动',
       width: 90,
@@ -569,7 +657,7 @@ const QualityQuery = () => {
             scroll={{ x: 1500 }}
             expandable={{
               expandedRowKeys,
-              onExpandedRowsChange: (keys) => setExpandedRowKeys(keys as Key[]),
+              onExpandedRowsChange: (keys) => setExpandedRowKeys((keys as Key[]).slice(-1)),
               expandedRowRender: (record) => <QualityChartPanel target={record} />,
               columnWidth: 42,
             }}

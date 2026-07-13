@@ -62,7 +62,7 @@ def send_notification(
 @shared_task
 def send_test_notification(channel_type: str, config: Dict[str, Any]):
     """发送测试通知"""
-    title = "网络监控系统测试通知"
+    title = "并行网络运营平台测试通知"
     content = f"这是一条测试通知，用于验证{channel_type}渠道配置是否正确。"
     
     return send_notification.apply_async(

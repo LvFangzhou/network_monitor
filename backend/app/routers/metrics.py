@@ -3,8 +3,10 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
 from datetime import datetime, timezone
 import asyncio
+import builtins
 import io
 import ipaddress
 import json
@@ -35,7 +37,7 @@ from app.services.flow_listener import flow_listener
 from app.utils.snmp_system_info import extract_snmp_model
 from app.utils.controller_client import ControllerClient
 from app.utils.controller_settings import find_controller_settings
-from app.utils.quality_probe import run_quality_ping, write_quality_probe_result
+from app.utils.quality_probe import apply_quality_loss_window, run_quality_ping, write_quality_probe_result
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -48,6 +50,9 @@ MONITOR_CACHE_STALE_SECONDS = 7 * 24 * 60 * 60
 MAX_INTERFACE_HISTORY_SECONDS = 7 * 24 * 60 * 60
 RATE_FALLBACK_MAX_SECONDS = 5 * 60
 HISTORY_REQUEST_CACHE_SECONDS = 8
+TRAFFIC_SUMMARY_CACHE_SECONDS_SHORT = 30
+TRAFFIC_SUMMARY_CACHE_SECONDS_NORMAL = 60
+TRAFFIC_SUMMARY_CACHE_SECONDS_LONG = 300
 DASHBOARD_STATS_CACHE_SECONDS = 300
 DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS = 2 * 60
 DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX = "monitor:cache:overview_snapshot"
@@ -282,10 +287,10 @@ def _apply_lldp_device_ip_fallback(db: Session, rows: List[Dict[str, Any]]) -> L
     for item in rows:
         raw_mgmt_ip = str(item.get("remote_mgmt_addr") or "").strip()
         raw_remote_system = str(item.get("remote_system") or "").strip()
-        remote_port_alias_name = _extract_device_name_from_port_alias(item.get("local_port"))
-        local_port_alias_name = _extract_device_name_from_port_alias(item.get("remote_port"))
         sys_desc_name = _extract_device_name_from_sys_desc(item.get("remote_sys_desc"))
-        alias_name = remote_port_alias_name or local_port_alias_name or sys_desc_name
+        # LLDP 的 System Name/系统描述才是邻居身份的可信来源；接口描述是人为配置，
+        # 可能写错或沿用旧描述，不能用它覆盖真实邻居名称。
+        alias_name = sys_desc_name
         normalized = _normalize_neighbor_device_name(alias_name or raw_remote_system)
         mapped_ip = device_map.get(normalized)
         mapped_name = name_map.get(normalized)
@@ -381,7 +386,7 @@ def _lldp_cli_profile(device: Device) -> Optional[Tuple[str, List[str]]]:
 def _strip_terminal_control(text: str) -> str:
     text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text or "")
     text = text.replace("\r", "")
-    text = re.sub(r"--More--|More:\s*<space>|\x08+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"-+\s*More\s*-+|--More--|More:\s*<space>|\x08+", "", text, flags=re.IGNORECASE)
     return text
 
 
@@ -395,7 +400,7 @@ def _read_ssh_channel(channel: Any, idle_seconds: float = 0.7, timeout_seconds: 
             if not data:
                 break
             text = data.decode("utf-8", errors="ignore")
-            if "--More--" in text or "More:" in text:
+            if re.search(r"-+\s*More\s*-+|--More--|More:\s*<space>", text, flags=re.IGNORECASE):
                 try:
                     channel.send(" ")
                 except Exception:
@@ -477,6 +482,17 @@ def _normalize_lldp_interface_key(value: Optional[str]) -> str:
         return ""
     text = text.replace(" ", "").replace("_", "").replace("-", "")
     text = text.replace("interface", "")
+    numeric_prefix_map = [
+        ("400ge", "400g"),
+        ("200ge", "200g"),
+        ("100ge", "100g"),
+        ("50ge", "50g"),
+        ("25ge", "25g"),
+        ("10ge", "10g"),
+    ]
+    for src, dst in numeric_prefix_map:
+        if text.startswith(src):
+            return f"{dst}{text[len(src):]}"
     match = re.match(r"^([a-z]+)([0-9].*)$", text)
     if not match:
         return text
@@ -550,6 +566,67 @@ def _parse_ruijie_lldp_cli(output: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def _parse_ruijie_lldp_detail_cli(output: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    clean_output = _strip_terminal_control(output)
+    blocks = re.split(r"LLDP neighbor-information of port\s+\[", clean_output, flags=re.IGNORECASE)
+    for block in blocks[1:]:
+        header, _, body = block.partition("]")
+        local_port = header.strip()
+        if not local_port:
+            continue
+        system_match = re.search(r"^\s*System name\s*:\s*(.+?)\s*$", body, flags=re.IGNORECASE | re.MULTILINE)
+        port_match = re.search(r"^\s*Port ID\s*:\s*(.+?)\s*$", body, flags=re.IGNORECASE | re.MULTILINE)
+        chassis_match = re.search(r"^\s*Chassis ID\s*:\s*(.+?)\s*$", body, flags=re.IGNORECASE | re.MULTILINE)
+        mgmt_match = re.search(r"^\s*Management address\s*:\s*(.+?)\s*$", body, flags=re.IGNORECASE | re.MULTILINE)
+        remote_system = system_match.group(1).strip() if system_match else ""
+        remote_port = port_match.group(1).strip() if port_match else ""
+        chassis_id = chassis_match.group(1).strip() if chassis_match else ""
+        row = _lldp_cli_row(local_port, remote_system, remote_port, chassis_id, "cli:ruijie-detail")
+        if mgmt_match:
+            row["remote_mgmt_addr"] = mgmt_match.group(1).strip()
+        rows.append(row)
+    return rows
+
+
+def _merge_cli_lldp_rows(primary_rows: List[Dict[str, Any]], detail_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not detail_rows:
+        return primary_rows or []
+    if not primary_rows:
+        return detail_rows
+    detail_by_key: Dict[str, Dict[str, Any]] = {}
+    for row in detail_rows:
+        for key in _lldp_row_interface_keys(row):
+            detail_by_key.setdefault(key, row)
+    merged: List[Dict[str, Any]] = []
+    used = set()
+    for raw in primary_rows:
+        row = {**raw}
+        detail = None
+        for key in _lldp_row_interface_keys(row):
+            if key in detail_by_key:
+                detail = detail_by_key[key]
+                break
+        if detail:
+            used.add(id(detail))
+            for field in ("remote_system", "remote_display_name", "remote_port", "remote_port_id", "remote_chassis_id", "remote_mgmt_addr", "peer"):
+                value = detail.get(field)
+                if value not in (None, "", "-"):
+                    row[field] = value
+            row["source"] = f"{row.get('source') or 'cli'}+detail"
+            row["remote_name_source"] = detail.get("remote_name_source") or row.get("remote_name_source") or "cli"
+        merged.append(row)
+    existing_keys = {key for row in merged for key in _lldp_row_interface_keys(row)}
+    for row in detail_rows:
+        if id(row) in used:
+            continue
+        keys = _lldp_row_interface_keys(row)
+        if not any(key in existing_keys for key in keys):
+            merged.append(row)
+            existing_keys.update(keys)
+    return merged
+
+
 def _parse_asteros_lldp_cli(output: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for raw_line in _strip_terminal_control(output).splitlines():
@@ -595,7 +672,21 @@ def _collect_lldp_neighbors_from_cli(device: Device) -> List[Dict[str, Any]]:
     vendor_key, commands = profile
     try:
         output = _run_lldp_cli_command(device, commands)
-        return _parse_lldp_cli_output(vendor_key, output)
+        rows = _parse_lldp_cli_output(vendor_key, output)
+        if vendor_key == "ruijie" and rows:
+            local_ports: List[str] = []
+            for row in rows:
+                local_port = str(row.get("local_port") or row.get("local_port_id") or "").strip()
+                if local_port and local_port not in local_ports:
+                    local_ports.append(local_port)
+            # 锐捷 show lldp neighbors 汇总有时没有完整对端接口/管理地址，detail 里才准确。
+            # 控制上限避免单次详情页刷新拖太久；常见 64/128 口设备足够覆盖。
+            detail_commands = [f"show lldp neighbors interface {port} detail" for port in local_ports[:128]]
+            if detail_commands:
+                detail_output = _run_lldp_cli_command(device, ["terminal length 0", "screen-length 0 temporary", *detail_commands])
+                detail_rows = _parse_ruijie_lldp_detail_cli(detail_output)
+                rows = _merge_cli_lldp_rows(rows, detail_rows)
+        return rows
     except Exception as exc:
         logger.warning("LLDP CLI采集失败", device_id=device.id, device_ip=device.ip_address, error=str(exc))
         return []
@@ -603,7 +694,10 @@ def _collect_lldp_neighbors_from_cli(device: Device) -> List[Dict[str, Any]]:
 
 def _lldp_row_interface_keys(row: Dict[str, Any]) -> List[str]:
     keys: List[str] = []
-    for field in ("local_port", "local_port_id", "interface", "remote_port", "remote_port_id"):
+    # 合并 SNMP 与 CLI LLDP 时只能按“本端接口”匹配，不能把 remote_port 也放进匹配键。
+    # 多台设备的对端端口可能相同，或 local_port_desc 被写成人为描述，按 remote_port
+    # 匹配会把邻居串到其他接口上。
+    for field in ("local_port", "local_port_id", "interface"):
         key = _normalize_lldp_interface_key(row.get(field))
         if key and key not in keys:
             keys.append(key)
@@ -1082,37 +1176,302 @@ def _flux_time(value: datetime) -> str:
     return f'time(v: "{value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}")'
 
 
+def _build_query_range_clause(
+    range_value: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    start_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+) -> Tuple[str, bool, Optional[datetime], Optional[datetime]]:
+    """Build a Flux range() argument from either relative or absolute query params."""
+    start_time = datetime.fromtimestamp(start_ts / 1000, timezone.utc) if start_ts else _parse_query_datetime(start)
+    end_time = datetime.fromtimestamp(end_ts / 1000, timezone.utc) if end_ts else (_parse_query_datetime(end) or datetime.now(timezone.utc))
+    if start_time and end_time and start_time < end_time:
+        return f"start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}", True, start_time, end_time
+    return f"start: {range_value}", False, None, None
+
+
+def _traffic_summary_cache_ttl(range_seconds: int, use_absolute_range: bool) -> int:
+    if use_absolute_range:
+        return TRAFFIC_SUMMARY_CACHE_SECONDS_LONG
+    if range_seconds <= 3600:
+        return TRAFFIC_SUMMARY_CACHE_SECONDS_SHORT
+    if range_seconds <= 86400:
+        return TRAFFIC_SUMMARY_CACHE_SECONDS_NORMAL
+    return TRAFFIC_SUMMARY_CACHE_SECONDS_LONG
+
+
+def _circuit_traffic_targets(circuit: Circuit) -> List[Dict[str, Any]]:
+    targets: List[Dict[str, Any]] = []
+    if circuit.primary_device_id and circuit.primary_port_name:
+        targets.append({
+            "device_id": circuit.primary_device_id,
+            "device_name": circuit.primary_device_ref.name if circuit.primary_device_ref else None,
+            "device_ip": circuit.primary_device_ref.ip_address if circuit.primary_device_ref else None,
+            "port_name": circuit.primary_port_name,
+            "side": "主线",
+        })
+    if circuit.access_mode == "dual" and circuit.secondary_device_id and circuit.secondary_port_name:
+        targets.append({
+            "device_id": circuit.secondary_device_id,
+            "device_name": circuit.secondary_device_ref.name if circuit.secondary_device_ref else None,
+            "device_ip": circuit.secondary_device_ref.ip_address if circuit.secondary_device_ref else None,
+            "port_name": circuit.secondary_port_name,
+            "side": "备线",
+        })
+    if circuit.aggregation_monitor_device_id and circuit.aggregation_interface_name:
+        targets.append({
+            "device_id": circuit.aggregation_monitor_device_id,
+            "device_name": circuit.aggregation_monitor_device_ref.name if circuit.aggregation_monitor_device_ref else None,
+            "device_ip": circuit.aggregation_monitor_device_ref.ip_address if circuit.aggregation_monitor_device_ref else None,
+            "port_name": circuit.aggregation_interface_name,
+            "side": "聚合",
+        })
+    return targets
+
+
+def _matched_cached_interface(device_id: int, port_name: str) -> Optional[Dict[str, Any]]:
+    cached = _load_monitor_cache("interfaces", int(device_id))
+    interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
+    normalized_target = re.sub(r"\s+", "", str(port_name or "")).lower()
+    canonical_target = _normalize_lldp_interface_key(port_name)
+    if not normalized_target and not canonical_target:
+        return None
+    for item in interfaces:
+        candidates = [item.get("name"), item.get("description"), item.get("alias")]
+        for candidate in candidates:
+            normalized_candidate = re.sub(r"\s+", "", str(candidate or "")).lower()
+            canonical_candidate = _normalize_lldp_interface_key(candidate)
+            if normalized_candidate and normalized_candidate == normalized_target:
+                return item
+            if canonical_candidate and canonical_target and canonical_candidate == canonical_target:
+                return item
+    return None
+
+
+def _matched_history_interface(device_id: int, port_name: str) -> Optional[Dict[str, Any]]:
+    """Fallback interface resolver using recent Influx tags when Redis interface cache is empty/stale."""
+    normalized_target = re.sub(r"\s+", "", str(port_name or "")).lower()
+    canonical_target = _normalize_lldp_interface_key(port_name)
+    if not normalized_target and not canonical_target:
+        return None
+    flux = f'''
+    from(bucket: "{influx_client.bucket}")
+      |> range(start: -7d)
+      |> filter(fn: (r) => r._measurement == "interface_monitoring")
+      |> filter(fn: (r) => r.device_id == {_flux_string(device_id)})
+      |> filter(fn: (r) => r._field == "in_octets" or r._field == "out_octets" or r._field == "in_bps" or r._field == "out_bps" or r._field == "speed_bps")
+      |> group(columns: ["device_id", "interface_index", "interface_name"])
+      |> last()
+      |> keep(columns: ["_time", "device_id", "interface_index", "interface_name", "_field", "_value"])
+    '''
+    try:
+        rows = influx_client.query(flux)
+    except Exception as exc:
+        logger.warning("从历史数据匹配线路接口失败", device_id=device_id, port_name=port_name, error=str(exc))
+        return None
+    candidates: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        interface_index = row.get("interface_index")
+        interface_name = row.get("interface_name")
+        if interface_index is None and not interface_name:
+            continue
+        key = f"{interface_index}:{interface_name}"
+        item = candidates.setdefault(key, {"index": interface_index, "name": interface_name, "alias": interface_name})
+        if row.get("_field") == "speed_bps" and row.get("_value") is not None:
+            item["speed_bps"] = row.get("_value")
+
+    for item in candidates.values():
+        candidate = item.get("name") or item.get("alias")
+        normalized_candidate = re.sub(r"\s+", "", str(candidate or "")).lower()
+        canonical_candidate = _normalize_lldp_interface_key(candidate)
+        if normalized_candidate and normalized_candidate == normalized_target:
+            return item
+        if canonical_candidate and canonical_target and canonical_candidate == canonical_target:
+            return item
+    return None
+
+
+def _build_circuit_traffic_targets(circuit: Circuit) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Resolve circuit device/interface bindings into monitor interface targets."""
+    targets: List[Dict[str, Any]] = []
+    skipped_targets: List[Dict[str, Any]] = []
+    for target in _circuit_traffic_targets(circuit):
+        matched = _matched_cached_interface(int(target["device_id"]), str(target.get("port_name") or ""))
+        if not matched or matched.get("index") is None:
+            matched = _matched_history_interface(int(target["device_id"]), str(target.get("port_name") or ""))
+        if not matched or matched.get("index") is None:
+            skipped_targets.append({
+                "circuit_id": circuit.id,
+                "circuit_name": circuit.name,
+                **target,
+                "reason": "接口缓存未命中",
+            })
+            continue
+        targets.append({
+            "circuit_id": circuit.id,
+            "circuit_name": circuit.name,
+            **target,
+            "interface_index": matched.get("index"),
+            "interface_name": matched.get("name") or matched.get("alias") or target.get("port_name"),
+            "interface_alias": matched.get("alias"),
+            "interface_description": matched.get("description"),
+            "speed_bps": matched.get("speed_bps") or matched.get("speed") or matched.get("if_speed"),
+        })
+    return targets, skipped_targets
+
+
+def _traffic_summary_rows(
+    targets: List[Dict[str, Any]],
+    range_clause: str,
+    interval: str,
+    traffic_range_clause: str,
+    octet_interval: str,
+    rate_window_seconds: int,
+    interval_seconds: int,
+    range_seconds: int,
+    cutoff_ts: float,
+    stop_ts: Optional[float],
+    aggregate_by_time: bool = True,
+) -> List[Dict[str, Any]]:
+    predicates = []
+    speed_by_target: Dict[str, Optional[float]] = {}
+    for target in targets:
+        interface_index = target.get("interface_index")
+        device_id = target.get("device_id")
+        interface_name = target.get("interface_name")
+        if interface_index is None or device_id is None:
+            continue
+        speed_by_target[f"{device_id}:{interface_index}"] = _safe_float(target.get("speed_bps"))
+        name_clause = f' or r.interface_name == {_flux_string(interface_name)}' if interface_name else ""
+        predicates.append(
+            f'(r.device_id == {_flux_string(device_id)} and (r.interface_index == {_flux_string(interface_index)}{name_clause}))'
+        )
+    if not predicates:
+        return []
+    target_filter = " or ".join(predicates)
+    flux = f'''
+    rates = from(bucket: "{influx_client.bucket}")
+      |> range({range_clause})
+      |> filter(fn: (r) => r._measurement == "interface_monitoring")
+      |> filter(fn: (r) => {target_filter})
+      |> filter(fn: (r) => r._field == "in_bps" or r._field == "out_bps" or r._field == "speed_bps")
+      |> aggregateWindow(every: {interval}, fn: max, createEmpty: false)
+
+    octets = from(bucket: "{influx_client.bucket}")
+      |> range({traffic_range_clause})
+      |> filter(fn: (r) => r._measurement == "interface_monitoring")
+      |> filter(fn: (r) => {target_filter})
+      |> filter(fn: (r) => r._field == "in_octets" or r._field == "out_octets")
+      |> aggregateWindow(every: {octet_interval}, fn: last, createEmpty: false)
+
+    union(tables: [rates, octets])
+      |> group(columns: ["device_id", "interface_index", "interface_name"])
+      |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> sort(columns: ["_time"])
+    '''
+    rows = influx_client.query(flux)
+    _apply_windowed_octet_rates(rows, rate_window_seconds)
+    _apply_windowed_bps_average(rows, rate_window_seconds, interval_seconds, range_seconds)
+
+    filtered_rows: List[Dict[str, Any]] = []
+    by_time: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        row_time = _parse_history_time(row)
+        if not row_time:
+            continue
+        row_ts = row_time.timestamp()
+        if row_ts < cutoff_ts or (stop_ts is not None and row_ts > stop_ts):
+            continue
+        target_speed = speed_by_target.get(f"{row.get('device_id')}:{row.get('interface_index')}")
+        if row.get("speed_bps") is None and target_speed:
+            row["speed_bps"] = target_speed
+        _sanitize_impossible_interface_rates(row)
+        if not aggregate_by_time:
+            filtered_rows.append({
+                "_time": row_time.isoformat(),
+                "device_id": row.get("device_id"),
+                "interface_index": row.get("interface_index"),
+                "interface_name": row.get("interface_name"),
+                "in_bps": float(_safe_float(row.get("in_bps")) or 0.0),
+                "out_bps": float(_safe_float(row.get("out_bps")) or 0.0),
+            })
+            continue
+        timestamp_key = row_time.isoformat()
+        item = by_time.setdefault(timestamp_key, {"_time": timestamp_key, "in_bps": 0.0, "out_bps": 0.0})
+        item["in_bps"] = float(item.get("in_bps") or 0.0) + float(_safe_float(row.get("in_bps")) or 0.0)
+        item["out_bps"] = float(item.get("out_bps") or 0.0) + float(_safe_float(row.get("out_bps")) or 0.0)
+    if not aggregate_by_time:
+        return sorted(filtered_rows, key=lambda item: str(item.get("_time") or ""))
+    return [by_time[key] for key in sorted(by_time.keys())]
+
+
+def _aggregate_traffic_rows_by_time(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_time: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = str(row.get("_time") or "")
+        if not key:
+            continue
+        item = by_time.setdefault(key, {"_time": key, "in_bps": 0.0, "out_bps": 0.0})
+        item["in_bps"] = float(item.get("in_bps") or 0.0) + float(_safe_float(row.get("in_bps")) or 0.0)
+        item["out_bps"] = float(item.get("out_bps") or 0.0) + float(_safe_float(row.get("out_bps")) or 0.0)
+    return [by_time[key] for key in sorted(by_time.keys())]
+
+
+def _group_traffic_rows_by_target(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for row in rows:
+        key = f"{row.get('device_id')}:{row.get('interface_index')}"
+        row_time = str(row.get("_time") or "")
+        if not row_time:
+            continue
+        by_time = grouped.setdefault(key, {})
+        item = by_time.setdefault(row_time, {"_time": row_time, "in_bps": 0.0, "out_bps": 0.0})
+        item["in_bps"] = float(item.get("in_bps") or 0.0) + float(_safe_float(row.get("in_bps")) or 0.0)
+        item["out_bps"] = float(item.get("out_bps") or 0.0) + float(_safe_float(row.get("out_bps")) or 0.0)
+    return {key: [items[item_key] for item_key in sorted(items.keys())] for key, items in grouped.items()}
+
+
 def _apply_windowed_octet_rates(rows: List[Dict[str, Any]], window_seconds: int) -> None:
     if window_seconds <= 0:
         return
 
     timed_rows = [(row, _parse_history_time(row)) for row in rows]
     timed_rows = [(row, row_time) for row, row_time in timed_rows if row_time is not None]
-    timed_rows.sort(key=lambda item: item[1])
+    grouped_rows: Dict[str, List[tuple[Dict[str, Any], datetime]]] = {}
+    for row, row_time in timed_rows:
+        # Counter deltas must be calculated per physical/logical interface.
+        # If all interfaces share one rolling candidate list, a later sample
+        # from interface B may subtract a previous counter from interface A,
+        # producing fake Tbps spikes in circuit/summary charts.
+        group_key = f"{row.get('device_id')}:{row.get('interface_index')}:{row.get('interface_name') or ''}"
+        grouped_rows.setdefault(group_key, []).append((row, row_time))
 
-    for octet_key, bps_key in [("in_octets", "in_bps"), ("out_octets", "out_bps")]:
-        candidates: List[tuple[datetime, float]] = []
-        last_seen: Optional[tuple[datetime, float]] = None
-        for row, row_time in timed_rows:
-            current_value = _safe_float(row.get(octet_key))
-            if current_value is None:
-                continue
+    for group_items in grouped_rows.values():
+        group_items.sort(key=lambda item: item[1])
+        for octet_key, bps_key in [("in_octets", "in_bps"), ("out_octets", "out_bps")]:
+            candidates: List[tuple[datetime, float]] = []
+            last_seen: Optional[tuple[datetime, float]] = None
+            for row, row_time in group_items:
+                current_value = _safe_float(row.get(octet_key))
+                if current_value is None:
+                    continue
 
-            cutoff = row_time.timestamp() - window_seconds
-            candidates = [(time_value, value) for time_value, value in candidates if time_value.timestamp() >= cutoff]
-            previous = candidates[0] if candidates else last_seen
-            if previous:
-                previous_time, previous_value = previous
-                elapsed = (row_time - previous_time).total_seconds()
-                delta = current_value - previous_value
-                if 0 < elapsed <= RATE_FALLBACK_MAX_SECONDS and delta >= 0:
-                    # Grafana/Prometheus 的常见写法是 rate(ifHC*Octets[5m]) * 8。
-                    # 这里同样优先用 counter 在窗口内的增量重新计算展示速率，
-                    # 覆盖采集侧较短窗口写入的 *_bps，避免 SNMP 轮询抖动直接映射到曲线。
-                    row[bps_key] = round((delta * 8) / elapsed, 2)
-                    row["sample_seconds"] = round(elapsed, 2)
-            candidates.append((row_time, current_value))
-            last_seen = (row_time, current_value)
+                cutoff = row_time.timestamp() - window_seconds
+                candidates = [(time_value, value) for time_value, value in candidates if time_value.timestamp() >= cutoff]
+                previous = candidates[0] if candidates else last_seen
+                if previous:
+                    previous_time, previous_value = previous
+                    elapsed = (row_time - previous_time).total_seconds()
+                    delta = current_value - previous_value
+                    if 0 < elapsed <= RATE_FALLBACK_MAX_SECONDS and delta >= 0:
+                        # Grafana/Prometheus 的常见写法是 rate(ifHC*Octets[5m]) * 8。
+                        # 这里同样优先用 counter 在窗口内的增量重新计算展示速率，
+                        # 覆盖采集侧较短窗口写入的 *_bps，避免 SNMP 轮询抖动直接映射到曲线。
+                        row[bps_key] = round((delta * 8) / elapsed, 2)
+                        row["sample_seconds"] = round(elapsed, 2)
+                candidates.append((row_time, current_value))
+                last_seen = (row_time, current_value)
 
 
 def _apply_windowed_bps_average(rows: List[Dict[str, Any]], window_seconds: int, interval_seconds: int, range_seconds: int) -> None:
@@ -2360,6 +2719,234 @@ async def get_monitor_device_interfaces(device_id: int, db: Session = Depends(ge
     }
 
 
+@router.get("/traffic/summary")
+async def get_traffic_summary(
+    line_type: str = Query(..., description="线路类型：internet/private_line"),
+    datacenter_id: Optional[int] = Query(None, description="可选机房ID"),
+    range: str = Query("-24h", description="历史时间范围"),
+    interval: str = Query("5m", description="聚合间隔"),
+    start: Optional[str] = Query(None, description="绝对开始时间"),
+    end: Optional[str] = Query(None, description="绝对结束时间"),
+    start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
+    end_ts: Optional[float] = Query(None, description="绝对结束时间戳毫秒"),
+    fresh: bool = Query(False, description="是否绕过Redis缓存"),
+    db: Session = Depends(get_db),
+):
+    """公网/专线流量汇总曲线。用于流量查询首页，服务端聚合并共享缓存。"""
+    if line_type not in {"internet", "private_line"}:
+        raise HTTPException(status_code=400, detail="line_type 仅支持 internet/private_line")
+
+    safe_range = _normalize_query_range(range, "-24h")
+    safe_interval = _normalize_query_interval(interval, "5m")
+    start_time = datetime.fromtimestamp(start_ts / 1000, timezone.utc) if start_ts else _parse_query_datetime(start)
+    end_time = datetime.fromtimestamp(end_ts / 1000, timezone.utc) if end_ts else (_parse_query_datetime(end) or datetime.now(timezone.utc))
+    use_absolute_range = bool(start_time and start_time < end_time)
+    range_seconds = min(
+        int((end_time - start_time).total_seconds()) if use_absolute_range and start_time else _parse_flux_duration_seconds(safe_range, 86400),
+        MAX_INTERFACE_HISTORY_SECONDS,
+    )
+    interval_seconds = _history_interval_seconds(safe_interval)
+    rate_window_seconds = 5 * 60
+    octet_interval = safe_interval if rate_window_seconds >= interval_seconds else _flux_duration(rate_window_seconds)
+
+    if use_absolute_range and start_time:
+        range_clause = f"start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}"
+        traffic_start_time = start_time.timestamp() - rate_window_seconds
+        traffic_range_clause = f"start: {_flux_time(datetime.fromtimestamp(traffic_start_time, timezone.utc))}, stop: {_flux_time(end_time)}"
+        cache_range_key = f"abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}"
+        cutoff_ts = start_time.timestamp()
+        stop_ts = end_time.timestamp()
+    else:
+        traffic_start = _flux_duration(range_seconds + rate_window_seconds)
+        range_clause = f"start: {safe_range}"
+        traffic_range_clause = f"start: -{traffic_start}"
+        cache_range_key = safe_range
+        cutoff_ts = datetime.now(timezone.utc).timestamp() - range_seconds
+        stop_ts = None
+
+    cache_key = f"traffic:summary:v1:{line_type}:{datacenter_id or 'all'}:{cache_range_key}:{safe_interval}:{octet_interval}:{rate_window_seconds}"
+    if not fresh:
+        cached = redis_client.get(cache_key)
+        if cached:
+            try:
+                return json.loads(cached)
+            except Exception:
+                redis_client.delete(cache_key)
+
+    query = db.query(Circuit).filter(Circuit.status == "active", Circuit.line_type == line_type)
+    if datacenter_id:
+        query = query.filter(Circuit.datacenter_id == datacenter_id)
+    circuits = query.order_by(Circuit.id.desc()).all()
+
+    targets: List[Dict[str, Any]] = []
+    skipped_targets: List[Dict[str, Any]] = []
+    for circuit in circuits:
+        resolved_targets, skipped = _build_circuit_traffic_targets(circuit)
+        targets.extend(resolved_targets)
+        skipped_targets.extend(skipped)
+
+    by_time: Dict[str, Dict[str, Any]] = {}
+    # 避免线路多时Flux过滤表达式过长，分批聚合后再在Python侧汇总。
+    for offset in builtins.range(0, len(targets), 80):
+        chunk = targets[offset:offset + 80]
+        for row in _traffic_summary_rows(
+            chunk,
+            range_clause,
+            safe_interval,
+            traffic_range_clause,
+            octet_interval,
+            rate_window_seconds,
+            interval_seconds,
+            range_seconds,
+            cutoff_ts,
+            stop_ts,
+        ):
+            key = str(row.get("_time"))
+            item = by_time.setdefault(key, {"_time": key, "in_bps": 0.0, "out_bps": 0.0})
+            item["in_bps"] = float(item.get("in_bps") or 0.0) + float(_safe_float(row.get("in_bps")) or 0.0)
+            item["out_bps"] = float(item.get("out_bps") or 0.0) + float(_safe_float(row.get("out_bps")) or 0.0)
+
+    data = [by_time[key] for key in sorted(by_time.keys())]
+    payload = {
+        "line_type": line_type,
+        "datacenter_id": datacenter_id,
+        "range": safe_range,
+        "start": start_time.isoformat() if use_absolute_range and start_time else None,
+        "end": end_time.isoformat() if use_absolute_range and end_time else None,
+        "interval": safe_interval,
+        "rate_window": _flux_duration(rate_window_seconds),
+        "data": data,
+        "total": len(data),
+        "target_count": len(targets),
+        "skipped_target_count": len(skipped_targets),
+        "skipped_targets": skipped_targets[:20],
+        "cached": False,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    redis_client.setex(
+        cache_key,
+        _traffic_summary_cache_ttl(range_seconds, use_absolute_range),
+        json.dumps({**payload, "cached": True}, ensure_ascii=False, default=str),
+    )
+    return payload
+
+
+@router.get("/traffic/circuits/{circuit_id}/history")
+async def get_circuit_traffic_history(
+    circuit_id: int,
+    range: str = Query("-24h", description="历史时间范围"),
+    interval: str = Query("5m", description="聚合间隔"),
+    start: Optional[str] = Query(None, description="绝对开始时间"),
+    end: Optional[str] = Query(None, description="绝对结束时间"),
+    start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
+    end_ts: Optional[float] = Query(None, description="绝对结束时间戳毫秒"),
+    fresh: bool = Query(False, description="是否绕过Redis缓存"),
+    db: Session = Depends(get_db),
+):
+    """单条公网/专线的服务端聚合历史曲线。前端只发一个请求，结果可跨用户复用Redis缓存。"""
+    circuit = db.query(Circuit).filter(Circuit.id == circuit_id, Circuit.status == "active").first()
+    if not circuit:
+        raise HTTPException(status_code=404, detail="线路不存在或未启用")
+
+    safe_range = _normalize_query_range(range, "-24h")
+    safe_interval = _normalize_query_interval(interval, "5m")
+    start_time = datetime.fromtimestamp(start_ts / 1000, timezone.utc) if start_ts else _parse_query_datetime(start)
+    end_time = datetime.fromtimestamp(end_ts / 1000, timezone.utc) if end_ts else (_parse_query_datetime(end) or datetime.now(timezone.utc))
+    use_absolute_range = bool(start_time and start_time < end_time)
+    range_seconds = min(
+        int((end_time - start_time).total_seconds()) if use_absolute_range and start_time else _parse_flux_duration_seconds(safe_range, 86400),
+        MAX_INTERFACE_HISTORY_SECONDS,
+    )
+    interval_seconds = _history_interval_seconds(safe_interval)
+    rate_window_seconds = 5 * 60
+    octet_interval = safe_interval if rate_window_seconds >= interval_seconds else _flux_duration(rate_window_seconds)
+
+    if use_absolute_range and start_time:
+        range_clause = f"start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}"
+        traffic_start_time = start_time.timestamp() - rate_window_seconds
+        traffic_range_clause = f"start: {_flux_time(datetime.fromtimestamp(traffic_start_time, timezone.utc))}, stop: {_flux_time(end_time)}"
+        cache_range_key = f"abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}"
+        cutoff_ts = start_time.timestamp()
+        stop_ts = end_time.timestamp()
+    else:
+        traffic_start = _flux_duration(range_seconds + rate_window_seconds)
+        range_clause = f"start: {safe_range}"
+        traffic_range_clause = f"start: -{traffic_start}"
+        cache_range_key = safe_range
+        cutoff_ts = datetime.now(timezone.utc).timestamp() - range_seconds
+        stop_ts = None
+
+    cache_key = f"traffic:circuit_history:v1:{circuit_id}:{cache_range_key}:{safe_interval}:{octet_interval}:{rate_window_seconds}"
+    if not fresh:
+        cached = redis_client.get(cache_key)
+        if cached:
+            try:
+                return json.loads(cached)
+            except Exception:
+                redis_client.delete(cache_key)
+
+    targets, skipped_targets = _build_circuit_traffic_targets(circuit)
+    all_rows: List[Dict[str, Any]] = []
+    for offset in builtins.range(0, len(targets), 80):
+        chunk = targets[offset:offset + 80]
+        all_rows.extend(_traffic_summary_rows(
+            chunk,
+            range_clause,
+            safe_interval,
+            traffic_range_clause,
+            octet_interval,
+            rate_window_seconds,
+            interval_seconds,
+            range_seconds,
+            cutoff_ts,
+            stop_ts,
+            aggregate_by_time=False,
+        ))
+
+    grouped = _group_traffic_rows_by_target(all_rows)
+    response_targets = []
+    for target in targets:
+        key = f"{target.get('device_id')}:{target.get('interface_index')}"
+        response_targets.append({
+            "device_id": target.get("device_id"),
+            "device_name": target.get("device_name"),
+            "device_ip": target.get("device_ip"),
+            "port_name": target.get("port_name"),
+            "side": target.get("side"),
+            "interface": {
+                "index": target.get("interface_index"),
+                "name": target.get("interface_name") or target.get("port_name"),
+                "alias": target.get("interface_alias"),
+                "description": target.get("interface_description"),
+            },
+            "data": grouped.get(key, []),
+        })
+
+    data = _aggregate_traffic_rows_by_time(all_rows)
+    payload = {
+        "circuit": circuit.to_dict(),
+        "range": safe_range,
+        "start": start_time.isoformat() if use_absolute_range and start_time else None,
+        "end": end_time.isoformat() if use_absolute_range and end_time else None,
+        "interval": safe_interval,
+        "rate_window": _flux_duration(rate_window_seconds),
+        "aggregate": data,
+        "data": data,
+        "targets": response_targets,
+        "target_count": len(targets),
+        "skipped_target_count": len(skipped_targets),
+        "skipped_targets": skipped_targets[:20],
+        "cached": False,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    redis_client.setex(
+        cache_key,
+        _traffic_summary_cache_ttl(range_seconds, use_absolute_range),
+        json.dumps({**payload, "cached": True}, ensure_ascii=False, default=str),
+    )
+    return payload
+
+
 @router.get("/monitoring/devices/{device_id}/interfaces/{interface_index}")
 async def get_monitor_device_interface_stats(
     device_id: int,
@@ -2812,6 +3399,10 @@ async def get_ip_flow_traffic(
     db: Session = Depends(get_db),
     range: str = Query("-1h", description="历史时间范围，例如 -10m/-30m/-1h/-6h"),
     interval: str = Query("30s", description="聚合间隔，例如 10s/30s/1m/5m"),
+    start: Optional[str] = Query(None, description="绝对开始时间"),
+    end: Optional[str] = Query(None, description="绝对结束时间"),
+    start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
+    end_ts: Optional[float] = Query(None, description="绝对结束时间戳毫秒"),
 ):
     """按单个公网 IP 查询 sFlow/NetFlow 聚合后的出入向流量。"""
     try:
@@ -2823,11 +3414,12 @@ async def get_ip_flow_traffic(
     range_value = _normalize_query_range(range)
     interval_value = _normalize_query_interval(interval)
     interval_seconds = _parse_flux_duration_seconds(interval_value, 30)
+    range_clause, use_absolute_range, start_time, end_time = _build_query_range_clause(range_value, start, end, start_ts, end_ts)
     customers = _find_customers_by_public_cidr(db, cidr)
 
     customer_flux = f'''
     from(bucket: "{influx_client.bucket}")
-      |> range(start: {range_value})
+      |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "customer_ip_traffic")
       |> filter(fn: (r) => (exists r.ip and r.ip == {_flux_string(str(ip_value))}) or (not exists r.ip and r.cidr == {_flux_string(cidr)}))
       |> filter(fn: (r) => r._field == "in_bps" or r._field == "out_bps")
@@ -2842,7 +3434,7 @@ async def get_ip_flow_traffic(
     if not rows:
         sflow_flux = f'''
         from(bucket: "{influx_client.bucket}")
-          |> range(start: {range_value})
+          |> range({range_clause})
           |> filter(fn: (r) => r._measurement == "sflow_interface_ip_traffic")
           |> filter(fn: (r) => r.ip == {_flux_string(str(ip_value))})
           |> filter(fn: (r) => r._field == "in_bps" or r._field == "out_bps")
@@ -2860,6 +3452,8 @@ async def get_ip_flow_traffic(
         "customers": customers,
         "source": source,
         "range": range_value,
+        "start": start_time.isoformat() if use_absolute_range and start_time else None,
+        "end": end_time.isoformat() if use_absolute_range and end_time else None,
         "interval": interval_value,
         "interval_seconds": interval_seconds,
         "data": rows,
@@ -2874,6 +3468,10 @@ async def get_interface_top_ips(
     range: str = Query("-10m", description="历史时间范围，例如 -10m/-30m/-1h"),
     interval: str = Query("10s", description="聚合间隔，例如 10s/30s/1m"),
     limit: int = Query(20, ge=1, le=100),
+    start: Optional[str] = Query(None, description="绝对开始时间"),
+    end: Optional[str] = Query(None, description="绝对结束时间"),
+    start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
+    end_ts: Optional[float] = Query(None, description="绝对结束时间戳毫秒"),
 ):
     """按 sFlow 采样接口统计 Top IP 带宽排行。"""
     try:
@@ -2884,10 +3482,11 @@ async def get_interface_top_ips(
     range_value = _normalize_query_range(range, "-10m")
     interval_value = _normalize_query_interval(interval, "10s")
     interval_seconds = _parse_flux_duration_seconds(interval_value, 10)
+    range_clause, use_absolute_range, start_time, end_time = _build_query_range_clause(range_value, start, end, start_ts, end_ts)
 
     flux = f'''
     from(bucket: "{influx_client.bucket}")
-      |> range(start: {range_value})
+      |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "sflow_interface_ip_traffic")
       |> filter(fn: (r) => r.agent_ip == {_flux_string(agent_value)})
       |> filter(fn: (r) => r.interface_index == {_flux_string(interface_index)})
@@ -2911,6 +3510,8 @@ async def get_interface_top_ips(
         "agent_ip": agent_value,
         "interface_index": interface_index,
         "range": range_value,
+        "start": start_time.isoformat() if use_absolute_range and start_time else None,
+        "end": end_time.isoformat() if use_absolute_range and end_time else None,
         "interval": interval_value,
         "interval_seconds": interval_seconds,
         "items": rows,
@@ -2921,13 +3522,18 @@ async def get_interface_top_ips(
 @router.get("/flow/sflow-agents")
 async def get_sflow_agents(
     range: str = Query("-30m", description="历史时间范围，例如 -10m/-30m/-1h"),
+    start: Optional[str] = Query(None, description="绝对开始时间"),
+    end: Optional[str] = Query(None, description="绝对结束时间"),
+    start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
+    end_ts: Optional[float] = Query(None, description="绝对结束时间戳毫秒"),
     db: Session = Depends(get_db),
 ):
     """列出最近有 sFlow 数据的 Agent，便于前端直接下拉选择。"""
     range_value = _normalize_query_range(range, "-30m")
+    range_clause, use_absolute_range, start_time, end_time = _build_query_range_clause(range_value, start, end, start_ts, end_ts)
     flux = f'''
     from(bucket: "{influx_client.bucket}")
-      |> range(start: {range_value})
+      |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "sflow_interface_ip_traffic")
       |> filter(fn: (r) => r._field == "total_bps")
       |> group(columns: ["agent_ip", "interface_index"])
@@ -2952,7 +3558,7 @@ async def get_sflow_agents(
             item["last_seen"] = row_time
 
     if not agent_map:
-        return {"range": range_value, "items": [], "total": 0}
+        return {"range": range_value, "start": start_time.isoformat() if use_absolute_range and start_time else None, "end": end_time.isoformat() if use_absolute_range and end_time else None, "items": [], "total": 0}
 
     devices = db.query(Device).filter(Device.ip_address.in_(list(agent_map.keys()))).all()
     device_map = {device.ip_address: device for device in devices}
@@ -2978,13 +3584,17 @@ async def get_sflow_agents(
         return f"{datacenter.get('name') or ''}|{device.get('name') or ''}|{item.get('agent_ip') or ''}"
 
     rows = sorted(agent_map.values(), key=_agent_sort_key)
-    return {"range": range_value, "items": rows, "total": len(rows)}
+    return {"range": range_value, "start": start_time.isoformat() if use_absolute_range and start_time else None, "end": end_time.isoformat() if use_absolute_range and end_time else None, "items": rows, "total": len(rows)}
 
 
 @router.get("/flow/sflow-interfaces")
 async def get_sflow_interfaces(
     agent_ip: str = Query(..., description="sFlow Agent/设备 IP"),
     range: str = Query("-30m", description="历史时间范围，例如 -10m/-30m/-1h"),
+    start: Optional[str] = Query(None, description="绝对开始时间"),
+    end: Optional[str] = Query(None, description="绝对结束时间"),
+    start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
+    end_ts: Optional[float] = Query(None, description="绝对结束时间戳毫秒"),
     db: Session = Depends(get_db),
 ):
     """列出某个 sFlow Agent 最近上报过数据的接口。"""
@@ -2994,9 +3604,10 @@ async def get_sflow_interfaces(
         raise HTTPException(status_code=400, detail="设备 IP 地址格式不正确") from exc
 
     range_value = _normalize_query_range(range, "-30m")
+    range_clause, use_absolute_range, start_time, end_time = _build_query_range_clause(range_value, start, end, start_ts, end_ts)
     flux = f'''
     from(bucket: "{influx_client.bucket}")
-      |> range(start: {range_value})
+      |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "sflow_interface_ip_traffic")
       |> filter(fn: (r) => r.agent_ip == {_flux_string(agent_value)})
       |> filter(fn: (r) => r._field == "total_bps")
@@ -3037,6 +3648,8 @@ async def get_sflow_interfaces(
     return {
         "agent_ip": agent_value,
         "range": range_value,
+        "start": start_time.isoformat() if use_absolute_range and start_time else None,
+        "end": end_time.isoformat() if use_absolute_range and end_time else None,
         "items": rows,
         "total": len(rows),
     }
@@ -3050,6 +3663,10 @@ async def get_interface_ip_series(
     interval: str = Query("10s", description="聚合间隔，例如 10s/30s/1m"),
     limit: int = Query(10, ge=1, le=20),
     ip: Optional[str] = Query(None, description="指定 IP，留空则展示 Top IP"),
+    start: Optional[str] = Query(None, description="绝对开始时间"),
+    end: Optional[str] = Query(None, description="绝对结束时间"),
+    start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
+    end_ts: Optional[float] = Query(None, description="绝对结束时间戳毫秒"),
 ):
     """按接口返回 IP 带宽排行和折线图数据。"""
     try:
@@ -3067,10 +3684,11 @@ async def get_interface_ip_series(
     range_value = _normalize_query_range(range, "-10m")
     interval_value = _normalize_query_interval(interval, "10s")
     interval_seconds = _parse_flux_duration_seconds(interval_value, 10)
+    range_clause, use_absolute_range, start_time, end_time = _build_query_range_clause(range_value, start, end, start_ts, end_ts)
 
     top_flux = f'''
     from(bucket: "{influx_client.bucket}")
-      |> range(start: {range_value})
+      |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "sflow_interface_ip_traffic")
       |> filter(fn: (r) => r.agent_ip == {_flux_string(agent_value)})
       |> filter(fn: (r) => r.interface_index == {_flux_string(interface_index)})
@@ -3124,6 +3742,8 @@ async def get_interface_ip_series(
             "agent_ip": agent_value,
             "interface_index": interface_index,
             "range": range_value,
+            "start": start_time.isoformat() if use_absolute_range and start_time else None,
+            "end": end_time.isoformat() if use_absolute_range and end_time else None,
             "interval": interval_value,
             "interval_seconds": interval_seconds,
             "top_ips": top_rows,
@@ -3136,7 +3756,7 @@ async def get_interface_ip_series(
     ip_filter = " or ".join([f'r.ip == {_flux_string(item)}' for item in selected_ips])
     series_flux = f'''
     from(bucket: "{influx_client.bucket}")
-      |> range(start: {range_value})
+      |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "sflow_interface_ip_traffic")
       |> filter(fn: (r) => r.agent_ip == {_flux_string(agent_value)})
       |> filter(fn: (r) => r.interface_index == {_flux_string(interface_index)})
@@ -3151,6 +3771,8 @@ async def get_interface_ip_series(
         "agent_ip": agent_value,
         "interface_index": interface_index,
         "range": range_value,
+        "start": start_time.isoformat() if use_absolute_range and start_time else None,
+        "end": end_time.isoformat() if use_absolute_range and end_time else None,
         "interval": interval_value,
         "interval_seconds": interval_seconds,
         "top_ips": top_rows,
@@ -3959,6 +4581,7 @@ async def test_quality_probe_target(target_id: int, db: Session = Depends(get_db
         db_target.packet_count or 5,
         db_target.timeout_ms or 1000,
     )
+    result = apply_quality_loss_window(db_target.id, result)
     db_target.last_probe_at = datetime.now(timezone.utc)
     db_target.last_success = bool(result.get("success"))
     db_target.last_avg_latency_ms = result.get("avg_latency_ms")
@@ -3990,6 +4613,10 @@ async def get_quality_probe_history(
     target_id: int,
     range: str = Query("-24h", description="查询范围，例如 -1h/-6h/-24h/-7d/-30d/-365d"),
     interval: str = Query("1m", description="聚合间隔，例如 30s/1m/5m/1h"),
+    start: Optional[str] = Query(None, description="绝对开始时间"),
+    end: Optional[str] = Query(None, description="绝对结束时间"),
+    start_ts: Optional[float] = Query(None, description="绝对开始时间戳毫秒"),
+    end_ts: Optional[float] = Query(None, description="绝对结束时间戳毫秒"),
     db: Session = Depends(get_db),
 ):
     """查询公网质量探测历史曲线"""
@@ -3998,38 +4625,103 @@ async def get_quality_probe_history(
         raise HTTPException(status_code=404, detail="质量探测目标不存在")
     safe_range = _safe_flux_duration(range, "-24h")
     safe_interval = _safe_flux_interval(interval, "1m")
+    range_clause, use_absolute_range, start_time, end_time = _build_query_range_clause(safe_range, start, end, start_ts, end_ts)
+    cache_range_key = f"abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}" if use_absolute_range and start_time and end_time else safe_range
+    cache_key = f"quality_probe:history:v4:{target_id}:{cache_range_key}:{safe_interval}"
+    cached = redis_client.get(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            redis_client.delete(cache_key)
     escaped_id = _flux_string(target_id)
-    flux = f'''
+    metrics_flux = f'''
     from(bucket: "{influx_client.bucket}")
-      |> range(start: {safe_range})
+      |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "quality_probe")
       |> filter(fn: (r) => r.target_id == {escaped_id})
-      |> filter(fn: (r) => r._field == "avg_latency_ms" or r._field == "min_latency_ms" or r._field == "max_latency_ms" or r._field == "jitter_ms" or r._field == "packet_loss_percent" or r._field == "availability_percent")
-      |> aggregateWindow(every: {safe_interval}, fn: last, createEmpty: false)
+      |> filter(fn: (r) => r._field == "avg_latency_ms" or r._field == "min_latency_ms" or r._field == "max_latency_ms" or r._field == "jitter_ms")
+      |> aggregateWindow(every: {safe_interval}, fn: mean, createEmpty: false)
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> sort(columns: ["_time"])
     '''
-    rows = influx_client.query(flux)
-    data = []
-    for row in rows:
-        item = {
-            "_time": row.get("_time") or row.get("time"),
+    counts_flux = f'''
+    from(bucket: "{influx_client.bucket}")
+      |> range({range_clause})
+      |> filter(fn: (r) => r._measurement == "quality_probe")
+      |> filter(fn: (r) => r.target_id == {escaped_id})
+      |> filter(fn: (r) => r._field == "sent" or r._field == "received")
+      |> aggregateWindow(every: {safe_interval}, fn: sum, createEmpty: false)
+      |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> sort(columns: ["_time"])
+    '''
+    rows_by_time: Dict[str, Dict[str, Any]] = {}
+    for row in influx_client.query(metrics_flux):
+        ts = row.get("_time") or row.get("time")
+        if ts is None:
+            continue
+        rows_by_time[str(ts)] = {
+            "_time": ts,
             "avg_latency_ms": row.get("avg_latency_ms"),
             "min_latency_ms": row.get("min_latency_ms"),
             "max_latency_ms": row.get("max_latency_ms"),
             "jitter_ms": row.get("jitter_ms"),
-            "packet_loss_percent": row.get("packet_loss_percent"),
-            "availability_percent": row.get("availability_percent"),
+            "packet_loss_percent": None,
+            "availability_percent": None,
         }
-        if item["_time"] is not None:
-            data.append(item)
-    return {
+    for row in influx_client.query(counts_flux):
+        ts = row.get("_time") or row.get("time")
+        if ts is None:
+            continue
+        item = rows_by_time.setdefault(str(ts), {
+            "_time": ts,
+            "avg_latency_ms": None,
+            "min_latency_ms": None,
+            "max_latency_ms": None,
+            "jitter_ms": None,
+            "packet_loss_percent": None,
+            "availability_percent": None,
+        })
+        sent = _safe_float(row.get("sent")) or 0.0
+        received = _safe_float(row.get("received")) or 0.0
+        item["sent"] = sent
+        item["received"] = max(0.0, min(received, sent)) if sent > 0 else 0.0
+    data = sorted(rows_by_time.values(), key=lambda item: str(item.get("_time") or ""))
+    rolling_window_seconds = max(300, _history_interval_seconds(safe_interval) * 3)
+    rolling_counts: deque[Tuple[datetime, float, float]] = deque()
+    rolling_sent = 0.0
+    rolling_received = 0.0
+    for item in data:
+        item_time = _parse_history_time(item)
+        sent = _safe_float(item.pop("sent", None)) or 0.0
+        received = _safe_float(item.pop("received", None)) or 0.0
+        if item_time is not None and sent > 0:
+            rolling_counts.append((item_time, sent, received))
+            rolling_sent += sent
+            rolling_received += received
+            while rolling_counts and (item_time - rolling_counts[0][0]).total_seconds() > rolling_window_seconds:
+                _, old_sent, old_received = rolling_counts.popleft()
+                rolling_sent -= old_sent
+                rolling_received -= old_received
+        if rolling_sent > 0:
+            bounded_received = max(0.0, min(rolling_received, rolling_sent))
+            item["packet_loss_percent"] = round((rolling_sent - bounded_received) * 100.0 / rolling_sent, 2)
+            item["availability_percent"] = round(bounded_received * 100.0 / rolling_sent, 2)
+    payload = {
         "target": _quality_target_payload(db_target),
         "range": safe_range,
+        "start": start_time.isoformat() if use_absolute_range and start_time else None,
+        "end": end_time.isoformat() if use_absolute_range and end_time else None,
         "interval": safe_interval,
         "data": data,
         "total": len(data),
     }
+    redis_client.setex(
+        cache_key,
+        HISTORY_REQUEST_CACHE_SECONDS,
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
+    return payload
 
 
 @router.get("/measurements")

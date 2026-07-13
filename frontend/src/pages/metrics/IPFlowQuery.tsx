@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
-import { Button, Card, Empty, Input, Select, Space, Spin, Table, Tag, Typography, message, theme } from 'antd'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Button, Card, DatePicker, Empty, Input, Select, Space, Spin, Table, Tag, Typography, message, theme } from 'antd'
 import { LineChartOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts'
@@ -16,6 +16,7 @@ import {
 } from '../../api/metrics'
 
 const { Text } = Typography
+const { RangePicker } = DatePicker
 
 type ChartPoint = {
   timestamp: number
@@ -41,6 +42,7 @@ const RANGE_OPTIONS = [
   { value: '-24h', label: '过去24小时', interval: '5m' },
   { value: '-3d', label: '过去3天', interval: '5m' },
   { value: '-7d', label: '过去7天', interval: '5m' },
+  { value: 'custom', label: '自定义时间', interval: '1m' },
 ]
 
 const REFRESH_OPTIONS = [
@@ -93,6 +95,30 @@ const getXAxisTickCount = (rangeValue: string) => {
   return 8
 }
 
+const getCustomInterval = (customRange?: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null) => {
+  if (!customRange?.[0] || !customRange?.[1]) return '1m'
+  const seconds = Math.max(1, customRange[1].diff(customRange[0], 'second'))
+  if (seconds <= 30 * 60) return '10s'
+  if (seconds <= 2 * 60 * 60) return '30s'
+  if (seconds <= 12 * 60 * 60) return '1m'
+  if (seconds <= 3 * 24 * 60 * 60) return '5m'
+  if (seconds <= 7 * 24 * 60 * 60) return '15m'
+  return '1h'
+}
+
+const buildRangeParams = (rangeValue: string, customRange?: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null) => {
+  const selected = RANGE_OPTIONS.find((item) => item.value === rangeValue) || RANGE_OPTIONS[1]
+  if (rangeValue === 'custom' && customRange?.[0] && customRange?.[1]) {
+    return {
+      range: '-1h',
+      interval: getCustomInterval(customRange),
+      start_ts: customRange[0].valueOf(),
+      end_ts: customRange[1].valueOf(),
+    }
+  }
+  return { range: selected.value === 'custom' ? '-1h' : selected.value, interval: selected.interval }
+}
+
 const formatXAxisTick = (timestamp: number, rangeValue: string) => {
   const time = dayjs(timestamp)
   if (rangeValue === '-10m') return time.format('HH:mm:ss')
@@ -138,6 +164,7 @@ export default function IPFlowQuery() {
   const [ipInput, setIpInput] = useState(searchParams.get('ip') || '')
   const [currentIp, setCurrentIp] = useState(searchParams.get('ip') || '')
   const [rangeValue, setRangeValue] = useState(searchParams.get('range') || '-30m')
+  const [customRange, setCustomRange] = useState<[dayjs.Dayjs | null, dayjs.Dayjs | null] | null>([dayjs().subtract(1, 'hour'), dayjs()])
   const [refreshSeconds, setRefreshSeconds] = useState(10)
   const [loading, setLoading] = useState(false)
   const [points, setPoints] = useState<ChartPoint[]>([])
@@ -158,8 +185,12 @@ export default function IPFlowQuery() {
   const [analyzerFilterIp, setAnalyzerFilterIp] = useState('')
   const [selectedRank, setSelectedRank] = useState<number | null>(null)
   const [visibleTopIps, setVisibleTopIps] = useState<string[]>([])
+  const trafficRequestSeqRef = useRef(0)
+  const sflowAgentsRequestSeqRef = useRef(0)
+  const sflowInterfacesRequestSeqRef = useRef(0)
+  const analyzerRequestSeqRef = useRef(0)
 
-  const selectedRange = RANGE_OPTIONS.find((item) => item.value === rangeValue) || RANGE_OPTIONS[1]
+  const selectedRange = useMemo(() => buildRangeParams(rangeValue, customRange), [rangeValue, customRange])
 
   const selectedSflowAgent = useMemo(
     () => sflowAgents.find((item) => item.agent_ip === analyzerDeviceIp),
@@ -171,7 +202,12 @@ export default function IPFlowQuery() {
     [sflowInterfaces, analyzerInterfaceIndex]
   )
 
-  const fetchTraffic = async (ipValue = currentIp, range = rangeValue, silent = false) => {
+  const fetchTraffic = async (
+    ipValue = currentIp,
+    range = rangeValue,
+    silent = false,
+    customRangeOverride: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null = customRange
+  ) => {
     const trimmedIp = ipValue.trim()
     if (!trimmedIp) {
       setPoints([])
@@ -183,53 +219,69 @@ export default function IPFlowQuery() {
       return
     }
 
+    const requestSeq = trafficRequestSeqRef.current + 1
+    trafficRequestSeqRef.current = requestSeq
     setLoading(!silent)
     try {
-      const selected = RANGE_OPTIONS.find((item) => item.value === range) || RANGE_OPTIONS[1]
+      const selected = buildRangeParams(range, customRangeOverride)
       const result = await getIpFlowTraffic({
         ip: trimmedIp,
-        range: selected.value,
-        interval: selected.interval,
+        ...selected,
       })
+      if (trafficRequestSeqRef.current !== requestSeq) return
       setCurrentIp(result.ip)
       setIpInput(result.ip)
       setCustomers(result.customers || [])
       setFlowSource(result.source)
       setPoints((result.data || []).map(normalizePoint).filter((item) => Number.isFinite(item.timestamp)))
       setLastUpdatedAt(dayjs().format('YYYY-MM-DD HH:mm:ss'))
-      setSearchParams({ ip: result.ip, range: selected.value })
+      setSearchParams({ ip: result.ip, range })
     } catch (error: any) {
+      if (trafficRequestSeqRef.current !== requestSeq) return
       if (!silent) message.error(error?.response?.data?.detail || '获取IP流量失败')
       setPoints([])
       setCustomers([])
       setFlowSource(undefined)
     } finally {
-      setLoading(false)
+      if (trafficRequestSeqRef.current === requestSeq) setLoading(false)
     }
   }
 
-  const fetchSflowAgents = async (silent = false) => {
+  const fetchSflowAgents = async (
+    silent = false,
+    range = rangeValue,
+    customRangeOverride: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null = customRange
+  ) => {
+    const requestSeq = sflowAgentsRequestSeqRef.current + 1
+    sflowAgentsRequestSeqRef.current = requestSeq
     setSflowAgentsLoading(true)
     try {
-      const result = await getSflowAgents({ range: selectedRange.value })
+      const result = await getSflowAgents(buildRangeParams(range, customRangeOverride))
+      if (sflowAgentsRequestSeqRef.current !== requestSeq) return
       const items = result.items || []
       setSflowAgents(items)
       if (!analyzerDeviceIp && items.length) {
         setAnalyzerDeviceIp(items[0].agent_ip)
-        void fetchSflowInterfaces(items[0].agent_ip, true)
+        void fetchSflowInterfaces(items[0].agent_ip, true, range, customRangeOverride)
       }
       if (!silent && !items.length) {
         message.info('当前时间范围内暂未发现 sFlow Agent 数据')
       }
     } catch (error: any) {
+      if (sflowAgentsRequestSeqRef.current !== requestSeq) return
       if (!silent) message.error(error?.response?.data?.detail || '获取sFlow Agent失败')
       setSflowAgents([])
     } finally {
-      setSflowAgentsLoading(false)
+      if (sflowAgentsRequestSeqRef.current === requestSeq) setSflowAgentsLoading(false)
     }
   }
 
-  const fetchSflowInterfaces = async (agentIpValue = analyzerDeviceIp, silent = false) => {
+  const fetchSflowInterfaces = async (
+    agentIpValue = analyzerDeviceIp,
+    silent = false,
+    range = rangeValue,
+    customRangeOverride: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null = customRange
+  ) => {
     const trimmedIp = agentIpValue.trim()
     if (!trimmedIp) {
       setSflowInterfaces([])
@@ -239,12 +291,15 @@ export default function IPFlowQuery() {
       if (!silent) message.warning('请输入正确的设备 IP')
       return
     }
+    const requestSeq = sflowInterfacesRequestSeqRef.current + 1
+    sflowInterfacesRequestSeqRef.current = requestSeq
     setSflowInterfacesLoading(true)
     try {
       const result = await getSflowInterfaces({
         agent_ip: trimmedIp,
-        range: selectedRange.value,
+        ...buildRangeParams(range, customRangeOverride),
       })
+      if (sflowInterfacesRequestSeqRef.current !== requestSeq) return
       const items = result.items || []
       setAnalyzerDeviceIp(result.agent_ip)
       setSflowInterfaces(items)
@@ -259,14 +314,19 @@ export default function IPFlowQuery() {
         message.info('当前时间范围内没有查询到该设备的 sFlow 接口数据')
       }
     } catch (error: any) {
+      if (sflowInterfacesRequestSeqRef.current !== requestSeq) return
       if (!silent) message.error(error?.response?.data?.detail || '获取sFlow接口失败')
       setSflowInterfaces([])
     } finally {
-      setSflowInterfacesLoading(false)
+      if (sflowInterfacesRequestSeqRef.current === requestSeq) setSflowInterfacesLoading(false)
     }
   }
 
-  const fetchInterfaceAnalysis = async (ipValue = analyzerFilterIp) => {
+  const fetchInterfaceAnalysis = async (
+    ipValue = analyzerFilterIp,
+    range = rangeValue,
+    customRangeOverride: [dayjs.Dayjs | null, dayjs.Dayjs | null] | null = customRange
+  ) => {
     const trimmedIp = analyzerDeviceIp.trim()
     if (!isIpLike(trimmedIp)) {
       message.warning('请输入正确的设备 IP')
@@ -281,16 +341,18 @@ export default function IPFlowQuery() {
       message.warning('请输入正确的分析 IP')
       return
     }
+    const requestSeq = analyzerRequestSeqRef.current + 1
+    analyzerRequestSeqRef.current = requestSeq
     setAnalyzerLoading(true)
     try {
       const result = await getInterfaceIpSeries({
         agent_ip: trimmedIp,
         interface_index: analyzerInterfaceIndex,
-        range: selectedRange.value,
-        interval: selectedRange.interval,
+        ...buildRangeParams(range, customRangeOverride),
         limit: 20,
         ip: targetIp || undefined,
       })
+      if (analyzerRequestSeqRef.current !== requestSeq) return
       setTopIps(result.top_ips || [])
       setVisibleTopIps([])
       setSelectedRank(result.selected_rank ?? null)
@@ -304,47 +366,48 @@ export default function IPFlowQuery() {
       setAnalyzerSeries(Array.from(pointMap.values()).sort((a, b) => a.timestamp - b.timestamp))
       setSearchParams({
         ...(currentIp ? { ip: currentIp } : {}),
-        range: selectedRange.value,
+        range,
         agent_ip: result.agent_ip,
         interface_index: String(result.interface_index),
       })
     } catch (error: any) {
+      if (analyzerRequestSeqRef.current !== requestSeq) return
       message.error(error?.response?.data?.detail || '获取接口IP分析失败')
       setTopIps([])
       setAnalyzerSeries([])
       setSelectedRank(null)
     } finally {
-      setAnalyzerLoading(false)
+      if (analyzerRequestSeqRef.current === requestSeq) setAnalyzerLoading(false)
     }
   }
 
   useEffect(() => {
     if (!currentIp) return
     const timer = window.setInterval(() => {
-      fetchTraffic(currentIp, rangeValue, true)
+      fetchTraffic(currentIp, rangeValue, true, customRange)
     }, refreshSeconds * 1000)
     return () => window.clearInterval(timer)
-  }, [currentIp, rangeValue, refreshSeconds])
+  }, [currentIp, rangeValue, customRange, refreshSeconds])
 
   useEffect(() => {
     const initialIp = searchParams.get('ip')
     if (initialIp) {
       fetchTraffic(initialIp, rangeValue)
     }
-    void fetchSflowAgents(true)
+    void fetchSflowAgents(true, rangeValue, customRange)
     const initialAgentIp = searchParams.get('agent_ip')
     if (initialAgentIp) {
-      void fetchSflowInterfaces(initialAgentIp, true)
+      void fetchSflowInterfaces(initialAgentIp, true, rangeValue, customRange)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
     if (analyzerDeviceIp && isIpLike(analyzerDeviceIp)) {
-      void fetchSflowInterfaces(analyzerDeviceIp, true)
+      void fetchSflowInterfaces(analyzerDeviceIp, true, rangeValue, customRange)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rangeValue])
+  }, [rangeValue, customRange])
 
   const chartMeta = useMemo(() => {
     const validPoints = points.filter((point) => typeof point.in_bps === 'number' || typeof point.out_bps === 'number')
@@ -605,6 +668,19 @@ export default function IPFlowQuery() {
               if (currentIp) fetchTraffic(currentIp, value)
             }}
           />
+          {rangeValue === 'custom' && (
+            <RangePicker
+              showTime
+              value={customRange as any}
+              allowClear={false}
+              onChange={(value) => {
+                const nextRange = value as [dayjs.Dayjs | null, dayjs.Dayjs | null] | null
+                setCustomRange(nextRange)
+                if (currentIp) void fetchTraffic(currentIp, 'custom', false, nextRange)
+              }}
+              style={{ width: 380 }}
+            />
+          )}
           <Select
             value={refreshSeconds}
             options={REFRESH_OPTIONS}

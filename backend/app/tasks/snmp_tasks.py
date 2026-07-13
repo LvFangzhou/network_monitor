@@ -16,7 +16,7 @@ import uuid
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models import Device, Circuit
+from app.models import Device, Circuit, AlertRule
 from app.collectors import snmp_collector
 from app.core import get_logger
 from app.utils import redis_client, influx_client
@@ -67,6 +67,10 @@ INTERFACE_REALTIME_LOCK_TTL_SECONDS = 120
 INTERFACE_REALTIME_MAX_WORKERS = max(1, int(settings.SNMP_INTERFACE_REALTIME_MAX_WORKERS))
 INTERFACE_RATE_CAP_MULTIPLIER = 1.03
 ICMP_REACHABILITY_LOCK_TTL_SECONDS = max(25, (ICMP_PING_PACKETS * ICMP_PING_TIMEOUT_SECONDS) + 15)
+DEVICE_DETAIL_PREWARM_INTERVAL_SECONDS = 600
+DEVICE_DETAIL_PREWARM_BATCH_COUNT = 10
+DEVICE_DETAIL_PREWARM_MAX_WORKERS = 4
+DEVICE_DETAIL_PREWARM_LOCK_TTL_SECONDS = 180
 ASTERNOS_COUNTER_METRICS = [
     {
         "field": "queue_egress_dropped_pkts_delta",
@@ -280,6 +284,10 @@ def _interface_realtime_lock_key(kind: str = "asternos") -> str:
     return f"interface_realtime_collect:{kind}:lock"
 
 
+def _device_detail_prewarm_lock_key() -> str:
+    return "device_detail_prewarm:lock"
+
+
 def _bucket_cursor_key(kind: str) -> str:
     return f"collect:bucket_cursor:{kind}"
 
@@ -333,6 +341,179 @@ def _release_interface_realtime_lock(kind: str = "asternos", token: Optional[str
     if token and current != token:
         return
     redis_client.delete(key)
+
+
+def _try_lock_device_detail_prewarm() -> Optional[str]:
+    token = uuid.uuid4().hex
+    locked = redis_client.set(
+        _device_detail_prewarm_lock_key(),
+        token,
+        ex=DEVICE_DETAIL_PREWARM_LOCK_TTL_SECONDS,
+        nx=True,
+    )
+    return token if locked else None
+
+
+def _release_device_detail_prewarm_lock(token: Optional[str] = None) -> None:
+    key = _device_detail_prewarm_lock_key()
+    current = redis_client.get(key)
+    if isinstance(current, bytes):
+        current = current.decode("utf-8", errors="ignore")
+    if token and current != token:
+        return
+    redis_client.delete(key)
+
+
+def _build_qos_discard_rule_payload(name: str, metric_type: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "description": "仅监控 device_id 136、193 的接口 QoS/丢弃增量",
+        "rule_type": "threshold",
+        "metric_type": metric_type,
+        "condition": ">",
+        "threshold": 60.0,
+        "duration": 60,
+        "severity": "critical",
+        "suppress_duration": 300,
+        "enabled": 1,
+        "device_ids": [136, 193],
+        "extra_config": {
+            "applicable_vendors": ["H3C"],
+            "model_regex": "S6805",
+            "time_range": "-10m",
+            "interface_regex": "^(Ten-GigabitEthernet|HundredGigE|Bridge-Aggregation).*",
+            "exclude_interface_regex": "^(NULL|Loop|InLoop|Vlan-interface|M-GigabitEthernet).*",
+        },
+        "notification_channels": [],
+    }
+
+
+def _ensure_alert_rule(db, payload: Dict[str, Any]) -> Dict[str, Any]:
+    rule = db.query(AlertRule).filter(AlertRule.name == payload["name"]).first()
+    created = False
+    if not rule:
+        rule = AlertRule(name=payload["name"], metric_type=payload["metric_type"], condition=payload["condition"], threshold=payload["threshold"])
+        created = True
+        db.add(rule)
+    rule.description = payload["description"]
+    rule.rule_type = payload["rule_type"]
+    rule.metric_type = payload["metric_type"]
+    rule.condition = payload["condition"]
+    rule.threshold = payload["threshold"]
+    rule.duration = payload["duration"]
+    rule.severity = payload["severity"]
+    rule.suppress_duration = payload["suppress_duration"]
+    rule.enabled = payload["enabled"]
+    rule.device_ids = payload["device_ids"]
+    rule.extra_config = payload["extra_config"]
+    rule.notification_channels = payload["notification_channels"]
+    return {"name": payload["name"], "created": created}
+
+
+def _prewarm_device_detail_snapshot(device: Device) -> Dict[str, Any]:
+    monitor_source = str(device.monitor_source or "snmp")
+    collected_at = datetime.now(timezone.utc).isoformat()
+
+    if monitor_source == "asternos_exporter":
+        metrics = asyncio.run(asternos_exporter_client.scrape(device))
+        interfaces = _build_asternos_interfaces(metrics)
+        overview = {
+            "connectivity": {
+                "type": "exporter",
+                "status": "reachable",
+                "message": f"http://{device.ip_address}:8101/metrics",
+            },
+            "resources": {
+                "cpu_percent": _normalize_percent(_safe_float(asternos_exporter_client._first(metrics, "device_cpu_usage"))),
+                "memory_percent": _normalize_percent(_safe_float(asternos_exporter_client._first(metrics, "device_memory_usage"))),
+                "temperature": _max_metric_value(asternos_exporter_client._rows(metrics, "device_sensor_tempt")),
+                "storage_percent": None,
+            },
+            "sessions": {"current": None, "total": None, "usage_percent": None},
+            "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
+            "protocols": {
+                "bgp": _summarize_exporter_protocol(asternos_exporter_client._rows(metrics, "bgp_status"), ["established", "up"]),
+                "ospf": _summarize_exporter_protocol(asternos_exporter_client._rows(metrics, "ospf_status"), ["full", "established", "up"]),
+            },
+            "system_info": asternos_exporter_client.system_info(metrics),
+            "collected_at": collected_at,
+        }
+        _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at, "source": "prewarm_exporter"})
+        _set_monitor_cache("overview", device.id, overview)
+        return {"device_id": device.id, "source": "asternos_exporter", "interfaces": len(interfaces)}
+
+    if not device.snmp_version:
+        return {"device_id": device.id, "skipped": "no_snmp"}
+
+    interfaces = snmp_collector.list_interfaces(device)
+    _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at, "source": "prewarm_snmp"})
+    return {"device_id": device.id, "source": "snmp", "interfaces": len(interfaces)}
+
+
+@shared_task(name="app.tasks.snmp_tasks.ensure_qos_discard_rules")
+def ensure_qos_discard_rules():
+    """幂等创建/修正指定设备 QoS 丢弃规则。"""
+    db = SessionLocal()
+    try:
+        results = []
+        results.append(_ensure_alert_rule(db, _build_qos_discard_rule_payload("H3C S6805 指定设备入向丢弃异常", "interface_in_discards_delta")))
+        results.append(_ensure_alert_rule(db, _build_qos_discard_rule_payload("H3C S6805 指定设备出向丢弃异常", "interface_out_discards_delta")))
+        db.commit()
+        return {"success": True, "rules": results}
+    except Exception as exc:
+        db.rollback()
+        logger.error("确保QoS丢弃规则失败", error=str(exc))
+        return {"success": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+@shared_task(name="app.tasks.snmp_tasks.prewarm_device_detail_caches")
+def prewarm_device_detail_caches():
+    """后台分桶预热设备详情所需缓存，允许前台读取 10 分钟内快照以换取秒开。"""
+    lock_token = _try_lock_device_detail_prewarm()
+    if not lock_token:
+        return {"skipped": True, "reason": "上一轮设备详情预热未完成"}
+
+    db = SessionLocal()
+    try:
+        devices = db.query(Device).filter(
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+        ).order_by(Device.id.asc()).all()
+        current_bucket = _next_round_robin_bucket("device_detail_prewarm", DEVICE_DETAIL_PREWARM_BATCH_COUNT)
+        devices_in_bucket = [
+            device for device in devices
+            if int(device.id or 0) % DEVICE_DETAIL_PREWARM_BATCH_COUNT == current_bucket
+        ]
+        workers = min(DEVICE_DETAIL_PREWARM_MAX_WORKERS, max(1, len(devices_in_bucket)))
+        results: List[Dict[str, Any]] = []
+
+        if devices_in_bucket:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_prewarm_device_detail_snapshot, device): device for device in devices_in_bucket}
+                for future in as_completed(futures):
+                    device = futures[future]
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        logger.warning("设备详情预热失败", device_id=device.id, ip_address=device.ip_address, error=str(exc))
+                        results.append({"device_id": device.id, "error": str(exc)})
+
+        return {
+            "success": True,
+            "bucket": current_bucket,
+            "bucket_count": DEVICE_DETAIL_PREWARM_BATCH_COUNT,
+            "total_devices": len(devices),
+            "devices_in_bucket": len(devices_in_bucket),
+            "results": results,
+        }
+    except Exception as exc:
+        logger.error("设备详情预热批量失败", error=str(exc))
+        return {"success": False, "error": str(exc)}
+    finally:
+        _release_device_detail_prewarm_lock(lock_token)
+        db.close()
 
 
 def _try_lock_icmp_reachability() -> Optional[str]:

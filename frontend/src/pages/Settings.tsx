@@ -48,6 +48,22 @@ const tablePagination = {
   showTotal: (total: number, range: [number, number]) => `第 ${range[0]}-${range[1]} 条 / 共 ${total} 条`,
 }
 
+const formatShanghaiTime = (value?: string | null) => {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
 const ControllerIntegrationPanel = () => {
   const [form] = Form.useForm<ControllerSettingsPayload>()
   const [loading, setLoading] = useState(false)
@@ -591,7 +607,7 @@ const Settings = () => {
             <Typography.Text>电话：{currentUser?.phone || '-'}</Typography.Text>
             <Typography.Text>部门：{currentUser?.department || '-'}</Typography.Text>
             <Typography.Text>
-              最后登录时间：{currentUser?.last_login ? new Date(currentUser.last_login).toLocaleString() : '-'}
+              最后登录时间：{formatShanghaiTime(currentUser?.last_login)}
             </Typography.Text>
           </Space>
         </Card>
@@ -646,7 +662,7 @@ const Settings = () => {
                       title: '最后登录时间',
                       dataIndex: 'last_login',
                       key: 'last_login',
-                      render: (value?: string | null) => value ? new Date(value).toLocaleString() : '-',
+                      render: (value?: string | null) => formatShanghaiTime(value),
                     },
                     {
                       title: '在线状态',
@@ -660,7 +676,7 @@ const Settings = () => {
                       title: '最后离线时间',
                       dataIndex: 'last_offline_at',
                       key: 'last_offline_at',
-                      render: (value?: string | null, record?: User) => record?.online ? '-' : (value ? new Date(value).toLocaleString() : '-'),
+                      render: (value?: string | null, record?: User) => record?.online ? '-' : formatShanghaiTime(value),
                     },
                     {
                       title: '可访问菜单',
@@ -775,7 +791,7 @@ const Settings = () => {
                     onChange: (page, pageSize) => fetchAuditLogs(page, pageSize, auditFilters),
                   }}
                   columns={[
-                    { title: '时间', dataIndex: 'created_at', width: 180, render: (value?: string) => value ? new Date(value).toLocaleString() : '-' },
+                    { title: '时间', dataIndex: 'created_at', width: 180, render: (value?: string) => formatShanghaiTime(value) },
                     { title: '账号', dataIndex: 'username', width: 120 },
                     { title: '菜单', dataIndex: 'menu', width: 120, render: (value?: string) => value || '-' },
                     { title: '动作', dataIndex: 'action', width: 90, render: (value: string) => <Tag>{value}</Tag> },

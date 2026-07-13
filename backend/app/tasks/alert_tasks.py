@@ -133,6 +133,32 @@ def _rule_applicable_vendors(rule: AlertRule) -> List[str]:
     extra_config = rule.extra_config or {}
     return _normalize_vendor_list(extra_config.get("applicable_vendors") or extra_config.get("vendors"))
 
+
+def _device_matches_model_filter(device: Device, extra_config: Optional[Dict[str, Any]]) -> bool:
+    config = extra_config or {}
+    model_value = str(getattr(device, "model", "") or "").strip()
+    model_keyword = str(config.get("model") or config.get("model_keyword") or "").strip().lower()
+    model_regex = str(config.get("model_regex") or "").strip()
+    exclude_model_regex = str(config.get("exclude_model_regex") or "").strip()
+
+    if model_keyword and model_keyword not in model_value.lower():
+        return False
+    if model_regex:
+        try:
+            if not re.search(model_regex, model_value, re.IGNORECASE):
+                return False
+        except re.error:
+            logger.warning("告警规则型号正则无效", model_regex=model_regex)
+            return False
+    if exclude_model_regex:
+        try:
+            if re.search(exclude_model_regex, model_value, re.IGNORECASE):
+                return False
+        except re.error:
+            logger.warning("告警规则排除型号正则无效", exclude_model_regex=exclude_model_regex)
+            return False
+    return True
+
 def _is_asternos_vendor(vendor: Optional[str]) -> bool:
     vendor_value = (vendor or "").strip().lower()
     return any(marker in vendor_value for marker in ["asternos", "asterfusion", "asteros", "aster", "星融元"])
@@ -278,6 +304,8 @@ METRIC_VALUE_LABELS = {
 
 FAST_ALERT_METRIC_TYPES = {
     "interface_admin_up_oper_down",
+    "interface_in_discards_delta",
+    "interface_out_discards_delta",
 }
 
 REACHABILITY_ALERT_METRIC_TYPES = {
@@ -1402,6 +1430,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
         )
         return False
     devices = [device for device in devices if _vendor_matches_any(device.vendor, applicable_vendors)]
+    devices = [device for device in devices if _device_matches_model_filter(device, rule.extra_config or {})]
 
     if rule.metric_type == "device_reachability":
         devices = [

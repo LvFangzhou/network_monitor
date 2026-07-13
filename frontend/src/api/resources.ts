@@ -225,11 +225,11 @@ export interface IPRecord {
 }
 
 export const getVendors = async (): Promise<{ total: number; items: Vendor[] }> => {
-  return await request.get('/resources/vendors') as { total: number; items: Vendor[] }
+  return await request.get('/resources/vendors', { params: { limit: 1000 } }) as { total: number; items: Vendor[] }
 }
 
 export const getCustomers = async (search?: string): Promise<{ total: number; items: Customer[] }> => {
-  const params = search ? { search } : undefined
+  const params = search ? { search, limit: 200 } : { limit: 200 }
   return await request.get('/resources/customers', { params }) as { total: number; items: Customer[] }
 }
 
@@ -275,6 +275,8 @@ export const getCircuits = async (params?: {
   line_type?: string
   access_mode?: string
   customer_id?: number
+  vendor_id?: number
+  status?: string
   search?: string
 }): Promise<{ total: number; items: Circuit[] }> => {
   return await request.get('/resources/circuits', { params }) as { total: number; items: Circuit[] }

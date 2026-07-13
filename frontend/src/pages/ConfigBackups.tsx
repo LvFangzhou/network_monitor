@@ -318,8 +318,10 @@ const ConfigBackups = () => {
         setLatestJob(result.job)
         setJobs((prev) => [result.job, ...prev.filter((item) => item.id !== result.job.id)].slice(0, jobsPageSize))
       }
-      await loadJobs(1, jobsPageSize)
       setJobsPage(1)
+      window.setTimeout(() => {
+        void refreshJobProgress(1, jobsPageSize)
+      }, 600)
     } catch (error: any) {
       hideLoading()
       message.error(error?.response?.data?.detail || '触发配置备份失败')
@@ -470,6 +472,16 @@ const ConfigBackups = () => {
   const isFinishedJob = Boolean(latestJob && ['success', 'partial_failed', 'failed', 'cancelled'].includes(latestJob.status))
   const completedCount = (latestJob?.success_count || 0) + (latestJob?.failed_count || 0)
   const unfinishedCount = Math.max((latestJob?.total_devices || 0) - completedCount, 0)
+  const backupStageText = useMemo(() => {
+    if (!latestJob) return ''
+    if (latestJob.status === 'pending') return '任务已提交，正在等待配置备份 Worker 接收。'
+    if (latestJob.status === 'running') {
+      if (!latestJob.total_devices) return '任务已启动，正在加载需要备份的上线设备清单。'
+      if (completedCount === 0) return `已启动 ${latestJob.total_devices} 台设备采集，正在并发建立 SSH 连接并读取运行/启动配置，等待首批设备返回。`
+      return `正在执行，剩余 ${unfinishedCount} 台设备；部分设备仍在 SSH 登录、分页读取或一致性检查中。`
+    }
+    return ''
+  }, [completedCount, latestJob, unfinishedCount])
 
   const filteredLatestResults = useMemo(() => {
     const text = resultFilterText.trim().toLowerCase()
@@ -677,9 +689,12 @@ const ConfigBackups = () => {
                     percent={progressPercent}
                     status="active"
                   />
-                  <Text type="secondary">
-                    已完成 {completedCount} / {latestJob.total_devices || 0}，成功 {latestJob.success_count || 0}，失败 {latestJob.failed_count || 0}
-                  </Text>
+                  <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                    <Text type="secondary">
+                      已完成 {completedCount} / {latestJob.total_devices || 0}，成功 {latestJob.success_count || 0}，失败 {latestJob.failed_count || 0}
+                    </Text>
+                    {backupStageText ? <Text type="secondary">{backupStageText}</Text> : null}
+                  </Space>
                 </div>
               ) : latestJob && isFinishedJob ? (
                 <div style={{ padding: 12, borderRadius: 12, background: colorFillQuaternary }}>

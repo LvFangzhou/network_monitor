@@ -387,6 +387,7 @@ class QualityProbeTarget(Base):
             "last_success": self.last_success,
             "last_avg_latency_ms": self.last_avg_latency_ms,
             "last_packet_loss_percent": self.last_packet_loss_percent,
+            "last_availability_percent": round(max(0.0, 100.0 - float(self.last_packet_loss_percent)), 2) if self.last_packet_loss_percent is not None else None,
             "last_jitter_ms": self.last_jitter_ms,
             "last_error": self.last_error,
             "created_at": self.created_at.isoformat() if self.created_at else None,
