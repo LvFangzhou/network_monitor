@@ -314,6 +314,14 @@ const getCardSubtitle = (card: CircuitTrafficCard, target?: LoadedTrafficTarget)
   return getTrafficTargets(card.circuit).map(formatTrafficTargetText).join('  |  ')
 }
 
+const getTrafficCardGridColumn = (card: CircuitTrafficCard) => {
+  const isSummaryCard = card.circuit.id < 0
+  if (isSummaryCard) return undefined
+  if ((card.aggregateData?.length || 0) > 0 && card.targets.length > 1) return '1 / -1'
+  if (card.circuit.access_mode === 'dual') return '1 / -1'
+  return undefined
+}
+
 const TrafficChart = ({
   title,
   subtitle,
@@ -881,6 +889,7 @@ const TrafficQuery = () => {
     const chartScale = getChartScale(aggregateData)
     const isSummaryCard = card.circuit.id < 0
     const showTargetCharts = !isSummaryCard && card.targets.length > 1
+    const detailGridColumns = card.targets.length === 2 ? 'repeat(2, minmax(0, 1fr))' : 'repeat(auto-fit, minmax(420px, 1fr))'
     const query = getCardQueryState(card.circuit.id)
     const controls = (
       <Space wrap size="small" style={{ width: '100%', justifyContent: 'flex-end' }}>
@@ -905,6 +914,7 @@ const TrafficQuery = () => {
           if (draggingId && !isSummaryCard) reorderVisibleCards(draggingId, card.circuit.id)
           setDraggingId(null)
         }}
+        style={{ gridColumn: getTrafficCardGridColumn(card) }}
         styles={{ body: { padding: 14 } }}
       >
         <Spin spinning={Boolean(card.loading)} tip="正在读取接口历史流量...">
@@ -928,7 +938,7 @@ const TrafficQuery = () => {
                 scale={chartScale}
               />
               {showTargetCharts ? (
-                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 16 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: detailGridColumns, gap: 16 }}>
                   {card.targets.map((target) => (
                     <TrafficChart
                       key={`${card.circuit.id}-${target.deviceIp}-${target.portName}-${target.side}`}
