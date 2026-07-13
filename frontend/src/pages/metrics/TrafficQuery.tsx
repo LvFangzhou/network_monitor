@@ -410,7 +410,7 @@ const TrafficChart = ({
             <YAxis tickFormatter={(value) => formatScaledAxisValue(Number(value), scale)} width={82} tick={{ fontSize: 12 }} />
             <RechartsTooltip
               labelFormatter={(value) => dayjs(Number(value)).format('YYYY-MM-DD HH:mm:ss')}
-              formatter={(value: any, name: string) => [formatBps(Number(value)), name === 'in_area_bps' ? '入方向' : '出方向']}
+              formatter={(value: any, name: string, props: any) => [formatBps(Number(value)), props?.dataKey === 'in_area_bps' ? '入方向' : name || '出方向']}
             />
             <Area type="monotone" dataKey="in_area_bps" name="入方向" stroke="#35a800" fill="#35a800" fillOpacity={0.82} strokeWidth={1.2} dot={false} connectNulls={false} />
             <Area type="monotone" dataKey="out_line_bps" name="出方向" stroke="#5f7fd8" fill="transparent" strokeWidth={1.5} dot={false} connectNulls={false} />
