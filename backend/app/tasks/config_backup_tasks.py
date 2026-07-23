@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.core import get_logger
 from app.database import SessionLocal
-from app.models import ConfigBackupJob, ConfigBackupResult, Datacenter, Device
+from app.models import ConfigBackupJob, ConfigBackupResult, Device
 from app.tasks import celery_app
 from app.tasks.system_tasks import _notification_channels
 from app.utils import notification_manager
@@ -867,45 +867,14 @@ def _format_duration(seconds: Optional[int]) -> str:
     return f"{hours}小时{minutes}分" if minutes else f"{hours}小时"
 
 
-def _split_network_owner_emails(value: Optional[str]) -> List[str]:
-    if not value:
-        return []
-    mentions = []
-    for item in re.split(r"[,，;；\s]+", value):
-        item = item.strip().lstrip("@")
-        if item:
-            mentions.append(item)
-    return list(dict.fromkeys(mentions))
-
-
-def _load_datacenter_contacts(datacenter_names: List[str]) -> Dict[str, Dict[str, Any]]:
-    names = [name for name in dict.fromkeys(datacenter_names) if name and name != "未设置机房"]
-    if not names:
-        return {}
-    db = SessionLocal()
-    try:
-        rows = db.query(Datacenter).filter(Datacenter.name.in_(names)).all()
-        return {
-            row.name: {
-                "network_owner": row.network_owner or row.contact_person,
-                "network_owner_emails": _split_network_owner_emails(getattr(row, "network_owner_email", None)),
-            }
-            for row in rows
-        }
-    finally:
-        db.close()
-
-
 def _build_backup_card_data(job: ConfigBackupJob, datacenter_stats: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
     failed = job.failed_count or 0
     save_failed = getattr(job, "config_save_failed_count", 0) or 0
     changed = getattr(job, "config_changed_count", 0) or 0
     saved = getattr(job, "config_saved_count", 0) or 0
     duration_seconds = _seconds_between(job.started_at, job.finished_at)
-    contact_map = _load_datacenter_contacts(list(datacenter_stats.keys()))
     datacenter_rows = []
     for datacenter, stats in sorted(datacenter_stats.items(), key=lambda item: item[0]):
-        contact_info = contact_map.get(datacenter, {})
         datacenter_rows.append({
             "name": datacenter,
             "success": stats.get("success", 0),
@@ -913,8 +882,6 @@ def _build_backup_card_data(job: ConfigBackupJob, datacenter_stats: Dict[str, Di
             "changed": stats.get("changed", 0),
             "saved": stats.get("saved", 0),
             "save_failed": stats.get("save_failed", 0),
-            "network_owner": contact_info.get("network_owner"),
-            "network_owner_emails": contact_info.get("network_owner_emails") or [],
         })
     return {
         "severity": "P2" if failed == 0 and save_failed == 0 else "P1",

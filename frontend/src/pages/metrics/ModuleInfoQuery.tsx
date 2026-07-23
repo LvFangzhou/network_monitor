@@ -2,11 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { DragEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { Button, Card, Checkbox, Dropdown, Input, Select, Space, Table, Tag, Tooltip, Typography, message } from 'antd'
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons'
-import {
-  getControllerOptions,
-  getControllerOpticals,
-  type ControllerOption,
-} from '../../api/controller'
+import { getLocalOpticalModules } from '../../api/metrics'
 
 const { Text } = Typography
 
@@ -26,6 +22,8 @@ const DEFAULT_VISIBLE_COLUMN_KEYS = [
   'curTxPower',
   'curTemperature',
   'curVoltage',
+  'biasCurrent',
+  'waveLength',
   'mfgDate',
   'time',
 ]
@@ -35,6 +33,8 @@ const SOURCE_LABELS: Record<string, string> = {
   snmp: '设备SNMP',
   netconf: 'NETCONF',
   gnmi: 'gNMI Telemetry',
+  telemetry: 'H3C Telemetry',
+  exporter: 'AsterNOS Exporter',
 }
 
 type MetricRange = { min: number; max: number; source: string }
@@ -78,12 +78,24 @@ const normalizeDisplayPower = (value?: number | string | null) => {
   return normalized
 }
 
+const normalizeRecordPower = (record: any, value?: number | string | null) =>
+  record?.normalizedValues ? formatNumber(value) : normalizeDisplayPower(value)
+
+const normalizeRecordTemperature = (record: any, value?: number | string | null) =>
+  record?.normalizedValues ? formatNumber(value) : normalizeTemperature(value)
+
+const normalizeRecordVoltage = (record: any, value?: number | string | null) =>
+  record?.normalizedValues ? formatNumber(value) : normalizeVoltage(value)
+
 const normalizeControllerPowerThreshold = (value?: number | string | null) => {
   const numeric = formatNumber(value)
   if (numeric === null || isInvalidOpticalRawValue(numeric)) return null
   if (numeric > 0 && Math.abs(numeric) > 1000) return 10 * Math.log10(numeric / 10000)
   return normalizePower(numeric)
 }
+
+const normalizeRecordPowerThreshold = (record: any, value?: number | string | null) =>
+  record?.normalizedValues ? formatNumber(value) : normalizeControllerPowerThreshold(value)
 
 const normalizeTemperature = (value?: number | string | null) => {
   const numeric = formatNumber(value)
@@ -130,7 +142,7 @@ const H3C_OPTICAL_RANGES: Array<{ match: (record: any) => boolean; rx: MetricRan
   { match: (r) => isSpeed(r, 50) && hasAny(r, ['ER']), tx: range(0.4, 6.6, 'H3C 50G ER'), rx: range(-17.6, -3.4, 'H3C 50G ER') },
   { match: (r) => isSpeed(r, 50), tx: range(-4.5, 4.2, 'H3C 50G LR'), rx: range(-10.8, 4.2, 'H3C 50G LR') },
 
-  // 10G 常见 H3C 光模块兜底；如果控制器返回了模块自身阈值，会优先使用控制器阈值。
+  // 10G 常见 H3C 光模块兜底；如果采集结果带有模块自身阈值，会优先使用模块阈值。
   { match: (r) => isSpeed(r, 10) && hasAny(r, ['ZR']), tx: range(0, 4, 'H3C 10G ZR 常用范围'), rx: range(-24, -7, 'H3C 10G ZR 常用范围') },
   { match: (r) => isSpeed(r, 10) && hasAny(r, ['ER']), tx: range(-1, 4, 'H3C 10G ER 常用范围'), rx: range(-15.8, -1, 'H3C 10G ER 常用范围') },
   { match: (r) => isSpeed(r, 10) && hasAny(r, ['LR', 'LXM']), tx: range(-8.2, 0.5, 'H3C 10G LR 常用范围'), rx: range(-14.4, 0.5, 'H3C 10G LR 常用范围') },
@@ -150,7 +162,7 @@ const isMetricAbnormal = (value: number | null, targetRange?: MetricRange) =>
 const MetricText = ({ value, unit, danger, targetRange }: { value: number | null; unit: string; danger: boolean; targetRange?: MetricRange }) => {
   if (value === null) {
     return (
-      <Tooltip title="控制器返回无效占位值，通常表示该模块本次未采集到有效数据">
+      <Tooltip title="采集源未返回有效值，通常表示该模块本次未采集到对应指标">
         <Text type="secondary">未读到</Text>
       </Tooltip>
     )
@@ -230,6 +242,10 @@ function hasAny(record: any, keywords: string[]) {
 const getH3cPowerThresholds = (record: any) => {
   const controllerThresholds = getControllerPowerThresholds(record)
   if (controllerThresholds.rxPower && controllerThresholds.txPower) return controllerThresholds
+  // 型号固定范围来自 H3C 手册，不能直接套到锐捷、Asteros 等厂商。
+  // 非 H3C 设备只有在自身上报有效 DDM 阈值时才进行红色异常判断。
+  const vendorText = `${record?.vendorName || ''} ${record?.source || ''}`.toLowerCase()
+  if (!vendorText.includes('h3c') && !vendorText.includes('华三')) return getGenericPowerThresholds(record)
   const matched = H3C_OPTICAL_RANGES.find((item) => item.match(record))
   if (matched) return { rxPower: matched.rx, txPower: matched.tx }
   if (isSpeed(record, 400)) return { txPower: range(-6.5, 5.3, 'H3C 400G 通用范围'), rxPower: range(-9.1, 5.3, 'H3C 400G 通用范围') }
@@ -241,26 +257,54 @@ const getH3cPowerThresholds = (record: any) => {
   return {}
 }
 
+const getGenericPowerThresholds = (record: any) => {
+  if (isSpeed(record, 400)) return { txPower: range(-7, 6, '400G 模块通用保护范围'), rxPower: range(-12, 6, '400G 模块通用保护范围') }
+  if (isSpeed(record, 200)) return { txPower: range(-7, 6, '200G 模块通用保护范围'), rxPower: range(-13, 6, '200G 模块通用保护范围') }
+  if (isSpeed(record, 100)) return { txPower: range(-10, 7, '100G 模块通用保护范围'), rxPower: range(-30, 6, '100G 模块通用保护范围') }
+  if (isSpeed(record, 50)) return { txPower: range(-8, 7, '50G 模块通用保护范围'), rxPower: range(-20, 6, '50G 模块通用保护范围') }
+  if (isSpeed(record, 25)) return { txPower: range(-9, 4, '25G 模块通用保护范围'), rxPower: range(-15, 4, '25G 模块通用保护范围') }
+  if (isSpeed(record, 10)) return { txPower: range(-9, 5, '10G 模块通用保护范围'), rxPower: range(-25, 2, '10G 模块通用保护范围') }
+  return {}
+}
+
 const getControllerPowerThresholds = (record: any) => {
-  const rxLo = normalizeControllerPowerThreshold(record?.rcvPwrLoAlarm)
-  const rxHi = normalizeControllerPowerThreshold(record?.rcvPwrHiAlarm)
-  const txLo = normalizeControllerPowerThreshold(record?.pwrOutLoAlarm)
-  const txHi = normalizeControllerPowerThreshold(record?.pwrOutHiAlarm)
+  const rxWarnLo = normalizeRecordPowerThreshold(record, record?.rcvPwrLoWarn)
+  const rxWarnHi = normalizeRecordPowerThreshold(record, record?.rcvPwrHiWarn)
+  const txWarnLo = normalizeRecordPowerThreshold(record, record?.pwrOutLoWarn)
+  const txWarnHi = normalizeRecordPowerThreshold(record, record?.pwrOutHiWarn)
+  const rxAlarmLo = normalizeRecordPowerThreshold(record, record?.rcvPwrLoAlarm)
+  const rxAlarmHi = normalizeRecordPowerThreshold(record, record?.rcvPwrHiAlarm)
+  const txAlarmLo = normalizeRecordPowerThreshold(record, record?.pwrOutLoAlarm)
+  const txAlarmHi = normalizeRecordPowerThreshold(record, record?.pwrOutHiAlarm)
   return {
-    rxPower: rxLo !== null && rxHi !== null && rxLo < rxHi ? range(rxLo, rxHi, '控制器模块 RX 告警阈值') : undefined,
-    txPower: txLo !== null && txHi !== null && txLo < txHi ? range(txLo, txHi, '控制器模块 TX 告警阈值') : undefined,
+    rxPower: rxWarnLo !== null && rxWarnHi !== null && rxWarnLo < rxWarnHi
+      ? range(rxWarnLo, rxWarnHi, '设备模块 RX 预警阈值')
+      : rxAlarmLo !== null && rxAlarmHi !== null && rxAlarmLo < rxAlarmHi ? range(rxAlarmLo, rxAlarmHi, '设备模块 RX 告警阈值') : undefined,
+    txPower: txWarnLo !== null && txWarnHi !== null && txWarnLo < txWarnHi
+      ? range(txWarnLo, txWarnHi, '设备模块 TX 预警阈值')
+      : txAlarmLo !== null && txAlarmHi !== null && txAlarmLo < txAlarmHi ? range(txAlarmLo, txAlarmHi, '设备模块 TX 告警阈值') : undefined,
   }
 }
 
 const getTemperatureThreshold = (record: any): MetricRange => {
-  if (isSpeed(record, 200)) return range(0, 75, 'H3C 200G 适宜工作温度')
-  return range(0, 70, 'H3C 25G/100G/400G 适宜工作温度')
+  const warnLo = formatNumber(record?.tempLoWarn)
+  const warnHi = formatNumber(record?.tempHiWarn)
+  if (warnLo !== null && warnHi !== null && warnLo < warnHi) return range(warnLo, warnHi, '设备模块温度预警阈值')
+  const alarmLo = formatNumber(record?.tempLoAlarm)
+  const alarmHi = formatNumber(record?.tempHiAlarm)
+  if (alarmLo !== null && alarmHi !== null && alarmLo < alarmHi) return range(alarmLo, alarmHi, '设备模块温度告警阈值')
+  const vendorText = `${record?.vendorName || ''} ${record?.source || ''}`.toLowerCase()
+  if (isSpeed(record, 200) && (vendorText.includes('h3c') || vendorText.includes('华三'))) return range(0, 75, 'H3C 200G 适宜工作温度')
+  return range(0, 70, '光模块常用工作温度范围')
 }
 
 const getVoltageThreshold = (record: any): MetricRange => {
-  const lo = normalizeVoltage(record?.vccLoAlarm)
-  const hi = normalizeVoltage(record?.vccHiAlarm)
-  if (lo !== null && hi !== null && lo < hi) return range(lo, hi, '控制器模块 VCC 告警阈值')
+  const warnLo = record?.normalizedValues ? formatNumber(record?.vccLoWarn) : normalizeVoltage(record?.vccLoWarn)
+  const warnHi = record?.normalizedValues ? formatNumber(record?.vccHiWarn) : normalizeVoltage(record?.vccHiWarn)
+  if (warnLo !== null && warnHi !== null && warnLo < warnHi) return range(warnLo, warnHi, '设备模块 VCC 预警阈值')
+  const alarmLo = record?.normalizedValues ? formatNumber(record?.vccLoAlarm) : normalizeVoltage(record?.vccLoAlarm)
+  const alarmHi = record?.normalizedValues ? formatNumber(record?.vccHiAlarm) : normalizeVoltage(record?.vccHiAlarm)
+  if (alarmLo !== null && alarmHi !== null && alarmLo < alarmHi) return range(alarmLo, alarmHi, '设备模块 VCC 告警阈值')
   return range(2.97, 3.63, '3.3V 光模块常用 VCC 范围')
 }
 
@@ -270,9 +314,13 @@ const getOpticalThresholds = (record: any): OpticalThresholds => ({
   voltage: getVoltageThreshold(record),
 })
 
+const hasChannelPowerAbnormal = (record: any, field: 'rx_power_dbm' | 'tx_power_dbm', targetRange?: MetricRange) =>
+  Boolean(targetRange) && Array.isArray(record?.channels) && record.channels.some((channel: any) => {
+    const value = formatNumber(channel?.[field])
+    return isPowerAbnormal(value, targetRange)
+  })
+
 const ModuleInfoQuery = () => {
-  const [controllers, setControllers] = useState<ControllerOption[]>([])
-  const [controllerId, setControllerId] = useState<string>()
   const [loading, setLoading] = useState(false)
   const [items, setItems] = useState<any[]>([])
   const [total, setTotal] = useState(0)
@@ -282,6 +330,9 @@ const ModuleInfoQuery = () => {
   const [deviceIp, setDeviceIp] = useState('')
   const [interfaceName, setInterfaceName] = useState('')
   const [vendorName, setVendorName] = useState('')
+  const [datacenterName, setDatacenterName] = useState('')
+  const [availableVendors, setAvailableVendors] = useState<string[]>([])
+  const [availableDatacenters, setAvailableDatacenters] = useState<string[]>([])
   const [draggingColumnKey, setDraggingColumnKey] = useState<string | null>(null)
   const [dragOverColumnKey, setDragOverColumnKey] = useState<string | null>(null)
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
@@ -303,43 +354,33 @@ const ModuleInfoQuery = () => {
     }
   })
 
-  const controllerOptions = useMemo(
-    () => controllers.map((item) => ({ value: item.id, label: `${item.name}（${item.base_url}）` })),
-    [controllers],
-  )
-
   const vendorOptions = useMemo(() => {
-    const values = Array.from(new Set(items.map((item) => String(item.vendorName || '').trim()).filter(Boolean)))
+    const values = Array.from(new Set(availableVendors.map((item) => String(item || '').trim()).filter(Boolean)))
       .sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }))
     return [{ value: '', label: '全部厂商' }, ...values.map((value) => ({ value, label: value }))]
-  }, [items])
+  }, [availableVendors])
 
-  const loadControllers = async () => {
-    try {
-      const result = await getControllerOptions()
-      setControllers(result.items || [])
-      setControllerId((current) => current || result.items?.[0]?.id)
-    } catch (error: any) {
-      message.error(error?.response?.data?.detail || '获取控制器列表失败')
-    }
-  }
+  const datacenterOptions = useMemo(() => [
+    { value: '', label: '全部机房' },
+    ...availableDatacenters.map((value) => ({ value, label: value })),
+  ], [availableDatacenters])
 
   const loadData = async (nextPage = page, nextPageSize = pageSize) => {
-    if (!controllerId) return
     setLoading(true)
     try {
-      const result = await getControllerOpticals({
-        controller_id: controllerId,
+      const result = await getLocalOpticalModules({
         page: nextPage,
         page_size: nextPageSize,
         search: search.trim() || undefined,
         device_ip: deviceIp.trim() || undefined,
         interface_name: interfaceName.trim() || undefined,
         vendor_name: vendorName || undefined,
-        hours: 3,
+        datacenter_name: datacenterName || undefined,
       })
       setItems(result.items || [])
       setTotal(result.total || 0)
+      setAvailableVendors(result.vendors || [])
+      setAvailableDatacenters(result.datacenters || [])
       setPage(nextPage)
       setPageSize(nextPageSize)
     } catch (error: any) {
@@ -350,30 +391,24 @@ const ModuleInfoQuery = () => {
   }
 
   useEffect(() => {
-    loadControllers()
+    loadData(1, pageSize)
   }, [])
 
   useEffect(() => {
-    if (controllerId) loadData(1, pageSize)
-  }, [controllerId])
-
-  useEffect(() => {
-    if (!controllerId) return undefined
     const timer = window.setTimeout(() => {
       loadData(1, pageSize)
     }, 350)
     return () => window.clearTimeout(timer)
-  }, [search, deviceIp, interfaceName, vendorName])
+  }, [search, deviceIp, interfaceName, vendorName, datacenterName])
 
   useEffect(() => {
-    if (!controllerId) return undefined
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
         loadData(page, pageSize)
       }
     }, MODULE_REFRESH_INTERVAL_MS)
     return () => window.clearInterval(timer)
-  }, [controllerId, page, pageSize, search, deviceIp, interfaceName, vendorName])
+  }, [page, pageSize, search, deviceIp, interfaceName, vendorName, datacenterName])
 
   const updateVisibleColumnKeys = (updater: string[] | ((current: string[]) => string[])) => {
     setVisibleColumnKeys((current) => {
@@ -416,6 +451,8 @@ const ModuleInfoQuery = () => {
     { label: '发光', value: 'curTxPower' },
     { label: '温度', value: 'curTemperature' },
     { label: '电压', value: 'curVoltage' },
+    { label: '偏置电流', value: 'biasCurrent' },
+    { label: '波长', value: 'waveLength' },
     { label: '生产日期', value: 'mfgDate' },
     { label: '采集时间', value: 'time' },
   ]
@@ -490,11 +527,12 @@ const ModuleInfoQuery = () => {
       key: 'curRxPower',
       dataIndex: 'curRxPower',
       width: 120,
-      sorter: (a: any, b: any) => (normalizeDisplayPower(a.curRxPower) ?? -999) - (normalizeDisplayPower(b.curRxPower) ?? -999),
+      sorter: (a: any, b: any) => (normalizeRecordPower(a, a.curRxPower) ?? -999) - (normalizeRecordPower(b, b.curRxPower) ?? -999),
       render: (value: any, record: any) => {
         const thresholds = getOpticalThresholds(record)
-        const normalized = normalizeDisplayPower(value)
-        return <MetricText value={normalized} unit="dBm" targetRange={thresholds.rxPower} danger={isInterfaceUp(record) && isPowerAbnormal(normalized, thresholds.rxPower)} />
+        const normalized = normalizeRecordPower(record, value)
+        const danger = isPowerAbnormal(normalized, thresholds.rxPower) || hasChannelPowerAbnormal(record, 'rx_power_dbm', thresholds.rxPower)
+        return <MetricText value={normalized} unit="dBm" targetRange={thresholds.rxPower} danger={isInterfaceUp(record) && danger} />
       },
     },
     {
@@ -502,11 +540,12 @@ const ModuleInfoQuery = () => {
       key: 'curTxPower',
       dataIndex: 'curTxPower',
       width: 120,
-      sorter: (a: any, b: any) => (normalizeDisplayPower(a.curTxPower) ?? -999) - (normalizeDisplayPower(b.curTxPower) ?? -999),
+      sorter: (a: any, b: any) => (normalizeRecordPower(a, a.curTxPower) ?? -999) - (normalizeRecordPower(b, b.curTxPower) ?? -999),
       render: (value: any, record: any) => {
         const thresholds = getOpticalThresholds(record)
-        const normalized = normalizeDisplayPower(value)
-        return <MetricText value={normalized} unit="dBm" targetRange={thresholds.txPower} danger={isInterfaceUp(record) && isPowerAbnormal(normalized, thresholds.txPower)} />
+        const normalized = normalizeRecordPower(record, value)
+        const danger = isPowerAbnormal(normalized, thresholds.txPower) || hasChannelPowerAbnormal(record, 'tx_power_dbm', thresholds.txPower)
+        return <MetricText value={normalized} unit="dBm" targetRange={thresholds.txPower} danger={isInterfaceUp(record) && danger} />
       },
     },
     {
@@ -514,10 +553,10 @@ const ModuleInfoQuery = () => {
       key: 'curTemperature',
       dataIndex: 'curTemperature',
       width: 110,
-      sorter: (a: any, b: any) => (normalizeTemperature(a.curTemperature) ?? -999) - (normalizeTemperature(b.curTemperature) ?? -999),
+      sorter: (a: any, b: any) => (normalizeRecordTemperature(a, a.curTemperature) ?? -999) - (normalizeRecordTemperature(b, b.curTemperature) ?? -999),
       render: (value: any, record: any) => {
         const thresholds = getOpticalThresholds(record)
-        const normalized = normalizeTemperature(value)
+        const normalized = normalizeRecordTemperature(record, value)
         return <MetricText value={normalized} unit="℃" targetRange={thresholds.temperature} danger={isMetricAbnormal(normalized, thresholds.temperature)} />
       },
     },
@@ -526,13 +565,15 @@ const ModuleInfoQuery = () => {
       key: 'curVoltage',
       dataIndex: 'curVoltage',
       width: 110,
-      sorter: (a: any, b: any) => (normalizeVoltage(a.curVoltage) ?? -999) - (normalizeVoltage(b.curVoltage) ?? -999),
+      sorter: (a: any, b: any) => (normalizeRecordVoltage(a, a.curVoltage) ?? -999) - (normalizeRecordVoltage(b, b.curVoltage) ?? -999),
       render: (value: any, record: any) => {
         const thresholds = getOpticalThresholds(record)
-        const normalized = normalizeVoltage(value)
+        const normalized = normalizeRecordVoltage(record, value)
         return <MetricText value={normalized} unit="V" targetRange={thresholds.voltage} danger={isMetricAbnormal(normalized, thresholds.voltage)} />
       },
     },
+    { title: '偏置电流', key: 'biasCurrent', dataIndex: 'biasCurrent', width: 120, sorter: (a: any, b: any) => Number(a.biasCurrent || -1) - Number(b.biasCurrent || -1), render: (value: any) => formatNumber(value) === null ? '-' : `${Number(value).toFixed(2)} mA` },
+    { title: '波长', key: 'waveLength', dataIndex: 'waveLength', width: 105, sorter: (a: any, b: any) => Number(a.waveLength || -1) - Number(b.waveLength || -1), render: (value: any) => formatNumber(value) === null ? '-' : `${Number(value)} nm` },
     { title: '生产日期', key: 'mfgDate', dataIndex: 'mfgDate', width: 130, sorter: (a: any, b: any) => compareNatural(a.mfgDate, b.mfgDate), render: (value: string) => value || '-' },
     { title: '采集时间', key: 'time', dataIndex: 'time', width: 170, sorter: (a: any, b: any) => Number(a.time || 0) - Number(b.time || 0), render: (value: any) => value ? new Date(Number(value)).toLocaleString() : '-' },
   ]
@@ -619,13 +660,6 @@ const ModuleInfoQuery = () => {
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <Card bodyStyle={{ padding: 16 }}>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center' }}>
-          <Select
-            style={{ minWidth: 300 }}
-            placeholder="选择控制器"
-            value={controllerId}
-            options={controllerOptions}
-            onChange={setControllerId}
-          />
           <Input
             allowClear
             prefix={<SearchOutlined />}
@@ -657,6 +691,16 @@ const ModuleInfoQuery = () => {
             options={vendorOptions}
             optionFilterProp="label"
             onChange={(value) => setVendorName(value || '')}
+          />
+          <Select
+            allowClear
+            showSearch
+            style={{ width: 190 }}
+            placeholder="全部机房"
+            value={datacenterName || undefined}
+            options={datacenterOptions}
+            optionFilterProp="label"
+            onChange={(value) => setDatacenterName(value || '')}
           />
           <Space size={10} wrap style={{ marginLeft: 'auto' }}>
             {loading ? <ReloadOutlined spin style={{ color: '#1677ff' }} /> : null}
@@ -712,7 +756,7 @@ const ModuleInfoQuery = () => {
             >
               <Button>显示/隐藏列</Button>
             </Dropdown>
-            <Button icon={<ReloadOutlined />} onClick={() => loadData(page, pageSize)} disabled={!controllerId} loading={loading}>
+            <Button icon={<ReloadOutlined />} onClick={() => loadData(page, pageSize)} loading={loading}>
               刷新
             </Button>
           </Space>
@@ -720,7 +764,7 @@ const ModuleInfoQuery = () => {
         <Space wrap style={{ marginTop: 12 }}>
           <Tag color="blue">模块 {total}</Tag>
           <Tag>当前页 {items.length}</Tag>
-          <Text type="secondary">数据窗口：最近3小时；页面每600秒自动刷新一次，仅在当前页面可见时刷新。</Text>
+          <Text type="secondary">数据来自本平台 H3C Telemetry、设备 SNMP 与 AsterNOS Exporter；页面每600秒自动刷新。</Text>
         </Space>
       </Card>
 
@@ -730,6 +774,39 @@ const ModuleInfoQuery = () => {
           rowClassName={(record) => isInterfaceUp(record) ? '' : 'module-interface-down-row'}
           loading={loading}
           dataSource={items}
+          expandable={{
+            rowExpandable: (record) => Array.isArray(record.channels) && record.channels.length > 0,
+            expandedRowRender: (record) => (
+              <Table
+                size="small"
+                pagination={false}
+                rowKey={(channel: any) => String(channel.channel)}
+                dataSource={record.channels || []}
+                columns={[
+                  { title: '光通道', dataIndex: 'channel', width: 90, render: (value) => `Lane ${value}` },
+                  {
+                    title: '收光', dataIndex: 'rx_power_dbm', width: 120,
+                    render: (value) => {
+                      const normalized = formatNumber(value)
+                      const targetRange = getOpticalThresholds(record).rxPower
+                      return <MetricText value={normalized} unit="dBm" targetRange={targetRange} danger={isInterfaceUp(record) && isPowerAbnormal(normalized, targetRange)} />
+                    },
+                  },
+                  {
+                    title: '发光', dataIndex: 'tx_power_dbm', width: 120,
+                    render: (value) => {
+                      const normalized = formatNumber(value)
+                      const targetRange = getOpticalThresholds(record).txPower
+                      return <MetricText value={normalized} unit="dBm" targetRange={targetRange} danger={isInterfaceUp(record) && isPowerAbnormal(normalized, targetRange)} />
+                    },
+                  },
+                  { title: '偏置电流', dataIndex: 'bias_current_ma', width: 130, render: (value) => formatNumber(value) === null ? '-' : `${Number(value).toFixed(2)} mA` },
+                  { title: '温度', dataIndex: 'temperature_c', width: 100, render: (value) => formatNumber(value) === null ? '-' : `${Number(value).toFixed(1)} ℃` },
+                  { title: '采集时间', dataIndex: 'collected_at', render: (value) => value ? new Date(value).toLocaleString() : '-' },
+                ]}
+              />
+            ),
+          }}
           tableLayout="fixed"
           scroll={{ x: Math.max(tableScrollX, 1200), y: 'calc(100vh - 360px)' }}
           pagination={{

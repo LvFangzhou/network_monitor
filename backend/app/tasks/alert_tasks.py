@@ -2,6 +2,7 @@
 告警检测和处理任务
 """
 import asyncio
+import contextvars
 import json
 import re
 import threading
@@ -17,11 +18,12 @@ from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional
 
 from app.database import SessionLocal
-from app.models import AlertRule, AlertHistory, AlertSilence, Circuit, Device, SyslogEvent
+from app.models import AlertRule, AlertHistory, AlertSilence, Circuit, Device, QualityProbeTarget, SyslogEvent
 from app.utils import influx_client, notification_manager, redis_client
 from app.utils.asternos_exporter_client import asternos_exporter_client
 from app.utils.interface_scope import is_interface_monitored
 from app.utils.interface_scope import get_interface_scope
+from app.utils.monitor_profile import device_feature_enabled, get_device_monitor_profile
 from app.config import settings
 from app.core import get_logger
 
@@ -32,20 +34,32 @@ FAST_CHECK_ALERTS_LOCK_KEY = "alerts:check_fast_alerts:lock"
 REACHABILITY_CHECK_ALERTS_LOCK_KEY = "alerts:check_reachability_alerts:lock"
 PROTOCOL_CHECK_ALERTS_LOCK_KEY = "alerts:check_protocol_alerts:lock"
 DEVICE_HEALTH_CHECK_ALERTS_LOCK_KEY = "alerts:check_device_health_alerts:lock"
+OPTICAL_CHECK_ALERTS_LOCK_KEY = "alerts:check_optical_alerts:lock"
 INTERFACE_ALERT_RECOVERY_LOCK_KEY = "alerts:resolve_interface_alerts_quick:lock"
+HILLSTONE_BFD_RECOVERY_LOCK_KEY = "alerts:reconcile_hillstone_bfd_traps:lock"
 CHECK_ALERTS_LOCK_TTL_SECONDS = 900
 FAST_CHECK_ALERTS_LOCK_TTL_SECONDS = 300
 REACHABILITY_CHECK_ALERTS_LOCK_TTL_SECONDS = 180
 PROTOCOL_CHECK_ALERTS_LOCK_TTL_SECONDS = 180
 DEVICE_HEALTH_CHECK_ALERTS_LOCK_TTL_SECONDS = 120
+OPTICAL_CHECK_ALERTS_LOCK_TTL_SECONDS = 240
 INTERFACE_ALERT_RECOVERY_LOCK_TTL_SECONDS = 45
-EXPORTER_SCRAPE_CACHE_TTL_SECONDS = 5
+EXPORTER_SCRAPE_CACHE_TTL_SECONDS = 60
 ROBOT_NOTIFICATION_INTERVAL_SECONDS = 2
 PENDING_ALERT_TTL_SECONDS = 7200
 INTERFACE_ADMIN_UP_OPER_DOWN_MIN_TRIGGER_SECONDS = 120
 INTERFACE_ADMIN_UP_OPER_DOWN_MAX_SAMPLE_AGE_SECONDS = 180
+REACHABILITY_MAX_SAMPLE_AGE_SECONDS = 180
+INTERFACE_MAX_SAMPLE_AGE_SECONDS = 180
+OPTICAL_MAX_SAMPLE_AGE_SECONDS = 420
+PROTOCOL_MAX_SAMPLE_AGE_SECONDS = 420
+CIRCUIT_MAX_SAMPLE_AGE_SECONDS = 180
+GENERAL_METRIC_MAX_SAMPLE_AGE_SECONDS = 420
 _EXPORTER_SCRAPE_CACHE: Dict[int, Dict[str, Any]] = {}
 _EXPORTER_SCRAPE_CACHE_LOCK = threading.Lock()
+_ALERT_RUN_EXPORTER_CACHE: contextvars.ContextVar[Optional[Dict[int, Dict[str, List[Dict[str, Any]]]]]] = (
+    contextvars.ContextVar("alert_run_exporter_cache", default=None)
+)
 EXPORTER_DELTA_CACHE_TTL_SECONDS = 86400
 RULE_STATUS_PREWARM_URL = "http://api:8000/api/v1/alerts/rules/{rule_id}/status?limit={limit}&max_runtime_seconds={max_runtime_seconds}"
 RULE_STATUS_PREWARM_LOCK_KEY = "alerts:rule_status_prewarm:lock"
@@ -92,6 +106,139 @@ def enqueue_alert_notification(
         if redis_client.get(queued_key) == token:
             redis_client.delete(queued_key)
         raise
+
+
+def _parse_hillstone_bfd_sessions(output: str) -> Dict[tuple[str, str], str]:
+    """解析 ``show bfd session``，返回 (本端, 对端) -> 状态。"""
+    sessions: Dict[tuple[str, str], str] = {}
+    for line in str(output or "").splitlines():
+        match = re.match(
+            r"^\s*([0-9a-fA-F:.]+)\s+([0-9a-fA-F:.]+)\s+([A-Za-z][A-Za-z-]*)\b",
+            line,
+        )
+        if not match:
+            continue
+        sessions[(match.group(1).lower(), match.group(2).lower())] = match.group(3).lower()
+    return sessions
+
+
+def _hillstone_bfd_alert_endpoints(alert: AlertHistory) -> Optional[tuple[str, str]]:
+    text = "\n".join(
+        str(value or "")
+        for value in (alert.alert_target_key, alert.alert_target_name, alert.message)
+    )
+    local_match = re.search(r"\blocal\s*=\s*([^|\s]+)", text, re.IGNORECASE)
+    neighbor_match = re.search(r"\bneighbor\s*=\s*([^|\s]+)", text, re.IGNORECASE)
+    if not local_match:
+        local_match = re.search(r"\blocal\s*:\s*([0-9a-fA-F:.]+)(?=\s|$)", text, re.IGNORECASE)
+    if not neighbor_match:
+        neighbor_match = re.search(r"\bneighbor\s*:\s*([0-9a-fA-F:.]+)(?=\s|$)", text, re.IGNORECASE)
+    if not local_match or not neighbor_match:
+        return None
+    return local_match.group(1).lower(), neighbor_match.group(1).lower()
+
+
+def _collect_hillstone_bfd_sessions(device: Device) -> Dict[tuple[str, str], str]:
+    """通过山石 CLI 查询当前 BFD 状态；查询失败时抛错，不误恢复告警。"""
+    from netmiko import ConnectHandler
+    from app.tasks.config_backup_tasks import _netmiko_device_type
+
+    username = str(device.ssh_username or "").strip()
+    if not username or not device.ssh_password:
+        raise RuntimeError("设备未配置可用的 SSH 用户名/密码")
+    connection = ConnectHandler(
+        device_type=_netmiko_device_type(device),
+        host=device.ip_address,
+        port=int(device.ssh_port or 22),
+        username=username,
+        password=device.ssh_password,
+        timeout=20,
+        conn_timeout=15,
+        banner_timeout=15,
+        auth_timeout=15,
+        fast_cli=False,
+    )
+    try:
+        output = connection.send_command(
+            "show bfd session",
+            read_timeout=30,
+            strip_prompt=True,
+            strip_command=True,
+        )
+    finally:
+        connection.disconnect()
+    return _parse_hillstone_bfd_sessions(output)
+
+
+@shared_task(name="app.tasks.alert_tasks.reconcile_hillstone_bfd_trap_alerts", time_limit=50, soft_time_limit=45)
+def reconcile_hillstone_bfd_trap_alerts():
+    """山石只发送 BFD Down Trap；定期用当前 CLI 状态补齐真实恢复。"""
+    if not redis_client.set(HILLSTONE_BFD_RECOVERY_LOCK_KEY, uuid.uuid4().hex, ex=55, nx=True):
+        return {"skipped": "locked"}
+
+    db = SessionLocal()
+    resolved_ids: List[int] = []
+    checked_devices = 0
+    try:
+        active = (
+            db.query(AlertHistory)
+            .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+            .filter(
+                AlertRule.metric_type == "snmp_trap",
+                AlertRule.name.ilike("%BFD%Down%"),
+                AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+            )
+            .order_by(AlertHistory.device_id, AlertHistory.started_at)
+            .all()
+        )
+        alerts_by_device: Dict[int, List[AlertHistory]] = {}
+        for alert in active:
+            alerts_by_device.setdefault(int(alert.device_id), []).append(alert)
+
+        for device_id, alerts in alerts_by_device.items():
+            device = db.query(Device).filter(Device.id == device_id).first()
+            if not device or not _is_hillstone_vendor(device.vendor):
+                continue
+            try:
+                sessions = _collect_hillstone_bfd_sessions(device)
+                checked_devices += 1
+            except Exception as exc:
+                logger.warning(
+                    "山石BFD恢复回查失败，保留原告警",
+                    device_id=device_id,
+                    ip=getattr(device, "ip_address", None),
+                    error=str(exc),
+                )
+                continue
+
+            now = _utc_now()
+            for alert in alerts:
+                endpoints = _hillstone_bfd_alert_endpoints(alert)
+                if not endpoints:
+                    continue
+                state = sessions.get(endpoints)
+                if state not in {"up", "established"}:
+                    continue
+                alert.status = "resolved"
+                alert.resolved_by = "hillstone_bfd_cli"
+                alert.resolved_at = now
+                alert.updated_at = now
+                alert.resolution_note = (
+                    f"设备当前 BFD 会话 {endpoints[0]} -> {endpoints[1]} 状态已恢复为 Up（CLI核验）"
+                )
+                resolved_ids.append(int(alert.id))
+            if resolved_ids:
+                db.commit()
+
+        for alert_id in resolved_ids:
+            enqueue_alert_notification(alert_id, "auto_resolved", "hillstone_bfd_cli")
+        return {"checked_devices": checked_devices, "resolved": len(resolved_ids)}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+        redis_client.delete(HILLSTONE_BFD_RECOVERY_LOCK_KEY)
 
 
 
@@ -141,6 +288,18 @@ def _device_matches_model_filter(device: Device, extra_config: Optional[Dict[str
     model_keyword = str(config.get("model") or config.get("model_keyword") or "").strip().lower()
     model_regex = str(config.get("model_regex") or "").strip()
     exclude_model_regex = str(config.get("exclude_model_regex") or "").strip()
+    models = config.get("models") or []
+
+    if isinstance(models, str):
+        models = [item.strip() for item in models.split(",") if item.strip()]
+    if isinstance(models, list) and models:
+        normalized_model = re.sub(r"[^a-z0-9]+", "", model_value.lower())
+        normalized_allowed = [re.sub(r"[^a-z0-9]+", "", str(item).lower()) for item in models if str(item or "").strip()]
+        if normalized_allowed and not any(
+            allowed == normalized_model or allowed in normalized_model or normalized_model in allowed
+            for allowed in normalized_allowed
+        ):
+            return False
 
     if model_keyword and model_keyword not in model_value.lower():
         return False
@@ -160,6 +319,26 @@ def _device_matches_model_filter(device: Device, extra_config: Optional[Dict[str
             return False
     return True
 
+
+def _device_matches_monitoring_scope(device: Device, extra_config: Optional[Dict[str, Any]]) -> bool:
+    config = extra_config or {}
+    profiles = config.get("monitor_profiles") or []
+    excluded_profiles = config.get("exclude_monitor_profiles") or []
+    required_features = config.get("required_features") or []
+    if isinstance(profiles, str):
+        profiles = [item.strip() for item in profiles.split(",") if item.strip()]
+    if isinstance(excluded_profiles, str):
+        excluded_profiles = [item.strip() for item in excluded_profiles.split(",") if item.strip()]
+    if isinstance(required_features, str):
+        required_features = [item.strip() for item in required_features.split(",") if item.strip()]
+
+    profile = get_device_monitor_profile(device)
+    if profiles and profile not in profiles:
+        return False
+    if excluded_profiles and profile in excluded_profiles:
+        return False
+    return all(device_feature_enabled(device, feature) for feature in required_features)
+
 def _is_asternos_vendor(vendor: Optional[str]) -> bool:
     vendor_value = (vendor or "").strip().lower()
     return any(marker in vendor_value for marker in ["asternos", "asterfusion", "asteros", "aster", "星融元"])
@@ -173,6 +352,14 @@ def _is_hillstone_vendor(vendor: Optional[str]) -> bool:
 def _get_effective_monitor_source(device: Device) -> str:
     return "asternos_exporter" if _is_asternos_vendor(device.vendor) else "snmp"
 
+OPTICAL_METRIC_TYPES = {
+    "optical_rx_power",
+    "optical_tx_power",
+    "optical_lane_power_delta",
+    "optical_rx_power_drop_24h",
+    "optical_rx_fec_correlation",
+}
+
 INTERFACE_METRIC_TYPES = {
     "interface_oper_status",
     "interface_admin_up_oper_down",
@@ -182,9 +369,7 @@ INTERFACE_METRIC_TYPES = {
     "interface_out_discards_delta",
     "interface_in_broadcast_pps",
     "interface_out_broadcast_pps",
-    "optical_rx_power",
-    "optical_tx_power",
-}
+} | OPTICAL_METRIC_TYPES
 DEFAULT_SKIPPED_INTERFACE_MARKERS = (
     "loopback",
     "null",
@@ -260,6 +445,7 @@ PERCENT_METRIC_TYPES = {
     "snmp_storage_usage",
     "snmp_pak_buffer_usage",
     "snmp_snat_resource_usage",
+    "quality_packet_loss",
 }
 
 NUMERIC_DETAIL_METRIC_TYPES = {
@@ -280,7 +466,11 @@ NUMERIC_DETAIL_METRIC_TYPES = {
     "snmp_slb_virtual_server_status",
     "optical_rx_power",
     "optical_tx_power",
+    "optical_lane_power_delta",
+    "optical_rx_power_drop_24h",
+    "optical_rx_fec_correlation",
     "exporter_metric",
+    "quality_packet_loss",
 }
 
 METRIC_VALUE_LABELS = {
@@ -301,6 +491,10 @@ METRIC_VALUE_LABELS = {
     "snmp_slb_virtual_server_status": "当前SLB虚拟服务状态",
     "optical_rx_power": "当前收光功率",
     "optical_tx_power": "当前发光功率",
+    "optical_lane_power_delta": "当前Lane收光功率差",
+    "optical_rx_power_drop_24h": "24小时收光衰减",
+    "optical_rx_fec_correlation": "当前FEC纠错包增长",
+    "quality_packet_loss": "最近5分钟丢包率",
 }
 
 FAST_ALERT_METRIC_TYPES = {
@@ -424,6 +618,38 @@ def _get_mention_users(rule: AlertRule) -> List[str]:
     return []
 
 
+def _quality_target_notification(rule: AlertRule, alert: AlertHistory) -> Dict[str, Any]:
+    if rule.metric_type != "quality_packet_loss" or alert.alert_target_type != "quality_probe":
+        return {}
+    target_notifications = (rule.extra_config or {}).get("target_notifications") or {}
+    return target_notifications.get(str(alert.alert_target_key or "")) or {}
+
+
+def _notification_channels_for_alert(rule: AlertRule, alert: AlertHistory) -> List[Dict[str, Any]]:
+    target_notification = _quality_target_notification(rule, alert)
+    if target_notification:
+        webhook_url = str(target_notification.get("webhook_url") or "").strip()
+        if not target_notification.get("enabled") or not webhook_url:
+            return []
+        channel_type = str(target_notification.get("channel_type") or "webhook")
+        config_key = "url" if channel_type == "webhook" else "webhook"
+        return [{
+            "type": channel_type,
+            "config": {
+                config_key: webhook_url,
+                "mention_users": target_notification.get("mention_users") or [],
+            },
+        }]
+    return list(rule.notification_channels or [])
+
+
+def _notification_mentions_for_alert(rule: AlertRule, alert: AlertHistory) -> List[str]:
+    target_notification = _quality_target_notification(rule, alert)
+    if target_notification:
+        return [str(item).strip() for item in (target_notification.get("mention_users") or []) if str(item).strip()]
+    return _get_mention_users(rule)
+
+
 def _build_detail_url(alert: AlertHistory) -> str:
     base = settings.FRONTEND_PUBLIC_URL.rstrip("/")
     return f"{base}/alerts/history?alert_id={alert.id}"
@@ -470,7 +696,7 @@ def _current_handler_text(alert: AlertHistory) -> str:
         return alert.ignored_by
     if alert.status == "resolved" and (resolved_by or alert.acknowledged_by):
         return resolved_by or alert.acknowledged_by or "-"
-    mention_users = _get_mention_users(alert.rule) if alert.rule else []
+    mention_users = _notification_mentions_for_alert(alert.rule, alert) if alert.rule else []
     return "、".join(mention_users) if mention_users else "待分配"
 
 
@@ -490,6 +716,20 @@ def _format_duration(started_at: Optional[datetime], ended_at: Optional[datetime
     return "".join(parts)
 
 
+def _reachability_recovery_fault_title(rule: AlertRule) -> str:
+    """Keep the original reachability type visible in recovery notices."""
+    original_title = str(getattr(rule, "name", None) or "").strip()
+    if original_title:
+        return original_title if "恢复" in original_title else f"{original_title}，已恢复"
+    metric_title = {
+        "device_reachability": "Ping不可达，已恢复",
+        "snmp_reachability": "SNMP不可达，已恢复",
+        "exporter_reachability": "Exporter不可达，已恢复",
+        "telemetry_reachability": "Telemetry不可达，已恢复",
+    }
+    return metric_title.get(rule.metric_type, "设备不可达，已恢复")
+
+
 def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[str]) -> str:
     severity = _normalize_severity_label(rule.severity)
     mentions = _get_mention_users(rule)
@@ -501,11 +741,86 @@ def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[
         return f"{severity}-{operation_name}{mention_suffix}"
     if event_type == "ignored":
         return f"{actor or '有人'}忽略了1条故障"
+    if rule.metric_type == "quality_packet_loss":
+        if event_type == "auto_resolved":
+            return f"{severity}-公网链路质量恢复{mention_suffix}"
+        return f"{severity}-公网链路质量下降{mention_suffix}"
     if event_type == "auto_resolved":
         if rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
-            return f"{severity}-设备重新可达，已恢复{mention_suffix}"
+            return f"{severity}-{_reachability_recovery_fault_title(rule)}{mention_suffix}"
         return f"{severity}-自动恢复通知{mention_suffix}"
     return f"{severity}-故障通知{mention_suffix}"
+
+
+def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
+    """Build a stable, readable context for quality-probe robot messages."""
+    try:
+        target_id = int(str(alert.alert_target_key or "").strip())
+    except (TypeError, ValueError):
+        target_id = 0
+    target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first() if target_id else None
+    rule = alert.rule
+    extra_config = (rule.extra_config or {}) if rule else {}
+    message = str(alert.message or "")
+    resolution_note = str(alert.resolution_note or "")
+    match = re.search(r"连续\s*(\d+)\s*个探测周期", message)
+    consecutive = int(match.group(1)) if match else 0
+    target_notification = (extra_config.get("target_notifications") or {}).get(str(target_id)) or {}
+    required_match = re.search(r"告警要求连续\s*(\d+)\s*个周期", message)
+    required_count = int(required_match.group(1)) if required_match else int(
+        target_notification.get("consecutive_samples") or extra_config.get("consecutive_samples") or 5
+    )
+    recovery_count_match = re.search(r"当前连续异常周期\s*(\d+)/(\d+)", resolution_note)
+    current_consecutive = int(recovery_count_match.group(1)) if recovery_count_match else consecutive
+    io_match = re.search(r"本轮收发[：:]\s*(\d+)\s*/\s*(\d+)", message)
+    received = int(io_match.group(1)) if io_match else None
+    sent = int(io_match.group(2)) if io_match else None
+    latency_match = re.search(r"当前延迟[：:]\s*([\d.]+)\s*ms", message, re.IGNORECASE)
+    loss = float(alert.alert_value or 0)
+    threshold = float(alert.threshold or (rule.threshold if rule else 0) or 0)
+    latency = float(latency_match.group(1)) if latency_match else getattr(target, "last_avg_latency_ms", None)
+    datacenter = getattr(target, "datacenter_ref", None)
+    datacenter_text = getattr(datacenter, "name", None) or "-"
+    operator = getattr(target, "operator_name", None) or "-"
+    interval_seconds = int(getattr(target, "interval_seconds", None) or 60)
+    packet_count = int(getattr(target, "packet_count", None) or 5)
+    timeout_ms = int(getattr(target, "timeout_ms", None) or 1000)
+    name = getattr(target, "name", None) or alert.alert_target_name or "-"
+    address = getattr(target, "target", None) or "-"
+    if not target and " / " in str(alert.alert_target_name or ""):
+        name, address = str(alert.alert_target_name).split(" / ", 1)
+    return {
+        "name": name,
+        "address": address,
+        "datacenter": datacenter_text,
+        "operator": operator,
+        "latency": "-" if latency is None else f"{float(latency):.2f} ms",
+        "loss": loss,
+        "threshold": threshold,
+        "consecutive": consecutive,
+        "current_consecutive": current_consecutive,
+        "required_count": required_count,
+        "probe_result": (
+            f"发送 {sent} / 收到 {received} / 丢失 {max(sent - received, 0)}"
+            if sent is not None and received is not None else "-"
+        ),
+        "recovery_reason": resolution_note.split("：", 1)[-1] if resolution_note else "触发条件已不再满足",
+        "sampling": f"每 {interval_seconds} 秒 / 每次 {packet_count} 包 / 超时 {timeout_ms} ms",
+    }
+
+
+def _quality_impact_text(loss_percent: float) -> str:
+    if loss_percent >= 100:
+        return "目标完全不可达，相关公网访问可能已经中断"
+    if loss_percent >= 10:
+        return "严重丢包，TCP 重传及实时业务体验可能明显受影响"
+    if loss_percent >= 3:
+        return "链路质量下降，可能出现访问变慢、卡顿或重传"
+    return "出现持续丢包，请关注链路稳定性"
+
+
+def _quality_action_text() -> str:
+    return "先在质量查询执行 MTR，再核对同机房公网出口流量及 BGP 状态"
 
 
 def _extract_trap_content_from_message(message: Optional[str]) -> str:
@@ -539,6 +854,45 @@ def _build_notification_content(
 ) -> str:
     rule = alert.rule
     device = alert.device
+    if rule and rule.metric_type == "quality_packet_loss" and not device:
+        alarm_id = _ensure_alarm_id(db, alert)
+        started_at_text = _format_local_time(alert.started_at)
+        context = _quality_probe_context(db, alert)
+        is_recovery = event_type == "auto_resolved"
+        lines = [
+            f"告警事件：{'公网链路质量恢复' if is_recovery else '公网链路质量下降'}",
+            f"探测名称：{context['name']}",
+            f"目标地址：{context['address']}",
+            f"所属机房：{context['datacenter']}",
+            f"运营商：{context['operator']}",
+            f"{'恢复时延迟' if is_recovery else '当前延迟'}：{context['latency']}",
+        ]
+        if is_recovery:
+            lines.extend([
+                f"恢复原因：{context['recovery_reason']}",
+                f"恢复时5分钟丢包率：{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%",
+                f"当前连续异常周期：{context['current_consecutive']} / {context['required_count']}",
+            ])
+        else:
+            lines.extend([
+                "触发原因：5分钟丢包率超阈值，并且连续异常周期达到要求（两个条件同时满足）",
+                f"5分钟丢包率：{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%",
+                f"连续异常周期：{context['consecutive']} / {context['required_count']}",
+                f"本轮探测：{context['probe_result']}",
+                f"影响判断：{_quality_impact_text(context['loss'])}",
+                f"处理建议：{_quality_action_text()}",
+            ])
+        lines.extend([f"采样方式：{context['sampling']}", f"Alarm ID：{alarm_id}"])
+        if event_type == "auto_resolved":
+            lines.extend([
+                f"发生时间：{started_at_text}",
+                f"恢复时间：{_format_local_time(alert.resolved_at)}",
+                f"持续时间：{_format_duration(alert.started_at, alert.resolved_at)}",
+            ])
+        else:
+            lines.extend([f"发生时间：{started_at_text}", f"当前处理人：{_current_handler_text(alert)}"])
+        lines.extend(["", f"故障详情：{_build_detail_url(alert)}"])
+        return "\n".join(lines)
     if not rule or not device:
         return alert.message or "告警详情不可用"
 
@@ -566,6 +920,8 @@ def _build_notification_content(
     numeric_detail = _build_numeric_detail_row(alert)
     if numeric_detail:
         lines.append(f"{numeric_detail['label']}：{numeric_detail['value']}")
+    for metadata in _alert_message_metadata(alert):
+        lines.append(f"{metadata['label']}：{metadata['value']}")
     if rule.metric_type in {"interface_oper_status", "interface_admin_up_oper_down"}:
         occurrence_label = "过去1小时down次数"
     elif rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
@@ -592,7 +948,7 @@ def _build_notification_content(
         if is_operation:
             return ""
         elif rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
-            lines[0] = "故障标题：【设备重新可达，已恢复】"
+            lines[0] = f"故障标题：【{_reachability_recovery_fault_title(rule)}】"
         lines.append(f"发生时间：{started_at_text}")
         lines.append(f"恢复时间：{resolved_at_text}")
         lines.append(f"持续时间：{_format_duration(alert.started_at, alert.resolved_at)}")
@@ -611,6 +967,60 @@ def _build_notification_card_data(
 ) -> Dict[str, Any]:
     rule = alert.rule
     device = alert.device
+    if rule and rule.metric_type == "quality_packet_loss" and not device:
+        alarm_id = _ensure_alarm_id(db, alert)
+        severity = _normalize_severity_label(rule.severity)
+        context = _quality_probe_context(db, alert)
+        is_recovery = event_type == "auto_resolved"
+        rows = [
+            {"label": "告警事件", "value": "公网链路质量恢复" if is_recovery else "公网链路质量下降"},
+            {"label": "探测名称", "value": context["name"]},
+            {"label": "目标地址", "value": context["address"]},
+            {"label": "所属机房", "value": context["datacenter"]},
+            {"label": "运营商", "value": context["operator"]},
+            {"label": "恢复时延迟" if is_recovery else "当前延迟", "value": context["latency"]},
+        ]
+        if is_recovery:
+            rows.extend([
+                {"label": "恢复原因", "value": context["recovery_reason"]},
+                {"label": "恢复时5分钟丢包率", "value": f"{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%"},
+                {"label": "当前连续异常周期", "value": f"{context['current_consecutive']} / {context['required_count']}"},
+            ])
+        else:
+            rows.extend([
+                {"label": "触发原因", "value": "5分钟丢包率超阈值 + 连续异常周期达标（同时满足）"},
+                {"label": "5分钟丢包率", "value": f"{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%"},
+                {"label": "连续异常周期", "value": f"{context['consecutive']} / {context['required_count']}"},
+                {"label": "本轮探测", "value": context["probe_result"]},
+                {"label": "影响判断", "value": _quality_impact_text(context["loss"])},
+                {"label": "处理建议", "value": _quality_action_text()},
+            ])
+        rows.extend([
+            {"label": "采样方式", "value": context["sampling"]},
+            {"label": "Alarm ID", "value": alarm_id},
+        ])
+        if event_type == "auto_resolved":
+            rows.extend([
+                {"label": "发生时间", "value": _format_local_time(alert.started_at)},
+                {"label": "恢复时间", "value": _format_local_time(alert.resolved_at)},
+                {"label": "持续时间", "value": _format_duration(alert.started_at, alert.resolved_at)},
+            ])
+        else:
+            rows.extend([
+                {"label": "发生时间", "value": _format_local_time(alert.started_at)},
+                {"label": "当前处理人", "value": _current_handler_text(alert)},
+            ])
+        return {
+            "severity": severity,
+            "title": _build_notification_title(rule, event_type, actor),
+            "headline": severity,
+            "summary": f"quality_packet_loss / {alert.alert_target_name or '-'}",
+            "subtitle": _format_local_time(alert.resolved_at if event_type == "auto_resolved" else alert.started_at),
+            "rows": rows,
+            "detail_url": _build_detail_url(alert),
+            "event_type": event_type,
+            "notification_kind": "alert",
+        }
     if not rule or not device:
         return {}
 
@@ -645,6 +1055,7 @@ def _build_notification_card_data(
     numeric_detail = _build_numeric_detail_row(alert)
     if numeric_detail:
         rows.append(numeric_detail)
+    rows.extend(_alert_message_metadata(alert))
     if not is_operation:
         rows.append({"label": occurrence_label, "value": f"{occurrence_count}次"})
     rows.append({"label": "Alarm ID", "value": alarm_id})
@@ -659,7 +1070,10 @@ def _build_notification_card_data(
         if is_operation:
             return {}
         elif rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
-            rows[0] = {"label": "故障标题", "value": "【设备重新可达，已恢复】"}
+            rows[0] = {
+                "label": "故障标题",
+                "value": f"【{_reachability_recovery_fault_title(rule)}】",
+            }
         rows.extend(
             [
                 {"label": "发生时间", "value": started_at_text},
@@ -814,12 +1228,71 @@ def _row_age_seconds(row: Dict[str, Any]) -> Optional[float]:
     return max((_utc_now() - row_time).total_seconds(), 0.0)
 
 
+def _sample_max_age_seconds(rule: AlertRule, target: Dict[str, Any]) -> int:
+    explicit = target.get("max_sample_age_seconds")
+    rule_extra_config = getattr(rule, "extra_config", None)
+    if explicit is None and isinstance(rule_extra_config, dict):
+        explicit = rule_extra_config.get("max_sample_age_seconds")
+    if explicit is not None:
+        try:
+            return max(int(explicit), 1)
+        except (TypeError, ValueError):
+            pass
+    if rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
+        return REACHABILITY_MAX_SAMPLE_AGE_SECONDS
+    if rule.metric_type in OPTICAL_METRIC_TYPES:
+        return OPTICAL_MAX_SAMPLE_AGE_SECONDS
+    if rule.metric_type in INTERFACE_METRIC_TYPES:
+        return INTERFACE_MAX_SAMPLE_AGE_SECONDS
+    if rule.metric_type in PROTOCOL_METRIC_TYPES:
+        return PROTOCOL_MAX_SAMPLE_AGE_SECONDS
+    if rule.metric_type in CIRCUIT_METRIC_TYPES:
+        return CIRCUIT_MAX_SAMPLE_AGE_SECONDS
+    return GENERAL_METRIC_MAX_SAMPLE_AGE_SECONDS
+
+
+def _sample_is_fresh(rule: AlertRule, device: Device, target: Dict[str, Any], phase: str) -> bool:
+    sample_age = target.get("sample_age_seconds")
+    if sample_age is None:
+        return True
+    try:
+        sample_age_value = float(sample_age)
+    except (TypeError, ValueError):
+        return True
+    max_age = _sample_max_age_seconds(rule, target)
+    if sample_age_value <= max_age:
+        return True
+    logger.info(
+        "跳过过期告警样本",
+        phase=phase,
+        rule_id=rule.id,
+        metric_type=rule.metric_type,
+        device_id=device.id,
+        target=target.get("target_name"),
+        sample_time=target.get("sample_time"),
+        sample_age_seconds=round(sample_age_value, 2),
+        max_sample_age_seconds=max_age,
+    )
+    return False
+
+
 def _duration_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any], value: float) -> bool:
     duration_seconds = max(int(rule.duration or 0), 0)
+    rule_extra_config = getattr(rule, "extra_config", None)
+    extra_config = rule_extra_config if isinstance(rule_extra_config, dict) else {}
+    required_samples = int(
+        target.get("required_samples")
+        or extra_config.get("required_samples")
+        or (3 if rule.metric_type in OPTICAL_METRIC_TYPES else 1)
+    )
+    required_samples = max(required_samples, 1)
     if rule.metric_type == "interface_admin_up_oper_down":
         duration_seconds = max(duration_seconds, INTERFACE_ADMIN_UP_OPER_DOWN_MIN_TRIGGER_SECONDS)
 
-    if duration_seconds <= 0:
+    if not _sample_is_fresh(rule, device, target, "trigger"):
+        return False
+
+    if duration_seconds <= 0 and required_samples <= 1:
         return True
 
     sample_time = str(target.get("sample_time") or "")
@@ -843,6 +1316,106 @@ def _duration_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
     key = _pending_alert_key(rule, device, target)
     pending_raw = redis_client.get(key)
     first_seen = now
+    first_sample_time = sample_time
+    latest_sample_time = sample_time
+    sample_count = 1
+    if pending_raw:
+        try:
+            pending_payload = json.loads(pending_raw)
+            first_seen = float(pending_payload.get("first_seen") or now)
+            first_sample_time = str(pending_payload.get("first_sample_time") or sample_time)
+            latest_sample_time = str(pending_payload.get("latest_sample_time") or first_sample_time or sample_time)
+            sample_count = max(int(pending_payload.get("sample_count") or 1), 1)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            first_seen = now
+            first_sample_time = sample_time
+            latest_sample_time = sample_time
+            sample_count = 1
+        if sample_time and sample_time != latest_sample_time:
+            latest_sample_time = sample_time
+            sample_count += 1
+            redis_client.set(
+                key,
+                json.dumps(
+                    {
+                        "first_seen": first_seen,
+                        "first_sample_time": first_sample_time,
+                        "latest_sample_time": latest_sample_time,
+                        "sample_count": sample_count,
+                        "rule_id": rule.id,
+                        "device_id": device.id,
+                        "target_key": target.get("target_key"),
+                        "target_name": target.get("target_name"),
+                        "value": value,
+                    },
+                    ensure_ascii=False,
+                ),
+                ex=max(duration_seconds * 3, duration_seconds + 60, PENDING_ALERT_TTL_SECONDS),
+            )
+    else:
+        redis_client.set(
+            key,
+            json.dumps(
+                {
+                    "first_seen": first_seen,
+                    "first_sample_time": first_sample_time,
+                    "latest_sample_time": latest_sample_time,
+                    "sample_count": sample_count,
+                    "rule_id": rule.id,
+                    "device_id": device.id,
+                    "target_key": target.get("target_key"),
+                    "target_name": target.get("target_name"),
+                    "value": value,
+                },
+                ensure_ascii=False,
+            ),
+            ex=max(duration_seconds * 3, duration_seconds + 60, PENDING_ALERT_TTL_SECONDS),
+        )
+        logger.info(
+            "告警进入持续时间确认",
+            rule_id=rule.id,
+            device_id=device.id,
+            target=target.get("target_name"),
+            duration_seconds=duration_seconds,
+            value=value,
+            required_samples=required_samples,
+        )
+
+    if sample_time and first_sample_time == latest_sample_time:
+        # 不能因为同一个异常样本被规则任务反复读取，就把瞬时异常升级为持续故障。
+        # 只有看到至少两个独立异常采样点后，持续时间才具有实际意义。
+        return False
+    if sample_count < required_samples:
+        return False
+    return (now - first_seen) >= duration_seconds
+
+
+def _requires_recovery_confirmation(rule: AlertRule) -> bool:
+    return (
+        rule.metric_type == "interface_admin_up_oper_down"
+        or rule.metric_type in PROTOCOL_METRIC_TYPES
+        or rule.metric_type in CIRCUIT_METRIC_TYPES
+    )
+
+
+def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any], value: float) -> bool:
+    if not _sample_is_fresh(rule, device, target, "recovery"):
+        return False
+    if not _requires_recovery_confirmation(rule):
+        return True
+
+    duration_seconds = max(int(rule.duration or 0), 0)
+    if rule.metric_type == "interface_admin_up_oper_down":
+        # 接口 AdminUp/物理Down 依赖高频接口采集。根因修复后如果再额外等待 60s，
+        # 实际恢复会变成“采集轮次 + 60s”，现场观感通常超过 1 分钟。
+        confirm_seconds = max(15, min(duration_seconds, 30) if duration_seconds else 15)
+    else:
+        confirm_seconds = max(60, duration_seconds)
+    now = time.time()
+    key = _pending_recovery_key(rule, device, target)
+    pending_raw = redis_client.get(key)
+    first_seen = now
+    sample_time = str(target.get("sample_time") or "")
     first_sample_time = sample_time
     latest_sample_time = sample_time
     if pending_raw:
@@ -872,7 +1445,7 @@ def _duration_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
                     },
                     ensure_ascii=False,
                 ),
-                ex=max(duration_seconds * 3, duration_seconds + 60, PENDING_ALERT_TTL_SECONDS),
+                ex=max(confirm_seconds * 3, confirm_seconds + 60, PENDING_ALERT_TTL_SECONDS),
             )
     else:
         redis_client.set(
@@ -882,66 +1455,6 @@ def _duration_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
                     "first_seen": first_seen,
                     "first_sample_time": first_sample_time,
                     "latest_sample_time": latest_sample_time,
-                    "rule_id": rule.id,
-                    "device_id": device.id,
-                    "target_key": target.get("target_key"),
-                    "target_name": target.get("target_name"),
-                    "value": value,
-                },
-                ensure_ascii=False,
-            ),
-            ex=max(duration_seconds * 3, duration_seconds + 60, PENDING_ALERT_TTL_SECONDS),
-        )
-        logger.info(
-            "告警进入持续时间确认",
-            rule_id=rule.id,
-            device_id=device.id,
-            target=target.get("target_name"),
-            duration_seconds=duration_seconds,
-            value=value,
-        )
-
-    if rule.metric_type == "interface_admin_up_oper_down" and sample_time and first_sample_time == latest_sample_time:
-        # 不能因为同一个异常样本被规则任务反复读取，就把瞬时/过期异常升级为 P1。
-        return False
-
-    return (now - first_seen) >= duration_seconds
-
-
-def _requires_recovery_confirmation(rule: AlertRule) -> bool:
-    return (
-        rule.metric_type == "interface_admin_up_oper_down"
-        or rule.metric_type in PROTOCOL_METRIC_TYPES
-        or rule.metric_type in CIRCUIT_METRIC_TYPES
-    )
-
-
-def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any], value: float) -> bool:
-    if not _requires_recovery_confirmation(rule):
-        return True
-
-    duration_seconds = max(int(rule.duration or 0), 0)
-    if rule.metric_type == "interface_admin_up_oper_down":
-        # 接口 AdminUp/物理Down 依赖高频接口采集。根因修复后如果再额外等待 60s，
-        # 实际恢复会变成“采集轮次 + 60s”，现场观感通常超过 1 分钟。
-        confirm_seconds = max(15, min(duration_seconds, 30) if duration_seconds else 15)
-    else:
-        confirm_seconds = max(60, duration_seconds)
-    now = time.time()
-    key = _pending_recovery_key(rule, device, target)
-    pending_raw = redis_client.get(key)
-    first_seen = now
-    if pending_raw:
-        try:
-            first_seen = float(json.loads(pending_raw).get("first_seen") or now)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            first_seen = now
-    else:
-        redis_client.set(
-            key,
-            json.dumps(
-                {
-                    "first_seen": first_seen,
                     "rule_id": rule.id,
                     "device_id": device.id,
                     "target_key": target.get("target_key"),
@@ -961,6 +1474,8 @@ def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
             value=value,
         )
 
+    if sample_time and first_sample_time == latest_sample_time:
+        return False
     return (now - first_seen) >= confirm_seconds
 
 
@@ -1150,6 +1665,7 @@ def _run_alert_checks(
         return {"skipped": True, "reason": f"{task_label} already running"}
 
     db = SessionLocal()
+    exporter_cache_token = _ALERT_RUN_EXPORTER_CACHE.set({})
     try:
         _resolve_alerts_for_disabled_rules(db)
         if not metric_types or metric_types & INTERFACE_METRIC_TYPES:
@@ -1200,6 +1716,7 @@ def _run_alert_checks(
         logger.error(f"{task_label}失败", error=str(e))
         return {"error": str(e)}
     finally:
+        _ALERT_RUN_EXPORTER_CACHE.reset(exporter_cache_token)
         db.close()
         if redis_client.get(lock_key) == lock_value:
             redis_client.delete(lock_key)
@@ -1284,6 +1801,17 @@ def check_device_health_alerts():
 
 
 @shared_task
+def check_optical_alerts():
+    """独立检查光模块质量，避免被慢速 Exporter 常规规则拖过任务上限。"""
+    return _run_alert_checks(
+        lock_key=OPTICAL_CHECK_ALERTS_LOCK_KEY,
+        lock_ttl_seconds=OPTICAL_CHECK_ALERTS_LOCK_TTL_SECONDS,
+        metric_types=OPTICAL_METRIC_TYPES,
+        task_label="光模块质量告警检查",
+    )
+
+
+@shared_task
 def check_alerts():
     """
     检查常规告警规则
@@ -1292,7 +1820,7 @@ def check_alerts():
     return _run_alert_checks(
         lock_key=CHECK_ALERTS_LOCK_KEY,
         lock_ttl_seconds=CHECK_ALERTS_LOCK_TTL_SECONDS,
-        exclude_metric_types=FAST_ALERT_METRIC_TYPES | REACHABILITY_ALERT_METRIC_TYPES | PROTOCOL_METRIC_TYPES | DEVICE_HEALTH_ALERT_METRIC_TYPES,
+        exclude_metric_types=FAST_ALERT_METRIC_TYPES | REACHABILITY_ALERT_METRIC_TYPES | PROTOCOL_METRIC_TYPES | DEVICE_HEALTH_ALERT_METRIC_TYPES | OPTICAL_METRIC_TYPES,
         task_label="常规告警检查",
     )
 
@@ -1409,6 +1937,10 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
     Returns:
         是否触发告警
     """
+    # 质量探测没有关联网络设备，由 quality_tasks 在每次 Ping 后直接评估。
+    if rule.metric_type == "quality_packet_loss":
+        return False
+
     # 获取规则适用的设备
     devices = []
     if rule.device_group_id:
@@ -1434,6 +1966,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
         return False
     devices = [device for device in devices if _vendor_matches_any(device.vendor, applicable_vendors)]
     devices = [device for device in devices if _device_matches_model_filter(device, rule.extra_config or {})]
+    devices = [device for device in devices if _device_matches_monitoring_scope(device, rule.extra_config or {})]
 
     if rule.metric_type == "device_reachability":
         devices = [
@@ -1528,7 +2061,9 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
     triggered = False
     
     for device in devices:
-        targets = _get_metric_targets(db, device, rule.metric_type, rule.extra_config or {})
+        targets = _get_metric_targets(db, device, rule.metric_type, rule.extra_config or {}, rule)
+        if rule.metric_type in OPTICAL_METRIC_TYPES:
+            _resolve_optical_alerts_on_inactive_interfaces(db, rule, device)
         if rule.metric_type in PROTOCOL_METRIC_TYPES or rule.metric_type in INTERFACE_METRIC_TYPES:
             _resolve_disappeared_target_alerts(
                 db,
@@ -1543,25 +2078,26 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
             )
         if not targets:
             continue
+        active_alerts = db.query(AlertHistory).filter(
+            AlertHistory.rule_id == rule.id,
+            AlertHistory.device_id == device.id,
+            AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+        ).all()
+        active_alerts_by_target = {
+            str(alert.alert_target_key or ""): alert
+            for alert in active_alerts
+        }
 
         for target in targets:
             value = target.get("value")
             if value is None:
                 continue
 
-            should_alert = _evaluate_rule_condition(rule, float(value))
+            effective_threshold = _effective_rule_threshold(rule, target)
+            should_alert = _evaluate_rule_condition(rule, float(value), target)
 
-            existing_query = db.query(AlertHistory).filter(
-                AlertHistory.rule_id == rule.id,
-                AlertHistory.device_id == device.id,
-                AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"])
-            )
-            if target.get("target_key"):
-                existing_query = existing_query.filter(AlertHistory.alert_target_key == target["target_key"])
-            else:
-                existing_query = existing_query.filter(AlertHistory.alert_target_key.is_(None))
-
-            existing = existing_query.first()
+            target_alert_key = str(target.get("target_key") or "")
+            existing = active_alerts_by_target.get(target_alert_key)
 
             if should_alert:
                 _clear_pending_recovery(rule, device, target)
@@ -1569,6 +2105,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                     if existing:
                         _clear_pending_alert(rule, device, target)
                         existing.alert_value = float(value)
+                        existing.threshold = effective_threshold
                         existing.updated_at = _utc_now()
                         existing.message = _build_alert_message(rule, device, float(value), target)
                         existing.alert_target_type = target.get("target_type")
@@ -1587,7 +2124,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                             rule_id=rule.id,
                             device_id=device.id,
                             alert_value=float(value),
-                            threshold=rule.threshold,
+                            threshold=effective_threshold,
                             message=_build_alert_message(rule, device, float(value), target),
                             alert_target_type=target.get("target_type"),
                             alert_target_key=target.get("target_key"),
@@ -1600,6 +2137,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                         db.add(alert)
                         db.commit()
                         db.refresh(alert)
+                        active_alerts_by_target[target_alert_key] = alert
                         _ensure_alarm_id(db, alert)
                         logger.info(
                             "告警命中屏蔽规则，已记录为忽略",
@@ -1612,6 +2150,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                     continue
                 if existing:
                     existing.alert_value = float(value)
+                    existing.threshold = effective_threshold
                     existing.updated_at = _utc_now()
                     existing.message = _build_alert_message(rule, device, float(value), target)
                     existing.alert_target_type = target.get("target_type")
@@ -1660,7 +2199,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                         rule_id=rule.id,
                         device_id=device.id,
                         alert_value=float(value),
-                        threshold=rule.threshold,
+                        threshold=effective_threshold,
                         message=_build_alert_message(rule, device, float(value), target),
                         alert_target_type=target.get("target_type"),
                         alert_target_key=target.get("target_key"),
@@ -1671,6 +2210,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                     db.add(alert)
                     db.commit()
                     db.refresh(alert)
+                    active_alerts_by_target[target_alert_key] = alert
                     _ensure_alarm_id(db, alert)
                     enqueue_alert_notification(alert.id)
 
@@ -1680,7 +2220,8 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                         device_id=device.id,
                         target=target.get("target_name"),
                         value=value,
-                        threshold=rule.threshold
+                        threshold=effective_threshold,
+                        threshold_source=target.get("threshold_source"),
                     )
                 triggered = True
             else:
@@ -1691,6 +2232,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                     _clear_pending_recovery(rule, device, target)
                     was_silenced_ignored = existing.status == "ignored" and existing.ignored_by == "alert_silence"
                     existing.alert_value = float(value)
+                    existing.threshold = effective_threshold
                     existing.message = _build_alert_message(rule, device, float(value), target)
                     existing.alert_target_type = target.get("target_type")
                     existing.alert_target_key = target.get("target_key")
@@ -1722,6 +2264,12 @@ def _resolve_disappeared_target_alerts(
     监控目标被删除/不再采集后，SNMP walk 不再返回该 target。
     这种场景不应继续保持活动告警，而应认为监控目标已消失并自动恢复。
     """
+    # 接口/协议目标偶尔会因为一次 SNMP walk 不完整、Exporter 短暂超时或分页截断
+    # 暂时不在本轮结果中。“没有采集到”不等于“状态已恢复”。这些状态类告警必须
+    # 明确采到正常值并通过恢复确认，不能仅凭目标消失就发送恢复通知。
+    if rule.metric_type in INTERFACE_METRIC_TYPES or rule.metric_type in PROTOCOL_METRIC_TYPES:
+        return
+
     active_alerts = db.query(AlertHistory).filter(
         AlertHistory.rule_id == rule.id,
         AlertHistory.device_id == device.id,
@@ -2041,7 +2589,7 @@ def _get_interface_last_fields(
     interface_name: str,
     fields: List[str],
     time_range: str,
-) -> Dict[str, Optional[float]]:
+) -> Dict[str, Any]:
     flux = _build_influx_last_fields_query(
         measurement="interface_monitoring",
         device_id=device_id,
@@ -2050,12 +2598,412 @@ def _get_interface_last_fields(
         tag_filters={"interface_name": interface_name},
     )
     results = influx_client.query(flux)
-    value_map: Dict[str, Optional[float]] = {field: None for field in fields}
+    value_map: Dict[str, Any] = {field: None for field in fields}
+    newest_sample_time: Optional[datetime] = None
     for item in results:
         field_name = item.get("field") or item.get("_field")
         if field_name in value_map and item.get("value") is not None:
             value_map[field_name] = float(item["value"])
+            row_time = _parse_row_time(item.get("_time") or item.get("time"))
+            if row_time and (newest_sample_time is None or row_time > newest_sample_time):
+                newest_sample_time = row_time
+    value_map["_sample_time"] = newest_sample_time.isoformat() if newest_sample_time else None
+    value_map["_sample_age_seconds"] = (
+        max((_utc_now() - newest_sample_time).total_seconds(), 0.0)
+        if newest_sample_time else None
+    )
     return value_map
+
+
+def _normalize_interface_identity(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _load_json_cache(key: str) -> Dict[str, Any]:
+    raw = redis_client.get(key)
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _optical_interface_states(device_id: int) -> Dict[str, Dict[str, Any]]:
+    payload = _load_json_cache(f"monitor:cache:interfaces:{device_id}")
+    states: Dict[str, Dict[str, Any]] = {}
+    for row in payload.get("interfaces") or payload.get("items") or []:
+        if not isinstance(row, dict):
+            continue
+        for value in (row.get("index"), row.get("interface_index"), row.get("name"), row.get("interface_name")):
+            key = _normalize_interface_identity(value)
+            if key:
+                states[key] = row
+    return states
+
+
+def _optical_interface_state(item: Dict[str, Any], states: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for value in (item.get("interface_index"), item.get("interface_name")):
+        state = states.get(_normalize_interface_identity(value))
+        if state:
+            return state
+    return None
+
+
+def _interface_state_is_up(state: Optional[Dict[str, Any]]) -> bool:
+    if not state:
+        return False
+    oper = str(state.get("oper_status") or state.get("if_oper_status") or "").strip().lower()
+    admin = str(state.get("admin_status") or state.get("if_admin_status") or "").strip().lower()
+    return oper in {"up", "1", "true"} and admin not in {"down", "2", "false"}
+
+
+def _resolve_optical_alerts_on_inactive_interfaces(
+    db: Session,
+    rule: AlertRule,
+    device: Device,
+) -> int:
+    """接口明确Down时，无光测量下限不应保持为光功率故障。"""
+    if rule.metric_type not in OPTICAL_METRIC_TYPES:
+        return 0
+    extra_config = rule.extra_config if isinstance(rule.extra_config, dict) else {}
+    if not extra_config.get("require_interface_up", True):
+        return 0
+    states = _optical_interface_states(device.id)
+    if not states:
+        return 0
+    alerts = db.query(AlertHistory).filter(
+        AlertHistory.rule_id == rule.id,
+        AlertHistory.device_id == device.id,
+        AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+    ).all()
+    resolved = 0
+    for alert in alerts:
+        state = (
+            states.get(_normalize_interface_identity(alert.alert_target_key))
+            or states.get(_normalize_interface_identity(alert.alert_target_name))
+        )
+        if not state or _interface_state_is_up(state):
+            continue
+        oper = str(state.get("oper_status") or state.get("if_oper_status") or "unknown").lower()
+        admin = str(state.get("admin_status") or state.get("if_admin_status") or "unknown").lower()
+        now = _utc_now()
+        alert.status = "resolved"
+        alert.resolved_at = now
+        alert.updated_at = now
+        alert.resolved_by = "system"
+        alert.resolution_note = f"接口当前为Down（admin={admin}, oper={oper}），无光读数不参与光模块功率告警"
+        db.commit()
+        resolved += 1
+        logger.info(
+            "接口Down，自动关闭光模块功率告警",
+            rule_id=rule.id,
+            alert_id=alert.id,
+            device_id=device.id,
+            interface=alert.alert_target_name,
+            admin_status=admin,
+            oper_status=oper,
+        )
+    return resolved
+
+
+def _optical_number(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (-60 <= number <= 30):
+        return None
+    return number
+
+
+def _module_threshold(item: Dict[str, Any], direction: str, condition: str, severity: str) -> tuple[Optional[float], Optional[str]]:
+    side = "low" if condition in {"<", "<="} else "high"
+    severity_text = str(severity or "").upper()
+    preferred = "alarm" if severity_text in {"P0", "CRITICAL"} else "warning"
+    alternate = "warning" if preferred == "alarm" else "alarm"
+    for level in (preferred, alternate):
+        key = f"{direction}_{side}_{level}_dbm"
+        value = _optical_number(item.get(key))
+        if value is not None:
+            return value, f"设备DDM {direction.upper()} {side.upper()} {level.upper()}阈值"
+    return None, None
+
+
+def _module_profile_bounds(item: Dict[str, Any], state: Optional[Dict[str, Any]]) -> Optional[Dict[str, tuple[float, float]]]:
+    text = " ".join(str(item.get(key) or "") for key in ("transceiver_type", "hardware_type", "vendor_name")).upper()
+    profiles = [
+        (("400G", "SR8"), {"rx": (-8.4, 4.0), "tx": (-6.5, 4.0)}),
+        (("400G", "DR4"), {"rx": (-5.9, 4.0), "tx": (-2.9, 4.0)}),
+        (("400G", "FR4"), {"rx": (-7.3, 4.4), "tx": (-3.2, 4.4)}),
+        (("400G", "LR4"), {"rx": (-9.0, 5.1), "tx": (-2.7, 5.1)}),
+        (("400G", "LR8"), {"rx": (-9.1, 5.3), "tx": (-2.8, 5.3)}),
+        (("200G", "SR4"), {"rx": (-8.4, 4.0), "tx": (-6.5, 4.0)}),
+        (("200G", "FR4"), {"rx": (-8.2, 4.7), "tx": (-4.2, 4.7)}),
+        (("100G", "CWDM4"), {"rx": (-11.5, 2.5), "tx": (-6.5, 2.5)}),
+        (("100G", "LR4"), {"rx": (-10.6, 4.5), "tx": (-4.3, 4.5)}),
+        (("100G", "SR4"), {"rx": (-10.3, 2.4), "tx": (-8.4, 2.4)}),
+        (("25G", "SR"), {"rx": (-10.3, 2.4), "tx": (-8.4, 2.4)}),
+        (("10G", "LR"), {"rx": (-14.4, 0.5), "tx": (-8.2, 0.5)}),
+        (("10G", "SR"), {"rx": (-9.9, -1.0), "tx": (-7.3, -1.0)}),
+    ]
+    for markers, bounds in profiles:
+        if all(marker in text for marker in markers):
+            return bounds
+
+    speed_bps = None
+    if state:
+        try:
+            speed_bps = float(state.get("speed_bps") or 0)
+        except (TypeError, ValueError):
+            speed_bps = None
+    try:
+        speed_mbps = float(item.get("speed_mbps") or 0)
+    except (TypeError, ValueError):
+        speed_mbps = 0
+    speed_gbps = speed_mbps / 1000 if speed_mbps else (speed_bps or 0) / 1_000_000_000
+    if speed_gbps >= 390:
+        return {"rx": (-9.1, 5.3), "tx": (-6.5, 5.3)}
+    if speed_gbps >= 190:
+        return {"rx": (-8.4, 4.7), "tx": (-6.5, 4.7)}
+    if speed_gbps >= 90:
+        return {"rx": (-20.9, 4.8), "tx": (-9.4, 6.5)}
+    if speed_gbps >= 20:
+        return {"rx": (-13.3, 2.4), "tx": (-8.4, 2.4)}
+    if speed_gbps >= 9:
+        return {"rx": (-24.0, 0.5), "tx": (-8.2, 4.0)}
+    return None
+
+
+def _optical_effective_threshold(
+    rule: AlertRule,
+    item: Dict[str, Any],
+    state: Optional[Dict[str, Any]],
+) -> tuple[float, str]:
+    direction = "rx" if rule.metric_type == "optical_rx_power" else "tx"
+    module_value, module_source = _module_threshold(item, direction, rule.condition, rule.severity)
+    if module_value is not None:
+        return module_value, module_source or "设备DDM阈值"
+    bounds = _module_profile_bounds(item, state)
+    if bounds and direction in bounds:
+        low, high = bounds[direction]
+        return (low if rule.condition in {"<", "<="} else high), "厂商/速率/模块类型阈值"
+    return float(rule.threshold), "规则默认阈值"
+
+
+def _optical_history_key(device_id: int, interface_key: str) -> str:
+    return f"alerts:optical_rx_history:{device_id}:{interface_key}"
+
+
+def _update_optical_rx_history(
+    device_id: int,
+    interface_key: str,
+    sample_time: Any,
+    current_rx: float,
+) -> Dict[str, Optional[float]]:
+    parsed_time = _parse_row_time(sample_time) or _utc_now()
+    timestamp = parsed_time.timestamp()
+    key = _optical_history_key(device_id, interface_key)
+    payload = _load_json_cache(key)
+    points = []
+    for point in payload.get("points") or []:
+        try:
+            point_time = float(point[0])
+            point_value = float(point[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if timestamp - point_time <= 49 * 3600:
+            points.append([point_time, point_value])
+    latest_sample = str(payload.get("latest_sample_time") or "")
+    sample_text = parsed_time.isoformat()
+    if sample_text != latest_sample:
+        if not points or timestamp - float(points[-1][0]) >= 30 * 60:
+            points.append([timestamp, float(current_rx)])
+        payload = {"points": points[-100:], "latest_sample_time": sample_text}
+        redis_client.set(key, json.dumps(payload, ensure_ascii=False), ex=72 * 3600)
+
+    def drop_for(window_seconds: int, minimum_age_seconds: int) -> Optional[float]:
+        candidates = [point for point in points if timestamp - float(point[0]) >= minimum_age_seconds]
+        if not candidates:
+            return None
+        target_time = timestamp - window_seconds
+        baseline = min(candidates, key=lambda point: abs(float(point[0]) - target_time))
+        return round(float(baseline[1]) - float(current_rx), 4)
+
+    return {
+        "drop_1h": drop_for(3600, 45 * 60),
+        "drop_24h": drop_for(24 * 3600, 23 * 3600),
+    }
+
+
+def _fec_rows(device_id: int) -> tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    payload = _load_json_cache(f"monitor:cache:telemetry_lossless:{device_id}:ifmgr_iffecdata")
+    collected_at = str(payload.get("collected_at") or "") or None
+    rows: Dict[str, Dict[str, Any]] = {}
+    for row in payload.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        key = _normalize_interface_identity(row.get("interface_name"))
+        if key:
+            rows[key] = row
+    return rows, collected_at
+
+
+def _fec_counter_delta(device_id: int, interface_key: str, row: Dict[str, Any], sample_time: str) -> Optional[Dict[str, float]]:
+    try:
+        correctable = float(row.get("fec_correctable_packets") or 0)
+        uncorrectable = float(row.get("fec_uncorrectable_packets") or 0)
+    except (TypeError, ValueError):
+        return None
+    key = f"alerts:fec_counter:{device_id}:{interface_key}"
+    previous = _load_json_cache(key)
+    if str(previous.get("sample_time") or "") == str(sample_time or ""):
+        if previous.get("correctable_delta") is None:
+            return None
+        return {
+            "correctable_delta": float(previous.get("correctable_delta") or 0),
+            "uncorrectable_delta": float(previous.get("uncorrectable_delta") or 0),
+        }
+    previous_correctable = previous.get("correctable")
+    previous_uncorrectable = previous.get("uncorrectable")
+    result = None
+    if previous_correctable is not None and previous_uncorrectable is not None:
+        result = {
+            "correctable_delta": max(correctable - float(previous_correctable), 0.0),
+            "uncorrectable_delta": max(uncorrectable - float(previous_uncorrectable), 0.0),
+        }
+    redis_client.set(
+        key,
+        json.dumps({
+            "sample_time": sample_time,
+            "correctable": correctable,
+            "uncorrectable": uncorrectable,
+            "correctable_delta": result.get("correctable_delta") if result else None,
+            "uncorrectable_delta": result.get("uncorrectable_delta") if result else None,
+        }),
+        ex=3 * 3600,
+    )
+    return result
+
+
+def _get_optical_targets(
+    db: Session,
+    device: Device,
+    metric_type: str,
+    extra_config: Dict[str, Any],
+    rule: Optional[AlertRule] = None,
+) -> List[Dict[str, Any]]:
+    payload = _load_json_cache(f"monitor:cache:optical_modules:{device.id}")
+    states = _optical_interface_states(device.id)
+    circuit_map = _device_interface_circuit_map(db, device.id)
+    fec_by_interface, fec_sample_time = _fec_rows(device.id) if metric_type == "optical_rx_fec_correlation" else ({}, None)
+    targets: List[Dict[str, Any]] = []
+    for item in payload.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        interface_name = str(item.get("interface_name") or "").strip()
+        interface_index = item.get("interface_index")
+        if not interface_name:
+            continue
+        if not _matches_text_filter(
+            interface_name,
+            str(extra_config.get("interface_name")) if extra_config.get("interface_name") else None,
+            str(extra_config.get("interface_regex")) if extra_config.get("interface_regex") else None,
+            str(extra_config.get("exclude_interface_regex")) if extra_config.get("exclude_interface_regex") else None,
+        ):
+            continue
+        if extra_config.get("interface_index") and str(interface_index) != str(extra_config.get("interface_index")):
+            continue
+        if _is_default_skipped_interface(interface_name) and not extra_config.get("include_logical_interfaces"):
+            continue
+        if not is_interface_monitored(device, interface_name, interface_index):
+            continue
+        state = _optical_interface_state(item, states)
+        if extra_config.get("require_interface_up", True) and not _interface_state_is_up(state):
+            continue
+
+        sample_time = str(item.get("collected_at") or payload.get("collected_at") or "") or None
+        sample_age = _row_age_seconds({"_time": sample_time}) if sample_time else None
+        interface_key = str(interface_index or _normalize_interface_identity(interface_name))
+        rx_power = _optical_number(item.get("rx_power_dbm"))
+        value: Optional[float] = None
+        details: List[str] = []
+        target: Dict[str, Any] = {
+            "target_type": "interface",
+            "target_key": interface_key,
+            "target_name": interface_name,
+            "sample_time": sample_time,
+            "sample_age_seconds": sample_age,
+            "required_samples": int(extra_config.get("required_samples") or 3),
+        }
+
+        history = None
+        if rx_power is not None:
+            history = _update_optical_rx_history(device.id, interface_key, sample_time, rx_power)
+
+        if metric_type in {"optical_rx_power", "optical_tx_power"}:
+            direction = "rx" if metric_type == "optical_rx_power" else "tx"
+            lane_values = [
+                _optical_number(channel.get(f"{direction}_power_dbm"))
+                for channel in item.get("channels") or []
+                if isinstance(channel, dict)
+            ]
+            lane_values = [lane for lane in lane_values if lane is not None]
+            if lane_values:
+                value = min(lane_values) if rule and rule.condition in {"<", "<="} else max(lane_values)
+            else:
+                value = _optical_number(item.get(f"{direction}_power_dbm"))
+            if value is None:
+                continue
+            if rule is not None:
+                threshold, source = _optical_effective_threshold(rule=rule, item=item, state=state)
+                if source.startswith("设备DDM"):
+                    lane_label = "最低" if rule.condition in {"<", "<="} else "最高"
+                    details.append(f"设备DDM阈值优先；当前{lane_label}Lane：{value:.2f}dBm")
+                target["effective_threshold"] = threshold
+                target["threshold_source"] = source
+        elif metric_type == "optical_lane_power_delta":
+            lane_values = [
+                _optical_number(channel.get("rx_power_dbm"))
+                for channel in item.get("channels") or []
+                if isinstance(channel, dict)
+            ]
+            lane_values = [lane for lane in lane_values if lane is not None]
+            if len(lane_values) < 2:
+                continue
+            value = round(max(lane_values) - min(lane_values), 4)
+            details.append(f"Lane最大/最小收光：{max(lane_values):.2f}/{min(lane_values):.2f}dBm")
+        elif metric_type == "optical_rx_power_drop_24h":
+            value = float(history.get("drop_24h") or 0.0) if history else 0.0
+            details.append(f"当前收光：{rx_power:.2f}dBm" if rx_power is not None else "当前收光：-")
+        elif metric_type == "optical_rx_fec_correlation":
+            fec_row = fec_by_interface.get(_normalize_interface_identity(interface_name))
+            if not fec_row or not fec_sample_time or not history:
+                continue
+            fec_delta = _fec_counter_delta(device.id, interface_key, fec_row, fec_sample_time)
+            if fec_delta is None:
+                continue
+            drop_1h = float(history.get("drop_1h") or 0.0)
+            corrected = float(fec_delta.get("correctable_delta") or 0.0)
+            uncorrected = float(fec_delta.get("uncorrectable_delta") or 0.0)
+            minimum_drop = float(extra_config.get("rx_drop_db") or 1.0)
+            value = max(corrected, 1_000_000_000.0 if uncorrected > 0 else 0.0) if drop_1h >= minimum_drop else 0.0
+            target["sample_time"] = fec_sample_time
+            target["sample_age_seconds"] = _row_age_seconds({"_time": fec_sample_time})
+            details.extend([
+                f"近1小时收光下降：{drop_1h:.2f}dB",
+                f"本周期FEC可纠错/不可纠错增长：{corrected:.0f}/{uncorrected:.0f}",
+            ])
+        if value is None:
+            continue
+        target["value"] = float(value)
+        if details:
+            target["diagnostic_text"] = "；".join(details)
+        targets.append(_enrich_interface_target_with_resources(db, device, target, circuit_map))
+    return targets
 
 
 def _get_circuit_targets(
@@ -2065,8 +3013,7 @@ def _get_circuit_targets(
     extra_config: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     line_type = "internet" if metric_type == "internet_circuit_traffic_floor" else "private_line"
-    default_time_range = "-90s" if metric_type in PROTOCOL_METRIC_TYPES else "-10m"
-    time_range = str(extra_config.get("time_range") or default_time_range)
+    time_range = str(extra_config.get("time_range") or "-10m")
     query = db.query(Circuit).filter(
         Circuit.line_type == line_type,
         Circuit.status == "active",
@@ -2093,6 +3040,8 @@ def _get_circuit_targets(
                 continue
             in_bps: Optional[float] = None
             out_bps: Optional[float] = None
+            sample_time: Optional[str] = None
+            sample_age_seconds: Optional[float] = None
             if _get_effective_monitor_source(device) == "asternos_exporter":
                 try:
                     stats = _get_exporter_interface_stats_cached(device, endpoint_port_name)
@@ -2110,6 +3059,8 @@ def _get_circuit_targets(
                 fields = _get_interface_last_fields(device.id, endpoint_port_name, ["in_bps", "out_bps"], time_range)
                 in_bps = fields.get("in_bps")
                 out_bps = fields.get("out_bps")
+                sample_time = fields.get("_sample_time")
+                sample_age_seconds = fields.get("_sample_age_seconds")
             if in_bps is None and out_bps is None:
                 continue
             traffic_floor_value = round(max(in_bps or 0.0, out_bps or 0.0) / 1_000_000, 2)
@@ -2119,6 +3070,8 @@ def _get_circuit_targets(
                     "target_key": f"circuit:{circuit.id}:{role}",
                     "target_name": f"{circuit.name} / {endpoint_port_name}",
                     "value": float(traffic_floor_value),
+                    "sample_time": sample_time,
+                    "sample_age_seconds": sample_age_seconds,
                 }
             )
     return targets
@@ -2132,11 +3085,16 @@ def _find_interface_circuits(db: Session, device_id: int, interface_name: Option
     normalized_interface = _normalize_interface_name(interface_name)
     if not normalized_interface:
         return []
+    return _device_interface_circuit_map(db, device_id).get(normalized_interface, [])
+
+
+def _device_interface_circuit_map(db: Session, device_id: int) -> Dict[str, List[Dict[str, Any]]]:
+    """Load a device's circuit bindings once instead of once per interface target."""
     circuits = db.query(Circuit).filter(
         Circuit.status == "active",
         or_(Circuit.primary_device_id == device_id, Circuit.secondary_device_id == device_id),
     ).all()
-    matches: List[Dict[str, Any]] = []
+    matches: Dict[str, List[Dict[str, Any]]] = {}
     for circuit in circuits:
         endpoints = [
             ("primary", circuit.primary_device_id, circuit.primary_port_name),
@@ -2145,9 +3103,10 @@ def _find_interface_circuits(db: Session, device_id: int, interface_name: Option
         for role, endpoint_device_id, endpoint_port_name in endpoints:
             if endpoint_device_id != device_id:
                 continue
-            if _normalize_interface_name(endpoint_port_name) != normalized_interface:
+            normalized_port = _normalize_interface_name(endpoint_port_name)
+            if not normalized_port:
                 continue
-            matches.append({
+            matches.setdefault(normalized_port, []).append({
                 "id": circuit.id,
                 "name": circuit.name,
                 "line_type": circuit.line_type,
@@ -2164,10 +3123,18 @@ def _line_type_label(line_type: Optional[str]) -> str:
     return "专线" if line_type == "private_line" else "公网"
 
 
-def _enrich_interface_target_with_resources(db: Session, device: Device, target: Dict[str, Any]) -> Dict[str, Any]:
+def _enrich_interface_target_with_resources(
+    db: Session,
+    device: Device,
+    target: Dict[str, Any],
+    circuit_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Dict[str, Any]:
     if target.get("target_type") != "interface":
         return target
-    circuits = _find_interface_circuits(db, device.id, target.get("target_name"))
+    if circuit_map is None:
+        circuits = _find_interface_circuits(db, device.id, target.get("target_name"))
+    else:
+        circuits = circuit_map.get(_normalize_interface_name(target.get("target_name")), [])
     if not circuits:
         return target
     resource_names = [
@@ -2314,11 +3281,18 @@ def _matches_label_filters(labels: Dict[str, Any], extra_config: Dict[str, Any])
 
 
 def _scrape_exporter_metrics_cached(device: Device) -> Dict[str, List[Dict[str, Any]]]:
+    run_cache = _ALERT_RUN_EXPORTER_CACHE.get()
+    if run_cache is not None and device.id in run_cache:
+        return run_cache[device.id]
+
     now = time.monotonic()
     with _EXPORTER_SCRAPE_CACHE_LOCK:
         cached = _EXPORTER_SCRAPE_CACHE.get(device.id)
         if cached and now - float(cached.get("created_at", 0.0)) < EXPORTER_SCRAPE_CACHE_TTL_SECONDS:
-            return cached.get("metrics", [])
+            metrics = cached.get("metrics", {})
+            if run_cache is not None:
+                run_cache[device.id] = metrics
+            return metrics
 
     try:
         metrics = asyncio.run(asternos_exporter_client.scrape(device))
@@ -2335,6 +3309,8 @@ def _scrape_exporter_metrics_cached(device: Device) -> Dict[str, List[Dict[str, 
             "created_at": now,
             "metrics": metrics,
         }
+    if run_cache is not None:
+        run_cache[device.id] = metrics
     return metrics
 
 
@@ -2513,12 +3489,65 @@ def _get_exporter_metric_targets(device: Device, extra_config: Dict[str, Any]) -
     return targets
 
 
-def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+INFLUX_DEVICE_SAMPLE_MAP: Dict[str, tuple[str, Optional[str], str]] = {
+    "snmp_cpu": ("snmp_metrics", "cpu", "usage"),
+    "snmp_memory": ("snmp_metrics", "memory", "usage_percent"),
+    "device_status": ("device_status", None, "status"),
+    "device_reachability": ("device_reachability", None, "reachable"),
+    "snmp_reachability": ("snmp_reachability", None, "reachable"),
+    "exporter_reachability": ("exporter_reachability", None, "reachable"),
+    "telemetry_reachability": ("telemetry_reachability", None, "reachable"),
+    "snmp_session_usage": ("snmp_sessions", None, "usage_percent"),
+    "snmp_ha_status": ("snmp_system", None, "ha_status"),
+    "snmp_session_queue_full_drop_delta": ("snmp_system", None, "pending_session_queue_full_drop"),
+}
+
+
+def _get_influx_device_sample(
+    device_id: int,
+    metric_type: str,
+    extra_config: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    source = INFLUX_DEVICE_SAMPLE_MAP.get(metric_type)
+    if not source:
+        return None
+    measurement, metric, field = source
+    tag_filters = {"metric_type": metric} if metric else None
+    default_range = "-5m" if metric_type in DEVICE_REACHABILITY_METRIC_TYPES else "-10m"
+    flux = _build_influx_last_value_query(
+        measurement=measurement,
+        device_id=device_id,
+        field=field,
+        start=str(extra_config.get("time_range") or default_range),
+        tag_filters=tag_filters,
+    )
+    rows = influx_client.query(flux)
+    if not rows or rows[0].get("value") is None:
+        return None
+    row = rows[0]
+    sample_time = row.get("_time") or row.get("time")
+    return {
+        "value": float(row["value"]),
+        "sample_time": str(sample_time) if sample_time is not None else None,
+        "sample_age_seconds": _row_age_seconds(row),
+    }
+
+
+def _get_metric_targets(
+    db: Session,
+    device: Device,
+    metric_type: str,
+    extra_config: Optional[Dict[str, Any]] = None,
+    rule: Optional[AlertRule] = None,
+) -> List[Dict[str, Any]]:
     extra_config = extra_config or {}
     targets: List[Dict[str, Any]] = []
 
     if metric_type in EXPORTER_METRIC_TYPES:
         return _get_exporter_metric_targets(device, extra_config)
+
+    if metric_type in OPTICAL_METRIC_TYPES:
+        return _get_optical_targets(db, device, metric_type, extra_config, rule)
 
     if metric_type == "syslog_keyword":
         value = _get_metric_value(db, device.id, metric_type, extra_config)
@@ -2533,14 +3562,14 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
         }]
 
     if metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
-        value = _get_metric_value(db, device.id, metric_type, extra_config)
-        if value is None:
+        sample = _get_influx_device_sample(device.id, metric_type, extra_config)
+        if not sample:
             return []
         return [{
             "target_type": "device",
             "target_key": str(device.id),
             "target_name": None,
-            "value": value,
+            **sample,
         }]
 
     if metric_type in CIRCUIT_METRIC_TYPES:
@@ -2572,6 +3601,8 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
                 "target_key": f"temperature:{sensor}",
                 "target_name": sensor,
                 "value": float(value),
+                "sample_time": str(item.get("_time") or item.get("time") or "") or None,
+                "sample_age_seconds": _row_age_seconds(item),
             })
         return targets
 
@@ -2640,6 +3671,8 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
                 "target_key": target_key,
                 "target_name": target_name,
                 "value": float(value),
+                "sample_time": str(item.get("_time") or item.get("time") or "") or None,
+                "sample_age_seconds": _row_age_seconds(item),
             })
         return targets
 
@@ -2660,6 +3693,15 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
     }
 
     if metric_type not in measurement_map:
+        if _get_effective_monitor_source(device) != "asternos_exporter":
+            sample = _get_influx_device_sample(device.id, metric_type, extra_config)
+            if sample:
+                return [{
+                    "target_type": "device",
+                    "target_key": str(device.id),
+                    "target_name": device.name,
+                    **sample,
+                }]
         value = _get_metric_value(db, device.id, metric_type, extra_config)
         if value is None:
             return []
@@ -2671,7 +3713,8 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
         }]
 
     measurement, field = measurement_map[metric_type]
-    time_range = str(extra_config.get("time_range") or "-10m")
+    default_time_range = "-7m" if metric_type in PROTOCOL_METRIC_TYPES else "-10m"
+    time_range = str(extra_config.get("time_range") or default_time_range)
     targets: List[Dict[str, Any]] = []
 
     if metric_type in INTERFACE_METRIC_TYPES:
@@ -2838,6 +3881,8 @@ def _get_metric_targets(db: Session, device: Device, metric_type: str, extra_con
                 "target_key": f"{protocol}:{peer}",
                 "target_name": f"{protocol.upper()} 邻居 {peer}",
                 "value": float(value),
+                "sample_time": str(item.get("_time") or item.get("time") or "") or None,
+                "sample_age_seconds": _row_age_seconds(item),
             })
         return targets
 
@@ -3024,24 +4069,35 @@ def _evaluate_condition(value: float, condition: str, threshold: float) -> bool:
     return False
 
 
-def _normalize_percent_metric_value(value: float) -> float:
-    """百分比指标兼容 0.85 和 85 两种写法。"""
+def _normalize_percent_threshold(value: float) -> float:
+    """告警阈值兼容 0.85 和 85 两种写法。"""
     if 0 <= value <= 1:
         return value * 100
     return value
 
 
-def _evaluate_rule_condition(rule: AlertRule, value: float) -> bool:
+def _effective_rule_threshold(rule: AlertRule, target: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    if target and target.get("effective_threshold") is not None:
+        try:
+            return float(target["effective_threshold"])
+        except (TypeError, ValueError):
+            pass
+    return float(rule.threshold) if rule.threshold is not None else None
+
+
+def _evaluate_rule_condition(rule: AlertRule, value: float, target: Optional[Dict[str, Any]] = None) -> bool:
     """按指标类型评估告警条件。"""
-    threshold = rule.threshold
+    threshold = _effective_rule_threshold(rule, target)
     if threshold is None:
         return False
 
     compare_value = float(value)
     compare_threshold = float(threshold)
     if rule.metric_type in PERCENT_METRIC_TYPES:
-        compare_value = _normalize_percent_metric_value(compare_value)
-        compare_threshold = _normalize_percent_metric_value(compare_threshold)
+        # 采集器写入的 usage/usage_percent 已经是 0~100 的百分数。
+        # 不能再把 1.0 当成 100%，否则设备 CPU 恰好为 1% 时会误告警。
+        # 只有历史规则阈值允许使用 0.7 表示 70%。
+        compare_threshold = _normalize_percent_threshold(compare_threshold)
 
     return _evaluate_condition(compare_value, rule.condition, compare_threshold)
 
@@ -3097,6 +4153,10 @@ def _numeric_detail_unit(rule: AlertRule) -> str:
         return "包"
     if rule.metric_type in {"optical_rx_power", "optical_tx_power"}:
         return "dBm"
+    if rule.metric_type in {"optical_lane_power_delta", "optical_rx_power_drop_24h"}:
+        return "dB"
+    if rule.metric_type == "optical_rx_fec_correlation":
+        return "个/周期"
     if rule.metric_type == "exporter_metric":
         metric_base = _exporter_metric_base(rule)
         label = str(extra_config.get("metric_label") or "").lower()
@@ -3115,7 +4175,7 @@ def _numeric_detail_unit(rule: AlertRule) -> str:
 def _format_numeric_detail_number(rule: AlertRule, value: float) -> str:
     unit = _numeric_detail_unit(rule)
     if unit == "%":
-        return f"{_normalize_percent_metric_value(float(value)):.1f}%"
+        return f"{float(value):.1f}%"
     if unit == "℃":
         return f"{float(value):.1f}℃"
     if unit == "dBm":
@@ -3137,7 +4197,7 @@ def _format_numeric_detail_threshold(rule: AlertRule, threshold: Optional[float]
     unit = _numeric_detail_unit(rule)
     threshold_value = float(threshold)
     if unit == "%":
-        return f"{rule.condition} {_normalize_percent_metric_value(threshold_value):.1f}%"
+        return f"{rule.condition} {_normalize_percent_threshold(threshold_value):.1f}%"
     if unit == "℃":
         return f"{rule.condition} {threshold_value:.1f}℃"
     if unit == "dBm":
@@ -3162,22 +4222,41 @@ def _build_numeric_detail_row(alert: AlertHistory) -> Optional[Dict[str, str]]:
     }
 
 
+def _alert_message_metadata(alert: AlertHistory) -> List[Dict[str, str]]:
+    """Preserve dynamic-threshold and correlation evidence in robot cards."""
+    labels = {"阈值来源", "关联判断"}
+    rows: List[Dict[str, str]] = []
+    for line in str(alert.message or "").splitlines():
+        if "：" in line:
+            label, value = line.split("：", 1)
+        elif ":" in line:
+            label, value = line.split(":", 1)
+        else:
+            continue
+        label = label.strip()
+        value = value.strip()
+        if label in labels and value:
+            rows.append({"label": label, "value": value})
+    return rows
+
+
 def _format_alert_value(rule: AlertRule, value: float) -> str:
     if _numeric_detail_label(rule):
         return _format_numeric_detail_number(rule, float(value))
     if rule.metric_type in PERCENT_METRIC_TYPES:
-        return f"{_normalize_percent_metric_value(float(value)):.1f}%"
+        return f"{float(value):.1f}%"
     return str(value)
 
 
-def _format_alert_threshold(rule: AlertRule) -> str:
-    if rule.threshold is None:
+def _format_alert_threshold(rule: AlertRule, target: Optional[Dict[str, Any]] = None) -> str:
+    threshold = _effective_rule_threshold(rule, target)
+    if threshold is None:
         return "-"
     if _numeric_detail_label(rule):
-        return _format_numeric_detail_threshold(rule)
+        return _format_numeric_detail_threshold(rule, threshold)
     if rule.metric_type in PERCENT_METRIC_TYPES:
-        return f"{rule.condition} {_normalize_percent_metric_value(float(rule.threshold)):.1f}%"
-    return f"{rule.condition} {rule.threshold}"
+        return f"{rule.condition} {_normalize_percent_threshold(float(threshold)):.1f}%"
+    return f"{rule.condition} {threshold}"
 
 
 def _build_alert_message(rule: AlertRule, device: Device, value: float, target: Optional[Dict[str, Any]] = None) -> str:
@@ -3213,6 +4292,11 @@ def _build_alert_message(rule: AlertRule, device: Device, value: float, target: 
         "snmp_slb_virtual_server_status": "SLB虚拟服务状态",
         "internet_circuit_traffic_floor": "公网线路流量掉底",
         "private_line_circuit_traffic_floor": "专线流量掉底",
+        "optical_rx_power": "模块收光功率",
+        "optical_tx_power": "模块发光功率",
+        "optical_lane_power_delta": "Lane收光功率差",
+        "optical_rx_power_drop_24h": "24小时收光衰减",
+        "optical_rx_fec_correlation": "光功率与FEC关联异常",
     }.get(rule.metric_type, rule.metric_type)
     resource_line = ""
     if target and target.get("resource_text"):
@@ -3220,12 +4304,20 @@ def _build_alert_message(rule: AlertRule, device: Device, value: float, target: 
     state_line = ""
     if target and target.get("state_text"):
         state_line = f"\n协议状态: {target['state_text']}"
+    threshold_source_line = ""
+    if target and target.get("threshold_source"):
+        threshold_source_line = f"\n阈值来源: {target['threshold_source']}"
+    diagnostic_line = ""
+    if target and target.get("diagnostic_text"):
+        diagnostic_line = f"\n关联判断: {target['diagnostic_text']}"
     return (
         f"设备 {device.name} ({device.ip_address}){target_text} 触发告警\n"
         f"规则: {rule.name}\n"
         f"指标: {metric_label}\n"
         f"当前值: {_format_alert_value(rule, value)}\n"
-        f"阈值: {_format_alert_threshold(rule)}"
+        f"阈值: {_format_alert_threshold(rule, target)}"
+        f"{threshold_source_line}"
+        f"{diagnostic_line}"
         f"{state_line}"
         f"{resource_line}"
     )
@@ -3271,7 +4363,10 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
             return
         
         rule = alert.rule
-        if not rule or not rule.notification_channels:
+        if not rule:
+            return
+        notification_channels = _notification_channels_for_alert(rule, alert)
+        if not notification_channels:
             return
         recent_success = False
         now = _utc_now()
@@ -3304,7 +4399,7 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
             title = f"{title}【{datacenter_text}】"
         content = _build_notification_content(db, alert, event_type, actor)
         card_data = _build_notification_card_data(db, alert, event_type, actor)
-        mention_users = _get_mention_users(rule)
+        mention_users = _notification_mentions_for_alert(rule, alert)
         
         # 异步发送通知
         loop = asyncio.new_event_loop()
@@ -3312,7 +4407,7 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
         try:
             async def _send_all():
                 results_inner = []
-                for channel in rule.notification_channels:
+                for channel in notification_channels:
                     channel_type = channel.get("type")
                     config = _build_channel_config(channel, mention_users)
                     await _wait_for_notification_slot(channel_type, config)
@@ -3339,7 +4434,7 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
                     "event_type": event_type,
                     "title": title,
                 }
-                for ch, result in zip(rule.notification_channels, results)
+                for ch, result in zip(notification_channels, results)
             )
             alert.notifications_sent = history
             alert.updated_at = _utc_now()

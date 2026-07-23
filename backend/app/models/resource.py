@@ -347,6 +347,11 @@ class QualityProbeTarget(Base):
     name = Column(String(100), nullable=False)
     target = Column(String(255), nullable=False)
     datacenter_id = Column(Integer, ForeignKey("datacenters.id"), nullable=True)
+    circuit_id = Column(Integer, ForeignKey("circuits.id", ondelete="SET NULL"), nullable=True, index=True)
+    device_id = Column(Integer, ForeignKey("devices.id", ondelete="SET NULL"), nullable=True, index=True)
+    probe_source = Column(String(30), default="server_icmp", nullable=False)
+    nqa_admin_name = Column(String(32))
+    nqa_operation_tag = Column(String(32))
     operator_name = Column(String(50))
     interval_seconds = Column(Integer, default=60)
     packet_count = Column(Integer, default=5)
@@ -366,14 +371,64 @@ class QualityProbeTarget(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     datacenter_ref = relationship("Datacenter")
+    circuit_ref = relationship("Circuit")
+    device_ref = relationship("Device")
 
     def to_dict(self):
+        circuit_device_ref = self.circuit_ref.primary_device_ref if self.circuit_ref else None
+        circuit_port_name = self.circuit_ref.primary_port_name if self.circuit_ref else None
+        circuit_local_interconnect_ip = None
+        circuit_remote_interconnect_ip = None
+        if self.circuit_ref:
+            circuit_local_interconnect_ip = (
+                self.circuit_ref.primary_local_interconnect_ip
+                or self.circuit_ref.primary_interconnect_ip
+                or self.circuit_ref.local_interconnect_address
+                or self.circuit_ref.interconnect_address
+            )
+            circuit_remote_interconnect_ip = (
+                self.circuit_ref.primary_remote_interconnect_ip
+                or self.circuit_ref.remote_interconnect_address
+            )
+        if (
+            self.circuit_ref
+            and self.device_id
+            and self.circuit_ref.secondary_device_id == self.device_id
+        ):
+            circuit_device_ref = self.circuit_ref.secondary_device_ref
+            circuit_port_name = self.circuit_ref.secondary_port_name
+            circuit_local_interconnect_ip = (
+                self.circuit_ref.secondary_local_interconnect_ip
+                or self.circuit_ref.secondary_interconnect_ip
+                or self.circuit_ref.local_interconnect_address
+                or self.circuit_ref.interconnect_address
+            )
+            circuit_remote_interconnect_ip = (
+                self.circuit_ref.secondary_remote_interconnect_ip
+                or self.circuit_ref.remote_interconnect_address
+            )
         return {
             "id": self.id,
             "name": self.name,
             "target": self.target,
             "datacenter_id": self.datacenter_id,
             "datacenter_name": self.datacenter_ref.name if self.datacenter_ref else None,
+            "circuit_id": self.circuit_id,
+            "circuit_name": self.circuit_ref.name if self.circuit_ref else None,
+            "circuit_line_type": self.circuit_ref.line_type if self.circuit_ref else None,
+            "circuit_customer_name": self.circuit_ref.customer_ref.name if self.circuit_ref and self.circuit_ref.customer_ref else None,
+            "circuit_bandwidth_mbps": self.circuit_ref.bandwidth_mbps if self.circuit_ref else None,
+            "circuit_device_name": circuit_device_ref.name if circuit_device_ref else None,
+            "circuit_device_ip": circuit_device_ref.ip_address if circuit_device_ref else None,
+            "circuit_port_name": circuit_port_name,
+            "circuit_local_interconnect_ip": circuit_local_interconnect_ip,
+            "circuit_remote_interconnect_ip": circuit_remote_interconnect_ip,
+            "device_id": self.device_id,
+            "device_name": self.device_ref.name if self.device_ref else None,
+            "device_ip": self.device_ref.ip_address if self.device_ref else None,
+            "probe_source": self.probe_source or "server_icmp",
+            "nqa_admin_name": self.nqa_admin_name,
+            "nqa_operation_tag": self.nqa_operation_tag,
             "operator_name": self.operator_name,
             "interval_seconds": self.interval_seconds,
             "packet_count": self.packet_count,

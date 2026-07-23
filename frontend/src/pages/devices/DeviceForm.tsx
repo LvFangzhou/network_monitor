@@ -24,6 +24,15 @@ const statusOptions = [
 
 const interfaceScopeExamples = '例如：400G1/0/1-400G1/0/64，或 1/0/1-1/0/64，多个范围可用逗号、空格或换行分隔'
 
+const monitorProfileOptions = [
+  { value: 'roce_fabric', label: 'RoCE Fabric（两张参数网）' },
+  { value: 'dc_fabric', label: '管理网（EVPN / VXLAN Fabric）' },
+  { value: 'oob_switch', label: '带外网（传统二三层）' },
+  { value: 'firewall', label: '防火墙（传统以太网）' },
+  { value: 'general_switch', label: '其他传统交换网络' },
+  { value: 'border', label: '边界 / 出口设备' },
+]
+
 const OptionalLabel = ({ children }: { children: string }) => (
   <span>
     {children}
@@ -67,8 +76,14 @@ const applyVendorMonitoringDefaults = (form: any, vendor?: string) => {
       prometheus_url: undefined,
       prometheus_job: undefined,
       prometheus_instance: undefined,
+      roce_enabled: false,
     })
     return
+  }
+
+  const normalizedVendor = (vendor || '').toLowerCase()
+  if (normalizedVendor.includes('hillstone') || normalizedVendor.includes('山石')) {
+    form.setFieldsValue({ monitor_profile: 'firewall', roce_enabled: false })
   }
 
   form.setFieldsValue({
@@ -92,6 +107,8 @@ const applyVendorMonitoringDefaults = (form: any, vendor?: string) => {
 
 const DeviceForm = () => {
   const [form] = Form.useForm()
+  const selectedVendor = Form.useWatch('vendor', form)
+  const selectedMonitorProfile = Form.useWatch('monitor_profile', form)
   const navigate = useNavigate()
   const { id } = useParams<{ id: string }>()
   const isEdit = !!id
@@ -148,6 +165,8 @@ const DeviceForm = () => {
     try {
       const device = await getDevice(Number(id))
       const interfaceScope = device.custom_fields?.monitoring?.interface_scope || {}
+      const monitoring = device.custom_fields?.monitoring || {}
+      const monitorFeatures = monitoring.features || {}
       form.setFieldsValue({
         name: device.name,
         status: device.status || 'in_stock',
@@ -195,6 +214,10 @@ const DeviceForm = () => {
         interface_scope_mode: interfaceScope.mode || 'all',
         interface_scope_include: interfaceScope.include || interfaceScope.include_patterns || '',
         interface_scope_exclude: interfaceScope.exclude || interfaceScope.exclude_patterns || '',
+        monitor_profile: monitoring.monitor_profile,
+        roce_enabled: monitorFeatures.roce,
+        evpn_vxlan_enabled: monitorFeatures.evpn_vxlan,
+        flow_export_enabled: monitorFeatures.flow_export,
         custom_fields_text: device.custom_fields ? JSON.stringify(device.custom_fields, null, 2) : '',
       })
     } catch (error) {
@@ -225,6 +248,19 @@ const DeviceForm = () => {
           exclude: interfaceScopeMode === 'exclude' ? (values.interface_scope_exclude || '') : '',
         },
       }
+      if (values.monitor_profile) {
+        parsedCustomFields.monitoring.monitor_profile = values.monitor_profile
+      }
+      const featureValues: Record<string, boolean> = {}
+      if (typeof values.roce_enabled === 'boolean') featureValues.roce = values.roce_enabled
+      if (typeof values.evpn_vxlan_enabled === 'boolean') featureValues.evpn_vxlan = values.evpn_vxlan_enabled
+      if (typeof values.flow_export_enabled === 'boolean') featureValues.flow_export = values.flow_export_enabled
+      if (Object.keys(featureValues).length > 0) {
+        parsedCustomFields.monitoring.features = {
+          ...(parsedCustomFields.monitoring.features || {}),
+          ...featureValues,
+        }
+      }
       if (monitorSource === 'asternos_exporter') {
         parsedCustomFields.monitoring = {
           ...(parsedCustomFields.monitoring || {}),
@@ -249,17 +285,20 @@ const DeviceForm = () => {
         prometheus_url: exporterUrl,
         prometheus_job: undefined,
         prometheus_instance: undefined,
-        snmp: {
-          version: values.snmp?.version || 'v2c',
-          port: values.snmp?.port || 161,
-          community: values.snmp?.community,
-          username: values.snmp?.username,
-          auth_protocol: values.snmp?.auth_protocol,
-          auth_password: values.snmp?.auth_password,
-          priv_protocol: values.snmp?.priv_protocol,
-          priv_password: values.snmp?.priv_password,
-          security_level: values.snmp?.security_level,
-        },
+        snmp:
+          monitorSource === 'asternos_exporter'
+            ? undefined
+            : {
+                version: values.snmp?.version || 'v2c',
+                port: values.snmp?.port || 161,
+                community: values.snmp?.community,
+                username: values.snmp?.username,
+                auth_protocol: values.snmp?.auth_protocol,
+                auth_password: values.snmp?.auth_password,
+                priv_protocol: values.snmp?.priv_protocol,
+                priv_password: values.snmp?.priv_password,
+                security_level: values.snmp?.security_level,
+              },
         gnmi: {
           enabled: monitorSource === 'snmp' ? values.network_monitor_mode === 'snmp_telemetry' : false,
           port: values.gnmi?.port || 57400,
@@ -464,6 +503,37 @@ const DeviceForm = () => {
           </Card>
 
           <Card size="small" title="监控配置" bordered={false} style={compactCardStyle}>
+
+        <Form.Item
+          name="monitor_profile"
+          label={<LabelWithTip label="监控模板" tip="决定设备适用的告警能力。留空时系统会按厂商、型号和设备角色自动匹配。" />}
+          style={compactFormItemStyle}
+        >
+          <Select
+            allowClear
+            placeholder="自动匹配"
+            options={monitorProfileOptions}
+            onChange={(value) => {
+              if (value === 'roce_fabric') {
+                form.setFieldsValue({ roce_enabled: true, evpn_vxlan_enabled: false })
+              } else if (value === 'dc_fabric') {
+                form.setFieldsValue({ roce_enabled: false, evpn_vxlan_enabled: true })
+              }
+            }}
+          />
+        </Form.Item>
+
+        <Space size={20} wrap style={{ marginBottom: 12 }}>
+          <Form.Item name="roce_enabled" label="RoCE / PFC / ECN" valuePropName="checked" style={{ marginBottom: 0 }}>
+            <Switch disabled={isAsterNOSVendor(selectedVendor)} />
+          </Form.Item>
+          <Form.Item name="evpn_vxlan_enabled" label="EVPN / VXLAN" valuePropName="checked" style={{ marginBottom: 0 }}>
+            <Switch disabled={selectedMonitorProfile === 'roce_fabric'} />
+          </Form.Item>
+          <Form.Item name="flow_export_enabled" label="流量导出" valuePropName="checked" style={{ marginBottom: 0 }}>
+            <Switch />
+          </Form.Item>
+        </Space>
 
         <Form.Item
           name="is_monitored"

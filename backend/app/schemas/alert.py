@@ -116,6 +116,12 @@ class AlertIgnore(BaseModel):
     actor_username: Optional[str] = None
 
 
+class AlertQuickSilence(BaseModel):
+    """从告警历史快捷创建限时屏蔽。"""
+    duration_hours: int = Field(..., ge=1, le=24 * 30)
+    actor_username: Optional[str] = None
+
+
 class AlertHistoryClear(BaseModel):
     """批量清除告警历史"""
     view: Optional[str] = None

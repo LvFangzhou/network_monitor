@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Card, DatePicker, Empty, Input, Select, Space, Spin, message } from 'antd'
 import { CloseOutlined, HolderOutlined, LockOutlined, ReloadOutlined, SearchOutlined, UnlockOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
@@ -53,6 +53,7 @@ type TrafficDashboardPrefs = {
   locked?: boolean
   defaultCircuitIds?: number[]
   visibleCircuitIds?: number[]
+  summaryPresetKeys?: string[]
 }
 
 type CircuitTrafficCard = {
@@ -327,11 +328,13 @@ const TrafficChart = ({
   subtitle,
   data,
   scale,
+  headerExtra,
 }: {
   title?: string
   subtitle?: string
   data: TrafficChartPoint[]
   scale: ChartScale
+  headerExtra?: ReactNode
 }) => {
   const [left, setLeft] = useState<number | null>(null)
   const [right, setRight] = useState<number | null>(null)
@@ -385,8 +388,16 @@ const TrafficChart = ({
           ) : null}
         </div>
       )}
-      extra={domain[0] !== 'dataMin' ? <Button size="small" type="link" onClick={resetZoom}>还原</Button> : null}
-      styles={{ body: { height: 300 } }}
+      extra={domain[0] !== 'dataMin' || headerExtra ? (
+        <Space wrap size={6} style={{ justifyContent: 'flex-end' }}>
+          {domain[0] !== 'dataMin' ? <Button size="small" type="link" onClick={resetZoom}>还原</Button> : null}
+          {headerExtra}
+        </Space>
+      ) : null}
+      styles={{
+        header: { padding: '8px 12px', minHeight: 54 },
+        body: { height: 300, padding: '6px 8px 8px' },
+      }}
     >
       {chartData.length ? (
         <ResponsiveContainer width="100%" height="100%">
@@ -630,9 +641,11 @@ const TrafficQuery = () => {
 
     setDashboardLoading(true)
     try {
-      const defaultPresetKeys = DEFAULT_SUMMARY_PRESETS.map((item) => item.key)
+      const requiredDefaultKeys = DEFAULT_SUMMARY_PRESETS.map((item) => item.key)
+      const savedDefaultOrder = (prefs.summaryPresetKeys || []).filter((key) => requiredDefaultKeys.includes(key))
+      const defaultPresetKeys = [...savedDefaultOrder, ...requiredDefaultKeys.filter((key) => !savedDefaultOrder.includes(key))]
       setSelectedPresetKeys(defaultPresetKeys)
-      await Promise.all(DEFAULT_SUMMARY_PRESETS.map((preset) => loadSummaryTrafficCard(preset)))
+      await Promise.all(defaultPresetKeys.map((key) => DEFAULT_SUMMARY_PRESETS.find((preset) => preset.key === key)).filter(Boolean).map((preset) => loadSummaryTrafficCard(preset as SummaryPreset)))
       if (visible.length) {
         const result = await getCircuits({ limit: 1000, status: 'active' })
         const byId = new Map((result.items || []).map((item) => [item.id, item]))
@@ -786,6 +799,7 @@ const TrafficQuery = () => {
     const nextKeys = Array.from(new Set([...defaultKeys, ...extraKeys]))
     const prevKeys = selectedPresetKeys
     setSelectedPresetKeys(nextKeys)
+    savePrefs({ summaryPresetKeys: nextKeys })
 
     const addedKeys = nextKeys.filter((key) => !prevKeys.includes(key))
     const removedKeys = prevKeys.filter((key) => !nextKeys.includes(key))
@@ -856,6 +870,29 @@ const TrafficQuery = () => {
     })
   }
 
+  const reorderDashboardCards = (sourceId: number, targetId: number) => {
+    if (layoutLocked || sourceId === targetId) return
+    if (sourceId >= 0 && targetId >= 0) {
+      reorderVisibleCards(sourceId, targetId)
+      return
+    }
+    if (sourceId < 0 && targetId < 0) {
+      const sourcePreset = summaryPresets.find((item) => getSummaryPresetId(item) === sourceId)
+      const targetPreset = summaryPresets.find((item) => getSummaryPresetId(item) === targetId)
+      if (!sourcePreset || !targetPreset) return
+      setSelectedPresetKeys((prev) => {
+        const sourceIndex = prev.indexOf(sourcePreset.key)
+        const targetIndex = prev.indexOf(targetPreset.key)
+        if (sourceIndex < 0 || targetIndex < 0) return prev
+        const next = [...prev]
+        const [moved] = next.splice(sourceIndex, 1)
+        next.splice(targetIndex, 0, moved)
+        savePrefs({ summaryPresetKeys: next })
+        return next
+      })
+    }
+  }
+
   const toggleLayoutLocked = () => {
     setLayoutLocked((prev) => {
       const next = !prev
@@ -865,8 +902,9 @@ const TrafficQuery = () => {
   }
 
   const visibleCards = Array.from(new Set(visibleCircuitIds)).map((id) => dashboardCards[id]).filter(Boolean)
-  const summaryCards = summaryPresets
-    .filter((preset) => selectedPresetKeys.includes(preset.key))
+  const summaryCards = selectedPresetKeys
+    .map((key) => summaryPresets.find((preset) => preset.key === key))
+    .filter((preset): preset is SummaryPreset => Boolean(preset))
     .map((preset) => dashboardCards[getSummaryPresetId(preset)])
     .filter(Boolean)
     .filter((card, index, cards) => cards.findIndex((item) => item.circuit.id === card.circuit.id || item.circuit.name === card.circuit.name) === index)
@@ -892,50 +930,59 @@ const TrafficQuery = () => {
     const detailGridColumns = card.targets.length === 2 ? 'repeat(2, minmax(0, 1fr))' : 'repeat(auto-fit, minmax(420px, 1fr))'
     const query = getCardQueryState(card.circuit.id)
     const controls = (
-      <Space wrap size="small" style={{ width: '100%', justifyContent: 'flex-end' }}>
-        <Select value={query.rangeValue} size="small" style={{ width: 132 }} options={RANGE_OPTIONS} onChange={(value) => handleCardRangeChange(card.circuit.id, value)} />
+      <Space wrap size={6} style={{ justifyContent: 'flex-end' }}>
+        <Button
+          size="small"
+          icon={<HolderOutlined />}
+          draggable={!layoutLocked}
+          disabled={layoutLocked}
+          title={layoutLocked ? '请先解除位置锁定' : '按住拖动调整图表顺序'}
+          onDragStart={() => {
+            if (!layoutLocked) setDraggingId(card.circuit.id)
+          }}
+          style={{
+            color: layoutLocked ? undefined : '#1677ff',
+            borderColor: layoutLocked ? undefined : '#91caff',
+            background: layoutLocked ? undefined : '#e6f4ff',
+            cursor: layoutLocked ? 'not-allowed' : 'grab',
+            fontWeight: 500,
+          }}
+        >
+          拖动
+        </Button>
+        <Select value={query.rangeValue} size="small" style={{ width: 124 }} options={RANGE_OPTIONS} onChange={(value) => handleCardRangeChange(card.circuit.id, value)} />
         {query.rangeValue === 'custom' ? (
           <RangePicker size="small" showTime value={query.customRange as any} onChange={(value) => handleCardCustomRangeChange(card.circuit.id, value as any)} />
         ) : null}
-        <Select value={query.intervalValue} size="small" style={{ width: 104 }} options={INTERVAL_OPTIONS} onChange={(value) => handleCardIntervalChange(card.circuit.id, value)} />
+        <Select value={query.intervalValue} size="small" style={{ width: 94 }} options={INTERVAL_OPTIONS} onChange={(value) => handleCardIntervalChange(card.circuit.id, value)} />
         <Button size="small" icon={<ReloadOutlined />} loading={card.loading} onClick={() => { void reloadCardById(card.circuit.id, true) }} />
         {!isSummaryCard ? <Button size="small" type="text" danger icon={<CloseOutlined />} onClick={() => removeCard(card.circuit.id)} /> : null}
       </Space>
     )
     return (
-      <Card
+      <div
         key={card.circuit.id}
-        draggable={false}
         onDragOver={(event) => {
-          if (!layoutLocked && !isSummaryCard) event.preventDefault()
+          if (!layoutLocked) event.preventDefault()
         }}
         onDrop={(event) => {
           event.preventDefault()
-          if (draggingId && !isSummaryCard) reorderVisibleCards(draggingId, card.circuit.id)
+          if (draggingId) reorderDashboardCards(draggingId, card.circuit.id)
           setDraggingId(null)
         }}
-        style={{ gridColumn: getTrafficCardGridColumn(card) }}
-        styles={{ body: { padding: 14 } }}
+        style={{ gridColumn: getTrafficCardGridColumn(card), minWidth: 0 }}
       >
         <Spin spinning={Boolean(card.loading)} tip="正在读取接口历史流量...">
           {card.error ? (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={card.error} />
+            <Card size="small"><Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={card.error} /></Card>
           ) : (
-            <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-              {!isSummaryCard ? (
-                <HolderOutlined
-                  draggable={!layoutLocked}
-                  onDragStart={() => {
-                    if (!layoutLocked) setDraggingId(card.circuit.id)
-                  }}
-                  style={{ color: layoutLocked ? '#d9d9d9' : '#8c8c8c', cursor: layoutLocked ? 'not-allowed' : 'grab', alignSelf: 'flex-start' }}
-                />
-              ) : null}
+            <div style={{ display: 'grid', gap: 12 }}>
               <TrafficChart
                 title={getCardTitle(card)}
                 subtitle={isSummaryCard ? getSummaryCardSubtitle(summaryPresets.find((preset) => getSummaryPresetId(preset) === card.circuit.id) || DEFAULT_SUMMARY_PRESETS[0]) : getCardSubtitle(card)}
                 data={aggregateData}
                 scale={chartScale}
+                headerExtra={controls}
               />
               {showTargetCharts ? (
                 <div style={{ display: 'grid', gridTemplateColumns: detailGridColumns, gap: 16 }}>
@@ -950,11 +997,10 @@ const TrafficQuery = () => {
                   ))}
                 </div>
               ) : null}
-              {controls}
-            </Space>
+            </div>
           )}
         </Spin>
-      </Card>
+      </div>
     )
   }
 
@@ -1057,9 +1103,10 @@ const TrafficQuery = () => {
             </Button>
           </Space>
         )}
+        styles={{ body: { padding: 12 } }}
       >
         <Spin spinning={dashboardLoading} tip="正在加载默认图表...">
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 16 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
             {summaryCards.map(renderTrafficCard)}
             {visibleNonDuplicateCards.map(renderTrafficCard)}
           </div>

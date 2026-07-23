@@ -253,6 +253,26 @@ def ensure_compatible_schema() -> None:
             ))
 
         if "quality_probe_targets" in table_names:
+            quality_probe_columns = {column["name"] for column in inspector.get_columns("quality_probe_targets")}
+            if "circuit_id" not in quality_probe_columns:
+                connection.execute(text(
+                    "ALTER TABLE quality_probe_targets ADD COLUMN circuit_id INTEGER "
+                    "REFERENCES circuits(id) ON DELETE SET NULL"
+                ))
+            if "device_id" not in quality_probe_columns:
+                connection.execute(text(
+                    "ALTER TABLE quality_probe_targets ADD COLUMN device_id INTEGER "
+                    "REFERENCES devices(id) ON DELETE SET NULL"
+                ))
+            if "probe_source" not in quality_probe_columns:
+                connection.execute(text(
+                    "ALTER TABLE quality_probe_targets ADD COLUMN probe_source VARCHAR(30) "
+                    "NOT NULL DEFAULT 'server_icmp'"
+                ))
+            if "nqa_admin_name" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN nqa_admin_name VARCHAR(32)"))
+            if "nqa_operation_tag" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN nqa_operation_tag VARCHAR(32)"))
             connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_active "
                 "ON quality_probe_targets (is_active, id)"
@@ -260,6 +280,14 @@ def ensure_compatible_schema() -> None:
             connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_datacenter "
                 "ON quality_probe_targets (datacenter_id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_circuit "
+                "ON quality_probe_targets (circuit_id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_device "
+                "ON quality_probe_targets (device_id)"
             ))
 
         if "alert_histories" in table_names:

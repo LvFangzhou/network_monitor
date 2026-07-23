@@ -21,6 +21,9 @@ from app.collectors import snmp_collector
 from app.core import get_logger
 from app.utils import redis_client, influx_client
 from app.utils.asternos_exporter_client import asternos_exporter_client
+from app.utils.monitor_profile import device_feature_enabled
+from app.utils.forwarding_collectors import collect_device_forwarding
+from app.utils.telemetry_forwarding import forwarding_cache_key
 
 logger = get_logger(__name__)
 
@@ -65,13 +68,20 @@ MONITOR_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 ASTERNOS_TASK_LOCK_TTL_SECONDS = max(45, min(180, ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS * 2))
 INTERFACE_REALTIME_LOCK_TTL_SECONDS = 120
 INTERFACE_REALTIME_MAX_WORKERS = max(1, int(settings.SNMP_INTERFACE_REALTIME_MAX_WORKERS))
+ROCE_INTERFACE_HEALTH_INTERVAL_SECONDS = 5 * 60
+ROCE_INTERFACE_HEALTH_BATCH_COUNT = max(1, math.ceil(ROCE_INTERFACE_HEALTH_INTERVAL_SECONDS / SNMP_SCHEDULER_INTERVAL_SECONDS))
+ROCE_INTERFACE_HEALTH_MAX_WORKERS = 6
 INTERFACE_RATE_CAP_MULTIPLIER = 1.03
 ICMP_REACHABILITY_LOCK_TTL_SECONDS = max(25, (ICMP_PING_PACKETS * ICMP_PING_TIMEOUT_SECONDS) + 15)
 DEVICE_DETAIL_PREWARM_INTERVAL_SECONDS = 600
 DEVICE_DETAIL_PREWARM_BATCH_COUNT = 10
 DEVICE_DETAIL_PREWARM_MAX_WORKERS = 4
-DEVICE_DETAIL_PREWARM_LOCK_TTL_SECONDS = 180
-DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS = 30 * 60
+DEVICE_DETAIL_PREWARM_LOCK_TTL_SECONDS = 6 * 60 * 60
+# 全量连接快照每天 00:00、12:00 更新。保留24小时可覆盖两轮之间的间隔，
+# 也能在某一轮调度异常时继续展示最近一次有效邻居信息。
+DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS = 24 * 60 * 60
+FORWARDING_PREWARM_MAX_WORKERS = 2
+FORWARDING_PREWARM_LOCK_TTL_SECONDS = 3 * 60 * 60
 ASTERNOS_COUNTER_METRICS = [
     {
         "field": "queue_egress_dropped_pkts_delta",
@@ -299,6 +309,14 @@ def _device_detail_prewarm_lock_key() -> str:
     return "device_detail_prewarm:lock"
 
 
+def _forwarding_prewarm_lock_key() -> str:
+    return "forwarding_prewarm:lock"
+
+
+def _forwarding_device_lock_key(device_id: int) -> str:
+    return f"forwarding_collect:lock:{int(device_id)}"
+
+
 def _bucket_cursor_key(kind: str) -> str:
     return f"collect:bucket_cursor:{kind}"
 
@@ -399,6 +417,40 @@ def _build_qos_discard_rule_payload(name: str, metric_type: str) -> Dict[str, An
     }
 
 
+def _build_roce_interface_rule_payload(
+    name: str,
+    metric_type: str,
+    threshold: float,
+    description: str,
+    notification_channels: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "rule_type": "threshold",
+        "metric_type": metric_type,
+        "condition": ">",
+        "threshold": threshold,
+        "duration": 120,
+        "severity": "P1",
+        "suppress_duration": 300,
+        "enabled": 1,
+        "device_ids": [],
+        "extra_config": {
+            "applicable_vendors": ["H3C"],
+            "model_regex": "^S9867-128DH$",
+            "monitor_profiles": ["roce_fabric"],
+            "required_features": ["roce"],
+            "time_range": "-15m",
+            "max_sample_age_seconds": 420,
+            "interface_regex": "^(FourHundredGigE|HundredGigE|Ten-GigabitEthernet).*",
+            "exclude_interface_regex": "^(NULL|Loop|InLoop|Vlan-interface|M-GigabitEthernet).*",
+            "generated_by": "ensure_h3c_s9867_roce_rules_v1",
+        },
+        "notification_channels": notification_channels,
+    }
+
+
 def _ensure_alert_rule(db, payload: Dict[str, Any]) -> Dict[str, Any]:
     rule = db.query(AlertRule).filter(AlertRule.name == payload["name"]).first()
     created = False
@@ -443,23 +495,26 @@ def _lldp_rows_have_useful_neighbor(rows: List[Dict[str, Any]]) -> bool:
         remote = str(row.get("remote_display_name") or row.get("remote_system") or row.get("peer") or "").strip()
         remote_port = str(row.get("remote_port") or row.get("remote_port_id") or row.get("remote_interface") or "").strip()
         remote_mgmt = str(row.get("remote_mgmt_addr") or row.get("remote_management_ip") or row.get("management_address") or "").strip()
-        if remote and remote not in {"-", "--"} and not _looks_like_mac(remote):
+        if remote and remote not in {"-", "--", "_", "__", "___"} and not _looks_like_mac(remote):
             return True
-        if remote_port and remote_port not in {"-", "--"} and not _looks_like_mac(remote_port):
+        if remote_port and remote_port not in {"-", "--", "_", "__", "___"} and not _looks_like_mac(remote_port):
             return True
         if remote_mgmt and remote_mgmt not in {"0.0.0.0", "-", "--"}:
             return True
     return False
 
 
-def _prewarm_lldp_neighbors(device: Device, db) -> Dict[str, Any]:
+def _prewarm_lldp_neighbors(device: Device, db, force_refresh: bool = False) -> Dict[str, Any]:
     cached_rows = _extract_cached_lldp_rows(_load_monitor_cache("lldp_neighbors_v2", device.id))
-    if _lldp_rows_have_useful_neighbor(cached_rows):
+    if not force_refresh and _lldp_rows_have_useful_neighbor(cached_rows):
         return {"lldp_cached": True, "lldp_neighbors": len(cached_rows)}
 
     from app.routers.metrics import _apply_lldp_device_ip_fallback, _collect_lldp_neighbors_from_cli, _merge_lldp_snmp_and_cli
 
-    snmp_rows = snmp_collector.collect_lldp_neighbors(device)
+    # AsterNOS 只使用 Exporter + CLI，不支持也不依赖 SNMP。这里如果执行
+    # snmpbulkwalk 会稳定等待161端口超时，拖慢整批全量预热。
+    is_asternos = str(device.monitor_source or "").strip().lower() == "asternos_exporter"
+    snmp_rows = [] if is_asternos else snmp_collector.collect_lldp_neighbors(device)
     cli_rows = _collect_lldp_neighbors_from_cli(device)
     rows = _merge_lldp_snmp_and_cli(snmp_rows or [], cli_rows or [])
     should_close_db = False
@@ -471,15 +526,16 @@ def _prewarm_lldp_neighbors(device: Device, db) -> Dict[str, Any]:
     finally:
         if should_close_db:
             db.close()
-    _set_monitor_cache("lldp_neighbors_v2", device.id, {
-        "neighbors": rows,
-        "collected_at": datetime.now(timezone.utc).isoformat(),
-        "source": "prewarm_snmp_cli",
-    })
+    if _lldp_rows_have_useful_neighbor(rows):
+        _set_monitor_cache("lldp_neighbors_v2", device.id, {
+            "neighbors": rows,
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "source": "prewarm_exporter_cli" if is_asternos else "prewarm_snmp_cli",
+        })
     return {"lldp_cached": False, "lldp_neighbors": len(rows)}
 
 
-def _prewarm_device_detail_snapshot(device: Device) -> Dict[str, Any]:
+def _prewarm_device_detail_snapshot(device: Device, force_lldp_refresh: bool = False) -> Dict[str, Any]:
     monitor_source = str(device.monitor_source or "snmp")
     collected_at = datetime.now(timezone.utc).isoformat()
 
@@ -509,7 +565,13 @@ def _prewarm_device_detail_snapshot(device: Device) -> Dict[str, Any]:
         }
         _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at, "source": "prewarm_exporter"})
         _set_monitor_cache("overview", device.id, overview)
-        return {"device_id": device.id, "source": "asternos_exporter", "interfaces": len(interfaces)}
+        result = {"device_id": device.id, "source": "asternos_exporter", "interfaces": len(interfaces)}
+        try:
+            result.update(_prewarm_lldp_neighbors(device, None, force_refresh=force_lldp_refresh))
+        except Exception as exc:
+            logger.warning("AsterNOS设备详情LLDP预热失败", device_id=device.id, ip_address=device.ip_address, error=str(exc))
+            result["lldp_error"] = str(exc)
+        return result
 
     if not device.snmp_version:
         return {"device_id": device.id, "skipped": "no_snmp"}
@@ -518,7 +580,7 @@ def _prewarm_device_detail_snapshot(device: Device) -> Dict[str, Any]:
     _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at, "source": "prewarm_snmp"})
     result = {"device_id": device.id, "source": "snmp", "interfaces": len(interfaces)}
     try:
-        result.update(_prewarm_lldp_neighbors(device, None))
+        result.update(_prewarm_lldp_neighbors(device, None, force_refresh=force_lldp_refresh))
     except Exception as exc:
         logger.warning("设备详情LLDP预热失败", device_id=device.id, ip_address=device.ip_address, error=str(exc))
         result["lldp_error"] = str(exc)
@@ -543,9 +605,101 @@ def ensure_qos_discard_rules():
         db.close()
 
 
-@shared_task(name="app.tasks.snmp_tasks.prewarm_device_detail_caches")
+@shared_task(name="app.tasks.snmp_tasks.ensure_h3c_s9867_roce_rules")
+def ensure_h3c_s9867_roce_rules():
+    """创建仅适用于H3C S9867 RoCE Fabric的接口质量规则。"""
+    db = SessionLocal()
+    try:
+        source_rule = (
+            db.query(AlertRule)
+            .filter(AlertRule.metric_type == "interface_in_errors_delta")
+            .order_by(AlertRule.id.asc())
+            .first()
+        )
+        channels = list(source_rule.notification_channels or []) if source_rule else []
+        definitions = [
+            ("【H3C S9867 RoCE】接口入方向错误包增长", "interface_in_errors_delta", 0.0, "RoCE物理端口入方向错误包在采集周期内出现增长。"),
+            ("【H3C S9867 RoCE】接口出方向错误包增长", "interface_out_errors_delta", 0.0, "RoCE物理端口出方向错误包在采集周期内出现增长。"),
+            ("【H3C S9867 RoCE】接口入方向丢弃包增长", "interface_in_discards_delta", 60.0, "RoCE物理端口入方向丢弃包在采集周期内增长超过60。"),
+            ("【H3C S9867 RoCE】接口出方向丢弃包增长", "interface_out_discards_delta", 60.0, "RoCE物理端口出方向丢弃包在采集周期内增长超过60。"),
+        ]
+        results = [
+            _ensure_alert_rule(db, _build_roce_interface_rule_payload(name, metric, threshold, description, channels))
+            for name, metric, threshold, description in definitions
+        ]
+        db.commit()
+        return {"success": True, "rules": results}
+    except Exception as exc:
+        db.rollback()
+        logger.error("确保H3C S9867 RoCE规则失败", error=str(exc))
+        return {"success": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+@shared_task(name="app.tasks.snmp_tasks.collect_h3c_s9867_roce_interface_health")
+def collect_h3c_s9867_roce_interface_health():
+    """每5分钟分桶采集S9867错误/丢弃计数，流量高频采集保持最高优先级。"""
+    lock_token = _try_lock_interface_realtime("roce_health")
+    if not lock_token:
+        return {"skipped": True, "reason": "上一轮RoCE接口健康采集未完成"}
+    db = SessionLocal()
+    try:
+        devices = db.query(Device).filter(
+            Device.snmp_version.isnot(None),
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+            or_(Device.monitor_source == "snmp", Device.monitor_source.is_(None)),
+        ).order_by(Device.id.asc()).all()
+        devices = [device for device in devices if device_feature_enabled(device, "roce")]
+        bucket = _next_round_robin_bucket("roce_interface_health", ROCE_INTERFACE_HEALTH_BATCH_COUNT)
+        selected = [device for device in devices if int(device.id or 0) % ROCE_INTERFACE_HEALTH_BATCH_COUNT == bucket]
+        results = []
+        skipped_locked = 0
+
+        def collect(device: Device) -> Dict[str, Any]:
+            if _get_device_status(device.id) == SNMP_STATUS_UNREACHABLE:
+                return {"device_id": device.id, "skipped": "unreachable"}
+            if not _try_lock_device(device.id):
+                return {"device_id": device.id, "skipped": "locked"}
+            try:
+                return snmp_collector.collect_interface_health(device)
+            finally:
+                _release_device_lock(device.id)
+
+        workers = min(ROCE_INTERFACE_HEALTH_MAX_WORKERS, max(1, len(selected)))
+        if selected:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(collect, device): device for device in selected}
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result.get("skipped") == "locked":
+                            skipped_locked += 1
+                        results.append(result)
+                    except Exception as exc:
+                        logger.warning("S9867 RoCE接口健康采集失败", device_id=futures[future].id, error=str(exc))
+        return {
+            "devices_total": len(devices),
+            "bucket": bucket,
+            "bucket_count": ROCE_INTERFACE_HEALTH_BATCH_COUNT,
+            "devices_selected": len(selected),
+            "devices_collected": len(results),
+            "points_written": sum(int(item.get("points_written") or 0) for item in results),
+            "skipped_locked": skipped_locked,
+        }
+    finally:
+        db.close()
+        _release_interface_realtime_lock("roce_health", lock_token)
+
+
+@shared_task(
+    name="app.tasks.snmp_tasks.prewarm_device_detail_caches",
+    time_limit=4 * 60 * 60,
+    soft_time_limit=3 * 60 * 60 + 50 * 60,
+)
 def prewarm_device_detail_caches():
-    """后台分桶预热设备详情所需缓存，允许前台读取 10 分钟内快照以换取秒开。"""
+    """每天00:00、12:00全量刷新设备连接缓存，普通详情页只读取该快照。"""
     lock_token = _try_lock_device_detail_prewarm()
     if not lock_token:
         return {"skipped": True, "reason": "上一轮设备详情预热未完成"}
@@ -556,17 +710,16 @@ def prewarm_device_detail_caches():
             Device.status.in_(["active", "online"]),
             Device.is_monitored == True,
         ).order_by(Device.id.asc()).all()
-        current_bucket = _next_round_robin_bucket("device_detail_prewarm", DEVICE_DETAIL_PREWARM_BATCH_COUNT)
-        devices_in_bucket = [
-            device for device in devices
-            if int(device.id or 0) % DEVICE_DETAIL_PREWARM_BATCH_COUNT == current_bucket
-        ]
+        devices_in_bucket = devices
         workers = min(DEVICE_DETAIL_PREWARM_MAX_WORKERS, max(1, len(devices_in_bucket)))
         results: List[Dict[str, Any]] = []
 
         if devices_in_bucket:
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(_prewarm_device_detail_snapshot, device): device for device in devices_in_bucket}
+                futures = {
+                    executor.submit(_prewarm_device_detail_snapshot, device, True): device
+                    for device in devices_in_bucket
+                }
                 for future in as_completed(futures):
                     device = futures[future]
                     try:
@@ -577,8 +730,7 @@ def prewarm_device_detail_caches():
 
         return {
             "success": True,
-            "bucket": current_bucket,
-            "bucket_count": DEVICE_DETAIL_PREWARM_BATCH_COUNT,
+            "mode": "full",
             "total_devices": len(devices),
             "devices_in_bucket": len(devices_in_bucket),
             "results": results,
@@ -588,6 +740,92 @@ def prewarm_device_detail_caches():
         return {"success": False, "error": str(exc)}
     finally:
         _release_device_detail_prewarm_lock(lock_token)
+        db.close()
+
+
+def _forwarding_cache_is_fresh(device_id: int, max_age_seconds: int = 11 * 60 * 60) -> bool:
+    newest: List[datetime] = []
+    for table_name in ("arp", "ipv4_routes"):
+        raw = redis_client.get(forwarding_cache_key(device_id, table_name))
+        if not raw:
+            return False
+        try:
+            payload = json.loads(raw)
+            value = str(payload.get("collected_at") or "").replace("Z", "+00:00")
+            collected_at = datetime.fromisoformat(value)
+            if collected_at.tzinfo is None:
+                collected_at = collected_at.replace(tzinfo=timezone.utc)
+            newest.append(collected_at.astimezone(timezone.utc))
+        except (TypeError, ValueError):
+            return False
+    return bool(newest) and all((datetime.now(timezone.utc) - value).total_seconds() < max_age_seconds for value in newest)
+
+
+@shared_task(
+    name="app.tasks.snmp_tasks.collect_forwarding_for_device",
+    time_limit=10 * 60,
+    soft_time_limit=9 * 60,
+)
+def collect_forwarding_for_device(device_id: int):
+    lock_key = _forwarding_device_lock_key(device_id)
+    if not redis_client.set(lock_key, "1", ex=10 * 60, nx=True):
+        return {"device_id": device_id, "skipped": "collecting"}
+    db = SessionLocal()
+    try:
+        device = db.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            return {"device_id": device_id, "error": "device_not_found"}
+        return collect_device_forwarding(device)
+    except Exception as exc:
+        logger.warning("设备转发表采集失败", device_id=device_id, error=str(exc))
+        return {"device_id": device_id, "error": str(exc)}
+    finally:
+        db.close()
+        redis_client.delete(lock_key)
+
+
+@shared_task(
+    name="app.tasks.snmp_tasks.prewarm_forwarding_caches",
+    time_limit=3 * 60 * 60,
+    soft_time_limit=2 * 60 * 60 + 50 * 60,
+)
+def prewarm_forwarding_caches(force: bool = False):
+    token = uuid.uuid4().hex
+    if not redis_client.set(_forwarding_prewarm_lock_key(), token, ex=FORWARDING_PREWARM_LOCK_TTL_SECONDS, nx=True):
+        return {"skipped": True, "reason": "previous forwarding prewarm still running"}
+    db = SessionLocal()
+    try:
+        devices = db.query(Device).filter(
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+        ).order_by(Device.id.asc()).all()
+        selected = list(devices) if force else [device for device in devices if not _forwarding_cache_is_fresh(device.id)]
+        results: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=FORWARDING_PREWARM_MAX_WORKERS) as executor:
+            futures = {executor.submit(collect_device_forwarding, device): device for device in selected}
+            for future in as_completed(futures):
+                device = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    logger.warning("转发表预热失败", device_id=device.id, ip_address=device.ip_address, error=str(exc))
+                    results.append({"device_id": device.id, "error": str(exc)})
+        return {
+            "success": True,
+            "force": bool(force),
+            "total_devices": len(devices),
+            "already_fresh": len(devices) - len(selected),
+            "selected": len(selected),
+            "success_count": sum(1 for item in results if not item.get("error")),
+            "failed_count": sum(1 for item in results if item.get("error")),
+            "results": results,
+        }
+    finally:
+        current = redis_client.get(_forwarding_prewarm_lock_key())
+        if isinstance(current, bytes):
+            current = current.decode("utf-8", errors="ignore")
+        if current == token:
+            redis_client.delete(_forwarding_prewarm_lock_key())
         db.close()
 
 
@@ -1035,6 +1273,49 @@ def _interface_point(device: Device, stats: Dict[str, Any], timestamp: datetime)
     _sanitize_interface_rates(stats)
     preserve_exporter_rates = str(device.monitor_source or "snmp") == "asternos_exporter"
 
+    fields = {
+        "in_bps": stats.get("in_bps") if (
+            "in_bps" in stats.get("_octet_rate_fields", [])
+            or stats.get("in_octets") is None
+            or (preserve_exporter_rates and stats.get("in_bps") is not None)
+        ) else None,
+        "out_bps": stats.get("out_bps") if (
+            "out_bps" in stats.get("_octet_rate_fields", [])
+            or stats.get("out_octets") is None
+            or (preserve_exporter_rates and stats.get("out_bps") is not None)
+        ) else None,
+        "in_octets": stats.get("in_octets"),
+        "out_octets": stats.get("out_octets"),
+        "in_utilization_percent": stats.get("in_utilization_percent"),
+        "out_utilization_percent": stats.get("out_utilization_percent"),
+        "in_discards": stats.get("in_discards"),
+        "out_discards": stats.get("out_discards"),
+        "in_discards_delta": stats.get("in_discards_delta"),
+        "out_discards_delta": stats.get("out_discards_delta"),
+        "in_errors": stats.get("in_errors"),
+        "out_errors": stats.get("out_errors"),
+        "in_errors_delta": stats.get("in_errors_delta"),
+        "out_errors_delta": stats.get("out_errors_delta"),
+        "queue_egress_dropped_pkts_delta": stats.get("queue_egress_dropped_pkts_delta"),
+        "queue_ingress_dropped_pkts_delta": stats.get("queue_ingress_dropped_pkts_delta"),
+        "pfc_rx_pkts_delta": stats.get("pfc_rx_pkts_delta"),
+        "pfc_tx_pkts_delta": stats.get("pfc_tx_pkts_delta"),
+        "ecn_marked_pkts_delta": stats.get("ecn_marked_pkts_delta"),
+        "buffer_usage": stats.get("buffer_usage"),
+        "queue_length": stats.get("queue_length"),
+        "speed_bps": stats.get("speed_bps"),
+        "sample_seconds": stats.get("sample_seconds"),
+    }
+    admin_status = stats.get("admin_status")
+    oper_status = stats.get("oper_status")
+    valid_statuses = {"up", "down", "testing", "dormant", "notPresent", "lowerLayerDown"}
+    if admin_status in valid_statuses and oper_status in valid_statuses:
+        fields.update({
+            "admin_status": 1.0 if admin_status == "up" else 0.0,
+            "oper_status": 1.0 if oper_status == "up" else 0.0,
+            "admin_up_oper_down": 1.0 if admin_status == "up" and oper_status != "up" else 0.0,
+        })
+
     return {
         "measurement": "interface_monitoring",
         "tags": {
@@ -1043,42 +1324,7 @@ def _interface_point(device: Device, stats: Dict[str, Any], timestamp: datetime)
             "interface_index": str(interface_index),
             "interface_name": stats.get("name"),
         },
-        "fields": {
-            "in_bps": stats.get("in_bps") if (
-                "in_bps" in stats.get("_octet_rate_fields", [])
-                or stats.get("in_octets") is None
-                or (preserve_exporter_rates and stats.get("in_bps") is not None)
-            ) else None,
-            "out_bps": stats.get("out_bps") if (
-                "out_bps" in stats.get("_octet_rate_fields", [])
-                or stats.get("out_octets") is None
-                or (preserve_exporter_rates and stats.get("out_bps") is not None)
-            ) else None,
-            "in_octets": stats.get("in_octets"),
-            "out_octets": stats.get("out_octets"),
-            "in_utilization_percent": stats.get("in_utilization_percent"),
-            "out_utilization_percent": stats.get("out_utilization_percent"),
-            "in_discards": stats.get("in_discards"),
-            "out_discards": stats.get("out_discards"),
-            "in_discards_delta": stats.get("in_discards_delta"),
-            "out_discards_delta": stats.get("out_discards_delta"),
-            "in_errors": stats.get("in_errors"),
-            "out_errors": stats.get("out_errors"),
-            "in_errors_delta": stats.get("in_errors_delta"),
-            "out_errors_delta": stats.get("out_errors_delta"),
-            "queue_egress_dropped_pkts_delta": stats.get("queue_egress_dropped_pkts_delta"),
-            "queue_ingress_dropped_pkts_delta": stats.get("queue_ingress_dropped_pkts_delta"),
-            "pfc_rx_pkts_delta": stats.get("pfc_rx_pkts_delta"),
-            "pfc_tx_pkts_delta": stats.get("pfc_tx_pkts_delta"),
-            "ecn_marked_pkts_delta": stats.get("ecn_marked_pkts_delta"),
-            "buffer_usage": stats.get("buffer_usage"),
-            "queue_length": stats.get("queue_length"),
-            "speed_bps": stats.get("speed_bps"),
-            "sample_seconds": stats.get("sample_seconds"),
-            "admin_status": 1.0 if stats.get("admin_status") == "up" else 0.0,
-            "oper_status": 1.0 if stats.get("oper_status") == "up" else 0.0,
-            "admin_up_oper_down": 1.0 if stats.get("admin_status") == "up" and stats.get("oper_status") != "up" else 0.0,
-        },
+        "fields": fields,
         "timestamp": timestamp,
     }
 
@@ -1780,6 +2026,7 @@ def collect_asternos_for_device(self, device_id: int):
         now = datetime.utcnow()
         collected_at = datetime.now(timezone.utc).isoformat()
         points = []
+        optical_items = []
 
         for interface in interfaces:
             stats = _build_asternos_interface_stats(device.id, metrics, interface)
@@ -1788,6 +2035,41 @@ def collect_asternos_for_device(self, device_id: int):
             if point:
                 points.append(point)
             points.extend(_asternos_queue_detail_points(device, stats, now))
+            if any(stats.get(field) is not None for field in ("rx_power", "tx_power", "optic_temperature")):
+                optical_item = {
+                    "device_id": device.id,
+                    "device_name": device.name,
+                    "device_ip": device.ip_address,
+                    "device_vendor": device.vendor,
+                    "interface_index": interface.get("index"),
+                    "interface_name": interface.get("name"),
+                    "rx_power_dbm": _safe_float(stats.get("rx_power")),
+                    "tx_power_dbm": _safe_float(stats.get("tx_power")),
+                    "temperature_c": _safe_float(stats.get("optic_temperature")),
+                    "source": "exporter",
+                    "collected_at": collected_at,
+                }
+                optical_items.append(optical_item)
+                optical_fields = {
+                    "rx_power": optical_item.get("rx_power_dbm"),
+                    "tx_power": optical_item.get("tx_power_dbm"),
+                    "temperature": optical_item.get("temperature_c"),
+                }
+                points.append({
+                    "measurement": "optical_monitoring",
+                    "tags": {
+                        "device_id": str(device.id),
+                        "device_name": device.name,
+                        "device_ip": device.ip_address,
+                        "vendor": device.vendor or "",
+                        "interface_index": str(interface.get("index") or ""),
+                        "interface_name": str(interface.get("name") or ""),
+                        "source": "exporter",
+                        "scope": "module",
+                    },
+                    "fields": optical_fields,
+                    "timestamp": now,
+                })
 
         if points:
             influx_client.write_points(points, sync=False)
@@ -1823,6 +2105,12 @@ def collect_asternos_for_device(self, device_id: int):
         _set_monitor_cache("interfaces", device.id, {"interfaces": interfaces, "collected_at": collected_at})
         _set_monitor_cache("overview", device.id, overview)
         _set_monitor_cache("protocol_neighbors", device.id, {"neighbors": neighbors, "collected_at": collected_at})
+        if optical_items:
+            _set_monitor_cache(
+                "optical_modules",
+                device.id,
+                {"items": optical_items, "collected_at": collected_at, "source": "exporter"},
+            )
         redis_client.set(f"asternos_collect:status:{device.id}", "reachable")
         _write_exporter_reachability(device, True)
 

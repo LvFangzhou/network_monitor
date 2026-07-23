@@ -55,11 +55,48 @@ export interface ServerResourceStats {
     free: number
     percent: number
   }
+  network: Array<{
+    name: string
+    operstate: string
+    speed_mbps?: number | null
+    rx_bytes: number
+    tx_bytes: number
+    rx_bps: number
+    tx_bps: number
+  }>
 }
 
 export const getServerResources = async (): Promise<ServerResourceStats> => {
   return await request.get('/metrics/server/resources') as ServerResourceStats
 }
+
+export interface ServerResourceHistory {
+  range: string
+  retention_days: number
+  samples: ServerResourceStats[]
+}
+
+export const getServerResourceHistory = async (range = '1h'): Promise<ServerResourceHistory> => {
+  return await request.get('/metrics/server/resources/history', { params: { range } }) as ServerResourceHistory
+}
+
+export const getLosslessTelemetryDevices = () =>
+  request.get<any, { total: number; items: any[] }>('/metrics/lossless/telemetry/devices')
+
+export const getLosslessTelemetrySnapshot = (deviceId: number, search?: string) =>
+  request.get<any, any>(`/metrics/lossless/telemetry/${deviceId}`, {
+    params: { search: search || undefined },
+  })
+
+export const getLocalOpticalModules = (params?: {
+  page?: number
+  page_size?: number
+  search?: string
+  device_ip?: string
+  interface_name?: string
+  vendor_name?: string
+  datacenter_name?: string
+}) => request.get<any, { total: number; items: any[]; vendors?: string[]; datacenters?: string[] }>('/metrics/modules', { params })
 
 export interface MonitorDevice {
   id: number
@@ -184,22 +221,6 @@ export interface MonitorHistoryPoint {
   [key: string]: any
 }
 
-export interface MonitorDynamicSeries {
-  key: string
-  label: string
-  color: string
-  field?: string
-  target?: string
-  queue?: string | null
-  prio?: string | null
-}
-
-export const getMonitorDeviceByIp = async (ipAddress: string): Promise<MonitorDevice> => {
-  return await request.get('/metrics/monitoring/devices/by-ip', {
-    params: { ip_address: ipAddress },
-  }) as MonitorDevice
-}
-
 export const getMonitorDeviceInterfaces = async (
   deviceId: number
 ): Promise<{ device: MonitorDevice; interfaces: MonitorInterface[]; total: number }> => {
@@ -207,18 +228,6 @@ export const getMonitorDeviceInterfaces = async (
     device: MonitorDevice
     interfaces: MonitorInterface[]
     total: number
-  }
-}
-
-export const getMonitorInterfaceStats = async (
-  deviceId: number,
-  interfaceIndex: number,
-  params?: { fresh?: boolean }
-): Promise<{ device: MonitorDevice; interface: MonitorInterface; collected_at: string }> => {
-  return await request.get(`/metrics/monitoring/devices/${deviceId}/interfaces/${interfaceIndex}`, { params }) as {
-    device: MonitorDevice
-    interface: MonitorInterface
-    collected_at: string
   }
 }
 
@@ -322,34 +331,6 @@ export const getCircuitTrafficHistory = async (
     skipped_target_count: number
     cached?: boolean
     generated_at?: string
-  }
-}
-
-export const getMonitorInterfaceQueueHistory = async (
-  deviceId: number,
-  interfaceIndex: number,
-  params: { group: string; range: string; interval: string }
-): Promise<{
-  device: MonitorDevice
-  interface_index: number
-  range: string
-  interval: string
-  series: MonitorDynamicSeries[]
-  data: MonitorHistoryPoint[]
-  total: number
-  message?: string
-}> => {
-  return await request.get(`/metrics/monitoring/devices/${deviceId}/interfaces/${interfaceIndex}/queue-history`, {
-    params,
-  }) as {
-    device: MonitorDevice
-    interface_index: number
-    range: string
-    interval: string
-    series: MonitorDynamicSeries[]
-    data: MonitorHistoryPoint[]
-    total: number
-    message?: string
   }
 }
 
@@ -751,6 +732,22 @@ export interface QualityProbeTarget {
   target: string
   datacenter_id?: number | null
   datacenter_name?: string | null
+  circuit_id?: number | null
+  circuit_name?: string | null
+  circuit_line_type?: 'internet' | 'private_line' | null
+  circuit_customer_name?: string | null
+  circuit_bandwidth_mbps?: number | null
+  circuit_device_name?: string | null
+  circuit_device_ip?: string | null
+  circuit_port_name?: string | null
+  circuit_local_interconnect_ip?: string | null
+  circuit_remote_interconnect_ip?: string | null
+  device_id?: number | null
+  device_name?: string | null
+  device_ip?: string | null
+  probe_source?: 'server_icmp' | 'device_nqa_snmp'
+  nqa_admin_name?: string | null
+  nqa_operation_tag?: string | null
   operator_name?: string | null
   interval_seconds: number
   packet_count: number
@@ -771,12 +768,34 @@ export interface QualityProbeTarget {
   updated_at?: string | null
 }
 
+export interface QualityAlertSettings {
+  rule_id?: number | null
+  enabled: boolean
+  loss_threshold_percent: number
+  consecutive_samples: number
+  severity: 'P0' | 'P1' | 'P2' | 'P3'
+  webhook_url: string
+  mention_users: string[]
+}
+
+export interface QualityTargetAlertSettings {
+  target_id: number
+  enabled: boolean
+  webhook_url: string
+  mention_users: string[]
+  channel_type?: string
+  loss_threshold_percent: number
+  consecutive_samples: number
+}
+
 export interface QualityProbeResult {
   success: boolean
   avg_latency_ms?: number | null
   min_latency_ms?: number | null
   max_latency_ms?: number | null
   jitter_ms?: number | null
+  jitter_sd_ms?: number | null
+  jitter_ds_ms?: number | null
   packet_loss_percent?: number | null
   availability_percent?: number | null
   received: number
@@ -790,8 +809,46 @@ export interface QualityProbeHistoryPoint {
   min_latency_ms?: number | null
   max_latency_ms?: number | null
   jitter_ms?: number | null
+  jitter_sd_ms?: number | null
+  jitter_ds_ms?: number | null
   packet_loss_percent?: number | null
   availability_percent?: number | null
+}
+
+export interface QualityNqaInstance {
+  key: string
+  admin_name: string
+  operation_tag: string
+  target: string
+  source?: string | null
+  frequency_seconds?: number | null
+  packet_count?: number | null
+  timeout_ms?: number | null
+  is_enabled: boolean
+  has_result: boolean
+  avg_latency_ms?: number | null
+  min_latency_ms?: number | null
+  max_latency_ms?: number | null
+  packet_loss_percent?: number | null
+  sent: number
+  received: number
+}
+
+export const getQualityNqaInstances = async (
+  deviceId: number,
+  forceRefresh = false,
+): Promise<{
+  device: { id: number; name: string; ip_address: string; datacenter_id?: number | null }
+  total: number
+  items: QualityNqaInstance[]
+}> => {
+  return await request.get('/metrics/quality/nqa-instances', {
+    params: { device_id: deviceId, force_refresh: forceRefresh },
+  }) as {
+    device: { id: number; name: string; ip_address: string; datacenter_id?: number | null }
+    total: number
+    items: QualityNqaInstance[]
+  }
 }
 
 export const getQualityProbeTargets = async (params?: {
@@ -799,6 +856,27 @@ export const getQualityProbeTargets = async (params?: {
   active?: boolean
 }): Promise<{ total: number; items: QualityProbeTarget[] }> => {
   return await request.get('/metrics/quality/probe-targets', { params }) as { total: number; items: QualityProbeTarget[] }
+}
+
+export const getQualityAlertSettings = async (): Promise<QualityAlertSettings> => {
+  return await request.get('/metrics/quality/alert-settings') as QualityAlertSettings
+}
+
+export const saveQualityAlertSettings = async (
+  data: Partial<QualityAlertSettings>
+): Promise<QualityAlertSettings> => {
+  return await request.post('/metrics/quality/alert-settings', data) as QualityAlertSettings
+}
+
+export const getQualityTargetAlertSettings = async (targetId: number): Promise<QualityTargetAlertSettings> => {
+  return await request.get(`/metrics/quality/probe-targets/${targetId}/alert-settings`) as QualityTargetAlertSettings
+}
+
+export const saveQualityTargetAlertSettings = async (
+  targetId: number,
+  data: Partial<QualityTargetAlertSettings>
+): Promise<QualityTargetAlertSettings> => {
+  return await request.post(`/metrics/quality/probe-targets/${targetId}/alert-settings`, data) as QualityTargetAlertSettings
 }
 
 export const createQualityProbeTarget = async (
@@ -857,3 +935,52 @@ export const getQualityProbeHistory = async (
     total: number
   }
 }
+
+export interface ForwardingDevice {
+  id: number
+  name: string
+  ip_address: string
+  vendor?: string
+  model?: string
+  datacenter_name?: string
+  collected_at?: string
+  arp_total: number
+  ipv4_route_total: number
+}
+
+export interface ForwardingTableResponse<T = Record<string, any>> {
+  device_id: number
+  collected_at?: string | null
+  summary: Record<string, number>
+  total: number
+  offset: number
+  limit: number
+  items: T[]
+}
+
+export const getForwardingDevices = async (): Promise<{ total: number; items: ForwardingDevice[] }> =>
+  await request.get('/metrics/forwarding/devices') as { total: number; items: ForwardingDevice[] }
+
+export const getForwardingSummary = async (deviceId: number): Promise<any> =>
+  await request.get(`/metrics/forwarding/${deviceId}/summary`)
+
+export const refreshForwardingDevice = async (deviceId: number): Promise<{ task_id: string; status: string; message: string }> =>
+  await request.post(`/metrics/forwarding/${deviceId}/refresh`)
+
+export const getForwardingArp = async (
+  deviceId: number,
+  params?: { search?: string; interface?: string; vrf_index?: number; offset?: number; limit?: number },
+): Promise<ForwardingTableResponse> =>
+  await request.get(`/metrics/forwarding/${deviceId}/arp`, { params }) as ForwardingTableResponse
+
+export const getForwardingRoutes = async (
+  deviceId: number,
+  params?: { search?: string; vrf?: string; interface?: string; group_prefix?: boolean; offset?: number; limit?: number },
+): Promise<ForwardingTableResponse> =>
+  await request.get(`/metrics/forwarding/${deviceId}/routes`, { params }) as ForwardingTableResponse
+
+export const getForwardingHistory = async (
+  deviceId: number,
+  params?: { table?: 'arp' | 'ipv4_routes'; range?: string; interval?: string },
+): Promise<{ data: Array<Record<string, any>> }> =>
+  await request.get(`/metrics/forwarding/${deviceId}/history`, { params }) as { data: Array<Record<string, any>> }

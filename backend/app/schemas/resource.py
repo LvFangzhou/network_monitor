@@ -249,6 +249,11 @@ class QualityProbeTargetBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     target: str = Field(..., min_length=1, max_length=255)
     datacenter_id: Optional[int] = None
+    circuit_id: Optional[int] = None
+    device_id: Optional[int] = None
+    probe_source: str = Field(default="server_icmp", pattern="^(server_icmp|device_nqa_snmp)$")
+    nqa_admin_name: Optional[str] = Field(None, max_length=32)
+    nqa_operation_tag: Optional[str] = Field(None, max_length=32)
     operator_name: Optional[str] = Field(None, max_length=50)
     interval_seconds: int = Field(default=60, ge=1, le=3600)
     packet_count: int = Field(default=5, ge=1, le=20)
@@ -268,6 +273,11 @@ class QualityProbeTargetUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     target: Optional[str] = Field(None, min_length=1, max_length=255)
     datacenter_id: Optional[int] = None
+    circuit_id: Optional[int] = None
+    device_id: Optional[int] = None
+    probe_source: Optional[str] = Field(None, pattern="^(server_icmp|device_nqa_snmp)$")
+    nqa_admin_name: Optional[str] = Field(None, max_length=32)
+    nqa_operation_tag: Optional[str] = Field(None, max_length=32)
     operator_name: Optional[str] = Field(None, max_length=50)
     interval_seconds: Optional[int] = Field(None, ge=1, le=3600)
     packet_count: Optional[int] = Field(None, ge=1, le=20)
@@ -282,6 +292,13 @@ class QualityProbeTargetUpdate(BaseModel):
 class QualityProbeTargetResponse(QualityProbeTargetBase):
     id: int
     datacenter_name: Optional[str] = None
+    circuit_name: Optional[str] = None
+    circuit_bandwidth_mbps: Optional[int] = None
+    circuit_device_name: Optional[str] = None
+    circuit_device_ip: Optional[str] = None
+    circuit_port_name: Optional[str] = None
+    device_name: Optional[str] = None
+    device_ip: Optional[str] = None
     last_probe_at: Optional[datetime] = None
     last_success: Optional[bool] = None
     last_avg_latency_ms: Optional[float] = None

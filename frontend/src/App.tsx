@@ -43,13 +43,13 @@ const loadAlertRules = () => import('./pages/alerts/AlertRules')
 const loadAlertHistory = () => import('./pages/alerts/AlertHistory')
 const loadAlertAudit = () => import('./pages/alerts/AlertAudit')
 const loadAlertSilences = () => import('./pages/alerts/AlertSilences')
-const loadMetrics = () => import('./pages/metrics/Metrics')
 const loadDeviceOverview = () => import('./pages/metrics/DeviceOverview')
 const loadIPFlowQuery = () => import('./pages/metrics/IPFlowQuery')
 const loadQualityQuery = () => import('./pages/metrics/QualityQuery')
 const loadTrafficQuery = () => import('./pages/metrics/TrafficQuery')
 const loadModuleInfoQuery = () => import('./pages/metrics/ModuleInfoQuery')
 const loadLosslessInfoQuery = () => import('./pages/metrics/LosslessInfoQuery')
+const loadGrafanaDashboard = () => import('./pages/metrics/GrafanaDashboard')
 const loadSettings = () => import('./pages/Settings')
 const loadTacacsManager = () => import('./pages/TacacsManager')
 const loadConfigBackups = () => import('./pages/ConfigBackups')
@@ -70,13 +70,13 @@ const AlertRules = lazyWithReload(loadAlertRules)
 const AlertHistory = lazyWithReload(loadAlertHistory)
 const AlertAudit = lazyWithReload(loadAlertAudit)
 const AlertSilences = lazyWithReload(loadAlertSilences)
-const Metrics = lazyWithReload(loadMetrics)
 const DeviceOverview = lazyWithReload(loadDeviceOverview)
 const IPFlowQuery = lazyWithReload(loadIPFlowQuery)
 const QualityQuery = lazyWithReload(loadQualityQuery)
 const TrafficQuery = lazyWithReload(loadTrafficQuery)
 const ModuleInfoQuery = lazyWithReload(loadModuleInfoQuery)
 const LosslessInfoQuery = lazyWithReload(loadLosslessInfoQuery)
+const GrafanaDashboard = lazyWithReload(loadGrafanaDashboard)
 const Settings = lazyWithReload(loadSettings)
 const TacacsManager = lazyWithReload(loadTacacsManager)
 const ConfigBackups = lazyWithReload(loadConfigBackups)
@@ -86,7 +86,7 @@ const preloadHighFrequencyRoutes = () => {
     void loadDeviceList()
     void loadDeviceDetail()
     void loadDeviceOverview()
-    void loadMetrics()
+    void loadGrafanaDashboard()
     void loadConfigBackups()
   }
   const requestIdle = (window as any).requestIdleCallback
@@ -97,17 +97,10 @@ const preloadHighFrequencyRoutes = () => {
   window.setTimeout(preload, 1200)
 }
 
-const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/port-query', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
-const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/port-query']
+const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/grafana', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
+const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/grafana']
 const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
-const ROUTE_ALIASES: Record<string, string[]> = {
-  '/port-query': ['/metrics'],
-  '/device-overview': ['/metrics'],
-  '/quality-query': ['/metrics'],
-  '/traffic-query': ['/metrics'],
-  '/module-info-query': ['/metrics'],
-  '/lossless-info-query': ['/metrics'],
-}
+const ROUTE_ALIASES: Record<string, string[]> = {}
 
 const getInitialRoute = (allowedMenus: string[] = []) => {
   const savedRoute = localStorage.getItem('lastVisitedRoute')
@@ -115,7 +108,7 @@ const getInitialRoute = (allowedMenus: string[] = []) => {
     ? FALLBACK_MENU_PATHS
     : (allowedMenus.length ? allowedMenus : FALLBACK_MENU_PATHS)
 
-  const normalizedSavedRoute = savedRoute === '/metrics' ? '/port-query' : savedRoute
+  const normalizedSavedRoute = savedRoute
   if (
     normalizedSavedRoute &&
     normalizedSavedRoute !== '/login' &&
@@ -276,15 +269,14 @@ function App() {
             <Route path="alerts/history" element={<MenuRoute menuPath="/alerts/history"><AlertHistory /></MenuRoute>} />
             <Route path="alerts/audit" element={<MenuRoute menuPath="/alerts/audit"><AlertAudit /></MenuRoute>} />
             <Route path="alerts/silences" element={<MenuRoute menuPath="/alerts/silences"><AlertSilences /></MenuRoute>} />
-            <Route path="port-query" element={<MenuRoute menuPath="/port-query"><Metrics /></MenuRoute>} />
             <Route path="ip-flow-query" element={<MenuRoute menuPath="/ip-flow-query"><IPFlowQuery /></MenuRoute>} />
             <Route path="quality-query" element={<MenuRoute menuPath="/quality-query"><QualityQuery /></MenuRoute>} />
             <Route path="traffic-query" element={<MenuRoute menuPath="/traffic-query"><TrafficQuery /></MenuRoute>} />
             <Route path="device-overview" element={<MenuRoute menuPath="/device-overview"><DeviceOverview /></MenuRoute>} />
             <Route path="module-info-query" element={<MenuRoute menuPath="/module-info-query"><ModuleInfoQuery /></MenuRoute>} />
             <Route path="lossless-info-query" element={<MenuRoute menuPath="/lossless-info-query"><LosslessInfoQuery /></MenuRoute>} />
+            <Route path="grafana" element={<MenuRoute menuPath="/grafana"><GrafanaDashboard /></MenuRoute>} />
             <Route path="config-backups" element={<MenuRoute menuPath="/config-backups"><ConfigBackups /></MenuRoute>} />
-            <Route path="metrics" element={<Navigate to="/port-query" replace />} />
             <Route path="settings" element={<MenuRoute menuPath="/settings"><Settings /></MenuRoute>} />
             <Route path="tacacs" element={<Navigate to="/tacacs/config" replace />} />
             <Route path="tacacs/config" element={<MenuRoute menuPath="/tacacs"><TacacsManager activeTab="config" /></MenuRoute>} />

@@ -1,12 +1,13 @@
 import { Suspense, lazy, type MouseEvent as ReactMouseEvent, type UIEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Alert, Button, Card, Col, DatePicker, Descriptions, Empty, Input, Progress, Row, Select, Space, Spin, Table, Tabs, Tag, Typography, message } from 'antd'
-import { ArrowLeftOutlined, DownloadOutlined, EditOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
+import { Alert, Button, Card, Col, DatePicker, Descriptions, Empty, Input, Modal, Progress, Row, Select, Space, Spin, Table, Tabs, Tag, Typography, message } from 'antd'
+import { ArrowLeftOutlined, CopyOutlined, DownloadOutlined, EditOutlined, FileTextOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import {
   getDevice,
   getDeviceConfigBackups,
   getDeviceConnections,
+  getDeviceCurrentConfig,
   getDeviceHardware,
   getDevicePerformance,
   getDeviceSyslog,
@@ -14,6 +15,7 @@ import {
   type Device,
   type DeviceConfigBackupRow,
   type DeviceConnectionRow,
+  type DeviceCurrentConfig,
   type DeviceHardwareRow,
   type DeviceLogRow,
   type DeviceTacacsRow,
@@ -28,6 +30,7 @@ const { Text } = Typography
 const InterfaceTrafficChart = lazy(() => import('./DeviceDetailCharts').then((module) => ({ default: module.InterfaceTrafficChart })))
 const MetricTrendChart = lazy(() => import('./DeviceDetailCharts').then((module) => ({ default: module.MetricTrendChart })))
 const InterfaceDiscardChart = lazy(() => import('./DeviceDetailCharts').then((module) => ({ default: module.InterfaceDiscardChart })))
+const ForwardingQuery = lazy(() => import('../metrics/ForwardingQuery'))
 
 const formatDateTimeText = (value?: string | null) => {
   const text = String(value || '').trim()
@@ -343,6 +346,10 @@ const DeviceDetail = () => {
   const [device, setDevice] = useState<Device | null>(null)
   const [loading, setLoading] = useState(true)
   const [activeTab, setActiveTab] = useState('connections')
+  const [currentConfigOpen, setCurrentConfigOpen] = useState(false)
+  const [currentConfigLoading, setCurrentConfigLoading] = useState(false)
+  const [currentConfig, setCurrentConfig] = useState<DeviceCurrentConfig | null>(null)
+  const [currentConfigError, setCurrentConfigError] = useState('')
 
   useEffect(() => {
     fetchDevice()
@@ -358,6 +365,33 @@ const DeviceDetail = () => {
       message.error('获取设备失败')
     } finally {
       setLoading(false)
+    }
+  }
+
+  const readCurrentConfig = async () => {
+    setCurrentConfigOpen(true)
+    setCurrentConfigLoading(true)
+    setCurrentConfig(null)
+    setCurrentConfigError('')
+    try {
+      const result = await getDeviceCurrentConfig(deviceId)
+      setCurrentConfig(result)
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || '读取当前配置失败，请检查设备SSH连通性和登录凭据'
+      setCurrentConfigError(detail)
+      message.error(detail)
+    } finally {
+      setCurrentConfigLoading(false)
+    }
+  }
+
+  const copyCurrentConfig = async () => {
+    if (!currentConfig?.config_content) return
+    try {
+      await navigator.clipboard.writeText(currentConfig.config_content)
+      message.success('配置已复制')
+    } catch {
+      message.error('复制失败，请手动选择配置内容')
     }
   }
 
@@ -389,9 +423,14 @@ const DeviceDetail = () => {
           <Tag color={statusConfig.color}>{statusConfig.label}</Tag>
         </Space>
       }
-      extra={canModify ? (
-        <Button type="primary" icon={<EditOutlined />} onClick={() => navigate(`/devices/edit/${device.id}`)}>编辑</Button>
-      ) : null}
+      extra={(
+        <Space>
+          <Button icon={<FileTextOutlined />} onClick={readCurrentConfig}>查看当前设备配置</Button>
+          {canModify && (
+            <Button type="primary" icon={<EditOutlined />} onClick={() => navigate(`/devices/edit/${device.id}`)}>编辑</Button>
+          )}
+        </Space>
+      )}
       styles={{ body: { paddingTop: 12 } }}
     >
       <Descriptions bordered size="small" column={4} labelStyle={{ width: 110, color: '#666' }}>
@@ -420,9 +459,52 @@ const DeviceDetail = () => {
           { key: 'config', label: '配置', children: <ConfigTab deviceId={device.id} /> },
           { key: 'performance', label: '性能', children: <PerformanceTab deviceId={device.id} /> },
           { key: 'hardware', label: '硬件', children: <HardwareTab deviceId={device.id} /> },
+          {
+            key: 'forwarding',
+            label: '转发表',
+            children: (
+              <Suspense fallback={<div style={{ minHeight: 240, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Spin /></div>}>
+                <ForwardingQuery fixedDeviceId={device.id} embedded />
+              </Suspense>
+            ),
+          },
           { key: 'tacacs', label: 'Tacacs', children: <TacacsTab deviceId={device.id} /> },
         ]}
       />
+      <Modal
+        open={currentConfigOpen}
+        title={`当前运行配置 - ${device.name}`}
+        width="76vw"
+        centered
+        style={{ maxWidth: 1280 }}
+        onCancel={() => setCurrentConfigOpen(false)}
+        footer={[
+          <Button key="refresh" icon={<ReloadOutlined />} loading={currentConfigLoading} onClick={readCurrentConfig}>重新读取</Button>,
+          <Button key="copy" icon={<CopyOutlined />} disabled={!currentConfig?.config_content} onClick={copyCurrentConfig}>复制配置</Button>,
+          <Button key="close" type="primary" onClick={() => setCurrentConfigOpen(false)}>关闭</Button>,
+        ]}
+      >
+        {currentConfigLoading ? (
+          <div style={{ minHeight: 360, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 16 }}>
+            <Spin size="large" />
+            <Text>正在建立 SSH 连接并读取设备最新运行配置，请稍候…</Text>
+            <Text type="secondary">设备配置较大或登录提示较慢时，可能需要几十秒。</Text>
+          </div>
+        ) : currentConfigError ? (
+          <Alert type="error" showIcon message="读取失败" description={currentConfigError} />
+        ) : currentConfig ? (
+          <>
+            <Space wrap style={{ marginBottom: 12 }}>
+              <Tag color="blue">命令：{currentConfig.command}</Tag>
+              <Tag>行数：{currentConfig.line_count}</Tag>
+              <Tag>读取时间：{formatDateTimeText(currentConfig.collected_at)}</Tag>
+            </Space>
+            <pre style={{ margin: 0, padding: 16, height: '66vh', minHeight: 380, maxHeight: 680, overflow: 'auto', background: '#0f172a', color: '#e2e8f0', borderRadius: 8, fontSize: 13, lineHeight: 1.55, whiteSpace: 'pre', fontFamily: 'SFMono-Regular, Consolas, "Liberation Mono", monospace' }}>
+              {currentConfig.config_content}
+            </pre>
+          </>
+        ) : null}
+      </Modal>
     </Card>
   )
 }

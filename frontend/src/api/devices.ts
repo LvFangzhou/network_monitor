@@ -351,6 +351,16 @@ export interface DeviceConfigBackupRow {
   finished_at?: string | null
 }
 
+export interface DeviceCurrentConfig {
+  device_id: number
+  device_name: string
+  device_ip: string
+  command: string
+  config_content: string
+  line_count: number
+  collected_at: string
+}
+
 export interface DevicePerformanceSeries {
   name: string
   measurement: string
@@ -386,7 +396,10 @@ export interface DeviceTacacsRow {
 }
 
 export const getDeviceConnections = async (id: number, params?: { force_refresh?: boolean }): Promise<{ total: number; items: DeviceConnectionRow[]; source?: string; message?: string }> => {
-  return await request.get(`/devices/${id}/detail/connections`, { params }) as { total: number; items: DeviceConnectionRow[]; source?: string; message?: string }
+  return await request.get(`/devices/${id}/detail/connections`, {
+    params,
+    timeout: params?.force_refresh ? 180000 : 30000,
+  }) as { total: number; items: DeviceConnectionRow[]; source?: string; message?: string }
 }
 
 export const getDeviceSyslog = async (id: number, params?: {
@@ -401,6 +414,10 @@ export const getDeviceSyslog = async (id: number, params?: {
 
 export const getDeviceConfigBackups = async (id: number, params?: { skip?: number; limit?: number }): Promise<{ total: number; items: DeviceConfigBackupRow[] }> => {
   return await request.get(`/devices/${id}/detail/config-backups`, { params }) as { total: number; items: DeviceConfigBackupRow[] }
+}
+
+export const getDeviceCurrentConfig = async (id: number): Promise<DeviceCurrentConfig> => {
+  return await request.post(`/devices/${id}/detail/current-config`, undefined, { timeout: 180000 }) as DeviceCurrentConfig
 }
 
 export const getDevicePerformance = async (id: number, params?: { range?: string; interval?: string; start?: string; end?: string; start_ts?: number; end_ts?: number }): Promise<{ series: DevicePerformanceSeries[]; range: string; interval: string }> => {

@@ -218,21 +218,10 @@ class NotificationManager:
                 dc_changed = int(item.get("changed") or 0)
                 dc_save_failed = int(item.get("save_failed") or 0)
                 prefix = "✅" if dc_failed == 0 and dc_changed == 0 and dc_save_failed == 0 else "⚠️"
-                owner = str(item.get("network_owner") or "").strip()
-                owner_emails = [str(email).strip() for email in (item.get("network_owner_emails") or []) if str(email).strip()]
-                contact_text = ""
-                if owner or owner_emails:
-                    contact_parts = []
-                    if owner:
-                        contact_parts.append(f"网络负责人 {owner}")
-                    if owner_emails:
-                        contact_parts.append(f"邮箱 {', '.join(owner_emails)}")
-                    contact_text = f" ｜ {' ｜ '.join(contact_parts)}"
                 lines.append(
                     f"{prefix} **{item.get('name') or '未设置机房'}**："
                     f"成功 {int(item.get('success') or 0)} / 失败 {dc_failed} / "
                     f"不一致 {dc_changed} / 已保存 {int(item.get('saved') or 0)} / 保存失败 {dc_save_failed}"
-                    f"{contact_text}"
                 )
         return "\n".join(lines)
 

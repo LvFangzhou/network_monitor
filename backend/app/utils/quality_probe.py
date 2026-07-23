@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -23,6 +24,260 @@ logger = get_logger(__name__)
 QUALITY_LOSS_WINDOW_SECONDS = 5 * 60
 QUALITY_LOSS_WINDOW_MAX_SAMPLES = 1200
 QUALITY_LOSS_WINDOW_TTL_SECONDS = 24 * 60 * 60
+DISMAN_PING_RESULTS_ENTRY_OID = "1.3.6.1.2.1.80.1.3.1"
+DISMAN_PING_CONTROL_ENTRY_OID = "1.3.6.1.2.1.80.1.2.1"
+
+
+def _decode_disman_ping_index(parts: List[int]) -> tuple[str, str] | None:
+    """Decode pingCtlOwnerIndex/pingCtlTestName from an OID suffix."""
+    try:
+        owner_length = parts[0]
+        owner_end = 1 + owner_length
+        owner = bytes(parts[1:owner_end]).decode("utf-8", errors="replace")
+        tag_length = parts[owner_end]
+        tag_start = owner_end + 1
+        tag = bytes(parts[tag_start:tag_start + tag_length]).decode("utf-8", errors="replace")
+        return owner, tag
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _encode_disman_ping_index(owner: str, operation_tag: str) -> str:
+    owner_bytes = str(owner).encode("utf-8")
+    tag_bytes = str(operation_tag).encode("utf-8")
+    parts = [len(owner_bytes), *owner_bytes, len(tag_bytes), *tag_bytes]
+    return ".".join(str(part) for part in parts)
+
+
+def _read_h3c_native_jitter(
+    collector: Any,
+    device: Any,
+    owner: str,
+    operation_tag: str,
+) -> Dict[str, Any]:
+    """Read native H3C ICMP-jitter statistics (legacy and new enterprise IDs)."""
+    index_suffix = _encode_disman_ping_index(owner, operation_tag)
+    type_oid = collector.snmp_get(
+        device,
+        f"{DISMAN_PING_CONTROL_ENTRY_OID}.16.{index_suffix}",
+    )
+    type_text = str(type_oid or "").strip().lstrip(".")
+    root_match = re.match(r"^(1\.3\.6\.1\.4\.1\.\d+\.8\.3)\.2\.3$", type_text)
+    if not root_match:
+        return {}
+
+    table_oid = f"{root_match.group(1)}.1.4.1"
+    rows = collector.snmp_walk(device, table_oid) or []
+    values: Dict[int, Any] = {}
+    prefix = table_oid + "."
+    for oid, value in rows:
+        oid_text = str(oid or "").lstrip(".")
+        if not oid_text.startswith(prefix) or "No Such" in str(value):
+            continue
+        try:
+            suffix = [int(part) for part in oid_text[len(prefix):].split(".")]
+            column = suffix[0]
+        except (TypeError, ValueError, IndexError):
+            continue
+        if _decode_disman_ping_index(suffix[1:]) == (owner, operation_tag):
+            values[column] = value
+
+    def _number(column: int) -> float | None:
+        try:
+            return float(values[column])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    if not values:
+        return {}
+    jitter_sd = _number(31)
+    jitter_ds = _number(32)
+    directional = [value for value in (jitter_sd, jitter_ds) if value is not None]
+    return {
+        "jitter_ms": round(max(directional), 2) if directional else None,
+        "jitter_sd_ms": jitter_sd,
+        "jitter_ds_ms": jitter_ds,
+        "jitter_source": "h3c_nqa_native",
+        "jitter_rtt_samples": int(_number(1) or 0),
+        "packet_loss_sd": int(_number(22) or 0),
+        "packet_loss_ds": int(_number(23) or 0),
+    }
+
+
+def discover_quality_nqa_snmp_instances(device: Any) -> List[Dict[str, Any]]:
+    """Discover configured DISMAN-PING-MIB NQA jobs and their latest results."""
+    from app.collectors.snmp_collector import SNMPCollector
+
+    collector = SNMPCollector()
+    control_rows = collector.snmp_walk(device, DISMAN_PING_CONTROL_ENTRY_OID) or []
+    result_rows = collector.snmp_walk(device, DISMAN_PING_RESULTS_ENTRY_OID) or []
+    instances: Dict[tuple[str, str], Dict[str, Any]] = {}
+
+    def _consume(rows: List[Any], base_oid: str, bucket: str) -> None:
+        prefix = base_oid + "."
+        for oid, value in rows:
+            oid_text = str(oid or "")
+            if not oid_text.startswith(prefix) or "No Such" in str(value):
+                continue
+            try:
+                suffix = [int(part) for part in oid_text[len(prefix):].split(".")]
+                column = suffix[0]
+            except (TypeError, ValueError, IndexError):
+                continue
+            index = _decode_disman_ping_index(suffix[1:])
+            if not index:
+                continue
+            item = instances.setdefault(index, {"admin_name": index[0], "operation_tag": index[1]})
+            item.setdefault(bucket, {})[column] = value
+
+    _consume(control_rows, DISMAN_PING_CONTROL_ENTRY_OID, "control")
+    _consume(result_rows, DISMAN_PING_RESULTS_ENTRY_OID, "result")
+
+    output: List[Dict[str, Any]] = []
+    for (admin_name, operation_tag), item in sorted(instances.items()):
+        control = item.get("control", {})
+        result = item.get("result", {})
+
+        def _number(values: Dict[int, Any], column: int) -> float | None:
+            try:
+                return float(values[column])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        sent = int(_number(result, 8) or 0)
+        received = max(0, min(int(_number(result, 7) or 0), sent)) if sent else 0
+        loss = round((sent - received) * 100.0 / sent, 2) if sent else None
+        frequency = int(_number(control, 10) or 0)
+        timeout_seconds = _number(control, 6)
+        output.append({
+            "key": f"{admin_name}\u0000{operation_tag}",
+            "admin_name": admin_name,
+            "operation_tag": operation_tag,
+            "target": str(control.get(4) or "").strip(),
+            "source": str(control.get(19) or "").strip() or None,
+            "frequency_seconds": frequency or None,
+            "packet_count": int(_number(control, 7) or 0) or None,
+            "timeout_ms": int(timeout_seconds * 1000) if timeout_seconds is not None else None,
+            "is_enabled": int(_number(control, 8) or 0) == 1,
+            "has_result": bool(result),
+            "avg_latency_ms": _number(result, 6),
+            "min_latency_ms": _number(result, 4),
+            "max_latency_ms": _number(result, 5),
+            "packet_loss_percent": loss,
+            "sent": sent,
+            "received": received,
+        })
+    return output
+
+
+def run_quality_nqa_snmp(target: Any, device: Any) -> Dict[str, Any]:
+    """Read the latest device-generated NQA result through DISMAN-PING-MIB.
+
+    H3C ICMP-jitter uses the device-native SD/DS value when available. ICMP
+    echo falls back to the absolute change between consecutive average RTTs.
+    """
+    from app.collectors.snmp_collector import SNMPCollector
+
+    owner = str(getattr(target, "nqa_admin_name", None) or "test")
+    operation_tag = str(getattr(target, "nqa_operation_tag", None) or "1")
+    collector = SNMPCollector()
+    try:
+        rows = collector.snmp_walk(device, DISMAN_PING_RESULTS_ENTRY_OID) or []
+    except Exception as exc:
+        return {
+            "success": False,
+            "avg_latency_ms": None,
+            "min_latency_ms": None,
+            "max_latency_ms": None,
+            "jitter_ms": None,
+            "packet_loss_percent": 100.0,
+            "availability_percent": 0.0,
+            "received": 0,
+            "sent": 0,
+            "error": f"SNMP读取NQA失败：{exc}",
+        }
+
+    values: Dict[int, Any] = {}
+    prefix = DISMAN_PING_RESULTS_ENTRY_OID + "."
+    for oid, value in rows:
+        oid_text = str(oid or "")
+        if not oid_text.startswith(prefix) or "No Such" in str(value):
+            continue
+        try:
+            suffix = [int(part) for part in oid_text[len(prefix):].split(".")]
+            column = suffix[0]
+        except (TypeError, ValueError, IndexError):
+            continue
+        index = _decode_disman_ping_index(suffix[1:])
+        if index == (owner, operation_tag):
+            values[column] = value
+
+    def _number(column: int) -> float | None:
+        try:
+            return float(values[column])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    min_latency = _number(4)
+    max_latency = _number(5)
+    avg_latency = _number(6)
+    received = int(_number(7) or 0)
+    sent = int(_number(8) or 0)
+    if not values or sent <= 0:
+        return {
+            "success": False,
+            "avg_latency_ms": avg_latency,
+            "min_latency_ms": min_latency,
+            "max_latency_ms": max_latency,
+            "jitter_ms": None,
+            "packet_loss_percent": 100.0 if sent > 0 else None,
+            "availability_percent": 0.0 if sent > 0 else None,
+            "received": received,
+            "sent": sent,
+            "error": f"未读取到NQA任务 {owner}/{operation_tag} 的有效结果",
+        }
+
+    received = max(0, min(received, sent))
+    loss = round((sent - received) * 100.0 / sent, 2)
+    availability = round(received * 100.0 / sent, 2)
+    native_jitter: Dict[str, Any] = {}
+    try:
+        native_jitter = _read_h3c_native_jitter(collector, device, owner, operation_tag)
+    except Exception as exc:
+        logger.debug("读取H3C原生NQA抖动失败，使用RTT变化估算", device=getattr(device, "ip_address", None), error=str(exc))
+
+    jitter = native_jitter.get("jitter_ms")
+    jitter_source = native_jitter.get("jitter_source")
+    if jitter is None and avg_latency is not None:
+        previous_key = f"quality_probe:nqa_prev_latency:{target.id}"
+        try:
+            previous = redis_client.get(previous_key)
+            if previous is not None:
+                jitter = round(abs(avg_latency - float(previous)), 2)
+                jitter_source = "rtt_delta_estimate"
+            redis_client.set(previous_key, str(avg_latency), ex=24 * 60 * 60)
+        except Exception:
+            pass
+
+    return {
+        "success": received > 0,
+        "avg_latency_ms": avg_latency,
+        "min_latency_ms": min_latency,
+        "max_latency_ms": max_latency,
+        "jitter_ms": jitter,
+        "packet_loss_percent": loss,
+        "availability_percent": availability,
+        "received": received,
+        "sent": sent,
+        "error": None if received > 0 else "NQA探测未收到响应",
+        "probe_source": "device_nqa_snmp",
+        "nqa_admin_name": owner,
+        "nqa_operation_tag": operation_tag,
+        "jitter_sd_ms": native_jitter.get("jitter_sd_ms"),
+        "jitter_ds_ms": native_jitter.get("jitter_ds_ms"),
+        "jitter_source": jitter_source,
+        "jitter_rtt_samples": native_jitter.get("jitter_rtt_samples"),
+    }
 
 
 def run_quality_ping(target_host: str, packet_count: int = 5, timeout_ms: int = 1000) -> Dict[str, Any]:
@@ -173,6 +428,8 @@ def write_quality_probe_result(target: Any, result: Dict[str, Any]) -> None:
                 "name": target.name,
                 "datacenter": target.datacenter_ref.name if getattr(target, "datacenter_ref", None) else "",
                 "operator": target.operator_name or "",
+                "probe_source": getattr(target, "probe_source", None) or "server_icmp",
+                "device_id": str(getattr(target, "device_id", None) or ""),
             },
             fields={
                 "success": bool(result.get("success")),
@@ -180,6 +437,8 @@ def write_quality_probe_result(target: Any, result: Dict[str, Any]) -> None:
                 "min_latency_ms": result.get("min_latency_ms"),
                 "max_latency_ms": result.get("max_latency_ms"),
                 "jitter_ms": result.get("jitter_ms"),
+                "jitter_sd_ms": result.get("jitter_sd_ms"),
+                "jitter_ds_ms": result.get("jitter_ds_ms"),
                 "packet_loss_percent": result.get("packet_loss_percent"),
                 "availability_percent": result.get("availability_percent"),
                 "received": result.get("received"),

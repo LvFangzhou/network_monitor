@@ -634,7 +634,7 @@ const CircuitList = ({ title = '公网管理', fixedLineType }: CircuitListProps
       return
     }
 
-    navigate('/port-query', {
+    navigate('/grafana', {
       state: {
         circuitMonitorTargets: targets,
         sourceCircuitName: record.name,

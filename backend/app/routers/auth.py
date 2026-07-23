@@ -60,7 +60,7 @@ MENU_OPTIONS = [
     {"label": "告警历史", "value": "/alerts/history"},
     {"label": "告警日志", "value": "/alerts/audit"},
     {"label": "告警屏蔽", "value": "/alerts/silences"},
-    {"label": "端口查询", "value": "/port-query"},
+    {"label": "接口查询", "value": "/grafana"},
     {"label": "IP查询", "value": "/ip-flow-query"},
     {"label": "质量查询", "value": "/quality-query"},
     {"label": "流量查询", "value": "/traffic-query"},
@@ -86,30 +86,19 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 def normalize_allowed_menus(allowed_menus: Optional[list[str]], is_superuser: bool = False) -> list[str]:
     if is_superuser:
         return DEFAULT_MENU_PERMISSIONS.copy()
-    normalized = list(allowed_menus or ["/dashboard", "/devices", "/port-query", "/ip-flow-query", "/quality-query", "/traffic-query", "/device-overview"])
+    normalized = list(allowed_menus or ["/dashboard", "/devices", "/grafana", "/ip-flow-query", "/quality-query", "/traffic-query", "/device-overview"])
     has_monitor_center_access = any(path in normalized for path in [
-        "/metrics",
         "/device-overview",
-        "/port-query",
+        "/grafana",
         "/ip-flow-query",
         "/module-info-query",
         "/lossless-info-query",
     ])
-    if "/metrics" in normalized and "/port-query" not in normalized:
-        normalized.append("/port-query")
-    if "/metrics" in normalized and "/device-overview" not in normalized:
-        normalized.append("/device-overview")
     if has_monitor_center_access and "/quality-query" not in normalized:
         normalized.append("/quality-query")
     if has_monitor_center_access and "/traffic-query" not in normalized:
         normalized.append("/traffic-query")
-    if "/metrics" in normalized and "/config-backups" not in normalized:
-        normalized.append("/config-backups")
-    if "/metrics" in normalized and "/module-info-query" not in normalized:
-        normalized.append("/module-info-query")
-    if "/metrics" in normalized and "/lossless-info-query" not in normalized:
-        normalized.append("/lossless-info-query")
-    return [path for path in normalized if path != "/metrics"]
+    return normalized
 
 
 def _online_key(user_id: int) -> str:

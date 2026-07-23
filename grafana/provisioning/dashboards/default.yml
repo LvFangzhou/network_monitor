@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: Network Monitor
+    orgId: 1
+    folder: 并行网络运营平台
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

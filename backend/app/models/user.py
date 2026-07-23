@@ -194,7 +194,7 @@ DEFAULT_MENU_PERMISSIONS = [
     "/alerts/history",
     "/alerts/audit",
     "/alerts/silences",
-    "/port-query",
+    "/grafana",
     "/ip-flow-query",
     "/quality-query",
     "/traffic-query",

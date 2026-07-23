@@ -22,6 +22,7 @@ from app.utils.interface_scope import alert_target_interface_is_monitored
 from app.utils.redis_client import redis_client
 from app.utils import influx_client
 from app.utils.asternos_exporter_client import asternos_exporter_client
+from app.utils.monitor_profile import normalize_monitoring_profile
 from app.schemas import (
     DeviceCreate, DeviceUpdate, DeviceResponse,
     DeviceGroupCreate, DeviceGroupUpdate, DeviceGroupResponse,
@@ -41,6 +42,7 @@ ACTIVE_ALERT_STATUSES = ("firing", "acknowledged", "ignored", "snoozed")
 DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX = "monitor:cache:overview_snapshot"
 DEVICE_OVERVIEW_LAST_SUCCESS_CACHE_PREFIX = "monitor:cache:last_success_overview_snapshot"
 DEVICE_OVERVIEW_REVISION_KEY = "monitor:cache:overview_revision"
+DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS = 24 * 60 * 60
 TACACS_LOG_FILE = Path("/app/data/tacacs/logs/tacacs.log")
 TACACS_LOG_PATTERN = re.compile(r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
 TACACS_MONTH_MAP = {
@@ -159,6 +161,28 @@ def _normalize_interface_key(value: Any) -> str:
     for src, dst in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
         normalized = normalized.replace(src, dst)
     return re.sub(r"[^a-z0-9/._-]", "", normalized)
+
+
+def _interface_config_lookup_keys(interface_name: Any) -> List[str]:
+    """Return possible keys for matching runtime interface rows to saved config blocks.
+
+    AsterNOS Exporter exposes physical ports as compact names like ``0/0`` while
+    the saved configuration uses ``interface ethernet 0/0``.  Without this alias
+    the detail connection page cannot reuse the backup config to fill interface
+    IPs, MTU and descriptions.
+    """
+    raw = str(interface_name or "").strip()
+    keys: List[str] = []
+
+    def _add(value: Any) -> None:
+        key = _normalize_interface_key(value)
+        if key and key not in keys:
+            keys.append(key)
+
+    _add(raw)
+    if re.fullmatch(r"\d+(?:/\d+)+", raw):
+        _add(f"ethernet {raw}")
+    return keys
 
 
 def _latest_device_config_text(db: Session, device_id: int) -> str:
@@ -331,6 +355,10 @@ def _is_default_interface_description(name: str, description: Any) -> bool:
     text = str(description or "").strip()
     if not text:
         return True
+    # Comware 会在部分管理/预定义接口的 ifAlias 中返回系统角色文本，
+    # 但 running-config 并没有 description，这类内容不能当成人工配置描述展示。
+    if re.fullmatch(r"Predefined\s+level-\d+\s+role", text, flags=re.IGNORECASE):
+        return True
     normalized_text = re.sub(r"\s+", "", text).lower()
     normalized_name = re.sub(r"\s+", "", str(name or "")).lower()
     default_values = {
@@ -382,7 +410,7 @@ def _best_lldp_remote_interface(neighbor: Dict[str, Any]) -> str:
     # LLDP remote_port_desc 经常是人为描述（如 M2M27U3940-9820-AGG01-100G19），
     # 不能直接当成“对端接口”。优先使用 remote_port_id；只有字段本身是接口格式时才展示。
     interface_pattern = re.compile(
-        r"^((?:FourHundredGigE|FourHundredGigabitEthernet|FHGigabitEthernet|FH|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet|400GE|200GE|100GE|100G|50GE|25GE|10GE|HGE|XGE|GE|MGE)\s*\d+(?:/\d+)+(?:[:/]\d+)?)$",
+        r"^((?:(?:FourHundredGigE|FourHundredGigabitEthernet|FHGigabitEthernet|FH|TwoHundredGigE|HundredGigE|FiftyGigE|Twenty-FiveGigE|TwentyFiveGigE|Ten-GigabitEthernet|TenGigabitEthernet|GigabitEthernet|M-GigabitEthernet|MGigabitEthernet|XGigabitEthernet|400GE|200GE|100GE|100G|50GE|25GE|10GE|HGE|XGE|GE|MGE)\s*\d+(?:/\d+)+(?:[:/]\d+)?|\d+(?:/\d+)+|(?:eth|ens|eno|enp|bond|team|ib|mgmt)[A-Za-z0-9_.:-]*))$",
         flags=re.IGNORECASE,
     )
     for field in ("remote_port_id", "remote_interface", "remote_port"):
@@ -472,6 +500,31 @@ def _lldp_row_precise_local_keys(row: Dict[str, Any]) -> List[str]:
     return keys
 
 
+def _interface_suffix_key(value: Any) -> str:
+    text = _normalize_interface_key(value)
+    if not text:
+        return ""
+    if text.isdigit():
+        return text
+    match = re.search(r"(\d+(?:/\d+)+)$", text)
+    return match.group(1) if match else ""
+
+
+def _display_interface_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    interface_match = re.search(
+        r"((?:FourHundredGigE|FourHundredGigabitEthernet|400GE|FHGigabitEthernet|FH|TwoHundredGigE|TwoHundredGigabitEthernet|200GE|HundredGigE|HundredGigabitEthernet|100GE|HGE|FiftyGigE|FiftyGigabitEthernet|50GE|Twenty-?FiveGigE|Twenty-?FiveGigabitEthernet|25GE|Ten-?GigabitEthernet|TenGigE|XGigabitEthernet|XGE|M-?GigabitEthernet|MGE|GigabitEthernet|GE|xethernet|cethernet|ethernet|loopback|vlanif|vlan|aggregate|bridge-aggregation|null|mgmt|mgt)\d+(?:/\d+)*(?:\.\d+)?)",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    if interface_match:
+        return interface_match.group(1)
+    return text
+
+
 def _lldp_row_quality(row: Dict[str, Any]) -> int:
     score = 0
     remote = _best_lldp_remote_device(row)
@@ -532,18 +585,65 @@ async def _collect_lldp_rows_for_device_detail(device: Device) -> List[Dict[str,
     try:
         from app.routers.metrics import _collect_lldp_neighbors_from_cli, _merge_lldp_snmp_and_cli, _store_monitor_cache
 
-        snmp_task = asyncio.to_thread(SNMPCollector().collect_lldp_neighbors, device)
         cli_task = asyncio.to_thread(_collect_lldp_neighbors_from_cli, device)
-        snmp_rows, cli_rows = await asyncio.gather(snmp_task, cli_task)
+        if resolve_monitor_source_by_vendor(device.vendor, device.monitor_source) == "asternos_exporter":
+            # AsterNOS 设备的监控源是 Exporter，不开放/不依赖 SNMP。手动刷新连接信息时
+            # 如果仍并行 snmpbulkwalk，会稳定等待 161 超时，前端就会出现“网络错误/读取失败”。
+            snmp_rows, cli_rows = [], await cli_task
+        else:
+            snmp_task = asyncio.to_thread(SNMPCollector().collect_lldp_neighbors, device)
+            snmp_rows, cli_rows = await asyncio.gather(snmp_task, cli_task)
         rows = _merge_lldp_snmp_and_cli(snmp_rows or [], cli_rows or [])
-        _store_monitor_cache("lldp_neighbors_v2", device.id, {
-            "neighbors": rows,
-            "collected_at": datetime.utcnow().isoformat(),
-        }, ttl_seconds=1800)
+        if _lldp_rows_have_useful_neighbor(rows):
+            _store_monitor_cache("lldp_neighbors_v2", device.id, {
+                "neighbors": rows,
+                "collected_at": datetime.utcnow().isoformat(),
+            }, ttl_seconds=DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS)
         return rows
     except Exception as exc:
         logger.warning("设备详情LLDP补采失败", device_id=device.id, device_ip=device.ip_address, error=str(exc))
         return []
+
+
+def _schedule_lldp_refresh_for_device_detail(device: Device, reason: str = "detail_refresh"):
+    """启动 LLDP 刷新任务；调用方可限时等待，超时后任务仍在后台完成并更新缓存。"""
+    lock_key = f"monitor:cache:lldp_refresh_lock:{device.id}"
+    try:
+        if not redis_client.set(lock_key, "1", ex=180, nx=True):
+            return None
+    except Exception:
+        logger.warning("设备详情LLDP后台刷新加锁失败", device_id=device.id, device_ip=device.ip_address, exc_info=True)
+        return None
+
+    async def _runner() -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        try:
+            rows = await _collect_lldp_rows_for_device_detail(device)
+            logger.info(
+                "设备详情LLDP后台刷新完成",
+                device_id=device.id,
+                device_ip=device.ip_address,
+                reason=reason,
+                rows=len(rows or []),
+            )
+            return rows
+        except Exception:
+            logger.warning("设备详情LLDP后台刷新异常", device_id=device.id, device_ip=device.ip_address, exc_info=True)
+            return []
+        finally:
+            try:
+                redis_client.delete(lock_key)
+            except Exception:
+                pass
+
+    try:
+        return asyncio.create_task(_runner())
+    except RuntimeError:
+        try:
+            redis_client.delete(lock_key)
+        except Exception:
+            pass
+        return None
 
 
 def _looks_like_mac(value: Any) -> bool:
@@ -1637,14 +1737,21 @@ async def get_device_detail_connections(
     interfaces = [] if force_refresh else cached_interfaces
     source = "cache"
     live_error = ""
+    if not interfaces and not force_refresh:
+        return {
+            "device": device.to_dict(),
+            "items": [],
+            "total": 0,
+            "source": "cache_miss",
+            "message": "连接信息缓存尚未生成，请等待每日00:00/12:00全量采集，或点击手动刷新实时读取",
+        }
     if not interfaces:
-        # 优先用后台快照；快照缺失时做一次限时 SNMP 轻量补采，避免详情页长期空白。
-        # 大端口设备 SNMP walk 可能较慢，所以必须设置超时，超时后仍返回页面而不是一直转圈。
+        # 只有用户明确点击“手动刷新”时才实时访问设备；普通进入详情页严格只读缓存。
         if monitor_source == "asternos_exporter":
             try:
                 interfaces = await asyncio.wait_for(
                     asternos_exporter_client.list_interfaces(device),
-                    timeout=10,
+                    timeout=30,
                 )
                 source = "exporter_live"
                 if interfaces:
@@ -1667,7 +1774,7 @@ async def get_device_detail_connections(
             try:
                 interfaces = await asyncio.wait_for(
                     asyncio.to_thread(SNMPCollector().list_interfaces, device),
-                    timeout=15,
+                    timeout=60,
                 )
                 source = "snmp_live"
                 if interfaces:
@@ -1714,12 +1821,21 @@ async def get_device_detail_connections(
         _cached_lldp_rows(cached_lldp),
         _cached_lldp_rows(cached_protocol),
     )
-    if monitor_source != "asternos_exporter" and interfaces and force_refresh:
-        collected_lldp_rows = await _collect_lldp_rows_for_device_detail(device)
-        if collected_lldp_rows:
-            # 手动刷新时用户期待看到本次设备实时返回的信息。旧 LLDP 缓存如果曾经因为
-            # local_port 描述或 ifIndex 错配产生串联，继续参与合并会把准确的实时结果覆盖掉。
-            lldp_rows = collected_lldp_rows if force_refresh else _merge_lldp_rows_for_device_detail(lldp_rows, collected_lldp_rows)
+    if interfaces and force_refresh:
+        if monitor_source == "asternos_exporter":
+            # AsterNOS 手动刷新明确执行 Exporter + CLI，并等待本次LLDP结果；全程不走SNMP。
+            collected_lldp_rows = await _collect_lldp_rows_for_device_detail(device)
+            if collected_lldp_rows:
+                lldp_rows = collected_lldp_rows
+            else:
+                live_error = live_error or "AsterNOS CLI 未返回有效LLDP邻居，暂时展示最近一次缓存"
+        else:
+            collected_lldp_rows = await _collect_lldp_rows_for_device_detail(device)
+            if collected_lldp_rows:
+                # 手动刷新时用户期待看到本次设备实时返回的信息。旧 LLDP 缓存如果曾经因为
+                # local_port 描述或 ifIndex 错配产生串联，继续参与合并会把准确的实时结果覆盖掉。
+                lldp_rows = collected_lldp_rows if force_refresh else _merge_lldp_rows_for_device_detail(lldp_rows, collected_lldp_rows)
+    # 普通查看不做任何实时LLDP补采；缓存缺失时保持为空，等待定时全量任务或手动刷新。
     lldp_rows = _enrich_lldp_rows_with_cmdb(db, lldp_rows)
 
     lldp_by_index: Dict[str, Dict[str, Any]] = {}
@@ -1730,10 +1846,14 @@ async def get_device_detail_connections(
         if local_index:
             lldp_by_index.setdefault(local_index, item)
     lldp_by_name: Dict[str, Dict[str, Any]] = {}
+    lldp_by_suffix: Dict[str, Dict[str, Any]] = {}
     for item in lldp_rows:
         for precise_key in _lldp_row_precise_local_keys(item):
             if precise_key.startswith("if:"):
                 lldp_by_name.setdefault(precise_key[3:], item)
+        suffix = _interface_suffix_key(item.get("local_port_id") or item.get("interface") or item.get("local_port"))
+        if suffix:
+            lldp_by_suffix.setdefault(suffix, item)
 
     config_fields = _parse_interface_config_fields(_latest_device_config_text(db, device.id))
 
@@ -1741,8 +1861,16 @@ async def get_device_detail_connections(
     for iface in interfaces or []:
         index = str(iface.get("index") or iface.get("interface_index") or "")
         name = str(iface.get("name") or iface.get("interface_name") or iface.get("alias") or "")
-        neighbor = (lldp_by_index.get(index) if index else None) or lldp_by_name.get(_normalize_interface_key(name)) or {}
-        config_item = config_fields.get(_normalize_interface_key(name)) or {}
+        neighbor = (
+            (lldp_by_index.get(index) if index else None)
+            or lldp_by_name.get(_normalize_interface_key(name))
+            or lldp_by_suffix.get(_interface_suffix_key(name))
+            or {}
+        )
+        config_item = next(
+            (config_fields.get(key) for key in _interface_config_lookup_keys(name) if config_fields.get(key)),
+            {},
+        )
         alias = iface.get("alias")
         description = _clean_interface_description(name, config_item.get("description"))
         if not description:
@@ -1759,8 +1887,8 @@ async def get_device_detail_connections(
         mtu = iface.get("mtu") or config_item.get("mtu")
         items.append({
             "index": index,
-            "name": name,
-            "logical_type": iface.get("logical_type") or iface.get("type") or iface.get("interface_type") or "",
+            "name": _display_interface_name(name),
+            "logical_type": "",
             "description": description,
             "speed_bps": iface.get("speed_bps"),
             "mtu": mtu,
@@ -1779,6 +1907,8 @@ async def get_device_detail_connections(
     message = None
     if force_refresh and live_error and source == "cache":
         message = "实时刷新失败，已回退展示最近一次接口快照"
+    elif force_refresh and monitor_source == "asternos_exporter" and live_error:
+        message = live_error
     if source == "cache" and items:
         missing_mtu_count = sum(1 for item in items if item.get("mtu") in (None, ""))
         missing_type_count = sum(1 for item in items if not item.get("logical_type"))
@@ -1860,6 +1990,57 @@ async def get_device_detail_config_backups(
             "line_count": item.line_count,
             "finished_at": item.finished_at.isoformat() if item.finished_at else None,
         } for item in rows],
+    }
+
+
+@router.post("/{device_id}/detail/current-config", response_model=dict)
+async def get_device_current_config(
+    device_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """实时登录设备并读取当前运行配置，不保存配置，也不写入备份任务。"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+
+    try:
+        from app.tasks.config_backup_tasks import _clean_config_output, _collect_config
+
+        command, content = await asyncio.to_thread(_collect_config, device)
+        cleaned_content = _clean_config_output(content or "", command)
+        if not cleaned_content.strip():
+            raise RuntimeError("设备返回的运行配置为空")
+    except Exception as exc:
+        logger.warning(
+            "实时读取设备配置失败",
+            device_id=device_id,
+            device_name=device.name,
+            device_ip=device.ip_address,
+            user=current_user.username,
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=f"读取当前配置失败：{exc}") from exc
+
+    collected_at = datetime.now(timezone.utc)
+    line_count = len(cleaned_content.splitlines())
+    logger.info(
+        "实时读取设备配置成功",
+        device_id=device_id,
+        device_name=device.name,
+        device_ip=device.ip_address,
+        user=current_user.username,
+        command=command,
+        line_count=line_count,
+    )
+    return {
+        "device_id": device.id,
+        "device_name": device.name,
+        "device_ip": device.ip_address,
+        "command": command,
+        "config_content": cleaned_content,
+        "line_count": line_count,
+        "collected_at": collected_at.isoformat(),
     }
 
 
@@ -2082,6 +2263,12 @@ async def create_device(device: DeviceCreate, db: Session = Depends(get_db)):
         device.hostname,
     )
     vendor_name = ensure_device_vendor_catalog(db, inferred_vendor)
+    custom_fields = normalize_monitoring_profile(
+        custom_fields,
+        vendor_name,
+        device.model,
+        device_role_name,
+    )
 
     # 创建设备
     db_device = Device(
@@ -2119,7 +2306,8 @@ async def create_device(device: DeviceCreate, db: Session = Depends(get_db)):
         status=normalize_inventory_status(device.status),
         last_seen=None,
         # SNMP配置
-        snmp_version=device.snmp.version,
+        # AsterNOS 仅使用 Exporter + CLI，不保存一个会误导采集逻辑的 SNMP 版本。
+        snmp_version=None if monitor_source == "asternos_exporter" else device.snmp.version,
         snmp_port=device.snmp.port,
         snmp_community=device.snmp.community,
         snmp_username=device.snmp.username,
@@ -2241,6 +2429,8 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
     )
     update_data["monitor_source"] = effective_monitor_source
     if effective_monitor_source == "asternos_exporter":
+        # 即使前端表单仍携带默认 v2c，AsterNOS 也不应保留 SNMP 启用标记。
+        db_device.snmp_version = None
         next_url, next_job, next_instance, next_custom_fields = normalize_monitoring_config(
             effective_monitor_source,
             update_data.get("ip_address", db_device.ip_address),
@@ -2280,6 +2470,14 @@ async def update_device(device_id: int, device: DeviceUpdate, db: Session = Depe
         update_data["vendor"] = ensure_device_vendor_catalog(db, effective_vendor)
     elif effective_monitor_source == "asternos_exporter" and not db_device.vendor:
         update_data["vendor"] = ensure_device_vendor_catalog(db, "Asterfusion")
+
+    # 每次保存均保证设备具有明确的监控模板和功能开关；已有手工选择会被保留。
+    update_data["custom_fields"] = normalize_monitoring_profile(
+        update_data.get("custom_fields", db_device.custom_fields),
+        update_data.get("vendor", effective_vendor or db_device.vendor),
+        update_data.get("model", db_device.model),
+        update_data.get("device_role", db_device.device_role),
+    )
     
     # 更新其他字段
     for key, value in update_data.items():

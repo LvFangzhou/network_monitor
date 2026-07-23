@@ -12,7 +12,9 @@ import argparse
 import binascii
 import json
 import logging
+import math
 import os
+import queue
 import re
 import signal
 import time
@@ -24,12 +26,63 @@ from typing import Any, Iterable, Iterator, Optional
 
 import grpc
 
+from app.utils.telemetry_lossless import (
+    LOSSLESS_SENSOR_PATHS,
+    compact_lossless_rows,
+    normalize_lossless_payload,
+    sensor_cache_suffix,
+)
+from app.utils.telemetry_forwarding import (
+    FORWARDING_SENSOR_PATHS,
+    annotate_ecmp,
+    build_forwarding_summary,
+    forwarding_cache_key,
+    forwarding_table_name,
+    normalize_forwarding_payload,
+)
+
 
 LOGGER = logging.getLogger("telemetry_receiver")
 
 PATH_PATTERN = re.compile(r"([A-Za-z][A-Za-z0-9]+/[A-Za-z0-9_./-]+)")
 JSON_MARKER = b'{"Notification"'
 MONITOR_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+SUPPORTED_CACHE_SENSOR_PATHS = {
+    "diagnostic/cpuhistory",
+    "diagnostic/memories",
+    "ifmgr/interfaces",
+    "device/physicalentities",
+    "device/transceivers",
+    "device/transceiverschannels",
+}
+
+# Keep one bounded diagnostic sample for the lossless paths while developing
+# field mappings. This is opt-in and never records credentials or every packet.
+LOSSLESS_SAMPLE_SENSOR_PATHS = {
+    "ifmgr/interfaces",
+    "ifmgr/statistics",
+    "ifmgr/ethportstatistics",
+    "buffermonitor/commbufferusages",
+    "buffermonitor/commheadroomusages",
+    "buffermonitor/ecnandwredstatistics",
+    "buffermonitor/egressdrops",
+    "buffermonitor/ingressdrops",
+    "buffermonitor/pfcspeeds",
+    "buffermonitor/pfcstatistics",
+    "qstat/queuestat",
+    "qos/interfaces/interface/input/queues/queue/state",
+    "pfc/pfcports/port",
+    "device/transceivers",
+    "device/transceiverschannels",
+    "components/component/optical-channel/state/esnr",
+    "components/component/optical-channel/state/pre-fec-ber",
+    "terminal-device/logical-channels/channel/ethernet/state/pre-fec-ber",
+    "ifmgr/iffecdata",
+    "arp/arptable",
+    "arp/arptableevent",
+    "route/ipv4routes",
+    "route/ipv6routes",
+}
 
 
 def _configure_logging() -> None:
@@ -63,12 +116,56 @@ def _extract_json_payload(payload: bytes) -> Optional[dict]:
 
 
 def _extract_sensor_path(payload: bytes) -> str:
+    # H3C grpc_dialout.DialoutMsg uses protobuf field 2 for sensorPath.
+    # Read that field directly so large field-3 JSON bodies are not decoded and
+    # regex-scanned on every incoming sample.
+    try:
+        offset = 0
+        size = len(payload)
+        while offset < size:
+            tag, offset = _read_protobuf_varint(payload, offset)
+            field_number = tag >> 3
+            wire_type = tag & 0x07
+            if wire_type == 0:
+                _value, offset = _read_protobuf_varint(payload, offset)
+            elif wire_type == 1:
+                offset += 8
+            elif wire_type == 2:
+                length, offset = _read_protobuf_varint(payload, offset)
+                end = offset + length
+                if end > size:
+                    break
+                if field_number == 2:
+                    return payload[offset:end].decode("utf-8", errors="ignore")
+                offset = end
+            elif wire_type == 5:
+                offset += 4
+            else:
+                break
+    except Exception:
+        pass
+
+    # Fallback for vendor variants or diagnostic payloads that do not use the
+    # documented DialoutMsg envelope.
     text = payload.decode("utf-8", errors="ignore")
     matches = PATH_PATTERN.findall(text)
     for item in matches:
         if not item.startswith(("http/", "https/")):
             return item
     return ""
+
+
+def _read_protobuf_varint(payload: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(payload) and shift < 70:
+        byte = payload[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+    raise ValueError("invalid protobuf varint")
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -199,8 +296,15 @@ class DeviceResolver:
 
 
 class TelemetryInfluxWriter:
-    def __init__(self, enabled: bool = True, batch_size: int = 500, flush_interval: float = 2.0) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        batch_size: int = 500,
+        flush_interval: float = 2.0,
+        write_interface_history: bool = False,
+    ) -> None:
         self.enabled = enabled
+        self.write_interface_history = write_interface_history
         self.batch_size = max(1, batch_size)
         self.flush_interval = max(0.1, flush_interval)
         self._points: list[dict[str, Any]] = []
@@ -208,6 +312,12 @@ class TelemetryInfluxWriter:
         self._resolver = DeviceResolver()
         self._written = 0
         self._lock = threading.Lock()
+        # Main transceiver and channel payloads arrive concurrently on worker
+        # threads. Serialize their read/merge/write cache cycle so one payload
+        # cannot overwrite fields written by the other.
+        self._optical_cache_lock = threading.Lock()
+        self._forwarding_cache_lock = threading.Lock()
+        self._forwarding_cycles: dict[tuple[int, str], dict[str, Any]] = {}
 
     def _set_monitor_cache(self, kind: str, device_id: int, payload: Any, suffix: str = "") -> None:
         try:
@@ -226,11 +336,40 @@ class TelemetryInfluxWriter:
         except Exception as exc:
             LOGGER.warning("telemetry cache update failed kind=%s device_id=%s error=%s", kind, device_id, exc)
 
-    def handle_payload(self, payload: bytes, received_at: datetime) -> int:
+    def should_process(self, sensor_path: str) -> bool:
+        sensor_path_lower = (sensor_path or "").lower()
+        if sensor_path_lower in SUPPORTED_CACHE_SENSOR_PATHS:
+            return True
+        if sensor_path_lower in LOSSLESS_SENSOR_PATHS:
+            return True
+        if sensor_path_lower in FORWARDING_SENSOR_PATHS:
+            return True
+        return sensor_path_lower == "ifmgr/statistics" and self.write_interface_history
+
+    def handle_payload(
+        self,
+        payload: bytes,
+        received_at: datetime,
+        sensor_path: str = "",
+        peer_ip: str = "",
+    ) -> int:
         if not self.enabled:
             return 0
-        sensor_path = _extract_sensor_path(payload)
+        sensor_path = sensor_path or _extract_sensor_path(payload)
         sensor_path_lower = sensor_path.lower()
+
+        # Most configured sensor paths are accepted for transport stability but
+        # do not yet have a storage/display mapping. Avoid decoding their large
+        # JSON bodies only to discard them afterwards. This keeps the processor
+        # ahead of H3C burst traffic without changing any implemented metric.
+        if (
+            sensor_path_lower not in SUPPORTED_CACHE_SENSOR_PATHS
+            and sensor_path_lower not in LOSSLESS_SENSOR_PATHS
+            and sensor_path_lower not in FORWARDING_SENSOR_PATHS
+            and sensor_path_lower != "ifmgr/statistics"
+        ):
+            return 0
+
         obj = _extract_json_payload(payload)
         if not obj:
             self._maybe_flush()
@@ -238,13 +377,31 @@ class TelemetryInfluxWriter:
 
         text = payload.decode("utf-8", errors="ignore")
         ip_match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", text)
-        device_ip = ip_match.group(1) if ip_match else ""
+        # Most buffer/PFC/queue payloads contain no IP address.  In Dial-out
+        # mode the TCP peer is the authoritative device source address.
+        device_ip = peer_ip or (ip_match.group(1) if ip_match else "")
         device = self._resolver.get(device_ip)
         if not device:
             return 0
 
+        if sensor_path_lower in FORWARDING_SENSOR_PATHS:
+            return self._handle_forwarding_payload(device, sensor_path_lower, obj, received_at)
+
         cache_written = self._handle_cache_payload(device, sensor_path_lower, obj, received_at)
-        if sensor_path_lower != "ifmgr/statistics":
+        if sensor_path_lower in LOSSLESS_SENSOR_PATHS:
+            rows = compact_lossless_rows(normalize_lossless_payload(sensor_path_lower, obj))
+            self._set_monitor_cache(
+                "telemetry_lossless",
+                int(device["id"]),
+                {
+                    "sensor_path": sensor_path_lower,
+                    "collected_at": received_at.isoformat(),
+                    "rows": rows,
+                },
+                sensor_cache_suffix(sensor_path_lower),
+            )
+            cache_written += len(rows)
+        if sensor_path_lower != "ifmgr/statistics" or not self.write_interface_history:
             self._maybe_flush()
             return cache_written
 
@@ -267,10 +424,118 @@ class TelemetryInfluxWriter:
         self._maybe_flush()
         return added + cache_written
 
+    def _handle_forwarding_payload(
+        self,
+        device: dict[str, Any],
+        sensor_path: str,
+        obj: dict,
+        received_at: datetime,
+    ) -> int:
+        incoming_rows = normalize_forwarding_payload(sensor_path, obj)
+        table_name = forwarding_table_name(sensor_path)
+        device_id = int(device["id"])
+        cache_key = forwarding_cache_key(device_id, table_name)
+        previous_rows: list[dict[str, Any]] = []
+
+        with self._forwarding_cache_lock:
+            try:
+                from app.utils import redis_client
+
+                previous_raw = redis_client.get(cache_key)
+                if previous_raw:
+                    previous_payload = json.loads(previous_raw)
+                    if isinstance(previous_payload, dict) and isinstance(previous_payload.get("rows"), list):
+                        previous_rows = previous_payload["rows"]
+            except Exception as exc:
+                LOGGER.warning("forwarding previous cache read failed device_id=%s table=%s error=%s", device_id, table_name, exc)
+
+            # H3C splits large routing tables into several Telemetry messages.
+            # Messages belonging to one sampling cycle arrive close together;
+            # merge them instead of letting the last packet overwrite the table.
+            cycle_key = (device_id, table_name)
+            now_monotonic = time.monotonic()
+            cycle = self._forwarding_cycles.get(cycle_key)
+            if not cycle or now_monotonic - float(cycle.get("last_received", 0)) > 60:
+                cycle = {
+                    "last_received": now_monotonic,
+                    "baseline_rows": previous_rows,
+                    "rows": [],
+                }
+                self._forwarding_cycles[cycle_key] = cycle
+            cycle["last_received"] = now_monotonic
+
+            if table_name == "arp":
+                row_key = lambda row: (row.get("vrf_index"), row.get("ip_address"))
+            else:
+                row_key = lambda row: (
+                    row.get("vrf"), row.get("prefix"), row.get("next_hop"), row.get("interface")
+                )
+            merged = {row_key(row): row for row in cycle.get("rows", [])}
+            merged.update({row_key(row): row for row in incoming_rows})
+            rows = list(merged.values())
+            if table_name != "arp":
+                rows = annotate_ecmp(rows)
+            cycle["rows"] = rows
+
+            summary = build_forwarding_summary(table_name, rows, cycle.get("baseline_rows") or [])
+            payload = {
+                "device_id": device_id,
+                "device_name": device.get("name"),
+                "device_ip": device.get("ip_address"),
+                "vendor": device.get("vendor"),
+                "sensor_path": sensor_path,
+                "table": table_name,
+                "collected_at": received_at.isoformat(),
+                "summary": summary,
+                "rows": rows,
+            }
+            try:
+                from app.utils import redis_client
+
+                redis_client.setex(cache_key, MONITOR_CACHE_TTL_SECONDS, json.dumps(payload, ensure_ascii=False, default=str))
+            except Exception as exc:
+                LOGGER.warning("forwarding cache write failed device_id=%s table=%s error=%s", device_id, table_name, exc)
+
+        # Large tables arrive in chunks. Persist only stable capacity/count
+        # fields; per-cycle add/remove changes are kept in the completed Redis
+        # snapshot and must not become transient false history spikes.
+        historical_fields = {
+            "total",
+            "prefix_total",
+            "ecmp_prefixes",
+            "blackhole_routes",
+            "incomplete",
+            "duplicate_ip",
+        }
+        point_fields = {
+            key: float(value)
+            for key, value in summary.items()
+            if key in historical_fields and isinstance(value, (int, float))
+        }
+        if point_fields:
+            with self._lock:
+                self._points.append({
+                    "measurement": "forwarding_monitoring",
+                    "tags": {
+                        "device_id": str(device_id),
+                        "device_name": str(device.get("name") or ""),
+                        "device_ip": str(device.get("ip_address") or ""),
+                        "forwarding_table": table_name,
+                    },
+                    "fields": point_fields,
+                    "timestamp": received_at,
+                })
+        self._maybe_flush()
+        return len(rows)
+
     def _handle_cache_payload(self, device: dict[str, Any], sensor_path: str, obj: dict, received_at: datetime) -> int:
         notification = obj.get("Notification") or {}
         collected_at = received_at.isoformat()
         device_id = int(device["id"])
+
+        if sensor_path in {"device/transceivers", "device/transceiverschannels"}:
+            with self._optical_cache_lock:
+                return self._handle_optical_payload(device, sensor_path, notification, received_at)
 
         if sensor_path == "diagnostic/cpuhistory":
             cpus = notification.get("Diagnostic", {}).get("CPUHistory", {}).get("CPU", [])
@@ -355,6 +620,218 @@ class TelemetryInfluxWriter:
 
         return 0
 
+    @staticmethod
+    def _valid_optical_number(value: Any, scale: float = 1.0) -> Optional[float]:
+        number = _safe_float(value)
+        if number is None or number >= 2147483647 or number <= -2147483648:
+            return None
+        return round(number * scale, 6)
+
+    @staticmethod
+    def _optical_microwatt_to_dbm(value: Any) -> Optional[float]:
+        """Convert H3C DDM power thresholds (0.1 uW) to dBm."""
+        number = _safe_float(value)
+        if number is None or number <= 0 or number >= 2147483647:
+            return None
+        # 0.1 uW / 1000 = 0.0001 mW, so raw / 10000 gives mW.
+        return round(10 * math.log10(number / 10000.0), 6)
+
+    def _handle_optical_payload(
+        self,
+        device: dict[str, Any],
+        sensor_path: str,
+        notification: dict[str, Any],
+        received_at: datetime,
+    ) -> int:
+        """Normalize H3C transceiver telemetry into one local cache/measurement.
+
+        The device/transceivers main table contains module identity and aggregate
+        values. device/transceiverschannels contains the individual optical
+        lanes. H3C uses 0.01 dBm for power, 0.01 V for voltage and 0.01 mA for
+        channel bias current.
+        """
+        device_id = int(device["id"])
+        cache_key = f"monitor:cache:optical_modules:{device_id}"
+        cached: dict[str, Any] = {"items": [], "collected_at": received_at.isoformat()}
+        try:
+            from app.utils import redis_client
+
+            raw = redis_client.get(cache_key)
+            if raw:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    cached = parsed
+        except Exception:
+            pass
+
+        modules: dict[str, dict[str, Any]] = {}
+        for existing in cached.get("items") or []:
+            if isinstance(existing, dict):
+                key = str(existing.get("interface_index") or existing.get("interface_name") or "")
+                if key:
+                    modules[key] = existing
+
+        points: list[dict[str, Any]] = []
+        if sensor_path == "device/transceivers":
+            rows = notification.get("Device", {}).get("Transceivers", {}).get("Interface", [])
+            if isinstance(rows, dict):
+                rows = [rows]
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                interface_index = _safe_int(row.get("IfIndex"))
+                interface_name = str(row.get("Name") or "").strip()
+                if interface_index is None or not interface_name:
+                    continue
+                key = str(interface_index)
+                item = modules.setdefault(key, {})
+                item.update({
+                    "device_id": device_id,
+                    "device_name": device.get("name"),
+                    "device_ip": device.get("ip_address"),
+                    "device_vendor": device.get("vendor"),
+                    "interface_index": interface_index,
+                    "interface_name": interface_name,
+                    "vendor_name": row.get("VendorName"),
+                    "serial_number": row.get("SerialNumber"),
+                    "transceiver_type": row.get("TransceiverType"),
+                    "hardware_type": row.get("HardwareType"),
+                    "wavelength_nm": self._valid_optical_number(row.get("WaveLength")),
+                    "distance_m": self._valid_optical_number(row.get("TransferDistance")),
+                    "speed_mbps": self._valid_optical_number(row.get("TransceiverSpeed")),
+                    "temperature_c": self._valid_optical_number(row.get("Temperature")),
+                    "voltage_v": self._valid_optical_number(row.get("Voltage"), 0.01),
+                    "total_rx_power_dbm": self._valid_optical_number(row.get("TotalRxPower"), 0.01),
+                    "total_tx_power_dbm": self._valid_optical_number(row.get("TotalTxPower"), 0.01),
+                    "rx_high_alarm_dbm": self._optical_microwatt_to_dbm(row.get("RcvPwrHiAlarm")),
+                    "rx_high_warning_dbm": self._optical_microwatt_to_dbm(row.get("RcvPwrHiWarn")),
+                    "rx_low_warning_dbm": self._optical_microwatt_to_dbm(row.get("RcvPwrLoWarn")),
+                    "rx_low_alarm_dbm": self._optical_microwatt_to_dbm(row.get("RcvPwrLoAlarm")),
+                    "tx_high_alarm_dbm": self._optical_microwatt_to_dbm(row.get("PwrOutHiAlarm")),
+                    "tx_high_warning_dbm": self._optical_microwatt_to_dbm(row.get("PwrOutHiWarn")),
+                    "tx_low_warning_dbm": self._optical_microwatt_to_dbm(row.get("PwrOutLoWarn")),
+                    "tx_low_alarm_dbm": self._optical_microwatt_to_dbm(row.get("PwrOutLoAlarm")),
+                    "temperature_high_alarm_c": self._valid_optical_number(row.get("TemperatureHiAlarm"), 0.001),
+                    "temperature_high_warning_c": self._valid_optical_number(row.get("TemperatureHiWarn"), 0.001),
+                    "temperature_low_warning_c": self._valid_optical_number(row.get("TemperatureLoWarn"), 0.001),
+                    "temperature_low_alarm_c": self._valid_optical_number(row.get("TemperatureLoAlarm"), 0.001),
+                    "voltage_high_alarm_v": self._valid_optical_number(row.get("VccHiAlarm"), 0.0001),
+                    "voltage_high_warning_v": self._valid_optical_number(row.get("VccHiWarn"), 0.0001),
+                    "voltage_low_warning_v": self._valid_optical_number(row.get("VccLoWarn"), 0.0001),
+                    "voltage_low_alarm_v": self._valid_optical_number(row.get("VccLoAlarm"), 0.0001),
+                    "manufacturer": row.get("RelySlotMfgName"),
+                    "manufactured_at": row.get("RelySlotMfgDate"),
+                    "source": "telemetry",
+                    "collected_at": received_at.isoformat(),
+                })
+                numeric_fields = {
+                    name: value for name, value in {
+                        "rx_power": item.get("rx_power_dbm"),
+                        "tx_power": item.get("tx_power_dbm"),
+                        "temperature": item.get("temperature_c"),
+                        "voltage": item.get("voltage_v"),
+                        "speed_mbps": item.get("speed_mbps"),
+                        "wavelength_nm": item.get("wavelength_nm"),
+                    }.items() if value is not None
+                }
+                if numeric_fields:
+                    points.append({
+                        "measurement": "optical_monitoring",
+                        "tags": {
+                            "device_id": str(device_id),
+                            "device_name": device.get("name") or "",
+                            "device_ip": device.get("ip_address") or "",
+                            "vendor": device.get("vendor") or "",
+                            "interface_index": key,
+                            "interface_name": interface_name,
+                            "source": "telemetry",
+                            "scope": "module",
+                        },
+                        "fields": numeric_fields,
+                        "timestamp": received_at,
+                    })
+        else:
+            rows = notification.get("Device", {}).get("TransceiversChannels", {}).get("Interface", [])
+            if isinstance(rows, dict):
+                rows = [rows]
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                interface_index = _safe_int(row.get("IfIndex"))
+                channel_index = _safe_int(row.get("ChannelIndex"))
+                interface_name = str(row.get("Name") or "").strip()
+                if interface_index is None or channel_index is None or not interface_name:
+                    continue
+                key = str(interface_index)
+                item = modules.setdefault(key, {
+                    "device_id": device_id,
+                    "device_name": device.get("name"),
+                    "device_ip": device.get("ip_address"),
+                    "device_vendor": device.get("vendor"),
+                    "interface_index": interface_index,
+                    "interface_name": interface_name,
+                    "source": "telemetry",
+                })
+                channel = {
+                    "channel": channel_index,
+                    "rx_power_dbm": self._valid_optical_number(row.get("ChannelCurRXPower"), 0.01),
+                    "tx_power_dbm": self._valid_optical_number(row.get("ChannelCurTXPower"), 0.01),
+                    "temperature_c": self._valid_optical_number(row.get("ChannelTemperature")),
+                    "bias_current_ma": self._valid_optical_number(row.get("ChannelBiasCurrent"), 0.01),
+                    "collected_at": received_at.isoformat(),
+                }
+                channels = {
+                    int(existing.get("channel")): existing
+                    for existing in item.get("channels") or []
+                    if isinstance(existing, dict) and _safe_int(existing.get("channel")) is not None
+                }
+                channels[channel_index] = channel
+                item["channels"] = [channels[index] for index in sorted(channels)]
+                rx_values = [entry.get("rx_power_dbm") for entry in item["channels"] if entry.get("rx_power_dbm") is not None]
+                tx_values = [entry.get("tx_power_dbm") for entry in item["channels"] if entry.get("tx_power_dbm") is not None]
+                # The module table's TotalRx/TotalTx values are aggregate power,
+                # while alarm ranges are per lane. Display the weakest lane so
+                # a degraded channel is not hidden by the aggregate value.
+                item["rx_power_dbm"] = min(rx_values) if rx_values else item.get("total_rx_power_dbm")
+                item["tx_power_dbm"] = min(tx_values) if tx_values else item.get("total_tx_power_dbm")
+                item["collected_at"] = received_at.isoformat()
+                numeric_fields = {
+                    name: value for name, value in {
+                        "rx_power": channel.get("rx_power_dbm"),
+                        "tx_power": channel.get("tx_power_dbm"),
+                        "temperature": channel.get("temperature_c"),
+                        "bias_current_ma": channel.get("bias_current_ma"),
+                    }.items() if value is not None
+                }
+                if numeric_fields:
+                    points.append({
+                        "measurement": "optical_monitoring",
+                        "tags": {
+                            "device_id": str(device_id),
+                            "device_name": device.get("name") or "",
+                            "device_ip": device.get("ip_address") or "",
+                            "vendor": device.get("vendor") or "",
+                            "interface_index": key,
+                            "interface_name": interface_name,
+                            "channel": str(channel_index),
+                            "source": "telemetry",
+                            "scope": "channel",
+                        },
+                        "fields": numeric_fields,
+                        "timestamp": received_at,
+                    })
+
+        if points:
+            with self._lock:
+                self._points.extend(points)
+        payload = {
+            "items": sorted(modules.values(), key=lambda row: int(row.get("interface_index") or 0)),
+            "collected_at": received_at.isoformat(),
+            "source": "telemetry",
+        }
+        self._set_monitor_cache("optical_modules", device_id, payload)
+        return len(points)
+
     def _merge_overview_cache(self, device: dict[str, Any], patch: dict[str, Any], collected_at: str) -> None:
         device_id = int(device["id"])
         overview: dict[str, Any] = {}
@@ -380,6 +857,12 @@ class TelemetryInfluxWriter:
             if isinstance(values, dict):
                 target = overview.setdefault(section, {})
                 for key, value in values.items():
+                    # Telemetry payloads do not always contain every overview
+                    # field (for example physicalentities has no uptime on
+                    # H3C S9867).  Keep an existing SNMP/Exporter value instead
+                    # of replacing it with an empty Telemetry placeholder.
+                    if value is None or value == "":
+                        continue
                     target[key] = value
                     if section in {"resources", "protocols", "system_info"}:
                         overview.setdefault("data_sources", {}).setdefault(section, {})[key] = "telemetry"
@@ -451,7 +934,7 @@ class TelemetryInfluxWriter:
 
             if influx_client.write_points(points, sync=False):
                 self._written += len(points)
-                LOGGER.info("telemetry points written measurement=interface_monitoring count=%s total=%s", len(points), self._written)
+                LOGGER.info("telemetry points written count=%s total=%s", len(points), self._written)
             else:
                 LOGGER.warning("telemetry points write returned false count=%s", len(points))
         except Exception as exc:
@@ -464,6 +947,84 @@ class TelemetryInfluxWriter:
         self._maybe_flush(force=False)
 
 
+class TelemetryPayloadProcessor:
+    """Decouple gRPC stream reads from JSON/cache/storage processing.
+
+    H3C devices can send large bursts from many sensor groups at the same time.
+    Processing those payloads inline applies HTTP/2 flow-control backpressure
+    and eventually makes some devices close the Dial-out RPC.  The bounded
+    queue lets the gRPC worker return to Read immediately while a separate
+    worker pool performs the slower processing.
+    """
+
+    def __init__(self, writer: TelemetryInfluxWriter, workers: int = 16, max_queue: int = 8192) -> None:
+        self.writer = writer
+        self.workers = max(1, workers)
+        self.queue: queue.Queue[Optional[tuple[bytes, datetime, str, str]]] = queue.Queue(maxsize=max(256, max_queue))
+        self._lock = threading.Lock()
+        self._submitted = 0
+        self._processed = 0
+        self._dropped = 0
+        self._last_log = time.time()
+        self._threads: list[threading.Thread] = []
+        for index in range(self.workers):
+            thread = threading.Thread(target=self._run, name=f"telemetry-payload-{index + 1}", daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def submit(self, payload: bytes, received_at: datetime, sensor_path: str, peer_ip: str = "") -> bool:
+        try:
+            self.queue.put_nowait((payload, received_at, sensor_path, peer_ip))
+            accepted = True
+        except queue.Full:
+            accepted = False
+        now = time.time()
+        with self._lock:
+            self._submitted += 1
+            if not accepted:
+                self._dropped += 1
+            should_log = now - self._last_log >= 60
+            if should_log:
+                self._last_log = now
+                LOGGER.info(
+                    "telemetry processor stats submitted=%s processed=%s dropped=%s queued=%s workers=%s",
+                    self._submitted,
+                    self._processed,
+                    self._dropped,
+                    self.queue.qsize(),
+                    self.workers,
+                )
+        if not accepted and self._dropped % 100 == 1:
+            LOGGER.warning("telemetry processor queue full dropped=%s queued=%s", self._dropped, self.queue.qsize())
+        return accepted
+
+    def _run(self) -> None:
+        while True:
+            item = self.queue.get()
+            if item is None:
+                self.queue.task_done()
+                return
+            payload, received_at, sensor_path, peer_ip = item
+            try:
+                self.writer.handle_payload(payload, received_at, sensor_path=sensor_path, peer_ip=peer_ip)
+            except Exception:
+                LOGGER.exception("telemetry payload processing failed bytes=%s", len(payload))
+            finally:
+                with self._lock:
+                    self._processed += 1
+                self.queue.task_done()
+
+    def stop(self) -> None:
+        for _thread in self._threads:
+            try:
+                self.queue.put_nowait(None)
+            except queue.Full:
+                break
+        for thread in self._threads:
+            thread.join(timeout=2)
+        self.writer.flush()
+
+
 class TelemetryRawRecorder:
     def __init__(
         self,
@@ -472,6 +1033,7 @@ class TelemetryRawRecorder:
         record_messages: bool = False,
         record_payloads: bool = False,
         record_events: bool = True,
+        record_sensor_samples: bool = False,
     ) -> None:
         self.spool_dir = Path(spool_dir)
         self.spool_dir.mkdir(parents=True, exist_ok=True)
@@ -479,8 +1041,11 @@ class TelemetryRawRecorder:
         self.record_messages = record_messages
         self.record_payloads = record_payloads
         self.record_events = record_events
+        self.record_sensor_samples = record_sensor_samples
         self._saved_messages = 0
         self._session_seq = 0
+        self._sampled_sensor_paths: set[str] = set()
+        self._sample_lock = threading.Lock()
 
     def next_session_id(self) -> str:
         self._session_seq += 1
@@ -503,6 +1068,27 @@ class TelemetryRawRecorder:
         payload_dir = self.spool_dir / "payloads" / session_id
         payload_dir.mkdir(parents=True, exist_ok=True)
         (payload_dir / f"{index:06d}.bin").write_bytes(payload)
+
+    def record_sensor_sample(self, sensor_path: str, payload: bytes) -> None:
+        """Persist only the first JSON sample for selected lossless paths."""
+        normalized = (sensor_path or "").strip().lower()
+        if not self.record_sensor_samples or normalized not in LOSSLESS_SAMPLE_SENSOR_PATHS:
+            return
+        with self._sample_lock:
+            if normalized in self._sampled_sensor_paths:
+                return
+            obj = _extract_json_payload(payload)
+            if not obj:
+                return
+            self._sampled_sensor_paths.add(normalized)
+            sample_dir = self.spool_dir / "sensor-samples"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            filename = normalized.replace("/", "__") + ".json"
+            (sample_dir / filename).write_text(
+                json.dumps(obj, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            LOGGER.info("telemetry sensor sample recorded path=%s file=%s", normalized, filename)
 
 
 def _protobuf_varint(value: int) -> bytes:
@@ -541,11 +1127,13 @@ class CatchAllTelemetryHandler(grpc.GenericRpcHandler):
         self,
         recorder: TelemetryRawRecorder,
         writer: TelemetryInfluxWriter,
+        processor: TelemetryPayloadProcessor,
         log_every: int = 100,
         ack_every: int = 1,
     ) -> None:
         self.recorder = recorder
         self.writer = writer
+        self.processor = processor
         self.log_every = max(1, log_every)
         self.ack_every = max(0, ack_every)
         self._active_lock = threading.Lock()
@@ -556,6 +1144,8 @@ class CatchAllTelemetryHandler(grpc.GenericRpcHandler):
 
         def stream_unary(request_iterator: Iterable[bytes], context: grpc.ServicerContext) -> bytes:
             peer = context.peer()
+            peer_match = re.match(r"^(?:ipv4:)?(\d{1,3}(?:\.\d{1,3}){3}):\d+$", peer or "")
+            peer_ip = peer_match.group(1) if peer_match else ""
             session_id = self.recorder.next_session_id()
             started = time.time()
             count = 0
@@ -648,9 +1238,10 @@ class CatchAllTelemetryHandler(grpc.GenericRpcHandler):
                             }
                         )
                     self.recorder.record_payload(session_id, count, payload)
-                    written_candidates = self.writer.handle_payload(payload, datetime.now(timezone.utc))
-                    if written_candidates and count % self.log_every == 0:
-                        LOGGER.info("telemetry payload mapped to interface points session=%s index=%s points=%s", session_id, count, written_candidates)
+                    sensor_path = _extract_sensor_path(payload)
+                    self.recorder.record_sensor_sample(sensor_path, payload)
+                    if self.writer.should_process(sensor_path):
+                        self.processor.submit(payload, datetime.now(timezone.utc), sensor_path, peer_ip=peer_ip)
             except grpc.RpcError as exc:  # pragma: no cover - runtime diagnostics only
                 code = None
                 details = ""
@@ -755,8 +1346,12 @@ def serve(
     record_messages: bool,
     record_payloads: bool,
     record_events: bool,
+    record_sensor_samples: bool,
     max_saved_messages: int,
     ack_every: int,
+    write_interface_history: bool,
+    process_workers: int,
+    process_queue_size: int,
 ) -> None:
     recorder = TelemetryRawRecorder(
         spool_dir=spool_dir,
@@ -764,16 +1359,36 @@ def serve(
         record_messages=record_messages,
         record_payloads=record_payloads,
         record_events=record_events,
+        record_sensor_samples=record_sensor_samples,
     )
-    writer = TelemetryInfluxWriter(enabled=write_influx)
+    writer = TelemetryInfluxWriter(
+        enabled=write_influx,
+        write_interface_history=write_interface_history,
+    )
+    processor = TelemetryPayloadProcessor(
+        writer=writer,
+        workers=process_workers,
+        max_queue=process_queue_size,
+    )
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers),
         options=[
             ("grpc.max_receive_message_length", 64 * 1024 * 1024),
             ("grpc.max_send_message_length", 4 * 1024 * 1024),
+            # H3C Dial-out sessions are designed to remain open. Permit enough
+            # concurrent HTTP/2 streams for all subscribed devices. Do not send
+            # server-initiated keepalive PINGs here: older Comware grpc-c++
+            # clients have been observed closing the RPC on those PINGs.
+            ("grpc.max_concurrent_streams", max(1024, max_workers * 2)),
         ],
     )
-    server.add_generic_rpc_handlers((CatchAllTelemetryHandler(recorder, writer=writer, log_every=log_every, ack_every=ack_every),))
+    server.add_generic_rpc_handlers((CatchAllTelemetryHandler(
+        recorder,
+        writer=writer,
+        processor=processor,
+        log_every=log_every,
+        ack_every=ack_every,
+    ),))
     bind_addr = f"{host}:{port}"
     bound_port = server.add_insecure_port(bind_addr)
     if bound_port == 0:
@@ -796,7 +1411,7 @@ def serve(
         while not stop_requested:
             time.sleep(1)
     finally:
-        writer.flush()
+        processor.stop()
         server.stop(grace=1)
 
 
@@ -812,8 +1427,16 @@ def main() -> None:
     parser.add_argument("--record-messages", action="store_true", default=os.getenv("TELEMETRY_RECEIVER_RECORD_MESSAGES", "false").lower() in {"1", "true", "yes", "on"})
     parser.add_argument("--record-payloads", action="store_true", default=os.getenv("TELEMETRY_RECEIVER_RECORD_PAYLOADS", "false").lower() in {"1", "true", "yes", "on"})
     parser.add_argument("--record-events", action="store_true", default=os.getenv("TELEMETRY_RECEIVER_RECORD_EVENTS", "true").lower() in {"1", "true", "yes", "on"})
+    parser.add_argument("--record-sensor-samples", action="store_true", default=os.getenv("TELEMETRY_RECEIVER_RECORD_SENSOR_SAMPLES", "false").lower() in {"1", "true", "yes", "on"})
     parser.add_argument("--max-saved-messages", type=int, default=int(os.getenv("TELEMETRY_RECEIVER_MAX_SAVED_MESSAGES", "0")))
     parser.add_argument("--ack-every", type=int, default=int(os.getenv("TELEMETRY_RECEIVER_ACK_EVERY", "1")))
+    parser.add_argument(
+        "--write-interface-history",
+        action="store_true",
+        default=os.getenv("TELEMETRY_RECEIVER_WRITE_INTERFACE_HISTORY", "false").lower() in {"1", "true", "yes", "on"},
+    )
+    parser.add_argument("--process-workers", type=int, default=int(os.getenv("TELEMETRY_RECEIVER_PROCESS_WORKERS", "16")))
+    parser.add_argument("--process-queue-size", type=int, default=int(os.getenv("TELEMETRY_RECEIVER_PROCESS_QUEUE_SIZE", "8192")))
     args = parser.parse_args()
     serve(
         args.host,
@@ -825,8 +1448,12 @@ def main() -> None:
         args.record_messages,
         args.record_payloads,
         args.record_events,
+        args.record_sensor_samples,
         args.max_saved_messages,
         args.ack_every,
+        args.write_interface_history,
+        args.process_workers,
+        args.process_queue_size,
     )
 
 

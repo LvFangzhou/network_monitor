@@ -66,9 +66,13 @@ const metricOptions = [
   { value: 'bfd_session_state', label: 'BFD 会话状态（需私有 MIB）' },
   { value: 'optical_rx_power', label: '收光功率（需私有 MIB）' },
   { value: 'optical_tx_power', label: '发光功率（需私有 MIB）' },
+  { value: 'optical_lane_power_delta', label: '光模块 Lane 收光功率差' },
+  { value: 'optical_rx_power_drop_24h', label: '光模块 24 小时收光衰减' },
+  { value: 'optical_rx_fec_correlation', label: '光功率下降并伴随 FEC 增长（H3C S9867）' },
   { value: 'internet_circuit_traffic_floor', label: '公网线路流量掉底' },
   { value: 'private_line_circuit_traffic_floor', label: '专线流量掉底' },
   { value: 'syslog_keyword', label: 'Syslog 关键字匹配' },
+  { value: 'quality_packet_loss', label: '公网质量探测连续丢包' },
 ]
 
 const conditionOptions = ['>', '>=', '<', '<=', '==', '!='].map((value) => ({

@@ -12,6 +12,13 @@ ASTERNOS_TASK_EXPIRES_SECONDS = max(1.0, ASTERNOS_SCHEDULER_INTERVAL_SECONDS - 1
 
 # 定时任务配置
 beat_schedule = {
+    'collect-server-resources-every-30s': {
+        'task': 'app.tasks.system_tasks.collect_server_resources',
+        'schedule': 30.0,
+        'options': {
+            'expires': 25.0,
+        },
+    },
     # SNMP全量采集调度 - 按配置分桶调度，避免 Beat 间隔和分桶间隔不一致导致部分桶永远扫不到。
     'collect-snmp-every-30s': {
         'task': 'app.tasks.snmp_tasks.collect_all_snmp',
@@ -27,6 +34,13 @@ beat_schedule = {
         'options': {
             'expires': SNMP_TASK_EXPIRES_SECONDS,
         }
+    },
+    'collect-h3c-s9867-roce-interface-health-every-30s': {
+        'task': 'app.tasks.snmp_tasks.collect_h3c_s9867_roce_interface_health',
+        'schedule': SNMP_SCHEDULER_INTERVAL_SECONDS,
+        'options': {
+            'expires': SNMP_TASK_EXPIRES_SECONDS,
+        },
     },
     # 线路绑定端口轻量采集 - 重点公网/专线端口保持10秒级曲线
     'collect-circuit-interface-realtime-every-30s': {
@@ -110,6 +124,15 @@ beat_schedule = {
         }
     },
 
+    # 山石仅上报 BFD Down Trap，没有配对的恢复 Trap；回查当前会话状态后再真实恢复。
+    'reconcile-hillstone-bfd-traps-every-60s': {
+        'task': 'app.tasks.alert_tasks.reconcile_hillstone_bfd_trap_alerts',
+        'schedule': 60.0,
+        'options': {
+            'expires': 50.0,
+        }
+    },
+
     # 设备可达性告警检查 - 每60秒执行一次，不被全量慢规则拖住
     'check-reachability-alerts-every-60s': {
         'task': 'app.tasks.alert_tasks.check_reachability_alerts',
@@ -125,6 +148,15 @@ beat_schedule = {
         'schedule': 60.0,
         'options': {
             'expires': 50.0,
+        }
+    },
+
+    # 光模块质量独立检查 - 5分钟采样足以覆盖 DDM/FEC 周期，且不受常规慢规则影响
+    'check-optical-alerts-every-5m': {
+        'task': 'app.tasks.alert_tasks.check_optical_alerts',
+        'schedule': 300.0,
+        'options': {
+            'expires': 240.0,
         }
     },
 
@@ -209,15 +241,30 @@ beat_schedule = {
             'expires': 50.0,
         },
     },
-    'prewarm-device-detail-caches-every-60s': {
+    'prewarm-device-detail-caches-daily-00-and-12': {
         'task': 'app.tasks.snmp_tasks.prewarm_device_detail_caches',
-        'schedule': 60.0,
+        'schedule': crontab(minute=0, hour='0,12'),
         'options': {
-            'expires': 50.0,
+            'expires': 6 * 60 * 60,
+        },
+    },
+    # ARP/FIB 明细体量较大，每12小时低并发采集并缓存；错开配置备份和连接信息预热。
+    'prewarm-forwarding-caches-daily-00-30-and-12-30': {
+        'task': 'app.tasks.snmp_tasks.prewarm_forwarding_caches',
+        'schedule': crontab(minute=30, hour='0,12'),
+        'options': {
+            'expires': 3 * 60 * 60,
         },
     },
     'ensure-qos-discard-rules-every-10m': {
         'task': 'app.tasks.snmp_tasks.ensure_qos_discard_rules',
+        'schedule': 600.0,
+        'options': {
+            'expires': 300.0,
+        },
+    },
+    'ensure-h3c-s9867-roce-rules-every-10m': {
+        'task': 'app.tasks.snmp_tasks.ensure_h3c_s9867_roce_rules',
         'schedule': 600.0,
         'options': {
             'expires': 300.0,

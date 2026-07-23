@@ -37,7 +37,21 @@ from app.services.flow_listener import flow_listener
 from app.utils.snmp_system_info import extract_snmp_model
 from app.utils.controller_client import ControllerClient
 from app.utils.controller_settings import find_controller_settings
-from app.utils.quality_probe import apply_quality_loss_window, run_quality_ping, write_quality_probe_result
+from app.utils.quality_probe import (
+    apply_quality_loss_window,
+    discover_quality_nqa_snmp_instances,
+    run_quality_nqa_snmp,
+    run_quality_ping,
+    write_quality_probe_result,
+)
+from app.utils.telemetry_lossless import LOSSLESS_SENSOR_PATHS, sensor_cache_suffix
+from app.utils.telemetry_forwarding import forwarding_cache_key
+from app.utils.server_resources import (
+    HISTORY_KEY as SERVER_RESOURCE_HISTORY_KEY,
+    collect_host_resource_sample,
+    load_host_resource_history,
+    store_host_resource_sample,
+)
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -49,6 +63,7 @@ SNMP_VERIFY_OID = "1.3.6.1.2.1.1.3.0"
 MONITOR_CACHE_STALE_SECONDS = 7 * 24 * 60 * 60
 MAX_INTERFACE_HISTORY_SECONDS = 7 * 24 * 60 * 60
 RATE_FALLBACK_MAX_SECONDS = 5 * 60
+OPTICAL_MODULE_CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 HISTORY_REQUEST_CACHE_SECONDS = 8
 TRAFFIC_SUMMARY_CACHE_SECONDS_SHORT = 30
 TRAFFIC_SUMMARY_CACHE_SECONDS_NORMAL = 60
@@ -58,6 +73,8 @@ DEVICE_OVERVIEW_RESPONSE_CACHE_SECONDS = 2 * 60
 DEVICE_OVERVIEW_SNAPSHOT_CACHE_PREFIX = "monitor:cache:overview_snapshot"
 DEVICE_OVERVIEW_LAST_SUCCESS_CACHE_PREFIX = "monitor:cache:last_success_overview_snapshot"
 DEVICE_OVERVIEW_REVISION_KEY = "monitor:cache:overview_revision"
+DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS = 24 * 60 * 60
+QUALITY_ALERT_METRIC_TYPE = "quality_packet_loss"
 FRESH_INTERFACE_SAMPLE_LOCK_SECONDS = 8
 FRESH_INTERFACE_SAMPLE_MAX_RANGE_SECONDS = 60 * 60
 INTERFACE_RATE_CAP_MULTIPLIER = 1.03
@@ -98,24 +115,6 @@ ASTERNOS_COUNTER_METRICS = [
         "target_labels": ["port", "queue"],
     },
 ]
-QUEUE_MONITOR_GROUP_FIELDS = {
-    "queueDropGrowth": ["queue_ingress_dropped_pkts_delta", "queue_egress_dropped_pkts_delta"],
-    "pfcGrowth": ["pfc_rx_pkts_delta", "pfc_tx_pkts_delta"],
-    "ecnGrowth": ["ecn_marked_pkts_delta"],
-}
-QUEUE_MONITOR_COLORS = [
-    "#fa541c",
-    "#eb2f96",
-    "#722ed1",
-    "#13c2c2",
-    "#fa8c16",
-    "#2f54eb",
-    "#52c41a",
-    "#f4d000",
-    "#1677ff",
-    "#a0d911",
-]
-
 
 def _quality_target_payload(target: QualityProbeTarget) -> Dict[str, Any]:
     return target.to_dict()
@@ -129,6 +128,150 @@ def _safe_flux_duration(value: str, default: str = "-24h") -> str:
 def _safe_flux_interval(value: str, default: str = "1m") -> str:
     text = str(value or default).strip()
     return text if re.fullmatch(r"\d+[smhdw]", text) else default
+
+
+@router.get("/modules")
+def list_local_optical_modules(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    search: Optional[str] = Query(None),
+    device_ip: Optional[str] = Query(None),
+    interface_name: Optional[str] = Query(None),
+    vendor_name: Optional[str] = Query(None),
+    datacenter_name: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return optical modules collected locally by Telemetry/SNMP/Exporter."""
+    devices = db.query(Device).filter(
+        Device.is_monitored == True,
+        Device.status.in_(["active", "online"]),
+    ).order_by(Device.ip_address.asc()).all()
+    rows: List[Dict[str, Any]] = []
+    keyword = str(search or "").strip().lower()
+    ip_filter = str(device_ip or "").strip().lower()
+    interface_filter = str(interface_name or "").strip().lower()
+    vendor_filter = str(vendor_name or "").strip().lower()
+    datacenter_filter = str(datacenter_name or "").strip().lower()
+    vendor_options = sorted({str(device.vendor or "").strip() for device in devices if str(device.vendor or "").strip()})
+    datacenter_options = sorted({
+        str(device.datacenter_ref.name or "").strip()
+        for device in devices
+        if device.datacenter_ref and str(device.datacenter_ref.name or "").strip()
+    })
+
+    for device in devices:
+        datacenter_name_value = device.datacenter_ref.name if device.datacenter_ref else ""
+        if datacenter_filter and datacenter_filter not in str(datacenter_name_value).lower():
+            continue
+        raw = redis_client.get(f"monitor:cache:optical_modules:{device.id}")
+        if not raw:
+            continue
+        try:
+            cached = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(cached, dict):
+            continue
+
+        interface_states: Dict[str, Dict[str, Any]] = {}
+        interface_raw = redis_client.get(f"monitor:cache:interfaces:{device.id}")
+        if interface_raw:
+            try:
+                interface_cache = json.loads(interface_raw)
+                for item in interface_cache.get("interfaces") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in (item.get("index"), item.get("name")):
+                        if key not in (None, ""):
+                            interface_states[str(key).lower()] = item
+            except Exception:
+                pass
+
+        datacenter_name = datacenter_name_value
+        for item in cached.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            iface = str(item.get("interface_name") or "").strip()
+            state = interface_states.get(str(item.get("interface_index") or "").lower()) or interface_states.get(iface.lower()) or {}
+            module_vendor = str(item.get("vendor_name") or item.get("manufacturer") or device.vendor or "").strip()
+            source = str(item.get("source") or cached.get("source") or "").strip().lower()
+            collected_at = item.get("collected_at") or cached.get("collected_at")
+            try:
+                time_ms = int(datetime.fromisoformat(str(collected_at).replace("Z", "+00:00")).timestamp() * 1000)
+            except Exception:
+                time_ms = None
+            row = {
+                "assetId": device.id,
+                "deviceName": device.name,
+                "deviceIp": device.ip_address,
+                "deviceVendor": device.vendor,
+                "datacenterName": datacenter_name,
+                "ifIndex": item.get("interface_index"),
+                "ifDesc": iface,
+                "ifOperStatus": 1 if str(state.get("oper_status") or "").lower() == "up" else 2,
+                "adminStatus": 1 if str(state.get("admin_status") or "").lower() == "up" else 2,
+                "vendorName": module_vendor,
+                "serialNumber": item.get("serial_number"),
+                "transceiveType": item.get("transceiver_type") or item.get("hardware_type"),
+                "transceiverSpeed": item.get("speed_mbps") or (
+                    float(state.get("speed_bps")) / 1_000_000 if state.get("speed_bps") else None
+                ),
+                "curRxPower": item.get("rx_power_dbm"),
+                "curTxPower": item.get("tx_power_dbm"),
+                "curTemperature": item.get("temperature_c"),
+                "curVoltage": item.get("voltage_v"),
+                "biasCurrent": item.get("bias_current_ma"),
+                "waveLength": item.get("wavelength_nm"),
+                "mfgDate": item.get("manufactured_at"),
+                "rcvPwrLoWarn": item.get("rx_low_warning_dbm"),
+                "rcvPwrHiWarn": item.get("rx_high_warning_dbm"),
+                "rcvPwrLoAlarm": item.get("rx_low_alarm_dbm"),
+                "rcvPwrHiAlarm": item.get("rx_high_alarm_dbm"),
+                "pwrOutLoWarn": item.get("tx_low_warning_dbm"),
+                "pwrOutHiWarn": item.get("tx_high_warning_dbm"),
+                "pwrOutLoAlarm": item.get("tx_low_alarm_dbm"),
+                "pwrOutHiAlarm": item.get("tx_high_alarm_dbm"),
+                "tempLoWarn": item.get("temperature_low_warning_c"),
+                "tempHiWarn": item.get("temperature_high_warning_c"),
+                "tempLoAlarm": item.get("temperature_low_alarm_c"),
+                "tempHiAlarm": item.get("temperature_high_alarm_c"),
+                "vccLoWarn": item.get("voltage_low_warning_v"),
+                "vccHiWarn": item.get("voltage_high_warning_v"),
+                "vccLoAlarm": item.get("voltage_low_alarm_v"),
+                "vccHiAlarm": item.get("voltage_high_alarm_v"),
+                "channels": item.get("channels") or [],
+                "sourceType": source,
+                "source": {"telemetry": "H3C Telemetry", "snmp": "设备SNMP", "exporter": "AsterNOS Exporter"}.get(source, source),
+                "normalizedValues": True,
+                "time": time_ms,
+            }
+            searchable = " ".join(str(value or "") for value in (
+                device.name, device.ip_address, datacenter_name, iface, module_vendor,
+                row.get("serialNumber"), row.get("transceiveType"), source,
+            )).lower()
+            if keyword and keyword not in searchable:
+                continue
+            if ip_filter and ip_filter not in str(device.ip_address).lower():
+                continue
+            if interface_filter and interface_filter not in iface.lower():
+                continue
+            # “厂商”筛选指设备录入厂商，不是光模块自身制造商。否则锐捷设备里
+            # 插入第三方模块时，可能同时出现在两个厂商的筛选结果中。
+            if vendor_filter and vendor_filter not in str(device.vendor or "").lower():
+                continue
+            rows.append(row)
+
+    rows.sort(key=lambda row: (tuple(int(part) if part.isdigit() else 999 for part in str(row.get("deviceIp") or "").split(".")), str(row.get("ifDesc") or "")))
+    total = len(rows)
+    start = (page - 1) * page_size
+    return {
+        "total": total,
+        "items": rows[start:start + page_size],
+        "page": page,
+        "page_size": page_size,
+        "vendors": vendor_options,
+        "datacenters": datacenter_options,
+    }
 
 
 def _run_mtr_or_trace(target: str) -> Dict[str, Any]:
@@ -418,6 +561,8 @@ def _run_lldp_cli_command(device: Device, commands: List[str]) -> str:
     username = str(getattr(device, "ssh_username", "") or "").strip()
     password = getattr(device, "ssh_password", None) or None
     key_text = str(getattr(device, "ssh_key", "") or "").strip()
+    profile = _lldp_cli_profile(device)
+    vendor_key = profile[0] if profile else (_normalize_vendor_text(getattr(device, "vendor", None)).split() or [""])[0]
     if not username or (not password and not key_text):
         return ""
     try:
@@ -426,15 +571,54 @@ def _run_lldp_cli_command(device: Device, commands: List[str]) -> str:
         logger.warning("LLDP CLI采集跳过：缺少paramiko", device_id=device.id, error=str(exc))
         return ""
 
+    if vendor_key == "ruijie":
+        try:
+            from netmiko import ConnectHandler
+            from app.tasks.config_backup_tasks import _netmiko_device_type
+
+            conn_params: Dict[str, Any] = {
+                "device_type": _netmiko_device_type(device),
+                "host": device.ip_address,
+                "port": int(getattr(device, "ssh_port", 22) or 22),
+                "username": username,
+                "timeout": 20,
+                "conn_timeout": 15,
+                "banner_timeout": 15,
+                "auth_timeout": 15,
+                "fast_cli": False,
+            }
+            if password:
+                conn_params["password"] = password
+            connection = ConnectHandler(**conn_params)
+            try:
+                outputs: List[str] = []
+                for command in commands:
+                    outputs.append(
+                        connection.send_command(
+                            command,
+                            expect_string=None,
+                            read_timeout=45,
+                            strip_prompt=False,
+                            strip_command=False,
+                        )
+                    )
+                combined = "\n".join(part for part in outputs if part)
+                if combined.strip():
+                    return combined
+            finally:
+                connection.disconnect()
+        except Exception as exc:
+            logger.info("LLDP CLI Netmiko采集失败，回退Paramiko", device_id=device.id, device_ip=device.ip_address, vendor=vendor_key, error=str(exc))
+
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     connect_kwargs: Dict[str, Any] = {
         "hostname": device.ip_address,
         "port": int(getattr(device, "ssh_port", 22) or 22),
         "username": username,
-        "timeout": 8,
-        "banner_timeout": 8,
-        "auth_timeout": 8,
+        "timeout": 12,
+        "banner_timeout": 12,
+        "auth_timeout": 12,
         "look_for_keys": False,
         "allow_agent": False,
     }
@@ -455,12 +639,40 @@ def _run_lldp_cli_command(device: Device, commands: List[str]) -> str:
         connect_kwargs["password"] = password
     try:
         client.connect(**connect_kwargs)
+        from app.tasks.config_backup_tasks import _handle_login_prompts, _looks_like_prompt_line, _read_shell_output, _screen_disable_commands
+
         shell = client.invoke_shell(width=240, height=5000)
-        output_parts = [_read_ssh_channel(shell, idle_seconds=0.5, timeout_seconds=3)]
+        initial_output = _read_shell_output(shell, idle_seconds=0.8, timeout_seconds=8)
+        _handle_login_prompts(shell, initial_output)
+        output_parts = [initial_output]
+        for disable_command in _screen_disable_commands(device):
+            shell.send(disable_command + "\n")
+            output_parts.append(_read_shell_output(shell, idle_seconds=0.5, timeout_seconds=4))
+        if vendor_key == "asteros":
+            prompt_output = ""
+            wait_started = time.monotonic()
+            while time.monotonic() - wait_started < 30:
+                chunk = _read_shell_output(shell, idle_seconds=1.2, timeout_seconds=2.5)
+                if chunk:
+                    output_parts.append(chunk)
+                    prompt_output += chunk
+                prompt_lines = [line.strip() for line in _strip_terminal_control(prompt_output).splitlines() if line.strip()]
+                if any(_looks_like_prompt_line(line) and line.endswith("#") for line in prompt_lines[-8:]):
+                    break
+                shell.send("\n")
+                time.sleep(1.0)
         for command in commands:
+            shell.send("\n")
+            _read_shell_output(shell, idle_seconds=0.4, timeout_seconds=2)
             shell.send(command + "\n")
-            output_parts.append(_read_ssh_channel(shell, idle_seconds=0.8, timeout_seconds=12))
-        return "\n".join(output_parts)
+            output_parts.append(
+                _read_shell_output(
+                    shell,
+                    idle_seconds=4.0 if vendor_key == "asteros" else 1.2,
+                    timeout_seconds=45 if vendor_key == "asteros" else 20,
+                )
+            )
+        return "\n".join(part for part in output_parts if part)
     finally:
         try:
             client.close()
@@ -632,11 +844,35 @@ def _parse_asteros_lldp_cli(output: str) -> List[Dict[str, Any]]:
     for raw_line in _strip_terminal_control(output).splitlines():
         line = raw_line.rstrip()
         stripped = line.strip()
-        if not stripped or stripped.startswith("Capability codes") or stripped.startswith("LocalPort") or stripped.startswith("---"):
+        if (
+            not stripped
+            or stripped.startswith("Capability codes")
+            or stripped.startswith("LocalPort")
+            or stripped.startswith("-----------")
+            or stripped.endswith("#")
+            or stripped.lower().startswith("show lldp neighbor summary")
+        ):
             continue
-        parts = re.split(r"\s{2,}", stripped)
+        if "#" in stripped and not re.match(r"^[A-Za-z0-9/_-]+\s{2,}", stripped):
+            continue
+        parts = [part.strip() for part in re.split(r"\s{2,}", stripped) if part.strip()]
         if len(parts) >= 5:
-            rows.append(_lldp_cli_row(parts[0], parts[1], parts[2], "", "cli:asteros"))
+            local_port = parts[0].strip()
+            remote_device = parts[1].strip()
+            remote_port_id = parts[2].strip()
+            remote_port_descr = parts[4].strip()
+            if any(value in {"_", "__", "___", "-", "--"} for value in (local_port, remote_device)):
+                continue
+            row = _lldp_cli_row(
+                local_port,
+                remote_device,
+                remote_port_descr or remote_port_id,
+                "",
+                "cli:asteros",
+            )
+            row["remote_port_id"] = remote_port_descr or remote_port_id
+            row["remote_chassis_id"] = remote_port_id if _is_probable_mac(remote_port_id) else ""
+            rows.append(row)
     return rows
 
 
@@ -880,7 +1116,7 @@ def _telemetry_snmp_disabled(device: Device) -> bool:
 
 def _telemetry_interface_enabled(device: Device) -> bool:
     # Telemetry gRPC 目前存在周期性断开，展示与端口历史先恢复 SNMP 主导。
-    # 保留接收服务和写入能力，但不再让 Telemetry 覆盖设备总览/端口查询。
+    # 保留接收服务和写入能力，但不再让 Telemetry 覆盖设备总览/接口查询。
     return False
 
 
@@ -1894,6 +2130,7 @@ def serialize_monitor_device(device: Device) -> dict:
         "device_role": device.device_role,
         "vendor": device.vendor,
         "model": device.model,
+        "serial_number": device.serial_number,
         "status": device.normalized_status if hasattr(device, "normalized_status") else device.status,
         "is_monitored": bool(device.is_monitored),
         "monitor_source": monitor_source,
@@ -2017,15 +2254,20 @@ def _latest_snmp_system_info(device_id: int) -> Dict[str, Any]:
 
 
 def _ensure_snmp_system_info_model(item: Dict[str, Any]) -> None:
-    """缓存里缺少 snmp_model 时，从 sys_descr 兜底补齐。"""
+    """Fill stable inventory fields when the live cache omits them."""
     system_info = item.get("system_info")
     if not isinstance(system_info, dict):
-        return
-    if system_info.get("snmp_model"):
-        return
-    snmp_model = extract_snmp_model(system_info.get("sys_descr"))
-    if snmp_model:
-        system_info["snmp_model"] = snmp_model
+        system_info = {}
+        item["system_info"] = system_info
+    device = item.get("device") if isinstance(item.get("device"), dict) else {}
+    if not system_info.get("snmp_model"):
+        snmp_model = extract_snmp_model(system_info.get("sys_descr")) or device.get("model")
+        if snmp_model:
+            system_info["snmp_model"] = snmp_model
+    if not system_info.get("serial_number") and device.get("serial_number"):
+        system_info["serial_number"] = device.get("serial_number")
+    if not system_info.get("sys_name"):
+        system_info["sys_name"] = device.get("hostname") or device.get("name")
 
 
 def _hardware_summary(device_id: int) -> Dict[str, Any]:
@@ -2657,34 +2899,6 @@ def _get_asternos_counter_deltas(device: Device, interface_name: str) -> Dict[st
     return {"counters": counters, "totals": totals}
 
 
-@router.get("/monitoring/devices/by-ip")
-async def get_monitor_device_by_ip(
-    ip_address: str = Query(..., description="设备管理IP"),
-    db: Session = Depends(get_db),
-):
-    """按管理IP获取监控设备信息"""
-    device = db.query(Device).filter(Device.ip_address == ip_address.strip()).first()
-    if not device:
-        raise HTTPException(status_code=404, detail="未找到该管理IP对应的网络设备")
-    if device.status not in {"active", "online"} or not device.is_monitored:
-        raise HTTPException(status_code=400, detail="该设备未加入监控，或当前不是上线状态")
-
-    monitor_source = get_effective_monitor_source(device)
-    if monitor_source == "asternos_exporter":
-        cached_overview = _load_monitor_cache("overview", device.id)
-        cached_status = (cached_overview or {}).get("connectivity", {}).get("status") if isinstance(cached_overview, dict) else None
-        if cached_status == "unreachable":
-            raise HTTPException(status_code=400, detail=(cached_overview or {}).get("connectivity", {}).get("message") or "AsterNOS Exporter 无法连通")
-        if cached_status is None:
-            logger.info("AsterNOS Exporter后台快照尚未生成，先返回设备信息", device_id=device.id)
-    else:
-        if not device.snmp_version:
-            raise HTTPException(status_code=400, detail="该设备未配置SNMP，请检查设备配置")
-        await ensure_device_snmp_reachable(device)
-
-    return serialize_monitor_device(device)
-
-
 @router.get("/monitoring/devices/{device_id}/interfaces")
 async def get_monitor_device_interfaces(device_id: int, db: Session = Depends(get_db)):
     """获取设备接口列表"""
@@ -2697,21 +2911,32 @@ async def get_monitor_device_interfaces(device_id: int, db: Session = Depends(ge
     monitor_source = get_effective_monitor_source(device)
     cached = _load_monitor_cache("interfaces", device.id)
     cached_interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
-    if _telemetry_interface_enabled(device) and cached_interfaces:
+    # 接口查询只需要接口清单和状态，优先复用每天 00:00/12:00 全量预热的公共缓存。
+    # 避免每位用户选择设备时再次发起 SNMP/Exporter 实时采集。
+    if cached_interfaces:
         interfaces = cached_interfaces
     elif monitor_source == "asternos_exporter":
-        cached = _load_monitor_cache("interfaces", device.id)
-        interfaces = cached.get("interfaces", []) if isinstance(cached, dict) else []
-        if not interfaces:
-            try:
-                interfaces = await asternos_exporter_client.list_interfaces(device)
-            except Exception as exc:
-                raise HTTPException(status_code=400, detail=f"AsterNOS Exporter 后台快照暂不可用：{exc}") from exc
+        try:
+            interfaces = await asternos_exporter_client.list_interfaces(device)
+            _store_monitor_cache(
+                "interfaces",
+                device.id,
+                {"interfaces": interfaces, "collected_at": datetime.now(timezone.utc).isoformat(), "source": "exporter_fallback"},
+                MONITOR_CACHE_STALE_SECONDS,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"AsterNOS Exporter 后台快照暂不可用：{exc}") from exc
     else:
         if not device.snmp_version:
             raise HTTPException(status_code=400, detail="该设备未配置SNMP，无法读取接口信息")
         await ensure_device_snmp_reachable(device)
         interfaces = await asyncio.to_thread(snmp_collector.list_interfaces, device)
+        _store_monitor_cache(
+            "interfaces",
+            device.id,
+            {"interfaces": interfaces, "collected_at": datetime.now(timezone.utc).isoformat(), "source": "snmp_fallback"},
+            MONITOR_CACHE_STALE_SECONDS,
+        )
     return {
         "device": serialize_monitor_device(device),
         "interfaces": interfaces,
@@ -2945,76 +3170,6 @@ async def get_circuit_traffic_history(
         json.dumps({**payload, "cached": True}, ensure_ascii=False, default=str),
     )
     return payload
-
-
-@router.get("/monitoring/devices/{device_id}/interfaces/{interface_index}")
-async def get_monitor_device_interface_stats(
-    device_id: int,
-    interface_index: int,
-    fresh: bool = Query(False, description="是否绕过缓存并实时采集当前端口"),
-    db: Session = Depends(get_db),
-):
-    """获取设备单个接口指标"""
-    device = db.query(Device).filter(Device.id == device_id).first()
-    if not device:
-        raise HTTPException(status_code=404, detail="设备不存在")
-    if device.status not in {"active", "online"} or not device.is_monitored:
-        raise HTTPException(status_code=400, detail="该设备未加入监控，或当前不是上线状态")
-
-    monitor_source = get_effective_monitor_source(device)
-    telemetry_cached_interfaces = _load_monitor_cache("interfaces", device.id)
-    telemetry_interface_names = []
-    if isinstance(telemetry_cached_interfaces, dict):
-        for item in telemetry_cached_interfaces.get("interfaces") or []:
-            if item.get("index") == interface_index:
-                telemetry_interface_names = [str(v) for v in [item.get("name"), item.get("alias")] if v]
-                break
-    if _telemetry_interface_enabled(device) and telemetry_interface_names:
-        interface_metrics = None if fresh else _latest_interface_metrics_from_history(device.id, interface_index, telemetry_interface_names, preferred_source="telemetry")
-        collected_at = datetime.now(timezone.utc).isoformat()
-        if not interface_metrics:
-            cached_item = next(
-                (item for item in (telemetry_cached_interfaces or {}).get("interfaces", []) if item.get("index") == interface_index),
-                None,
-            )
-            if cached_item:
-                interface_metrics = dict(cached_item)
-        if not interface_metrics:
-            raise HTTPException(status_code=404, detail="Telemetry 暂未收到该接口数据")
-    elif monitor_source == "asternos_exporter":
-        lookup = await _resolve_asternos_interface_lookup(device, interface_index)
-        interface_names = lookup["interface_names"]
-        cached = _load_monitor_cache("interface_stats", device.id, suffix=f":{interface_index}")
-        if not fresh and isinstance(cached, dict) and cached.get("interface"):
-            interface_metrics = cached["interface"]
-            collected_at = cached.get("collected_at") or datetime.now(timezone.utc).isoformat()
-        else:
-            interface_metrics = None if fresh else _latest_interface_metrics_from_history(device.id, interface_index, interface_names)
-            collected_at = datetime.now(timezone.utc).isoformat()
-            if not interface_metrics:
-                interface_metrics = await collect_current_interface_metrics(device, interface_index, allow_cache=not fresh)
-                if not interface_metrics:
-                    raise HTTPException(status_code=404, detail="未找到该接口")
-    else:
-        if not device.snmp_version:
-            raise HTTPException(status_code=400, detail="该设备未配置SNMP，无法读取接口信息")
-        interface_metrics = None if fresh else _latest_interface_metrics_from_history(device.id, interface_index)
-        collected_at = datetime.now(timezone.utc).isoformat()
-        if not interface_metrics:
-            interface_metrics = await asyncio.to_thread(
-                snmp_collector.get_interface_metrics,
-                device,
-                interface_index,
-            )
-
-    if not interface_metrics.get("name"):
-        raise HTTPException(status_code=404, detail="未找到该接口")
-
-    return {
-        "device": serialize_monitor_device(device),
-        "interface": interface_metrics,
-        "collected_at": collected_at,
-    }
 
 
 @router.get("/monitoring/devices/{device_id}/interfaces/{interface_index}/history")
@@ -3270,114 +3425,6 @@ async def get_monitor_device_interface_history(
         "rate_window": _flux_duration(rate_window_seconds),
         "data": history,
         "total": len(history),
-    }
-    redis_client.setex(
-        _monitor_cache_key("interface_history", device_id, suffix=cache_suffix),
-        HISTORY_REQUEST_CACHE_SECONDS,
-        json.dumps(response_data, default=str),
-    )
-    return response_data
-
-
-@router.get("/monitoring/devices/{device_id}/interfaces/{interface_index}/queue-history")
-async def get_monitor_device_interface_queue_history(
-    device_id: int,
-    interface_index: int,
-    group: str = Query("queueDropGrowth", description="队列监控分组"),
-    range: str = Query("-10m", description="历史时间范围"),
-    interval: str = Query("30s", description="聚合间隔"),
-    db: Session = Depends(get_db),
-):
-    """获取端口下具体队列/优先级的历史指标。"""
-    device = db.query(Device).filter(Device.id == device_id).first()
-    if not device:
-        raise HTTPException(status_code=404, detail="设备不存在")
-    if device.status not in {"active", "online"} or not device.is_monitored:
-        raise HTTPException(status_code=400, detail="该设备未加入监控，或当前不是上线状态")
-    if get_effective_monitor_source(device) != "asternos_exporter":
-        return {
-            "device": serialize_monitor_device(device),
-            "interface_index": interface_index,
-            "range": range,
-            "interval": interval,
-            "series": [],
-            "data": [],
-            "total": 0,
-            "message": "该设备暂未接入队列级 exporter 指标",
-        }
-
-    fields = QUEUE_MONITOR_GROUP_FIELDS.get(group)
-    if not fields:
-        raise HTTPException(status_code=400, detail="不支持的队列监控分组")
-
-    range_seconds = min(_parse_flux_duration_seconds(range, 600), MAX_INTERFACE_HISTORY_SECONDS)
-    range_value = _normalize_query_range(range, "-10m")
-    interval_value = _normalize_query_interval(interval, "30s")
-    lookup = await _resolve_asternos_interface_lookup(device, interface_index)
-    interface_filter = _interface_history_filter(interface_index, lookup["interface_names"])
-    field_filter = " or ".join(f'r.field == {_flux_string(field)}' for field in fields)
-    cache_suffix = f":queue:v1:{interface_index}:{group}:{range_value}:{interval_value}"
-    cached_response = _load_monitor_cache("interface_history", device_id, suffix=cache_suffix)
-    if isinstance(cached_response, dict):
-        return cached_response
-
-    flux = f'''
-    from(bucket: "{influx_client.bucket}")
-      |> range(start: {range_value})
-      |> filter(fn: (r) => r._measurement == "queue_monitoring")
-      |> filter(fn: (r) => r.device_id == "{device_id}")
-      |> filter(fn: (r) => {interface_filter})
-      |> filter(fn: (r) => r._field == "delta")
-      |> filter(fn: (r) => {field_filter})
-      |> aggregateWindow(every: {interval_value}, fn: max, createEmpty: false)
-      |> group(columns: ["field", "target"])
-      |> sort(columns: ["_time"])
-    '''
-    rows = influx_client.query(flux)
-    cutoff = datetime.now(timezone.utc).timestamp() - range_seconds
-    series_map: Dict[str, Dict[str, Any]] = {}
-    data_map: Dict[str, Dict[str, Any]] = {}
-
-    for row in rows:
-        row_time = _parse_history_time(row)
-        if not row_time or row_time.timestamp() < cutoff:
-            continue
-        value = _safe_float(row.get("value"))
-        if value is None:
-            continue
-        field = str(row.get("field") or row.get("metric_field") or "")
-        target = str(row.get("target") or "")
-        if not field or not target:
-            continue
-        series_id = f"{field}|{target}"
-        if series_id not in series_map:
-            queue = row.get("queue")
-            prio = row.get("prio")
-            detail = f"队列 {queue}" if queue not in (None, "") else (f"优先级 {prio}" if prio not in (None, "") else target)
-            field_label = next((item["label"] for item in ASTERNOS_COUNTER_METRICS if item["field"] == field), field)
-            series_map[series_id] = {
-                "key": f"queue_series_{len(series_map)}",
-                "label": f"{field_label} / {detail}",
-                "field": field,
-                "target": target,
-                "queue": queue,
-                "prio": prio,
-                "color": QUEUE_MONITOR_COLORS[len(series_map) % len(QUEUE_MONITOR_COLORS)],
-            }
-        timestamp_key = row_time.isoformat()
-        point = data_map.setdefault(timestamp_key, {"_time": timestamp_key})
-        point[series_map[series_id]["key"]] = value
-
-    series = list(series_map.values())
-    data = [data_map[key] for key in sorted(data_map.keys())]
-    response_data = {
-        "device": serialize_monitor_device(device),
-        "interface_index": interface_index,
-        "range": range_value,
-        "interval": interval_value,
-        "series": series,
-        "data": data,
-        "total": len(data),
     }
     redis_client.setex(
         _monitor_cache_key("interface_history", device_id, suffix=cache_suffix),
@@ -4148,13 +4195,33 @@ async def get_monitor_device_protocol_neighbors(device_id: int, db: Session = De
         raise HTTPException(status_code=404, detail="设备不存在")
     if get_effective_monitor_source(device) == "asternos_exporter":
         cached = _load_monitor_cache("protocol_neighbors", device.id)
-        if isinstance(cached, dict) and cached.get("neighbors"):
-            return {
-                "device": serialize_monitor_device(device),
-                "neighbors": cached["neighbors"],
-                "collected_at": cached.get("collected_at") or datetime.now(timezone.utc).isoformat(),
-            }
+        cached_lldp = _load_monitor_cache("lldp_neighbors_v2", device.id)
         neighbors = {"bgp": [], "ospf": [], "lldp": []}
+        if isinstance(cached, dict) and isinstance(cached.get("neighbors"), dict):
+            neighbors = cached["neighbors"]
+        if not isinstance(neighbors.get("lldp"), list) or not neighbors.get("lldp"):
+            if isinstance(cached_lldp, dict) and isinstance(cached_lldp.get("neighbors"), list):
+                neighbors["lldp"] = cached_lldp.get("neighbors") or []
+            else:
+                try:
+                    cli_lldp_rows = await asyncio.to_thread(_collect_lldp_neighbors_from_cli, device)
+                    neighbors["lldp"] = cli_lldp_rows or []
+                    _store_monitor_cache("lldp_neighbors_v2", device.id, {
+                        "neighbors": neighbors["lldp"],
+                        "collected_at": datetime.now(timezone.utc).isoformat(),
+                    }, ttl_seconds=DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS)
+                except Exception as exc:
+                    logger.warning("AsterNOS LLDP邻居采集失败", device_id=device.id, device_ip=device.ip_address, error=str(exc))
+        neighbors["lldp"] = _apply_lldp_device_ip_fallback(db, neighbors.get("lldp") or [])
+        return {
+            "device": serialize_monitor_device(device),
+            "neighbors": neighbors,
+            "collected_at": (
+                cached.get("collected_at")
+                if isinstance(cached, dict)
+                else datetime.now(timezone.utc).isoformat()
+            ) or datetime.now(timezone.utc).isoformat(),
+        }
     else:
         neighbors = _get_snmp_protocol_neighbors(device.id)
         cached_bgp_details = _load_monitor_cache("bgp_peer_details", device.id)
@@ -4168,7 +4235,7 @@ async def get_monitor_device_protocol_neighbors(device_id: int, db: Session = De
                 _store_monitor_cache("bgp_peer_details", device.id, {
                     "neighbors": bgp_rows,
                     "collected_at": datetime.now(timezone.utc).isoformat(),
-                }, ttl_seconds=1800)
+                }, ttl_seconds=DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS)
                 return bgp_rows
             except Exception as exc:
                 logger.warning("BGP邻居详情采集失败", device_id=device.id, device_ip=device.ip_address, error=str(exc))
@@ -4185,7 +4252,7 @@ async def get_monitor_device_protocol_neighbors(device_id: int, db: Session = De
                 _store_monitor_cache("lldp_neighbors_v2", device.id, {
                     "neighbors": lldp_rows,
                     "collected_at": datetime.now(timezone.utc).isoformat(),
-                }, ttl_seconds=1800)
+                }, ttl_seconds=DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS)
                 return lldp_rows
             except Exception as exc:
                 logger.warning("LLDP邻居采集失败", device_id=device.id, device_ip=device.ip_address, error=str(exc))
@@ -4464,40 +4531,44 @@ async def get_dashboard_stats(
 async def get_server_resources():
     """获取当前部署服务器的资源使用率"""
     try:
-        cpu_percent = psutil.cpu_percent(interval=0.2)
-        memory = psutil.virtual_memory()
-        disk = psutil.disk_usage("/")
-        load_avg = os.getloadavg() if hasattr(os, "getloadavg") else None
-        boot_time = datetime.fromtimestamp(psutil.boot_time(), timezone.utc)
-
-        return {
-            "hostname": socket.gethostname(),
-            "platform": platform.platform(),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "uptime_seconds": int((datetime.now(timezone.utc) - boot_time).total_seconds()),
-            "cpu": {
-                "percent": round(cpu_percent, 2),
-                "cores": psutil.cpu_count(logical=True) or 0,
-                "physical_cores": psutil.cpu_count(logical=False) or 0,
-                "load_avg": [round(value, 2) for value in load_avg] if load_avg else None,
-            },
-            "memory": {
-                "total": memory.total,
-                "used": memory.used,
-                "available": memory.available,
-                "percent": round(memory.percent, 2),
-            },
-            "disk": {
-                "path": "/",
-                "total": disk.total,
-                "used": disk.used,
-                "free": disk.free,
-                "percent": round(disk.percent, 2),
-            },
-        }
+        latest = redis_client.zrevrange(SERVER_RESOURCE_HISTORY_KEY, 0, 0)
+        if latest:
+            sample = json.loads(latest[0])
+            age_seconds = max(0, time.time() - int(sample.get("timestamp_ms", 0)) / 1000)
+            if age_seconds <= 90:
+                return sample
+        sample = await asyncio.to_thread(collect_host_resource_sample)
+        store_host_resource_sample(sample)
+        return sample
     except Exception as e:
         logger.error("获取服务器资源失败", error=str(e))
         raise HTTPException(status_code=500, detail=f"获取服务器资源失败: {str(e)}")
+
+
+@router.get("/server/resources/history")
+async def get_server_resource_history(
+    range_key: str = Query("1h", alias="range", description="1h/6h/24h/3d/7d"),
+):
+    """返回所有用户共享的宿主机资源历史，服务端自动降采样。"""
+    range_seconds = {
+        "1h": 3600,
+        "6h": 6 * 3600,
+        "24h": 24 * 3600,
+        "3d": 3 * 24 * 3600,
+        "7d": 7 * 24 * 3600,
+    }.get(range_key)
+    if range_seconds is None:
+        raise HTTPException(status_code=400, detail="不支持的时间范围")
+    try:
+        start_ms = int((time.time() - range_seconds) * 1000)
+        return {
+            "range": range_key,
+            "retention_days": 7,
+            "samples": load_host_resource_history(start_ms, max_points=720),
+        }
+    except Exception as exc:
+        logger.error("获取服务器资源历史失败", error=str(exc))
+        raise HTTPException(status_code=500, detail=f"获取服务器资源历史失败: {exc}")
 
 
 @router.get("/quality/probe-targets")
@@ -4507,7 +4578,11 @@ async def list_quality_probe_targets(
     db: Session = Depends(get_db),
 ):
     """列出公网质量探测目标"""
-    query = db.query(QualityProbeTarget).outerjoin(Datacenter, QualityProbeTarget.datacenter_id == Datacenter.id)
+    query = (
+        db.query(QualityProbeTarget)
+        .outerjoin(Datacenter, QualityProbeTarget.datacenter_id == Datacenter.id)
+        .outerjoin(Circuit, QualityProbeTarget.circuit_id == Circuit.id)
+    )
     if active is not None:
         query = query.filter(QualityProbeTarget.is_active == active)
     if search:
@@ -4517,9 +4592,210 @@ async def list_quality_probe_targets(
             QualityProbeTarget.target.ilike(keyword),
             QualityProbeTarget.operator_name.ilike(keyword),
             Datacenter.name.ilike(keyword),
+            Circuit.name.ilike(keyword),
         ))
     items = query.order_by(QualityProbeTarget.id.desc()).all()
     return {"total": len(items), "items": [_quality_target_payload(item) for item in items]}
+
+
+def _quality_alert_settings_payload(rule: Optional[AlertRule]) -> Dict[str, Any]:
+    extra_config = (rule.extra_config or {}) if rule else {}
+    channels = (rule.notification_channels or []) if rule else []
+    channel = next((item for item in channels if item.get("type") in {"wechat", "dingtalk", "feishu", "webhook"}), {})
+    config = channel.get("config") or {}
+    mention_users = extra_config.get("mention_users") or config.get("mention_users") or []
+    if isinstance(mention_users, str):
+        mention_users = [item.strip() for item in re.split(r"[,，;；\s]+", mention_users) if item.strip()]
+    return {
+        "rule_id": rule.id if rule else None,
+        "enabled": bool(rule.enabled) if rule else False,
+        "loss_threshold_percent": float(rule.threshold) if rule else 10.0,
+        "consecutive_samples": max(1, int(extra_config.get("consecutive_samples") or 5)),
+        "severity": rule.severity if rule else "P1",
+        "webhook_url": config.get("webhook") or config.get("url") or "",
+        "mention_users": mention_users,
+    }
+
+
+def _quality_target_alert_settings_payload(rule: Optional[AlertRule], target_id: int) -> Dict[str, Any]:
+    extra_config = (rule.extra_config or {}) if rule else {}
+    target_notifications = extra_config.get("target_notifications") or {}
+    item = target_notifications.get(str(target_id)) or {}
+    return {
+        "target_id": target_id,
+        "enabled": bool(item.get("enabled", False)),
+        "webhook_url": str(item.get("webhook_url") or ""),
+        "mention_users": item.get("mention_users") or [],
+        "channel_type": item.get("channel_type") or _quality_notification_type(item.get("webhook_url") or ""),
+        "loss_threshold_percent": float(
+            item.get("loss_threshold_percent")
+            if item.get("loss_threshold_percent") is not None
+            else (rule.threshold if rule else 10.0)
+        ),
+        "consecutive_samples": max(1, int(
+            item.get("consecutive_samples")
+            if item.get("consecutive_samples") is not None
+            else (extra_config.get("consecutive_samples") or 5)
+        )),
+    }
+
+
+def _get_or_create_quality_alert_rule(db: Session) -> AlertRule:
+    rule = db.query(AlertRule).filter(AlertRule.metric_type == QUALITY_ALERT_METRIC_TYPE).order_by(AlertRule.id.asc()).first()
+    if rule:
+        return rule
+    rule = AlertRule(
+        name="公网质量探测连续丢包",
+        description="连续多个探测周期发生丢包且最近5分钟滚动丢包率达到阈值",
+        rule_type="threshold",
+        metric_type=QUALITY_ALERT_METRIC_TYPE,
+        condition=">=",
+        threshold=10.0,
+        duration=0,
+        suppress_duration=300,
+        severity="P1",
+        enabled=0,
+        device_ids=[],
+        extra_config={"quality_probe_global": True, "consecutive_samples": 5, "target_notifications": {}},
+        notification_channels=[],
+    )
+    db.add(rule)
+    db.flush()
+    return rule
+
+
+def _quality_notification_type(webhook_url: str) -> str:
+    value = str(webhook_url or "").strip().lower()
+    if "work.weixin.qq.com" in value or "qyapi.weixin.qq.com" in value:
+        return "wechat"
+    if "oapi.dingtalk.com" in value or "api.dingtalk.com" in value:
+        return "dingtalk"
+    if "open.feishu.cn" in value or "open.larksuite.com" in value:
+        return "feishu"
+    return "webhook"
+
+
+@router.get("/quality/alert-settings")
+async def get_quality_alert_settings(db: Session = Depends(get_db)):
+    rule = db.query(AlertRule).filter(AlertRule.metric_type == QUALITY_ALERT_METRIC_TYPE).order_by(AlertRule.id.asc()).first()
+    return _quality_alert_settings_payload(rule)
+
+
+@router.post("/quality/alert-settings")
+async def save_quality_alert_settings(payload: dict, db: Session = Depends(get_db)):
+    enabled = bool(payload.get("enabled", True))
+    try:
+        threshold = float(payload.get("loss_threshold_percent", 10))
+        consecutive_samples = int(payload.get("consecutive_samples", 5))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="丢包率阈值或连续次数格式错误")
+    if not 0 < threshold <= 100:
+        raise HTTPException(status_code=400, detail="丢包率阈值必须大于0且不超过100")
+    if not 1 <= consecutive_samples <= 60:
+        raise HTTPException(status_code=400, detail="连续丢包次数必须在1到60之间")
+    severity = str(payload.get("severity") or "P1").upper()
+    if severity not in {"P0", "P1", "P2", "P3"}:
+        severity = "P1"
+    rule = _get_or_create_quality_alert_rule(db)
+    rule.threshold = threshold
+    rule.severity = severity
+    rule.enabled = 1 if enabled else 0
+    rule.extra_config = {
+        **(rule.extra_config or {}),
+        "quality_probe_global": True,
+        "consecutive_samples": consecutive_samples,
+        "target_notifications": (rule.extra_config or {}).get("target_notifications") or {},
+    }
+    # 机器人与负责人按探测目标分别保存，不再使用全局通知渠道。
+    rule.notification_channels = []
+    if not enabled and rule.id:
+        now = datetime.now(timezone.utc)
+        active_alerts = db.query(AlertHistory).filter(
+            AlertHistory.rule_id == rule.id,
+            AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+        ).all()
+        for alert in active_alerts:
+            alert.status = "resolved"
+            alert.resolved_at = now
+            alert.resolved_by = "rule_disabled"
+            alert.resolution_note = "质量告警机器人已停用"
+    db.commit()
+    db.refresh(rule)
+    return _quality_alert_settings_payload(rule)
+
+
+@router.get("/quality/probe-targets/{target_id}/alert-settings")
+async def get_quality_target_alert_settings(target_id: int, db: Session = Depends(get_db)):
+    target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="质量探测目标不存在")
+    rule = db.query(AlertRule).filter(AlertRule.metric_type == QUALITY_ALERT_METRIC_TYPE).order_by(AlertRule.id.asc()).first()
+    return _quality_target_alert_settings_payload(rule, target_id)
+
+
+@router.post("/quality/probe-targets/{target_id}/alert-settings")
+async def save_quality_target_alert_settings(target_id: int, payload: dict, db: Session = Depends(get_db)):
+    target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="质量探测目标不存在")
+    enabled = bool(payload.get("enabled", True))
+    webhook_url = str(payload.get("webhook_url") or "").strip()
+    if enabled and not webhook_url:
+        raise HTTPException(status_code=400, detail="启用该目标告警时必须填写机器人 Webhook")
+    if webhook_url and not re.match(r"^https?://", webhook_url, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="机器人 Webhook 必须以 http:// 或 https:// 开头")
+    raw_mentions = payload.get("mention_users") or []
+    if isinstance(raw_mentions, str):
+        mention_users = [item.strip() for item in re.split(r"[,，;；\s]+", raw_mentions) if item.strip()]
+    elif isinstance(raw_mentions, list):
+        mention_users = [str(item).strip() for item in raw_mentions if str(item).strip()]
+    else:
+        mention_users = []
+    rule = _get_or_create_quality_alert_rule(db)
+    try:
+        loss_threshold_percent = float(payload.get("loss_threshold_percent", rule.threshold or 10.0))
+        consecutive_samples = int(payload.get("consecutive_samples", (rule.extra_config or {}).get("consecutive_samples") or 5))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="该目标的丢包率阈值或连续次数格式错误")
+    if not 0 < loss_threshold_percent <= 100:
+        raise HTTPException(status_code=400, detail="该目标的丢包率阈值必须大于0且不超过100")
+    if not 1 <= consecutive_samples <= 60:
+        raise HTTPException(status_code=400, detail="该目标的连续丢包周期必须在1到60之间")
+    extra_config = dict(rule.extra_config or {})
+    target_notifications = dict(extra_config.get("target_notifications") or {})
+    target_notifications[str(target_id)] = {
+        "enabled": enabled,
+        "webhook_url": webhook_url,
+        "channel_type": _quality_notification_type(webhook_url),
+        "mention_users": mention_users,
+        "loss_threshold_percent": loss_threshold_percent,
+        "consecutive_samples": consecutive_samples,
+        "target_name": target.name,
+        "target": target.target,
+    }
+    extra_config["target_notifications"] = target_notifications
+    extra_config.setdefault("quality_probe_global", True)
+    extra_config.setdefault("consecutive_samples", 5)
+    rule.extra_config = extra_config
+    # 目标级开关是唯一生效开关；规则状态只作为“是否至少有一个目标启用”的汇总状态。
+    rule.enabled = 1 if any(bool(item.get("enabled")) for item in target_notifications.values()) else 0
+    if not enabled:
+        now = datetime.now(timezone.utc)
+        active_alerts = db.query(AlertHistory).filter(
+            AlertHistory.rule_id == rule.id,
+            AlertHistory.alert_target_type == "quality_probe",
+            AlertHistory.alert_target_key == str(target_id),
+            AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+        ).all()
+        for alert in active_alerts:
+            alert.status = "resolved"
+            alert.resolved_at = now
+            alert.resolved_by = "target_alert_disabled"
+            alert.resolution_note = "该质量探测目标的告警通知已停用"
+        redis_client.delete(f"quality_probe:consecutive_loss:{target_id}")
+    db.commit()
+    db.refresh(rule)
+    return _quality_target_alert_settings_payload(rule, target_id)
 
 
 @router.post("/quality/probe-targets")
@@ -4531,11 +4807,76 @@ async def create_quality_probe_target(
     data = payload.model_dump()
     data["target"] = data["target"].strip()
     data["name"] = data["name"].strip()
+    if data.get("probe_source") == "device_nqa_snmp":
+        device = db.query(Device).filter(Device.id == data.get("device_id")).first()
+        if not device:
+            raise HTTPException(status_code=400, detail="请选择有效的NQA采集设备")
+        if not data.get("nqa_admin_name") or not data.get("nqa_operation_tag"):
+            raise HTTPException(status_code=400, detail="请选择设备上已经识别到的NQA实例")
+        duplicate = db.query(QualityProbeTarget).filter(
+            QualityProbeTarget.probe_source == "device_nqa_snmp",
+            QualityProbeTarget.device_id == data.get("device_id"),
+            QualityProbeTarget.nqa_admin_name == data.get("nqa_admin_name"),
+            QualityProbeTarget.nqa_operation_tag == data.get("nqa_operation_tag"),
+        ).first()
+        if duplicate:
+            raise HTTPException(status_code=409, detail=f"该NQA实例已生成质量图：{duplicate.name}")
+    if data.get("circuit_id"):
+        expected_line_type = "private_line" if data.get("probe_source") == "device_nqa_snmp" else "internet"
+        circuit = db.query(Circuit).filter(
+            Circuit.id == data["circuit_id"],
+            Circuit.line_type == expected_line_type,
+        ).first()
+        if not circuit:
+            raise HTTPException(status_code=400, detail="关联的线路类型与探测数据源不匹配")
     db_target = QualityProbeTarget(**data)
     db.add(db_target)
     db.commit()
     db.refresh(db_target)
     return _quality_target_payload(db_target)
+
+
+@router.get("/quality/nqa-instances")
+async def list_quality_nqa_instances(
+    device_id: int = Query(..., ge=1),
+    force_refresh: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """List NQA jobs already configured on a device and visible through SNMP."""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if str(device.monitor_source or "snmp").lower() != "snmp":
+        raise HTTPException(status_code=400, detail="该设备不是SNMP监控源，无法读取NQA实例")
+
+    cache_key = f"quality_probe:nqa_instances:v1:{device_id}"
+    if not force_refresh:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
+    try:
+        instances = await asyncio.to_thread(discover_quality_nqa_snmp_instances, device)
+    except Exception as exc:
+        logger.warning("读取设备NQA实例失败", device_id=device_id, error=str(exc))
+        raise HTTPException(status_code=502, detail=f"读取设备NQA实例失败：{exc}")
+    response = {
+        "device": {
+            "id": device.id,
+            "name": device.name,
+            "ip_address": device.ip_address,
+            "datacenter_id": device.datacenter_id,
+        },
+        "total": len(instances),
+        "items": instances,
+    }
+    try:
+        redis_client.set(cache_key, json.dumps(response, ensure_ascii=False), ex=60)
+    except Exception:
+        pass
+    return response
 
 
 @router.put("/quality/probe-targets/{target_id}")
@@ -4548,7 +4889,33 @@ async def update_quality_probe_target(
     db_target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
     if not db_target:
         raise HTTPException(status_code=404, detail="质量探测目标不存在")
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    update_data = payload.model_dump(exclude_unset=True)
+    effective_source = update_data.get("probe_source", db_target.probe_source or "server_icmp")
+    if effective_source == "device_nqa_snmp":
+        device_id = update_data.get("device_id", db_target.device_id)
+        admin_name = update_data.get("nqa_admin_name", db_target.nqa_admin_name)
+        operation_tag = update_data.get("nqa_operation_tag", db_target.nqa_operation_tag)
+        if not db.query(Device).filter(Device.id == device_id).first():
+            raise HTTPException(status_code=400, detail="请选择有效的NQA采集设备")
+        if not admin_name or not operation_tag:
+            raise HTTPException(status_code=400, detail="请选择设备上已经识别到的NQA实例")
+        duplicate = db.query(QualityProbeTarget).filter(
+            QualityProbeTarget.id != target_id,
+            QualityProbeTarget.probe_source == "device_nqa_snmp",
+            QualityProbeTarget.device_id == device_id,
+            QualityProbeTarget.nqa_admin_name == admin_name,
+            QualityProbeTarget.nqa_operation_tag == operation_tag,
+        ).first()
+        if duplicate:
+            raise HTTPException(status_code=409, detail=f"该NQA实例已生成质量图：{duplicate.name}")
+    if update_data.get("circuit_id"):
+        circuit = db.query(Circuit).filter(
+            Circuit.id == update_data["circuit_id"],
+            Circuit.line_type == ("private_line" if effective_source == "device_nqa_snmp" else "internet"),
+        ).first()
+        if not circuit:
+            raise HTTPException(status_code=400, detail="关联的线路类型与探测数据源不匹配")
+    for key, value in update_data.items():
         if isinstance(value, str):
             value = value.strip()
         setattr(db_target, key, value)
@@ -4575,12 +4942,18 @@ async def test_quality_probe_target(target_id: int, db: Session = Depends(get_db
     if not db_target:
         raise HTTPException(status_code=404, detail="质量探测目标不存在")
 
-    result = await asyncio.to_thread(
-        run_quality_ping,
-        db_target.target,
-        db_target.packet_count or 5,
-        db_target.timeout_ms or 1000,
-    )
+    if (db_target.probe_source or "server_icmp") == "device_nqa_snmp":
+        device = db.query(Device).filter(Device.id == db_target.device_id).first()
+        if not device:
+            raise HTTPException(status_code=400, detail="NQA采集设备不存在")
+        result = await asyncio.to_thread(run_quality_nqa_snmp, db_target, device)
+    else:
+        result = await asyncio.to_thread(
+            run_quality_ping,
+            db_target.target,
+            db_target.packet_count or 5,
+            db_target.timeout_ms or 1000,
+        )
     result = apply_quality_loss_window(db_target.id, result)
     db_target.last_probe_at = datetime.now(timezone.utc)
     db_target.last_success = bool(result.get("success"))
@@ -4722,6 +5095,399 @@ async def get_quality_probe_history(
         json.dumps(payload, ensure_ascii=False, default=str),
     )
     return payload
+
+
+def _lossless_cache_payload(device_id: int, sensor_path: str) -> Dict[str, Any]:
+    raw = redis_client.get(
+        _monitor_cache_key("telemetry_lossless", device_id, sensor_cache_suffix(sensor_path))
+    )
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _lossless_row_key(row: Dict[str, Any]) -> str:
+    name = str(row.get("interface_name") or "").strip()
+    index = row.get("interface_index")
+    return name.lower() if name else f"index:{index}"
+
+
+def _merge_present(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+    for key, value in source.items():
+        if value is not None and value != "":
+            target[key] = value
+
+
+@router.get("/lossless/telemetry/devices")
+async def list_lossless_telemetry_devices(db: Session = Depends(get_db)):
+    devices = (
+        db.query(Device)
+        .filter(Device.is_monitored.is_(True))
+        .order_by(Device.name.asc())
+        .all()
+    )
+    items = []
+    for device in devices:
+        payload = _lossless_cache_payload(device.id, "ifmgr/interfaces")
+        if not payload:
+            continue
+        items.append({
+            "id": device.id,
+            "name": device.name,
+            "ip_address": device.ip_address,
+            "vendor": device.vendor,
+            "model": device.model,
+            "collected_at": payload.get("collected_at"),
+        })
+    return {"total": len(items), "items": items}
+
+
+@router.get("/lossless/telemetry/{device_id}")
+async def get_lossless_telemetry_snapshot(
+    device_id: int,
+    search: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+
+    port_map: Dict[str, Dict[str, Any]] = {}
+    queue_map: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+    path_status = []
+    newest = ""
+
+    for sensor_path in sorted(LOSSLESS_SENSOR_PATHS):
+        payload = _lossless_cache_payload(device_id, sensor_path)
+        collected_at = str(payload.get("collected_at") or "")
+        if collected_at > newest:
+            newest = collected_at
+        rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+        path_status.append({
+            "sensor_path": sensor_path,
+            "received": bool(payload),
+            "collected_at": collected_at or None,
+            "row_count": len(rows),
+        })
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            interface_key = _lossless_row_key(row)
+            if not interface_key:
+                continue
+            port = port_map.setdefault(interface_key, {
+                "interface_index": row.get("interface_index"),
+                "interface_name": row.get("interface_name") or "",
+            })
+            if row.get("scope") != "queue":
+                _merge_present(port, row)
+                continue
+
+            queue_key = (interface_key, row.get("queue_id"))
+            queue = queue_map.setdefault(queue_key, {
+                "interface_index": row.get("interface_index"),
+                "interface_name": row.get("interface_name") or "",
+                "queue_id": row.get("queue_id"),
+            })
+            direction = row.get("direction_code")
+            if direction in (0, 1):
+                # Preserve the vendor direction code explicitly.  The API does
+                # not relabel it as ingress/egress until the enum is confirmed
+                # against the exact Comware release.
+                for key, value in row.items():
+                    if key not in {"scope", "interface_index", "interface_name", "queue_id", "direction_code"} and value is not None:
+                        queue[f"direction_{direction}_{key}"] = value
+                queue[f"direction_{direction}_present"] = True
+            else:
+                _merge_present(queue, row)
+
+    for (interface_key, _queue_id), queue in queue_map.items():
+        port = port_map.setdefault(interface_key, {
+            "interface_index": queue.get("interface_index"),
+            "interface_name": queue.get("interface_name") or "",
+        })
+        port.setdefault("queues", []).append(queue)
+
+    for port in port_map.values():
+        queues = port.get("queues") or []
+        queues.sort(key=lambda row: (str(row.get("queue_id") or "")))
+        for field in ("queue_out_unicast_bps", "queue_out_unicast_pps", "queue_pfc_send_pps", "queue_pfc_recv_pps", "queue_out_no_buffer_pps"):
+            values = [_safe_float(row.get(field)) for row in queues]
+            values = [value for value in values if value is not None]
+            if values:
+                port[field] = sum(values)
+        for field in ("ingress_buffer_used", "egress_unicast_buffer_used", "egress_multicast_buffer_used", "headroom_used", "ingress_interval_peak", "egress_interval_peak"):
+            values = [_safe_float(row.get(field)) for row in queues]
+            values = [value for value in values if value is not None]
+            if values:
+                port[f"max_{field}"] = max(values)
+        speed_bps = _safe_float(port.get("speed_bps"))
+        if speed_bps and speed_bps > 0:
+            if port.get("in_utilization_percent") is None and _safe_float(port.get("in_bps")) is not None:
+                port["in_utilization_percent"] = round((_safe_float(port.get("in_bps")) or 0.0) * 100.0 / speed_bps, 4)
+            if port.get("out_utilization_percent") is None and _safe_float(port.get("out_bps")) is not None:
+                port["out_utilization_percent"] = round((_safe_float(port.get("out_bps")) or 0.0) * 100.0 / speed_bps, 4)
+
+    keyword = str(search or "").strip().lower()
+    ports = sorted(port_map.values(), key=lambda row: (int(row.get("interface_index") or 10**9), str(row.get("interface_name") or "")))
+    if keyword:
+        ports = [row for row in ports if keyword in str(row.get("interface_name") or "").lower()]
+
+    return {
+        "device": {
+            "id": device.id,
+            "name": device.name,
+            "ip_address": device.ip_address,
+            "vendor": device.vendor,
+            "model": device.model,
+        },
+        "collected_at": newest or None,
+        "ports": ports,
+        "total": len(ports),
+        "path_status": path_status,
+        "notes": {
+            "optical_power": "端口光功率来自 transceiver/channel 路径，本批端口与无损路径中不包含光功率字段",
+            "counter_rates": "ECN/WRED/Pause 的当前载荷是累计计数；速率需连续两个采样点计算，后续历史落库阶段启用",
+            "queue_direction": "QSTAT Direction 0/1 暂保留厂商原始枚举，避免方向未经确认时误标",
+        },
+    }
+
+
+def _forwarding_cache_payload(device_id: int, table_name: str) -> Dict[str, Any]:
+    raw = redis_client.get(forwarding_cache_key(device_id, table_name))
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+@router.get("/forwarding/devices")
+async def list_forwarding_devices(db: Session = Depends(get_db)):
+    devices = (
+        db.query(Device)
+        .filter(Device.is_monitored.is_(True))
+        .filter(or_(Device.vendor.ilike("%h3c%"), Device.vendor.ilike("%华三%")))
+        .order_by(Device.name.asc())
+        .all()
+    )
+    items = []
+    for device in devices:
+        arp_payload = _forwarding_cache_payload(device.id, "arp")
+        ipv4_payload = _forwarding_cache_payload(device.id, "ipv4_routes")
+        collected = max(
+            (str(payload.get("collected_at") or "") for payload in (arp_payload, ipv4_payload)),
+            default="",
+        )
+        items.append({
+            "id": device.id,
+            "name": device.name,
+            "ip_address": device.ip_address,
+            "vendor": device.vendor,
+            "model": device.model,
+            "datacenter_name": device.datacenter_ref.name if device.datacenter_ref else None,
+            "collected_at": collected or None,
+            "arp_total": (arp_payload.get("summary") or {}).get("total", 0),
+            "ipv4_route_total": (ipv4_payload.get("summary") or {}).get("total", 0),
+        })
+    return {"total": len(items), "items": items}
+
+
+@router.get("/forwarding/{device_id}/summary")
+async def get_forwarding_summary(device_id: int, db: Session = Depends(get_db)):
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    tables = {
+        table_name: _forwarding_cache_payload(device_id, table_name)
+        for table_name in ("arp", "ipv4_routes")
+    }
+    return {
+        "device": {"id": device.id, "name": device.name, "ip_address": device.ip_address, "model": device.model},
+        "tables": {
+            name: {
+                "received": bool(payload),
+                "collected_at": payload.get("collected_at"),
+                "source": payload.get("source"),
+                "message": payload.get("message"),
+                "summary": payload.get("summary") or {},
+            }
+            for name, payload in tables.items()
+        },
+    }
+
+
+@router.post("/forwarding/{device_id}/refresh")
+async def refresh_forwarding(device_id: int, db: Session = Depends(get_db)):
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    from app.tasks.snmp_tasks import collect_forwarding_for_device
+
+    task = collect_forwarding_for_device.delay(device_id)
+    return {
+        "device_id": device_id,
+        "task_id": task.id,
+        "status": "queued",
+        "message": "已提交实时采集，页面将自动读取新快照",
+    }
+
+
+@router.get("/forwarding/{device_id}/arp")
+async def get_forwarding_arp(
+    device_id: int,
+    search: Optional[str] = Query(None),
+    interface: Optional[str] = Query(None),
+    vrf_index: Optional[int] = Query(None),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    if not db.query(Device.id).filter(Device.id == device_id).first():
+        raise HTTPException(status_code=404, detail="设备不存在")
+    payload = _forwarding_cache_payload(device_id, "arp")
+    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+    keyword = str(search or "").strip().lower()
+    interface_keyword = str(interface or "").strip().lower()
+    if keyword:
+        rows = [row for row in rows if keyword in " ".join(str(row.get(field) or "").lower() for field in ("ip_address", "mac_address", "interface", "vrf", "state"))]
+    if interface_keyword:
+        rows = [row for row in rows if interface_keyword in str(row.get("interface") or "").lower()]
+    if vrf_index is not None:
+        rows = [row for row in rows if int(row.get("vrf_index") or 0) == vrf_index]
+    rows = sorted(rows, key=lambda row: (str(row.get("ip_address") or ""), str(row.get("interface") or "")))
+    return {
+        "device_id": device_id,
+        "collected_at": payload.get("collected_at"),
+        "summary": payload.get("summary") or {},
+        "total": len(rows),
+        "offset": offset,
+        "limit": limit,
+        "items": rows[offset:offset + limit],
+    }
+
+
+@router.get("/forwarding/{device_id}/routes")
+async def get_forwarding_routes(
+    device_id: int,
+    search: Optional[str] = Query(None),
+    vrf: Optional[str] = Query(None),
+    interface: Optional[str] = Query(None),
+    group_prefix: bool = Query(True),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    if not db.query(Device.id).filter(Device.id == device_id).first():
+        raise HTTPException(status_code=404, detail="设备不存在")
+    table_name = "ipv4_routes"
+    payload = _forwarding_cache_payload(device_id, table_name)
+    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+    vrf_keyword = str(vrf or "").strip().lower()
+    interface_keyword = str(interface or "").strip().lower()
+    if vrf_keyword:
+        rows = [row for row in rows if vrf_keyword in str(row.get("vrf") or "").lower()]
+    if interface_keyword:
+        rows = [row for row in rows if interface_keyword in str(row.get("interface") or "").lower()]
+
+    keyword = str(search or "").strip()
+    query_ip = None
+    if keyword:
+        try:
+            query_ip = ipaddress.ip_address(keyword.split("/")[0])
+        except ValueError:
+            query_ip = None
+        if query_ip is not None:
+            matched = []
+            for row in rows:
+                try:
+                    network = ipaddress.ip_network(str(row.get("prefix") or ""), strict=False)
+                except ValueError:
+                    continue
+                if query_ip.version == network.version and query_ip in network:
+                    matched.append(row)
+            rows = sorted(matched, key=lambda row: int(row.get("prefix_length") or 0), reverse=True)
+        else:
+            lowered = keyword.lower()
+            rows = [row for row in rows if lowered in " ".join(str(row.get(field) or "").lower() for field in ("prefix", "next_hop", "interface", "vrf", "neighbor", "origin_as", "flags"))]
+    else:
+        rows = sorted(rows, key=lambda row: (str(row.get("vrf") or ""), str(row.get("prefix") or ""), str(row.get("next_hop") or "")))
+    if group_prefix:
+        grouped: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for row in rows:
+            key = (str(row.get("vrf") or "default"), str(row.get("prefix") or ""))
+            item = grouped.setdefault(key, {**row, "next_hops": []})
+            hop = {
+                "next_hop": str(row.get("next_hop") or ""),
+                "interface": str(row.get("interface") or ""),
+                "metric": row.get("metric"),
+                "preference": row.get("preference"),
+            }
+            if hop not in item["next_hops"]:
+                item["next_hops"].append(hop)
+        rows = list(grouped.values())
+        for row in rows:
+            row["ecmp_count"] = len(row["next_hops"])
+            row["next_hop"] = " / ".join(
+                hop["next_hop"] or "直连" for hop in row["next_hops"]
+            )
+            row["interface"] = " / ".join(dict.fromkeys(
+                hop["interface"] for hop in row["next_hops"] if hop["interface"]
+            ))
+        rows = sorted(rows, key=lambda row: (str(row.get("vrf") or ""), str(row.get("prefix") or "")))
+
+    return {
+        "device_id": device_id,
+        "ip_version": 4,
+        "collected_at": payload.get("collected_at"),
+        "summary": payload.get("summary") or {},
+        "total": len(rows),
+        "offset": offset,
+        "limit": limit,
+        "grouped_by_prefix": group_prefix,
+        "items": rows[offset:offset + limit],
+    }
+
+
+@router.get("/forwarding/{device_id}/history")
+async def get_forwarding_history(
+    device_id: int,
+    table: str = Query("arp", pattern="^(arp|ipv4_routes)$"),
+    range: str = Query("-24h"),
+    interval: str = Query("5m"),
+    db: Session = Depends(get_db),
+):
+    if not db.query(Device.id).filter(Device.id == device_id).first():
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if not re.fullmatch(r"-\d+[smhdw]", range):
+        raise HTTPException(status_code=400, detail="range格式不正确")
+    if not re.fullmatch(r"\d+[smhdw]", interval):
+        raise HTTPException(status_code=400, detail="interval格式不正确")
+    flux = f'''
+    from(bucket: "{influx_client.bucket}")
+      |> range(start: {range})
+      |> filter(fn: (r) => r._measurement == "forwarding_monitoring")
+      |> filter(fn: (r) => r.device_id == "{device_id}")
+      |> filter(fn: (r) => exists r.forwarding_table and r.forwarding_table == "{table}")
+      |> aggregateWindow(every: {interval}, fn: max, createEmpty: false)
+      |> yield(name: "forwarding_summary")
+    '''
+    data = influx_client.query(flux)
+    points: Dict[str, Dict[str, Any]] = {}
+    for row in data:
+        timestamp = row.get("_time")
+        timestamp_text = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp or "")
+        point = points.setdefault(timestamp_text, {"time": timestamp_text})
+        field = str(row.get("_field") or "")
+        if field:
+            point[field] = row.get("_value")
+    return {"device_id": device_id, "table": table, "range": range, "interval": interval, "data": sorted(points.values(), key=lambda item: item["time"])}
 
 
 @router.get("/measurements")

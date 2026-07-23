@@ -271,6 +271,15 @@ def _canonical_target_key(definition: TrapDefinition, trap_oid: str, detail_text
     pair_oid = definition.firing_oid or trap_oid
     category = definition.category or pair_oid
     detail = detail_text or "device"
+    if definition.category == "bfd":
+        local_match = re.search(r"\blocal\s*:\s*([0-9a-fA-F:.]+)", detail, re.IGNORECASE)
+        neighbor_match = re.search(r"\bneighbor\s*:\s*([0-9a-fA-F:.]+)", detail, re.IGNORECASE)
+        if local_match or neighbor_match:
+            local = local_match.group(1).lower() if local_match else "unknown"
+            neighbor = neighbor_match.group(1).lower() if neighbor_match else "unknown"
+            # BFD Down Trap 的原文包含设备名和 "UP -> DOWN"。只用会话两端地址
+            # 作为对象键，避免同一会话因文案变化生成多条活动告警。
+            return f"hillstone_trap:bfd:local={local}|neighbor={neighbor}"
     return f"hillstone_trap:{category}:{detail}"
 
 

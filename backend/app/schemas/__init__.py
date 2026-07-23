@@ -9,7 +9,7 @@ from app.schemas.device import (
 )
 from app.schemas.alert import (
     AlertRuleBase, AlertRuleCreate, AlertRuleUpdate, AlertRuleResponse,
-    AlertHistoryResponse, AlertAcknowledge, AlertResolve, AlertIgnore, AlertHistoryClear, AlertStats, SyslogEventResponse,
+    AlertHistoryResponse, AlertAcknowledge, AlertResolve, AlertIgnore, AlertQuickSilence, AlertHistoryClear, AlertStats, SyslogEventResponse,
     AlertSilenceCreate, AlertSilenceUpdate, AlertSilenceResponse
 )
 from app.schemas.user import (
@@ -36,7 +36,7 @@ __all__ = [
     "DeviceRoleBase", "DeviceRoleCreate", "DeviceRoleUpdate", "DeviceRoleResponse",
     "DeviceVendorBase", "DeviceVendorCreate", "DeviceVendorUpdate", "DeviceVendorResponse",
     "AlertRuleBase", "AlertRuleCreate", "AlertRuleUpdate", "AlertRuleResponse",
-    "AlertHistoryResponse", "AlertAcknowledge", "AlertResolve", "AlertIgnore", "AlertHistoryClear", "AlertStats", "SyslogEventResponse",
+    "AlertHistoryResponse", "AlertAcknowledge", "AlertResolve", "AlertIgnore", "AlertQuickSilence", "AlertHistoryClear", "AlertStats", "SyslogEventResponse",
     "AlertSilenceCreate", "AlertSilenceUpdate", "AlertSilenceResponse",
     "UserBase", "UserCreate", "UserUpdate", "UserResponse",
     "RoleBase", "RoleResponse",

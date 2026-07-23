@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type CSSProperties } from 'react'
-import { Button, Card, Col, Input, Modal, Row, Segmented, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
-import { CheckOutlined, DeleteOutlined, EyeInvisibleOutlined, ReloadOutlined } from '@ant-design/icons'
+import { Button, Card, Col, Dropdown, Input, Modal, Row, Segmented, Select, Space, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
+import { CheckOutlined, DeleteOutlined, EyeInvisibleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
 import {
   Area,
   AreaChart,
@@ -22,6 +22,7 @@ import {
   getAlertHistory,
   getAlertHistorySummary,
   ignoreAlert,
+  quickSilenceAlert,
   resolveAlert,
   type AlertHistory as AlertHistoryItem,
   type AlertHistorySummary,
@@ -231,6 +232,7 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
   const [loading, setLoading] = useState(false)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [clearing, setClearing] = useState(false)
+  const [quickSilenceLoadingId, setQuickSilenceLoadingId] = useState<number | null>(null)
   const [statusFilter, setStatusFilter] = useState<string>()
   const [severityFilter, setSeverityFilter] = useState<string>()
   const [datacenterFilter, setDatacenterFilter] = useState<string>()
@@ -451,6 +453,30 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '解决失败')
     }
+  }
+
+  const handleQuickSilence = (record: AlertHistoryItem, durationHours: number) => {
+    const durationLabel = durationHours >= 24 && durationHours % 24 === 0
+      ? `${durationHours / 24}天`
+      : `${durationHours}小时`
+    Modal.confirm({
+      title: `屏蔽此告警 ${durationLabel}？`,
+      content: `仅屏蔽当前设备、当前规则${record.alert_target_name || record.alert_target_key ? '及当前对象' : ''}，到期后自动恢复检查。`,
+      okText: '确认屏蔽',
+      cancelText: '取消',
+      onOk: async () => {
+        setQuickSilenceLoadingId(record.id)
+        try {
+          await quickSilenceAlert(record.id, durationHours, currentUser?.username)
+          message.success(`已屏蔽 ${durationLabel}，到期后自动恢复检查`)
+          await Promise.all([fetchData(), fetchSummary()])
+        } catch (error: any) {
+          message.error(error?.response?.data?.detail || '屏蔽失败')
+        } finally {
+          setQuickSilenceLoadingId(null)
+        }
+      },
+    })
   }
 
   return (
@@ -810,7 +836,7 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
             },
             canModify ? {
               title: '操作',
-              width: 160,
+              width: 245,
               render: (_: unknown, record: AlertHistoryItem) => (
                 <Space>
                   {!isOperationRecord(record) && record.status === 'firing' && (
@@ -833,6 +859,31 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
                       解决
                       </Button>
                     </Tooltip>
+                  )}
+                  {!isOperationRecord(record) && record.status !== 'resolved' && record.status !== 'ignored' && (
+                    <Dropdown
+                      trigger={['click']}
+                      menu={{
+                        items: [
+                          { key: '6', label: '屏蔽6小时' },
+                          { key: '12', label: '屏蔽12小时' },
+                          { key: '24', label: '屏蔽24小时' },
+                          { key: '72', label: '屏蔽3天' },
+                          { key: '168', label: '屏蔽7天' },
+                          { key: '360', label: '屏蔽15天' },
+                        ],
+                        onClick: ({ key }) => handleQuickSilence(record, Number(key)),
+                      }}
+                    >
+                      <Button
+                        size="small"
+                        danger
+                        icon={<StopOutlined />}
+                        loading={quickSilenceLoadingId === record.id}
+                      >
+                        屏蔽
+                      </Button>
+                    </Dropdown>
                   )}
                 </Space>
               ),

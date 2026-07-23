@@ -534,7 +534,7 @@ const Settings = () => {
     userForm.setFieldsValue({
       is_active: true,
       read_only: false,
-      allowed_menus: ['/dashboard', '/devices', '/port-query', '/ip-flow-query', '/device-overview'],
+      allowed_menus: ['/dashboard', '/devices', '/grafana', '/ip-flow-query', '/device-overview'],
     })
     setUserModalOpen(true)
   }

@@ -40,8 +40,10 @@ class Settings(BaseSettings):
     POSTGRES_USER: str = "network_monitor"
     POSTGRES_PASSWORD: str = "network_monitor"
     POSTGRES_DB: str = "network_monitor"
-    DB_POOL_SIZE: int = 30
-    DB_MAX_OVERFLOW: int = 60
+    # Celery services each create their own engine; conservative defaults keep the
+    # aggregate connection count bounded. API overrides these values in compose.
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
     DB_POOL_TIMEOUT: int = 30
     DB_POOL_RECYCLE: int = 1800
     
@@ -91,7 +93,7 @@ class Settings(BaseSettings):
     # 全量 SNMP 端口采集按批次分摊：Beat 每 30 秒调度一批，默认约 5 分钟完整采集一轮。
     # 300-500 台 128 口交换机时，避免所有设备在同一个窗口内集中 walk。
     SNMP_SCHEDULER_INTERVAL_SECONDS: int = 30
-    SNMP_FULL_COLLECTION_INTERVAL_SECONDS: int = 300
+    SNMP_FULL_COLLECTION_INTERVAL_SECONDS: int = 180
     # 端口流量历史要持续可见，因此接口高频采集与全量资源采集拆分。
     # 这里保持约 60 秒内完整轮一遍所有 SNMP 设备端口基础流量数据。
     SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS: int = 60
@@ -99,7 +101,7 @@ class Settings(BaseSettings):
     SNMP_INTERFACE_REALTIME_MAX_WORKERS: int = 4
     # Asteros Exporter 全量资源/协议/队列指标也按批次分摊，避免和端口流量采集抢队列。
     ASTERNOS_SCHEDULER_INTERVAL_SECONDS: int = 30
-    ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS: int = 120
+    ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS: int = 60
     ASTERNOS_MAX_DEVICES_PER_TICK: int = 20
     
     # gNMI配置

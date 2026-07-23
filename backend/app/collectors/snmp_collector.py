@@ -162,6 +162,10 @@ class SNMPCollector(LoggerMixin):
             "1.3.6.1.2.1.15.3.1.2",
             "1.3.6.1.4.1.25506.2.202.1.1.2.1.4",
         ],
+        # HH3C-TRANSCEIVER-INFO-MIB. One subtree walk returns identity and
+        # dynamic DOM values, which is much lighter than walking every column.
+        "optical_info_table_oid": "1.3.6.1.4.1.25506.2.70.1.1.1",
+        "optical_vendor": "h3c",
     }
 
 
@@ -204,6 +208,10 @@ class SNMPCollector(LoggerMixin):
             "1.3.6.1.2.1.15.3.1.2",
             "1.3.6.1.4.1.4881.1.1.10.2.73.2.5.1.5",
         ],
+        # RUIJIE-FIBER-MIB::ruijieFiberEntry. RGOS exposes a large table with
+        # more than 160 columns; walking the whole subtree can time out. The
+        # collector therefore reads only the required identity/DOM columns.
+        "optical_ruijie_fiber_entry_oid": "1.3.6.1.4.1.4881.1.1.10.2.105.1.1.1",
     }
 
     DENSIVELO_PRIVATE_OIDS = {
@@ -1175,8 +1183,19 @@ class SNMPCollector(LoggerMixin):
         return {"points_written": len(points), "protocols": protocol_summary}
 
     def collect_optical_monitoring(self, device: Any) -> Dict[str, Any]:
-        """采集光模块 RX/TX 功率，需提供私有 OID"""
+        """Collect and cache normalized optical module information.
+
+        H3C uses HH3C-TRANSCEIVER-INFO-MIB, while Ruijie uses selected columns
+        from RUIJIE-FIBER-MIB. Other vendors retain configurable RX/TX OIDs.
+        """
         private_oids = self._get_private_oid_config(device)
+        ruijie_table_oid = private_oids.get("optical_ruijie_fiber_entry_oid")
+        if ruijie_table_oid:
+            return self._collect_ruijie_optical_monitoring(device, str(ruijie_table_oid))
+        table_oid = private_oids.get("optical_info_table_oid")
+        if table_oid:
+            return self._collect_h3c_optical_monitoring(device, str(table_oid))
+
         rx_oid = private_oids.get("optical_rx_oid")
         tx_oid = private_oids.get("optical_tx_oid")
         if not rx_oid and not tx_oid:
@@ -1216,11 +1235,415 @@ class SNMPCollector(LoggerMixin):
             influx_client.write_points(points, sync=False)
         return {"points_written": len(points)}
 
+    def _collect_ruijie_optical_monitoring(self, device: Any, table_oid: str) -> Dict[str, Any]:
+        """Collect Ruijie optical modules from RUIJIE-FIBER-MIB.
+
+        Power values and power thresholds are 0.01 dBm, voltage is mV and
+        bias current is uA. ``-10000`` is the vendor-defined invalid value.
+        Selected columns are walked concurrently because a full 164-column
+        table walk is slow enough to time out on RGOS devices.
+        """
+        column_names = {
+            2: "interface_name",
+            3: "transceiver_type_code",
+            5: "wavelength_nm",
+            15: "ddm_supported",
+            16: "serial_number",
+            17: "temperature_c",
+            19: "voltage_mv",
+            21: "bias_current_ua",
+            76: "rx_power_dbm",
+            77: "channel_1_rx_power_dbm",
+            78: "channel_2_rx_power_dbm",
+            79: "channel_3_rx_power_dbm",
+            80: "channel_4_rx_power_dbm",
+            81: "tx_power_dbm",
+            82: "channel_1_tx_power_dbm",
+            83: "channel_2_tx_power_dbm",
+            84: "channel_3_tx_power_dbm",
+            85: "channel_4_tx_power_dbm",
+            86: "wavelength_exact",
+            89: "speed_mbps",
+            91: "rx_low_warning_dbm",
+            92: "rx_high_warning_dbm",
+            93: "rx_low_alarm_dbm",
+            94: "rx_high_alarm_dbm",
+            95: "tx_low_warning_dbm",
+            96: "tx_high_warning_dbm",
+            97: "tx_low_alarm_dbm",
+            98: "tx_high_alarm_dbm",
+            143: "channel_5_rx_power_dbm",
+            144: "channel_6_rx_power_dbm",
+            145: "channel_7_rx_power_dbm",
+            146: "channel_8_rx_power_dbm",
+            147: "channel_5_tx_power_dbm",
+            148: "channel_6_tx_power_dbm",
+            149: "channel_7_tx_power_dbm",
+            150: "channel_8_tx_power_dbm",
+            153: "temperature_low_warning_c",
+            154: "temperature_high_warning_c",
+            155: "temperature_low_alarm_c",
+            156: "temperature_high_alarm_c",
+            157: "voltage_low_warning_mv",
+            158: "voltage_high_warning_mv",
+            159: "voltage_low_alarm_mv",
+            160: "voltage_high_alarm_mv",
+        }
+        transceiver_types = {
+            1: "Unknown",
+            36: "100G QSFP28 DAC",
+            37: "100G LR4 QSFP28",
+            38: "100G SR4 QSFP28",
+            39: "100G ER4 QSFP28",
+            62: "100G ZR QSFP28",
+            63: "100G CWDM4 QSFP28",
+            64: "10G SFP+ Passive DAC",
+            65: "10G SFP+ Active DAC",
+            78: "200G QSFP56 Passive DAC",
+            79: "200G QSFP56 Active DAC",
+            80: "400G SR8 QSFP-DD",
+            81: "400G DR4 QSFP-DD",
+            82: "400G FR4 QSFP-DD",
+            83: "400G QSFP-DD Passive DAC",
+            84: "400G QSFP-DD Active Cable",
+            85: "400G LR8 QSFP-DD",
+            86: "200G QSFP56 Loopback",
+            87: "400G QSFP-DD Active DAC",
+            88: "400G QSFP-DD Loopback",
+            95: "400G ZR QSFP-DD",
+            104: "400G ZR+ QSFP-DD",
+            105: "400G LR4 QSFP-DD",
+        }
+
+        def walk_column(column: int) -> Tuple[int, Dict[str, Any]]:
+            return column, self._walk_indexed_map(device, f"{table_oid}.{column}")
+
+        column_maps: Dict[int, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            for column, values in executor.map(walk_column, column_names):
+                column_maps[column] = values
+
+        indexes = sorted(
+            {index for values in column_maps.values() for index in values},
+            key=lambda value: tuple(int(part) if part.isdigit() else 0 for part in str(value).split(".")),
+        )
+        now = datetime.utcnow()
+        items: List[Dict[str, Any]] = []
+        points: List[Dict[str, Any]] = []
+
+        def number(column: int, index: str, scale: float = 1.0) -> Optional[float]:
+            value = self._normalize_numeric(column_maps.get(column, {}).get(index))
+            if value is None or value in {-10000, 2147483647, -2147483648}:
+                return None
+            return round(value * scale, 4)
+
+        for index in indexes:
+            interface_name = str(column_maps.get(2, {}).get(index) or f"if{index}").strip().strip('"')
+            serial_number = str(column_maps.get(16, {}).get(index) or "").strip().strip('"')
+            type_code_value = number(3, index)
+            type_code = int(type_code_value) if type_code_value is not None else 1
+            ddm_supported = number(15, index) == 1
+            if not serial_number and type_code in {0, 1}:
+                continue
+
+            channels: List[Dict[str, Any]] = []
+            for channel in range(1, 9):
+                rx_column = 76 + channel if channel <= 4 else 138 + channel
+                tx_column = 81 + channel if channel <= 4 else 142 + channel
+                rx_power = number(rx_column, index, 0.01)
+                tx_power = number(tx_column, index, 0.01)
+                if rx_power is None and tx_power is None:
+                    continue
+                channels.append({
+                    "channel": channel,
+                    "rx_power_dbm": rx_power,
+                    "tx_power_dbm": tx_power,
+                })
+
+            channel_rx = [row["rx_power_dbm"] for row in channels if row.get("rx_power_dbm") is not None]
+            channel_tx = [row["tx_power_dbm"] for row in channels if row.get("tx_power_dbm") is not None]
+            module_rx = number(76, index, 0.01)
+            module_tx = number(81, index, 0.01)
+            rx_power = min(channel_rx) if channel_rx else module_rx
+            tx_power = min(channel_tx) if channel_tx else module_tx
+            # Copper/active-cable/loopback modules may expose placeholder DOM
+            # values (commonly -40 dBm). Keep their inventory/temperature, but
+            # do not present those placeholders as real optical power.
+            if type_code in {36, 64, 65, 78, 79, 83, 84, 86, 87, 88, 89, 90, 91, 92, 98}:
+                channels = []
+                rx_power = None
+                tx_power = None
+            wavelength_exact = str(column_maps.get(86, {}).get(index) or "").strip().strip('"')
+            wavelength = self._normalize_numeric(wavelength_exact) if wavelength_exact else number(5, index)
+
+            item = {
+                "device_id": int(device.id),
+                "device_name": device.name,
+                "device_ip": device.ip_address,
+                "device_vendor": device.vendor,
+                "interface_index": str(index),
+                "interface_name": interface_name,
+                "source": "snmp",
+                "collected_at": now.isoformat() + "Z",
+                "serial_number": serial_number or None,
+                "transceiver_type": transceiver_types.get(type_code, f"Ruijie transceiver type {type_code}"),
+                "transceiver_type_code": type_code,
+                "ddm_supported": ddm_supported,
+                "wavelength_nm": wavelength,
+                "speed_mbps": number(89, index),
+                "temperature_c": number(17, index) if ddm_supported else None,
+                "voltage_v": number(19, index, 0.001) if ddm_supported else None,
+                "bias_current_ma": number(21, index, 0.001) if ddm_supported else None,
+                "rx_power_dbm": rx_power,
+                "tx_power_dbm": tx_power,
+                "rx_low_warning_dbm": number(91, index, 0.01),
+                "rx_high_warning_dbm": number(92, index, 0.01),
+                "rx_low_alarm_dbm": number(93, index, 0.01),
+                "rx_high_alarm_dbm": number(94, index, 0.01),
+                "tx_low_warning_dbm": number(95, index, 0.01),
+                "tx_high_warning_dbm": number(96, index, 0.01),
+                "tx_low_alarm_dbm": number(97, index, 0.01),
+                "tx_high_alarm_dbm": number(98, index, 0.01),
+                "temperature_low_warning_c": number(153, index),
+                "temperature_high_warning_c": number(154, index),
+                "temperature_low_alarm_c": number(155, index),
+                "temperature_high_alarm_c": number(156, index),
+                "voltage_low_warning_v": number(157, index, 0.001),
+                "voltage_high_warning_v": number(158, index, 0.001),
+                "voltage_low_alarm_v": number(159, index, 0.001),
+                "voltage_high_alarm_v": number(160, index, 0.001),
+                "channels": channels,
+            }
+            items.append(item)
+            fields = {
+                "rx_power": rx_power,
+                "tx_power": tx_power,
+                "temperature": item.get("temperature_c"),
+                "voltage": item.get("voltage_v"),
+                "bias_current_ma": item.get("bias_current_ma"),
+                "wavelength_nm": item.get("wavelength_nm"),
+            }
+            fields = {key: value for key, value in fields.items() if value is not None}
+            if fields:
+                points.append({
+                    "measurement": "optical_monitoring",
+                    "tags": {
+                        "device_id": str(device.id),
+                        "device_name": device.name,
+                        "device_ip": device.ip_address,
+                        "vendor": device.vendor or "Ruijie",
+                        "interface_index": str(index),
+                        "interface_name": interface_name,
+                        "source": "snmp",
+                        "scope": "module",
+                    },
+                    "fields": fields,
+                    "timestamp": now,
+                })
+
+        if points:
+            influx_client.write_points(points, sync=False)
+        redis_client.setex(
+            f"monitor:cache:optical_modules:{device.id}",
+            7 * 24 * 60 * 60,
+            json.dumps({"items": items, "collected_at": now.isoformat() + "Z", "source": "snmp"}, ensure_ascii=False),
+        )
+        return {"points_written": len(points), "modules": len(items)}
+
+    def _collect_h3c_optical_monitoring(self, device: Any, table_oid: str) -> Dict[str, Any]:
+        column_names = {
+            1: "hardware_type",
+            2: "transceiver_type",
+            3: "wavelength_nm",
+            4: "vendor_name",
+            5: "serial_number",
+            7: "distance_m",
+            9: "tx_power_dbm",
+            12: "rx_power_dbm",
+            15: "temperature_c",
+            16: "voltage_v",
+            17: "bias_current_ma",
+            60: "manufacturer",
+            61: "manufactured_at",
+            64: "tx_power_dbm",
+            65: "rx_power_dbm",
+        }
+        rows: Dict[str, Dict[str, Any]] = {}
+        base = table_oid.lstrip(".") + "."
+        for item_oid, value in self.snmp_walk(device, table_oid):
+            normalized_oid = str(item_oid).lstrip(".")
+            if not normalized_oid.startswith(base):
+                continue
+            suffix = normalized_oid[len(base):].split(".")
+            if len(suffix) < 2:
+                continue
+            try:
+                column = int(suffix[0])
+            except ValueError:
+                continue
+            field = column_names.get(column)
+            if not field:
+                continue
+            interface_index = ".".join(suffix[1:])
+            row = rows.setdefault(interface_index, {"interface_index": interface_index})
+            if field in {"hardware_type", "transceiver_type", "vendor_name", "serial_number", "manufacturer", "manufactured_at"}:
+                row[field] = str(value).strip().strip('"')
+                continue
+            number = self._normalize_numeric(value)
+            if number is None or number >= 2147483647 or number <= -2147483648:
+                continue
+            if field in {"rx_power_dbm", "tx_power_dbm", "voltage_v", "bias_current_ma"}:
+                number = round(number * 0.01, 4)
+            # Prefer total optical power (.64/.65) over unsupported aggregate
+            # values (.9/.12) when both are present on multi-lane modules.
+            if field not in row or column in {64, 65}:
+                row[field] = number
+
+        if_name_map = self._walk_indexed_map(device, "1.3.6.1.2.1.31.1.1.1.1", str)
+        now = datetime.utcnow()
+        items: List[Dict[str, Any]] = []
+        points: List[Dict[str, Any]] = []
+        for interface_index, row in rows.items():
+            interface_name = if_name_map.get(interface_index, f"if{interface_index}")
+            if not any(row.get(key) not in (None, "") for key in ("serial_number", "transceiver_type", "rx_power_dbm", "tx_power_dbm")):
+                continue
+            item = {
+                "device_id": int(device.id),
+                "device_name": device.name,
+                "device_ip": device.ip_address,
+                "device_vendor": device.vendor,
+                "interface_index": interface_index,
+                "interface_name": interface_name,
+                "source": "snmp",
+                "collected_at": now.isoformat() + "Z",
+                **row,
+            }
+            items.append(item)
+            fields = {
+                name: item.get(name) for name in (
+                    "rx_power_dbm", "tx_power_dbm", "temperature_c", "voltage_v",
+                    "bias_current_ma", "wavelength_nm", "distance_m",
+                ) if item.get(name) is not None
+            }
+            if fields:
+                points.append({
+                    "measurement": "optical_monitoring",
+                    "tags": {
+                        "device_id": str(device.id),
+                        "device_name": device.name,
+                        "device_ip": device.ip_address,
+                        "vendor": device.vendor or "",
+                        "interface_index": interface_index,
+                        "interface_name": interface_name,
+                        "source": "snmp",
+                        "scope": "module",
+                    },
+                    "fields": {
+                        "rx_power": fields.get("rx_power_dbm"),
+                        "tx_power": fields.get("tx_power_dbm"),
+                        "temperature": fields.get("temperature_c"),
+                        "voltage": fields.get("voltage_v"),
+                        "bias_current_ma": fields.get("bias_current_ma"),
+                        "wavelength_nm": fields.get("wavelength_nm"),
+                        "distance_m": fields.get("distance_m"),
+                    },
+                    "timestamp": now,
+                })
+        if points:
+            influx_client.write_points(points, sync=False)
+        if items:
+            redis_client.setex(
+                f"monitor:cache:optical_modules:{device.id}",
+                7 * 24 * 60 * 60,
+                json.dumps({"items": items, "collected_at": now.isoformat() + "Z", "source": "snmp"}, ensure_ascii=False),
+            )
+        return {"points_written": len(points), "modules": len(items)}
+
     def _interface_snapshot_cache_key(self, device_id: int, interface_index: int) -> str:
         return f"interface_monitoring:last:{device_id}:{interface_index}"
 
     def _interface_initialized_cache_key(self, device_id: int, interface_index: int) -> str:
         return f"interface_monitoring:initialized:{device_id}:{interface_index}"
+
+    def collect_interface_health(self, device: Any) -> Dict[str, Any]:
+        """低频采集接口错误/丢弃计数，不与高优先级流量轮询争抢速率字段。"""
+        walk_jobs = {
+            "if_name_map": ("1.3.6.1.2.1.31.1.1.1.1", str),
+            "in_discards_map": ("1.3.6.1.2.1.2.2.1.13", int),
+            "out_discards_map": ("1.3.6.1.2.1.2.2.1.19", int),
+            "in_errors_map": ("1.3.6.1.2.1.2.2.1.14", int),
+            "out_errors_map": ("1.3.6.1.2.1.2.2.1.20", int),
+        }
+        with ThreadPoolExecutor(max_workers=len(walk_jobs)) as executor:
+            futures = {
+                name: executor.submit(self._walk_indexed_map, device, oid, cast)
+                for name, (oid, cast) in walk_jobs.items()
+            }
+            walk_results = {name: future.result() for name, future in futures.items()}
+
+        indexes = sorted(
+            set().union(*(set(values.keys()) for values in walk_results.values())),
+            key=lambda item: int(item) if str(item).isdigit() else str(item),
+        )
+        now = datetime.utcnow()
+        now_ts = time.time()
+        points = []
+
+        def delta(current: Any, previous: Any) -> Optional[float]:
+            if current is None or previous is None:
+                return None
+            value = float(current) - float(previous)
+            return round(value, 2) if value >= 0 else None
+
+        for index in indexes:
+            current = {
+                "in_discards": walk_results["in_discards_map"].get(index),
+                "out_discards": walk_results["out_discards_map"].get(index),
+                "in_errors": walk_results["in_errors_map"].get(index),
+                "out_errors": walk_results["out_errors_map"].get(index),
+            }
+            if all(value is None for value in current.values()):
+                continue
+            cache_key = f"interface_health:last:{device.id}:{index}"
+            previous_raw = redis_client.get(cache_key)
+            redis_client.setex(cache_key, 172800, json.dumps({"timestamp": now_ts, **current}))
+            if not previous_raw:
+                continue
+            try:
+                previous = json.loads(previous_raw)
+            except Exception:
+                continue
+
+            fields = {
+                **{key: float(value) for key, value in current.items() if value is not None},
+                "in_discards_delta": delta(current["in_discards"], previous.get("in_discards")),
+                "out_discards_delta": delta(current["out_discards"], previous.get("out_discards")),
+                "in_errors_delta": delta(current["in_errors"], previous.get("in_errors")),
+                "out_errors_delta": delta(current["out_errors"], previous.get("out_errors")),
+                "sample_seconds": round(max(now_ts - float(previous.get("timestamp") or now_ts), 0.0), 2),
+            }
+            fields = {key: value for key, value in fields.items() if value is not None}
+            points.append({
+                "measurement": "interface_monitoring",
+                "tags": {
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                    "interface_index": str(index),
+                    "interface_name": walk_results["if_name_map"].get(index) or f"if{index}",
+                    "source": "snmp_roce_health",
+                },
+                "fields": fields,
+                "timestamp": now,
+            })
+
+        if points:
+            influx_client.write_points(points, sync=True)
+        return {
+            "device_id": device.id,
+            "interfaces_total": len(indexes),
+            "points_written": len(points),
+            "baseline": not bool(points),
+        }
 
     def collect_interface_monitoring(
         self,
@@ -1295,6 +1718,16 @@ class SNMPCollector(LoggerMixin):
             6: "notPresent",
             7: "lowerLayerDown",
         }
+
+        def valid_status_pair(index: Any) -> tuple[Optional[str], Optional[str]]:
+            """Return statuses only when both SNMP table values are trustworthy."""
+            admin_code = walk_results["admin_status_map"].get(index)
+            oper_code = walk_results["oper_status_map"].get(index)
+            # A timed-out walk produces no value. RFC2863 value 4 is explicitly
+            # unknown. Neither condition may be converted into a physical Down.
+            if admin_code not in status_map or oper_code not in status_map or oper_code == 4:
+                return None, None
+            return status_map[admin_code], status_map[oper_code]
         now = datetime.utcnow()
         now_ts = time.time()
         points = []
@@ -1344,14 +1777,40 @@ class SNMPCollector(LoggerMixin):
                 if not first_seen:
                     continue
 
-                admin_status = status_map.get(walk_results["admin_status_map"].get(index), "unknown")
-                oper_status = status_map.get(walk_results["oper_status_map"].get(index), "unknown")
+                admin_status, oper_status = valid_status_pair(index)
                 # 接口流量图以原始端口速率为最高优先级。线路/专线统计如果需要去重，
                 # 应在上层聚合查询里处理，不能在底层接口历史中把端口速率写成空值，
-                # 否则端口查询会出现“有采集行但无流量值”。
+                # 否则接口查询会出现“有采集行但无流量值”。
                 in_bps = 0.0
                 out_bps = 0.0
                 monitored_count += 1
+                fields = {
+                    "in_octets": int(current_in) if current_in is not None else 0,
+                    "out_octets": int(current_out) if current_out is not None else 0,
+                    "in_bps": in_bps,
+                    "out_bps": out_bps,
+                    "speed_bps": float(speed_bps) if speed_bps is not None else None,
+                    "in_utilization_percent": round((in_bps / speed_bps) * 100, 2) if speed_bps and in_bps is not None else None,
+                    "out_utilization_percent": round((out_bps / speed_bps) * 100, 2) if speed_bps and out_bps is not None else None,
+                    "in_discards": float(walk_results["in_discards_map"].get(index) or 0),
+                    "out_discards": float(walk_results["out_discards_map"].get(index) or 0),
+                    "in_errors": float(walk_results["in_errors_map"].get(index) or 0),
+                    "out_errors": float(walk_results["out_errors_map"].get(index) or 0),
+                    "queue_length": float(walk_results["queue_length_map"].get(index) or 0),
+                    "sample_seconds": 0.0,
+                    "in_discards_delta": 0.0,
+                    "out_discards_delta": 0.0,
+                    "in_errors_delta": 0.0,
+                    "out_errors_delta": 0.0,
+                }
+                if admin_status is not None and oper_status is not None:
+                    fields.update({
+                        "admin_status_code": float(walk_results["admin_status_map"][index]),
+                        "oper_status_code": float(walk_results["oper_status_map"][index]),
+                        "admin_up": 1.0 if admin_status == "up" else 0.0,
+                        "oper_up": 1.0 if oper_status == "up" else 0.0,
+                        "interface_admin_up_oper_down": 1.0 if admin_status == "up" and oper_status != "up" else 0.0,
+                    })
                 points.append({
                     "measurement": "interface_monitoring",
                     "tags": {
@@ -1361,30 +1820,7 @@ class SNMPCollector(LoggerMixin):
                         "interface_name": name,
                         "vendor": device.vendor or "",
                     },
-                    "fields": {
-                        "in_octets": int(current_in) if current_in is not None else 0,
-                        "out_octets": int(current_out) if current_out is not None else 0,
-                        "in_bps": in_bps,
-                        "out_bps": out_bps,
-                        "speed_bps": float(speed_bps) if speed_bps is not None else None,
-                        "in_utilization_percent": round((in_bps / speed_bps) * 100, 2) if speed_bps and in_bps is not None else None,
-                        "out_utilization_percent": round((out_bps / speed_bps) * 100, 2) if speed_bps and out_bps is not None else None,
-                        "admin_status_code": float(walk_results["admin_status_map"].get(index) or 0),
-                        "oper_status_code": float(walk_results["oper_status_map"].get(index) or 0),
-                        "admin_up": 1.0 if admin_status == "up" else 0.0,
-                        "oper_up": 1.0 if oper_status == "up" else 0.0,
-                        "interface_admin_up_oper_down": 1.0 if admin_status == "up" and oper_status != "up" else 0.0,
-                        "in_discards": float(walk_results["in_discards_map"].get(index) or 0),
-                        "out_discards": float(walk_results["out_discards_map"].get(index) or 0),
-                        "in_errors": float(walk_results["in_errors_map"].get(index) or 0),
-                        "out_errors": float(walk_results["out_errors_map"].get(index) or 0),
-                        "queue_length": float(walk_results["queue_length_map"].get(index) or 0),
-                        "sample_seconds": 0.0,
-                        "in_discards_delta": 0.0,
-                        "out_discards_delta": 0.0,
-                        "in_errors_delta": 0.0,
-                        "out_errors_delta": 0.0,
-                    },
+                    "fields": fields,
                     "timestamp": now,
                 })
                 continue
@@ -1446,11 +1882,38 @@ class SNMPCollector(LoggerMixin):
             in_bps, out_bps = self._sanitize_interface_rates(in_bps, out_bps, speed_bps)
             in_utilization = round((in_bps / speed_bps) * 100, 2) if in_bps is not None and speed_bps else None
             out_utilization = round((out_bps / speed_bps) * 100, 2) if out_bps is not None and speed_bps else None
-            admin_status_text = status_map.get(walk_results["admin_status_map"].get(index), "unknown")
-            oper_status_text = status_map.get(walk_results["oper_status_map"].get(index), "unknown")
-            admin_status_up = admin_status_text == "up"
-            oper_status_up = oper_status_text == "up"
+            admin_status_text, oper_status_text = valid_status_pair(index)
 
+            fields = {
+                "in_bps": in_bps,
+                "out_bps": out_bps,
+                "in_utilization_percent": in_utilization,
+                "out_utilization_percent": out_utilization,
+                "in_discards": walk_results["in_discards_map"].get(index),
+                "out_discards": walk_results["out_discards_map"].get(index),
+                "in_discards_delta": in_discards_delta,
+                "out_discards_delta": out_discards_delta,
+                "in_errors": walk_results["in_errors_map"].get(index),
+                "out_errors": walk_results["out_errors_map"].get(index),
+                "in_errors_delta": in_errors_delta,
+                "out_errors_delta": out_errors_delta,
+                "in_broadcast_packets": walk_results["in_broadcast_map"].get(index),
+                "out_broadcast_packets": walk_results["out_broadcast_map"].get(index),
+                "in_broadcast_delta": in_broadcast_delta,
+                "out_broadcast_delta": out_broadcast_delta,
+                "in_broadcast_pps": in_broadcast_pps,
+                "out_broadcast_pps": out_broadcast_pps,
+                "buffer_usage": walk_results["queue_length_map"].get(index),
+                "queue_length": walk_results["queue_length_map"].get(index),
+                "speed_bps": speed_bps,
+                "sample_seconds": sample_seconds,
+            }
+            if admin_status_text is not None and oper_status_text is not None:
+                fields.update({
+                    "admin_status": 1.0 if admin_status_text == "up" else 0.0,
+                    "oper_status": 1.0 if oper_status_text == "up" else 0.0,
+                    "admin_up_oper_down": 1.0 if admin_status_text == "up" and oper_status_text != "up" else 0.0,
+                })
             points.append({
                 "measurement": "interface_monitoring",
                 "tags": {
@@ -1459,33 +1922,7 @@ class SNMPCollector(LoggerMixin):
                     "interface_index": str(index),
                     "interface_name": name,
                 },
-                "fields": {
-                    "in_bps": in_bps,
-                    "out_bps": out_bps,
-                    "in_utilization_percent": in_utilization,
-                    "out_utilization_percent": out_utilization,
-                    "in_discards": walk_results["in_discards_map"].get(index),
-                    "out_discards": walk_results["out_discards_map"].get(index),
-                    "in_discards_delta": in_discards_delta,
-                    "out_discards_delta": out_discards_delta,
-                    "in_errors": walk_results["in_errors_map"].get(index),
-                    "out_errors": walk_results["out_errors_map"].get(index),
-                    "in_errors_delta": in_errors_delta,
-                    "out_errors_delta": out_errors_delta,
-                    "in_broadcast_packets": walk_results["in_broadcast_map"].get(index),
-                    "out_broadcast_packets": walk_results["out_broadcast_map"].get(index),
-                    "in_broadcast_delta": in_broadcast_delta,
-                    "out_broadcast_delta": out_broadcast_delta,
-                    "in_broadcast_pps": in_broadcast_pps,
-                    "out_broadcast_pps": out_broadcast_pps,
-                    "buffer_usage": walk_results["queue_length_map"].get(index),
-                    "queue_length": walk_results["queue_length_map"].get(index),
-                    "speed_bps": speed_bps,
-                    "admin_status": 1.0 if admin_status_up else 0.0,
-                    "oper_status": 1.0 if oper_status_up else 0.0,
-                    "admin_up_oper_down": 1.0 if admin_status_up and not oper_status_up else 0.0,
-                    "sample_seconds": sample_seconds,
-                },
+                "fields": fields,
                 "timestamp": now,
             })
 

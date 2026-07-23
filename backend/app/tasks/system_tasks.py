@@ -12,12 +12,26 @@ from celery import shared_task
 from app.config import settings
 from app.core import get_logger
 from app.utils import influx_client, notification_manager, redis_client
+from app.utils.server_resources import collect_host_resource_sample, store_host_resource_sample
 
 logger = get_logger(__name__)
 
 INFLUX_HEALTH_LOCK_KEY = "system:health:influxdb:lock"
 INFLUX_HEALTH_STATE_KEY = "system:health:influxdb:state"
 INFLUX_HEALTH_ALERT_KEY = "system:health:influxdb:last_alert"
+
+
+@shared_task
+def collect_server_resources() -> Dict[str, Any]:
+    """Persist one host resource sample for the shared seven-day dashboard history."""
+    sample = collect_host_resource_sample()
+    store_host_resource_sample(sample)
+    return {
+        "timestamp": sample.get("timestamp"),
+        "cpu_percent": sample.get("cpu", {}).get("percent"),
+        "memory_percent": sample.get("memory", {}).get("percent"),
+        "network_interfaces": len(sample.get("network") or []),
+    }
 
 
 def _detect_webhook_provider(webhook_url: str) -> str:

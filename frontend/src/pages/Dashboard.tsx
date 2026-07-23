@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Row, Col, Card, Statistic, Spin, Progress, Space, Typography, theme, Segmented, Tooltip as AntTooltip } from 'antd'
+import { Row, Col, Card, Statistic, Spin, Progress, Select, Space, Typography, theme, Segmented, Tooltip as AntTooltip } from 'antd'
 import {
   DesktopOutlined,
   CheckCircleOutlined,
@@ -11,7 +11,7 @@ import {
   QuestionCircleOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
-import { getDashboardStats, getServerResources, ServerResourceStats } from '../api/metrics'
+import { getDashboardStats, getServerResourceHistory, getServerResources, ServerResourceStats } from '../api/metrics'
 import { getDatacenters } from '../api/devices'
 import {
   CartesianGrid,
@@ -39,7 +39,10 @@ interface ResourceSample {
   cpu: number
   memory: number
   disk: number
+  [key: string]: number | string
 }
+
+type ResourceRange = '1h' | '6h' | '24h' | '3d' | '7d'
 
 type ChartMode = 'bar' | 'pie' | 'horizontal'
 type AssetMetricKey = 'devices' | 'public_circuits' | 'private_circuits'
@@ -90,6 +93,24 @@ const getLoadStatus = (loadAvg?: number[] | null, cores?: number) => {
   return { label: '正常', color: '#389e0d' }
 }
 
+const getPercentStatus = (percent: number, warning: number, critical: number) => {
+  if (percent >= critical) return { label: '高负载', color: '#cf1322' }
+  if (percent >= warning) return { label: '偏高', color: '#d48806' }
+  return { label: '正常', color: '#389e0d' }
+}
+
+const formatRate = (bps: number) => {
+  if (!Number.isFinite(bps) || bps <= 0) return '0 bps'
+  const units = ['bps', 'Kbps', 'Mbps', 'Gbps', 'Tbps']
+  let value = bps
+  let unit = 0
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000
+    unit += 1
+  }
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unit]}`
+}
+
 const Dashboard = () => {
   const navigate = useNavigate()
   const { token } = theme.useToken()
@@ -98,6 +119,7 @@ const Dashboard = () => {
   const [assetChartMode, setAssetChartMode] = useState<ChartMode>('horizontal')
   const [serverResources, setServerResources] = useState<ServerResourceStats | null>(null)
   const [resourceSamples, setResourceSamples] = useState<ResourceSample[]>([])
+  const [resourceRange, setResourceRange] = useState<ResourceRange>('1h')
   const [stats, setStats] = useState({
     total: 0,
     datacenters: 0,
@@ -117,6 +139,14 @@ const Dashboard = () => {
     () => getLoadStatus(serverResources?.cpu.load_avg, serverResources?.cpu.cores),
     [serverResources?.cpu.load_avg, serverResources?.cpu.cores]
   )
+  const memoryStatus = useMemo(
+    () => getPercentStatus(serverResources?.memory.percent || 0, 70, 85),
+    [serverResources?.memory.percent]
+  )
+  const diskStatus = useMemo(
+    () => getPercentStatus(serverResources?.disk.percent || 0, 75, 90),
+    [serverResources?.disk.percent]
+  )
 
   useEffect(() => {
     fetchStats()
@@ -124,6 +154,12 @@ const Dashboard = () => {
     const timer = window.setInterval(fetchServerResources, 10000)
     return () => window.clearInterval(timer)
   }, [])
+
+  useEffect(() => {
+    fetchServerResourceHistory(resourceRange)
+    const timer = window.setInterval(() => fetchServerResourceHistory(resourceRange), 30000)
+    return () => window.clearInterval(timer)
+  }, [resourceRange])
 
   const fetchStats = async () => {
     try {
@@ -157,21 +193,48 @@ const Dashboard = () => {
     try {
       const result = await getServerResources()
       setServerResources(result)
-      const timestamp = new Date(result.timestamp).getTime()
-      setResourceSamples((prev) => [
-        ...prev.slice(-35),
-        {
-          timestamp,
-          time: new Date(timestamp).toLocaleTimeString('zh-CN', { hour12: false }),
-          cpu: result.cpu.percent,
-          memory: result.memory.percent,
-          disk: result.disk.percent,
-        },
-      ])
     } catch (error) {
       console.error('获取服务器资源失败:', error)
     }
   }
+
+  const fetchServerResourceHistory = async (range: ResourceRange) => {
+    try {
+      const result = await getServerResourceHistory(range)
+      const includeDate = range === '24h' || range === '3d' || range === '7d'
+      setResourceSamples((result.samples || []).map((sample) => {
+        const timestamp = new Date(sample.timestamp).getTime()
+        const network: Record<string, number> = {}
+        for (const item of sample.network || []) {
+          const key = item.name.replace(/[^a-zA-Z0-9_-]/g, '_')
+          network[`network_${key}_rx`] = Number(item.rx_bps || 0)
+          network[`network_${key}_tx`] = Number(item.tx_bps || 0)
+        }
+        return {
+          timestamp,
+          time: new Date(timestamp).toLocaleString('zh-CN', {
+            month: includeDate ? '2-digit' : undefined,
+            day: includeDate ? '2-digit' : undefined,
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false,
+          }),
+          cpu: sample.cpu.percent,
+          memory: sample.memory.percent,
+          disk: sample.disk.percent,
+          ...network,
+        }
+      }))
+    } catch (error) {
+      console.error('获取服务器资源历史失败:', error)
+    }
+  }
+
+  const networkInterfaces = useMemo(() => (
+    (serverResources?.network || [])
+      .filter((item) => item.operstate === 'up' || item.rx_bps > 0 || item.tx_bps > 0)
+      .slice(0, 8)
+  ), [serverResources?.network])
 
   const deviceStatusData = useMemo(() => {
     const fallback = [
@@ -446,7 +509,20 @@ const Dashboard = () => {
             title="服务器资源使用率"
             extra={
               serverResources ? (
-                <Space size="middle">
+                <Space size="middle" wrap>
+                  <Select<ResourceRange>
+                    size="small"
+                    value={resourceRange}
+                    onChange={setResourceRange}
+                    style={{ width: 112 }}
+                    options={[
+                      { label: '过去1小时', value: '1h' },
+                      { label: '过去6小时', value: '6h' },
+                      { label: '过去24小时', value: '24h' },
+                      { label: '过去3天', value: '3d' },
+                      { label: '过去7天', value: '7d' },
+                    ]}
+                  />
                   <Text strong>{serverResources.hostname}</Text>
                   <Text type="secondary">{`运行 ${formatUptime(serverResources.uptime_seconds)}`}</Text>
                 </Space>
@@ -496,6 +572,7 @@ const Dashboard = () => {
                       <Text type="secondary">
                         {`${formatBytes(serverResources.memory.used)} / ${formatBytes(serverResources.memory.total)}`}
                       </Text>
+                      <div><Text style={{ color: memoryStatus.color }}>{`负载状态：${memoryStatus.label}`}</Text></div>
                     </Card>
                   </Col>
                   <Col xs={24} md={8}>
@@ -510,6 +587,7 @@ const Dashboard = () => {
                       <Text type="secondary">
                         {`${formatBytes(serverResources.disk.used)} / ${formatBytes(serverResources.disk.total)}`}
                       </Text>
+                      <div><Text style={{ color: diskStatus.color }}>{`负载状态：${diskStatus.label}`}</Text></div>
                     </Card>
                   </Col>
                 </Row>
@@ -537,6 +615,33 @@ const Dashboard = () => {
                       <Line type="monotone" dataKey="disk" name="磁盘" stroke="#f59e0b" strokeWidth={2.4} dot={false} />
                     </AreaChart>
                   </ResponsiveContainer>
+                </div>
+
+                <div>
+                  <Space direction="vertical" size={2} style={{ marginBottom: 8 }}>
+                    <Text strong>服务器网卡流量</Text>
+                    <Text type="secondary">展示宿主机已启用网卡的实时收发速率，历史数据由后台每 30 秒统一采集。</Text>
+                  </Space>
+                  <div style={{ width: '100%', height: 320 }}>
+                    <ResponsiveContainer>
+                      <AreaChart data={resourceSamples} margin={{ top: 16, right: 28, left: 12, bottom: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+                        <XAxis dataKey="time" minTickGap={32} tick={{ fill: axisColor, fontSize: 12 }} />
+                        <YAxis tickFormatter={(value) => formatRate(Number(value))} tick={{ fill: axisColor, fontSize: 12 }} width={76} />
+                        <Tooltip contentStyle={tooltipStyle} formatter={(value: number, name: string) => [formatRate(Number(value)), name]} />
+                        <Legend />
+                        {networkInterfaces.flatMap((item, index) => {
+                          const key = item.name.replace(/[^a-zA-Z0-9_-]/g, '_')
+                          const rxColor = CHART_COLORS[(index * 2) % CHART_COLORS.length]
+                          const txColor = CHART_COLORS[(index * 2 + 1) % CHART_COLORS.length]
+                          return [
+                            <Area key={`${item.name}-rx`} type="monotone" dataKey={`network_${key}_rx`} name={`${item.name} 入向`} stroke={rxColor} strokeWidth={2} fill={rxColor} fillOpacity={0.08} dot={false} connectNulls />,
+                            <Line key={`${item.name}-tx`} type="monotone" dataKey={`network_${key}_tx`} name={`${item.name} 出向`} stroke={txColor} strokeWidth={2} dot={false} connectNulls />,
+                          ]
+                        })}
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
               </Space>
             ) : (

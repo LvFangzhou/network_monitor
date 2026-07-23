@@ -41,9 +41,10 @@ from app.tasks.alert_tasks import (
 from app.tasks import celery_app
 from app.utils import notification_manager, redis_client
 from app.utils.ip_match import is_exact_ip_address
+from app.utils.monitor_profile import device_feature_enabled, get_device_monitor_profile
 from app.schemas import (
     AlertRuleCreate, AlertRuleUpdate, AlertRuleResponse,
-    AlertHistoryResponse, AlertAcknowledge, AlertResolve, AlertIgnore, AlertHistoryClear, SyslogEventResponse,
+    AlertHistoryResponse, AlertAcknowledge, AlertResolve, AlertIgnore, AlertQuickSilence, AlertHistoryClear, SyslogEventResponse,
     AlertSilenceCreate, AlertSilenceUpdate
 )
 from app.core import get_logger
@@ -219,7 +220,58 @@ def _validated_rule_extra_config(extra_config: Optional[Dict[str, Any]]) -> Dict
                 re.compile(pattern_value)
             except re.error as exc:
                 raise HTTPException(status_code=400, detail=f"{field_name} 正则无效: {exc}") from exc
+    for field_name in ("models", "monitor_profiles", "exclude_monitor_profiles", "required_features"):
+        values = config.get(field_name)
+        if values is None:
+            continue
+        if isinstance(values, str):
+            values = [item.strip() for item in values.split(",") if item.strip()]
+        if not isinstance(values, list):
+            raise HTTPException(status_code=400, detail=f"{field_name} 必须是列表。")
+        config[field_name] = [str(item).strip() for item in values if str(item or "").strip()]
     return config
+
+
+def _device_matches_rule_scope(device: Device, extra_config: Optional[Dict[str, Any]]) -> bool:
+    config = extra_config or {}
+    model_value = str(device.model or "").strip()
+    models = config.get("models") or []
+    if isinstance(models, str):
+        models = [item.strip() for item in models.split(",") if item.strip()]
+    if isinstance(models, list) and models:
+        normalized_model = re.sub(r"[^a-z0-9]+", "", model_value.lower())
+        normalized_allowed = [re.sub(r"[^a-z0-9]+", "", str(item).lower()) for item in models if str(item or "").strip()]
+        if normalized_allowed and not any(
+            allowed == normalized_model or allowed in normalized_model or normalized_model in allowed
+            for allowed in normalized_allowed
+        ):
+            return False
+
+    model_keyword = str(config.get("model") or config.get("model_keyword") or "").strip().lower()
+    if model_keyword and model_keyword not in model_value.lower():
+        return False
+    model_regex = str(config.get("model_regex") or "").strip()
+    if model_regex and not re.search(model_regex, model_value, re.IGNORECASE):
+        return False
+    exclude_model_regex = str(config.get("exclude_model_regex") or "").strip()
+    if exclude_model_regex and re.search(exclude_model_regex, model_value, re.IGNORECASE):
+        return False
+
+    profiles = config.get("monitor_profiles") or []
+    excluded_profiles = config.get("exclude_monitor_profiles") or []
+    required_features = config.get("required_features") or []
+    if isinstance(profiles, str):
+        profiles = [item.strip() for item in profiles.split(",") if item.strip()]
+    if isinstance(excluded_profiles, str):
+        excluded_profiles = [item.strip() for item in excluded_profiles.split(",") if item.strip()]
+    if isinstance(required_features, str):
+        required_features = [item.strip() for item in required_features.split(",") if item.strip()]
+    profile = get_device_monitor_profile(device)
+    if profiles and profile not in profiles:
+        return False
+    if excluded_profiles and profile in excluded_profiles:
+        return False
+    return all(device_feature_enabled(device, feature) for feature in required_features)
 
 def _get_silence_match_rule_filters(
     db: Session,
@@ -794,6 +846,7 @@ def _get_rule_applicable_devices(db: Session, rule: AlertRule) -> List[Device]:
     if not applicable_vendors:
         return []
     devices = [device for device in devices if _vendor_matches_any(device.vendor, applicable_vendors)]
+    devices = [device for device in devices if _device_matches_rule_scope(device, rule.extra_config or {})]
 
     if rule.metric_type == "device_reachability":
         return [
@@ -989,7 +1042,7 @@ def get_alert_rule_status(
             partial = True
             break
         try:
-            targets = _get_metric_targets(db, device, rule.metric_type, rule.extra_config or {})
+            targets = _get_metric_targets(db, device, rule.metric_type, rule.extra_config or {}, rule)
         except Exception as exc:
             logger.error("规则状态评估失败", rule_id=rule.id, device_id=device.id, error=str(exc))
             targets = []
@@ -1024,7 +1077,7 @@ def get_alert_rule_status(
             current_status = "no_data"
             is_alert = False
             if value is not None:
-                is_alert = _evaluate_rule_condition(rule, float(value))
+                is_alert = _evaluate_rule_condition(rule, float(value), target)
                 current_status = "alert" if is_alert else "normal"
 
             summary["total"] += 1
@@ -1044,7 +1097,7 @@ def get_alert_rule_status(
                 "target_key": target.get("target_key"),
                 "target_name": target.get("target_name"),
                 "value": float(value) if value is not None else None,
-                "condition": f"{rule.condition} {rule.threshold}",
+                "condition": f"{rule.condition} {target.get('effective_threshold', rule.threshold)}",
                 "status": current_status,
                 "state_text": target.get("state_text"),
                 "message": "触发告警" if is_alert else "正常",
@@ -1625,6 +1678,70 @@ async def ignore_alert(
 
     logger.info("告警已忽略", alert_id=alert_id, user=username)
     return alert.to_dict()
+
+
+@router.post("/history/{alert_id}/quick-silence")
+async def quick_silence_alert(
+    alert_id: int,
+    data: AlertQuickSilence,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """按当前告警的规则、设备和具体对象创建限时屏蔽。"""
+    alert = db.query(AlertHistory).filter(AlertHistory.id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="告警记录不存在")
+    if alert.status == "resolved":
+        raise HTTPException(status_code=400, detail="已恢复告警无需屏蔽")
+
+    username = (data.actor_username or current_user.username or "admin").strip() or "admin"
+    now = _utc_now()
+    expires_at = now + timedelta(hours=data.duration_hours)
+    target_value = str(alert.alert_target_key or alert.alert_target_name or "").strip()
+    conditions = []
+    if target_value:
+        conditions.append({"field": "interface", "operator": "equals", "value": target_value})
+
+    duration_label = f"{data.duration_hours // 24}天" if data.duration_hours % 24 == 0 else f"{data.duration_hours}小时"
+    alarm_label = alert.to_dict().get("alarm_id") or str(alert.id)
+    silence = AlertSilence(
+        name=f"快捷屏蔽 {alarm_label} {duration_label}"[:100],
+        rule_id=alert.rule_id,
+        device_id=alert.device_id,
+        conditions=conditions,
+        starts_at=now,
+        expires_at=expires_at,
+        reason=f"由 {username} 从告警历史快捷屏蔽，持续 {duration_label}",
+        created_by=username,
+        enabled=1,
+    )
+    db.add(silence)
+
+    # 当前告警立即停止重复通知；屏蔽到期后，若指标仍异常，检查任务会自动重新触发。
+    alert.status = "ignored"
+    alert.ignored_by = "alert_silence"
+    alert.ignored_at = now
+    alert.resolution_note = (
+        f"{username} 快捷屏蔽 {duration_label}，到期时间 {_format_snooze_until(expires_at)}；"
+        "到期后如故障仍存在会重新触发。"
+    )
+
+    db.commit()
+    db.refresh(silence)
+    db.refresh(alert)
+    logger.info(
+        "告警已快捷屏蔽",
+        alert_id=alert_id,
+        silence_id=silence.id,
+        user=username,
+        duration_hours=data.duration_hours,
+        target=target_value or "device",
+    )
+    return {
+        "alert": alert.to_dict(),
+        "silence": silence.to_dict(),
+        "expires_at": expires_at.isoformat(),
+    }
 
 
 @router.get("/silences", response_model=dict)

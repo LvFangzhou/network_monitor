@@ -31,7 +31,7 @@ export interface AlertHistory {
   alarm_id?: string | null
   rule_id: number
   rule_name?: string | null
-  device_id: number
+  device_id?: number | null
   device_name?: string | null
   device_ip?: string | null
   alert_value?: number | null
@@ -274,6 +274,17 @@ export const ignoreAlert = async (id: number, note?: string, actor_username?: st
 
 export const resolveAlert = async (id: number, note?: string, actor_username?: string): Promise<AlertHistory> => {
   return await request.post(`/alerts/history/${id}/resolve`, { note: note || '', actor_username: actor_username || '' }) as AlertHistory
+}
+
+export const quickSilenceAlert = async (
+  id: number,
+  durationHours: number,
+  actorUsername?: string,
+): Promise<{ alert: AlertHistory; silence: AlertSilence; expires_at: string }> => {
+  return await request.post(`/alerts/history/${id}/quick-silence`, {
+    duration_hours: durationHours,
+    actor_username: actorUsername || '',
+  }) as { alert: AlertHistory; silence: AlertSilence; expires_at: string }
 }
 
 export const getAlertStats = async (): Promise<AlertStats> => {

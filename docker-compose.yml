@@ -6,6 +6,7 @@ services:
     image: postgres:15-alpine
     container_name: nm-postgres
     environment:
+      TZ: Asia/Shanghai
       POSTGRES_USER: network_monitor
       POSTGRES_PASSWORD: network_monitor
       POSTGRES_DB: network_monitor
@@ -13,6 +14,22 @@ services:
       - ${DATA_ROOT:-./data}/postgres:/var/lib/postgresql/data
     ports:
       - "127.0.0.1:5432:5432"
+    command:
+      - postgres
+      - -c
+      - max_connections=150
+      - -c
+      - shared_buffers=4GB
+      - -c
+      - effective_cache_size=18GB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - timezone=Asia/Shanghai
+      - -c
+      - log_timezone=Asia/Shanghai
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U network_monitor"]
       interval: 10s
@@ -27,6 +44,7 @@ services:
     image: influxdb:2.7
     container_name: nm-influxdb
     environment:
+      TZ: Asia/Shanghai
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: admin
       DOCKER_INFLUXDB_INIT_PASSWORD: admin123456
@@ -46,11 +64,45 @@ services:
       - network-monitor
     restart: unless-stopped
 
+  # Grafana 可视化平台，通过前端 Nginx 的 /grafana/ 子路径访问。
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: nm-grafana
+    environment:
+      TZ: Asia/Shanghai
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:10086/grafana-app/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-before-production}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-network-monitor-token}
+      GRAFANA_POSTGRES_PASSWORD: ${GRAFANA_POSTGRES_PASSWORD:-change-me-before-production}
+    volumes:
+      - ${GRAFANA_DATA_ROOT:-./data/grafana}:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    networks:
+      - network-monitor
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
   # InfluxDB 每日备份，避免时序数据目录误删后完全不可恢复
   influxdb-backup:
     image: influxdb:2.7
     container_name: nm-influxdb-backup
     environment:
+      TZ: Asia/Shanghai
       INFLUXDB_URL: http://influxdb:8086
       INFLUXDB_TOKEN: network-monitor-token
       INFLUXDB_ORG: network-monitor
@@ -92,6 +144,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: nm-redis
+    environment:
+      TZ: Asia/Shanghai
     volumes:
       - ${DATA_ROOT:-./data}/redis:/data
     ports:
@@ -110,6 +164,7 @@ services:
     image: rabbitmq:3-management-alpine
     container_name: nm-rabbitmq
     environment:
+      TZ: Asia/Shanghai
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
     volumes:
@@ -131,7 +186,11 @@ services:
     build: ./backend
     image: network_monitor-backend:latest
     container_name: nm-api
+    # Syslog/Trap/Flow UDP listeners are started in-process, so API remains a
+    # single worker until those listeners are split into dedicated services.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     environment:
+      - TZ=Asia/Shanghai
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
@@ -144,6 +203,8 @@ services:
       - POSTGRES_USER=network_monitor
       - POSTGRES_PASSWORD=network_monitor
       - POSTGRES_DB=network_monitor
+      - DB_POOL_SIZE=10
+      - DB_MAX_OVERFLOW=20
       - INFLUXDB_URL=http://influxdb:8086
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
@@ -168,12 +229,12 @@ services:
       - RABBITMQ_USER=${RABBITMQ_USER:-guest}
       - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=160
       - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
       - ASTERNOS_MAX_DEVICES_PER_TICK=20
       - LOG_LEVEL=INFO
       - LOG_FORMAT=json
@@ -181,6 +242,10 @@ services:
       - ./backend/app:/app/app
       - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
       - /var/run/docker.sock:/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host-root:ro
+      - /etc/hostname:/host/etc/hostname:ro
     ports:
       - "127.0.0.1:8000:8000"
       - "514:514/udp"
@@ -207,6 +272,7 @@ services:
     container_name: nm-celery-beat
     command: celery -A app.tasks beat -l info
     environment:
+      - TZ=Asia/Shanghai
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
@@ -235,12 +301,12 @@ services:
       - RABBITMQ_USER=${RABBITMQ_USER:-guest}
       - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=160
       - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
       - ASTERNOS_MAX_DEVICES_PER_TICK=20
       - LOG_LEVEL=INFO
     volumes:
@@ -262,6 +328,7 @@ services:
     container_name: nm-celery-worker
     command: celery -A app.tasks worker -l info -Q celery,default,tacacs -n worker-background@%h --pool=prefork -c 3 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=80 --max-memory-per-child=450000
     environment:
+      - TZ=Asia/Shanghai
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
@@ -290,12 +357,12 @@ services:
       - RABBITMQ_USER=${RABBITMQ_USER:-guest}
       - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=160
       - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
       - ASTERNOS_MAX_DEVICES_PER_TICK=20
       - LOG_LEVEL=INFO
     volumes:
@@ -334,6 +401,7 @@ services:
     command: celery -A app.tasks worker -l info -Q config_backup -n worker-config-backup@%h --pool=prefork -c 1 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=10 --max-memory-per-child=900000
     cpu_shares: 512
     environment:
+      - TZ=Asia/Shanghai
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
@@ -434,6 +502,14 @@ services:
     <<: *celery-worker-base
     container_name: nm-celery-worker-system
     command: celery -A app.tasks worker -l info -Q system -n worker-system@%h --pool=threads -c 4 --prefetch-multiplier=1 -Ofair
+    volumes:
+      - ./backend/app:/app/app
+      - ${TACACS_DATA_ROOT:-./data/tacacs}:/app/data/tacacs
+      - ${INFLUXDB_DATA_ROOT:-./data/influxdb}:/host-data/influxdb:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host-root:ro
+      - /etc/hostname:/host/etc/hostname:ro
     deploy:
       resources:
         limits:
@@ -459,6 +535,7 @@ services:
     command: celery -A app.tasks worker -l info -Q asternos -n worker-asternos@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
     cpu_shares: 4096
     environment:
+      - TZ=Asia/Shanghai
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
@@ -487,11 +564,11 @@ services:
       - RABBITMQ_USER=${RABBITMQ_USER:-guest}
       - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=40
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
       - ASTERNOS_MAX_DEVICES_PER_TICK=40
       - LOG_LEVEL=INFO
     volumes:
@@ -520,6 +597,7 @@ services:
     command: celery -A app.tasks worker -l info -Q asternos_realtime -n worker-asternos-realtime@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
     cpu_shares: 4096
     environment:
+      - TZ=Asia/Shanghai
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
@@ -548,11 +626,11 @@ services:
       - RABBITMQ_USER=${RABBITMQ_USER:-guest}
       - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=40
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
-      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=120
+      - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
       - ASTERNOS_MAX_DEVICES_PER_TICK=40
       - LOG_LEVEL=INFO
     volumes:
@@ -581,6 +659,7 @@ services:
     command: celery -A app.tasks worker -l info -Q snmp_realtime -n worker-snmp@%h --pool=threads -c 16 --prefetch-multiplier=1 -Ofair
     cpu_shares: 2048
     environment:
+      - TZ=Asia/Shanghai
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
@@ -609,7 +688,7 @@ services:
       - RABBITMQ_USER=${RABBITMQ_USER:-guest}
       - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_MAX_DEVICES_PER_TICK=80
       - LOG_LEVEL=INFO
     volumes:
@@ -638,6 +717,7 @@ services:
     command: celery -A app.tasks worker -l info -Q snmp_circuit_realtime,snmp_interface_realtime -n worker-snmp-circuit@%h --pool=threads -c 36 --prefetch-multiplier=1 -Ofair
     cpu_shares: 12288
     environment:
+      - TZ=Asia/Shanghai
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
@@ -666,7 +746,7 @@ services:
       - RABBITMQ_USER=${RABBITMQ_USER:-guest}
       - RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-guest}
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
-      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=300
+      - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
       - SNMP_MAX_DEVICES_PER_TICK=160
       - SNMP_INTERFACE_REALTIME_MAX_WORKERS=32
@@ -699,6 +779,7 @@ services:
     container_name: nm-telemetry-receiver
     command: python -m app.services.telemetry_receiver --host 0.0.0.0 --port 50051
     environment:
+      - TZ=Asia/Shanghai
       - DEBUG=false
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
@@ -719,12 +800,24 @@ services:
       - LOG_LEVEL=INFO
       - TELEMETRY_RECEIVER_PORT=50051
       - TELEMETRY_RECEIVER_SPOOL_DIR=/app/data/telemetry
-      - TELEMETRY_RECEIVER_MAX_WORKERS=64
+      # H3C Dial-out is a long-lived client-streaming RPC. Each active stream
+      # occupies one worker in the synchronous grpc server, so this must stay
+      # comfortably above the number of subscribed devices.
+      - TELEMETRY_RECEIVER_MAX_WORKERS=512
       - TELEMETRY_RECEIVER_LOG_EVERY=5000
       - TELEMETRY_RECEIVER_WRITE_INFLUX=true
+      # SNMP remains authoritative for ordinary interface traffic history.
+      - TELEMETRY_RECEIVER_WRITE_INTERFACE_HISTORY=false
+      - TELEMETRY_RECEIVER_PROCESS_WORKERS=16
+      - TELEMETRY_RECEIVER_PROCESS_QUEUE_SIZE=16384
       - TELEMETRY_RECEIVER_RECORD_MESSAGES=false
       - TELEMETRY_RECEIVER_RECORD_PAYLOADS=false
-      - TELEMETRY_RECEIVER_RECORD_EVENTS=false
+      # Session-only diagnostics are low volume when RECORD_MESSAGES is false
+      # and let us distinguish device timeouts from receiver-side failures.
+      - TELEMETRY_RECEIVER_RECORD_EVENTS=true
+      # Diagnostic mode: retain only one JSON sample per supported lossless
+      # sensor path. Disable again after mappings have been verified.
+      - TELEMETRY_RECEIVER_RECORD_SENSOR_SAMPLES=${TELEMETRY_RECEIVER_RECORD_SENSOR_SAMPLES:-false}
       - TELEMETRY_RECEIVER_MAX_SAVED_MESSAGES=0
       - TELEMETRY_RECEIVER_ACK_EVERY=0
     volumes:
@@ -750,6 +843,8 @@ services:
   frontend:
     build: ./frontend
     container_name: nm-frontend
+    environment:
+      TZ: Asia/Shanghai
     ports:
       - "10086:80"
       - "40086:443"
@@ -769,8 +864,11 @@ services:
     volumes:
       - ${TACACS_DATA_ROOT:-./data/tacacs}/tac_plus.cfg:/etc/tacacs+/tac_plus.cfg:ro
       - ${TACACS_DATA_ROOT:-./data/tacacs}/logs:/var/log/tacacs+
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - /usr/share/zoneinfo/Asia/Shanghai:/usr/share/zoneinfo/Asia/Shanghai:ro
     environment:
-      - TZ=UTC
+      - TZ=Asia/Shanghai
     command: ["/usr/local/sbin/tac_plus", "-C", "/etc/tacacs+/tac_plus.cfg", "-G", "-l", "/var/log/tacacs+/tacacs.log"]
 
   # Nginx 反向代理（可选，用于高级配置）

@@ -41,15 +41,14 @@ const Layout = () => {
     token: { colorBgLayout, colorText, colorTextSecondary },
   } = theme.useToken()
 
-  const publicMenus = ['/alerts/history', '/alerts/audit', '/port-query']
+  const publicMenus = ['/alerts/history', '/alerts/audit', '/grafana']
   const allowedMenus = !token ? publicMenus : (user?.is_superuser ? ['*'] : (user?.allowed_menus || []))
   const canAccessMenu = (path: string) =>
     allowedMenus.includes('*') ||
     allowedMenus.includes(path) ||
-    (path.startsWith('/tacacs/') && allowedMenus.includes('/tacacs')) ||
-    ((path === '/port-query' || path === '/device-overview' || path === '/quality-query' || path === '/traffic-query' || path === '/module-info-query' || path === '/lossless-info-query' || path === '/config-backups') && allowedMenus.includes('/metrics'))
+    (path.startsWith('/tacacs/') && allowedMenus.includes('/tacacs'))
 
-  const selectedMenuKey = location.pathname === '/metrics' ? '/port-query' : location.pathname
+  const selectedMenuKey = location.pathname
 
   const filterMenuItems = (items: ItemType[]): ItemType[] => {
     return items.reduce<ItemType[]>((result, item) => {
@@ -117,7 +116,7 @@ const Layout = () => {
       label: '监控中心',
       children: [
         { key: '/device-overview', label: '设备总览' },
-        { key: '/port-query', label: '端口查询' },
+        { key: '/grafana', label: '接口查询' },
         { key: '/ip-flow-query', label: 'IP查询' },
         { key: '/quality-query', label: '质量查询' },
         { key: '/traffic-query', label: '流量查询' },
