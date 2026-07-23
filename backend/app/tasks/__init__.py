@@ -41,6 +41,8 @@ celery_app.conf.update(
         "app.tasks.snmp_tasks.prewarm_forwarding_caches": {"queue": "system"},
         "app.tasks.snmp_tasks.ensure_qos_discard_rules": {"queue": "system"},
         "app.tasks.snmp_tasks.ensure_h3c_s9867_roce_rules": {"queue": "system"},
+        "app.tasks.snmp_tasks.ensure_up_interface_crc_rules": {"queue": "system"},
+        "app.tasks.snmp_tasks.ensure_asternos_up_interface_quality_rules": {"queue": "system"},
         "app.tasks.alert_tasks.check_fast_alerts": {"queue": "alerts_fast"},
         "app.tasks.alert_tasks.resolve_interface_alerts_quick": {"queue": "alerts_health"},
         "app.tasks.snmp_tasks.collect_all_asternos_interface_realtime": {"queue": "asternos_realtime"},

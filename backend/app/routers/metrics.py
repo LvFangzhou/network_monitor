@@ -3286,6 +3286,8 @@ async def get_monitor_device_interface_history(
         r._field == "out_discards_delta" or
         r._field == "in_errors" or
         r._field == "out_errors" or
+        r._field == "crc_errors" or
+        r._field == "crc_errors_delta" or
         r._field == "in_errors_delta" or
         r._field == "out_errors_delta" or
         r._field == "queue_egress_dropped_pkts_delta" or
@@ -5000,7 +5002,7 @@ async def get_quality_probe_history(
     safe_interval = _safe_flux_interval(interval, "1m")
     range_clause, use_absolute_range, start_time, end_time = _build_query_range_clause(safe_range, start, end, start_ts, end_ts)
     cache_range_key = f"abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}" if use_absolute_range and start_time and end_time else safe_range
-    cache_key = f"quality_probe:history:v4:{target_id}:{cache_range_key}:{safe_interval}"
+    cache_key = f"quality_probe:history:v5:{target_id}:{cache_range_key}:{safe_interval}"
     cached = redis_client.get(cache_key)
     if cached:
         try:
@@ -5013,7 +5015,7 @@ async def get_quality_probe_history(
       |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "quality_probe")
       |> filter(fn: (r) => r.target_id == {escaped_id})
-      |> filter(fn: (r) => r._field == "avg_latency_ms" or r._field == "min_latency_ms" or r._field == "max_latency_ms" or r._field == "jitter_ms")
+      |> filter(fn: (r) => r._field == "avg_latency_ms" or r._field == "min_latency_ms" or r._field == "max_latency_ms" or r._field == "jitter_ms" or r._field == "jitter_sd_ms" or r._field == "jitter_ds_ms")
       |> aggregateWindow(every: {safe_interval}, fn: mean, createEmpty: false)
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> sort(columns: ["_time"])
@@ -5024,7 +5026,7 @@ async def get_quality_probe_history(
       |> filter(fn: (r) => r._measurement == "quality_probe")
       |> filter(fn: (r) => r.target_id == {escaped_id})
       |> filter(fn: (r) => r._field == "sent" or r._field == "received")
-      |> aggregateWindow(every: {safe_interval}, fn: sum, createEmpty: false)
+      |> aggregateWindow(every: {safe_interval}, fn: mean, createEmpty: false)
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> sort(columns: ["_time"])
     '''
@@ -5039,6 +5041,8 @@ async def get_quality_probe_history(
             "min_latency_ms": row.get("min_latency_ms"),
             "max_latency_ms": row.get("max_latency_ms"),
             "jitter_ms": row.get("jitter_ms"),
+            "jitter_sd_ms": row.get("jitter_sd_ms"),
+            "jitter_ds_ms": row.get("jitter_ds_ms"),
             "packet_loss_percent": None,
             "availability_percent": None,
         }
@@ -5052,6 +5056,8 @@ async def get_quality_probe_history(
             "min_latency_ms": None,
             "max_latency_ms": None,
             "jitter_ms": None,
+            "jitter_sd_ms": None,
+            "jitter_ds_ms": None,
             "packet_loss_percent": None,
             "availability_percent": None,
         })
@@ -5066,8 +5072,8 @@ async def get_quality_probe_history(
     rolling_received = 0.0
     for item in data:
         item_time = _parse_history_time(item)
-        sent = _safe_float(item.pop("sent", None)) or 0.0
-        received = _safe_float(item.pop("received", None)) or 0.0
+        sent = _safe_float(item.get("sent")) or 0.0
+        received = _safe_float(item.get("received")) or 0.0
         if item_time is not None and sent > 0:
             rolling_counts.append((item_time, sent, received))
             rolling_sent += sent

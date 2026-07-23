@@ -26,6 +26,8 @@ import {
   deleteQualityProbeTarget,
   getQualityProbeHistory,
   getCircuitTrafficHistory,
+  getMonitorDeviceInterfaces,
+  getMonitorInterfaceHistory,
   getQualityNqaInstances,
   getQualityTargetAlertSettings,
   getQualityProbeTargets,
@@ -34,6 +36,7 @@ import {
   testQualityProbeTarget,
   updateQualityProbeTarget,
   type QualityProbeHistoryPoint,
+  type MonitorInterface,
   type QualityNqaInstance,
   type QualityProbeTarget,
 } from '../../api/metrics'
@@ -129,6 +132,69 @@ const formatBps = (value?: number | null) => {
   return `${Number(value || 0).toFixed(0)} bps`
 }
 
+const circuitAddressFields = (circuit: Circuit) => [
+  circuit.primary_remote_interconnect_ip,
+  circuit.secondary_remote_interconnect_ip,
+  circuit.remote_interconnect_address,
+  circuit.primary_interconnect_ip,
+  circuit.secondary_interconnect_ip,
+  circuit.interconnect_address,
+  circuit.primary_local_interconnect_ip,
+  circuit.secondary_local_interconnect_ip,
+  circuit.local_interconnect_address,
+].map((item) => String(item || '').trim()).filter(Boolean)
+
+const circuitAddressMatches = (circuit: Circuit, targetAddress: string) => {
+  const normalizedTarget = String(targetAddress || '').trim()
+  if (!normalizedTarget) return false
+  return circuitAddressFields(circuit).some((address) => address === normalizedTarget || address.split('/')[0] === normalizedTarget)
+}
+
+const getCircuitDeviceBindings = (circuit: Circuit, deviceId?: number | null) => {
+  const bindings: Array<{ role: string; port?: string; deviceIp?: string; localIp?: string; remoteIp?: string }> = []
+  if (deviceId && circuit.primary_device_id === deviceId) {
+    bindings.push({
+      role: '主接入',
+      port: circuit.primary_port_name,
+      deviceIp: circuit.primary_device_ip,
+      localIp: circuit.primary_local_interconnect_ip || circuit.primary_interconnect_ip || circuit.local_interconnect_address || circuit.interconnect_address,
+      remoteIp: circuit.primary_remote_interconnect_ip || circuit.remote_interconnect_address,
+    })
+  }
+  if (deviceId && circuit.secondary_device_id === deviceId) {
+    bindings.push({
+      role: '备接入',
+      port: circuit.secondary_port_name,
+      deviceIp: circuit.secondary_device_ip,
+      localIp: circuit.secondary_local_interconnect_ip || circuit.secondary_interconnect_ip || circuit.local_interconnect_address || circuit.interconnect_address,
+      remoteIp: circuit.secondary_remote_interconnect_ip || circuit.remote_interconnect_address,
+    })
+  }
+  if (deviceId && circuit.aggregation_monitor_device_id === deviceId) {
+    bindings.push({
+      role: '聚合接口',
+      port: circuit.aggregation_interface_name,
+      deviceIp: circuit.aggregation_monitor_device_ip,
+      localIp: circuit.local_interconnect_address || circuit.interconnect_address || circuit.primary_local_interconnect_ip || circuit.primary_interconnect_ip,
+      remoteIp: circuit.remote_interconnect_address || circuit.primary_remote_interconnect_ip || circuit.secondary_remote_interconnect_ip,
+    })
+  }
+  return bindings.filter((item) => item.port || item.deviceIp || item.localIp || item.remoteIp)
+}
+
+const buildCircuitOptionLabel = (circuit: Circuit, deviceId?: number | null) => {
+  const bindings = getCircuitDeviceBindings(circuit, deviceId)
+  const bindingText = bindings.length
+    ? bindings.map((item) => [item.role, item.deviceIp, item.port].filter(Boolean).join(' ')).join('；')
+    : [circuit.primary_device_ip, circuit.primary_port_name].filter(Boolean).join(' ')
+  const interconnectText = bindings.length
+    ? bindings.map((item) => [item.localIp, item.remoteIp].filter(Boolean).join('→')).filter(Boolean).join('；')
+    : circuitAddressFields(circuit).slice(0, 2).join(' / ')
+  return [circuit.datacenter_name, circuit.name, circuit.customer_name || circuit.operator_name, bindingText, interconnectText]
+    .filter(Boolean)
+    .join(' / ')
+}
+
 type LinkedTrafficPoint = {
   ts: number
   in_bps: number
@@ -204,6 +270,23 @@ const buildQualityHistoryParams = (rangeValue: string, customRange?: [dayjs.Dayj
   return { range: option.value === 'custom' ? '-24h' : option.value, interval: option.interval }
 }
 
+const hasMetricValue = (data: Array<Record<string, any>>, key: string) => data.some((point) => {
+  const value = Number(point[key])
+  return Number.isFinite(value)
+})
+
+const normalizeInterfaceName = (value?: string | null) => String(value || '').trim().replace(/\s+/g, '').toLowerCase()
+
+const findInterfaceByName = (interfaces: MonitorInterface[], expectedName?: string | null) => {
+  const expectedRaw = String(expectedName || '').trim().toLowerCase()
+  const expectedNormalized = normalizeInterfaceName(expectedName)
+  if (!expectedNormalized) return undefined
+  return interfaces.find((item) => [item.name, item.alias, item.description].some((name) => {
+    const raw = String(name || '').trim().toLowerCase()
+    return raw === expectedRaw || normalizeInterfaceName(raw) === expectedNormalized
+  }))
+}
+
 const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
   const [rangeValue, setRangeValue] = useState('-1h')
   const [customRange, setCustomRange] = useState<[dayjs.Dayjs | null, dayjs.Dayjs | null] | null>([dayjs().subtract(1, 'hour'), dayjs()])
@@ -239,7 +322,9 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
   }, [rangeValue, customRange, target.id])
 
   const fetchLinkedTraffic = useCallback(async (silent = false) => {
-    if (!target.circuit_id) {
+    const hasCircuitBinding = Boolean(target.circuit_id)
+    const hasManualInterfaceBinding = Boolean(target.device_id && target.probe_interface_name)
+    if (!hasCircuitBinding && !hasManualInterfaceBinding) {
       setTrafficData([])
       return
     }
@@ -248,9 +333,21 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
     const params = buildQualityHistoryParams(rangeValue, customRange)
     if (!silent) setTrafficLoading(true)
     try {
-      const response = await getCircuitTrafficHistory(target.circuit_id, params)
+      let rows: Array<Record<string, any>> = []
+      if (target.circuit_id) {
+        const response = await getCircuitTrafficHistory(target.circuit_id, params)
+        rows = response.aggregate || response.data || []
+      } else if (target.device_id && target.probe_interface_name) {
+        const interfaceResponse = await getMonitorDeviceInterfaces(target.device_id)
+        if (trafficRequestSeqRef.current !== requestSeq) return
+        const matchedInterface = findInterfaceByName(interfaceResponse.interfaces || [], target.probe_interface_name)
+        if (!matchedInterface) {
+          throw new Error(`未在采集设备接口缓存中找到 ${target.probe_interface_name}`)
+        }
+        const response = await getMonitorInterfaceHistory(target.device_id, matchedInterface.index, params)
+        rows = response.data || []
+      }
       if (trafficRequestSeqRef.current !== requestSeq) return
-      const rows = response.aggregate || response.data || []
       setTrafficData(rows.map((point) => ({
         ts: new Date(String(point._time || point.time || '')).getTime(),
         in_bps: Number(point.in_bps || 0),
@@ -258,12 +355,12 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
       })).filter((point) => Number.isFinite(point.ts)).sort((left, right) => left.ts - right.ts))
     } catch (error: any) {
       if (trafficRequestSeqRef.current !== requestSeq) return
-      if (!silent) message.warning(error?.response?.data?.detail || '关联线路流量读取失败')
+      if (!silent) message.warning(error?.response?.data?.detail || error?.message || '关联接口流量读取失败')
       setTrafficData([])
     } finally {
       if (trafficRequestSeqRef.current === requestSeq && !silent) setTrafficLoading(false)
     }
-  }, [customRange, rangeValue, target.circuit_id])
+  }, [customRange, rangeValue, target.circuit_id, target.device_id, target.probe_interface_name])
 
   useEffect(() => {
     void fetchHistory()
@@ -455,10 +552,21 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
     return { divisor: 1, unit: 'bps' }
   }, [trafficData])
 
+  const trafficBindingAvailable = Boolean(target.circuit_id || (target.device_id && target.probe_interface_name))
+  const trafficBindingTitle = target.circuit_id
+    ? `关联${target.probe_source === 'device_nqa_snmp' ? '专线' : '出口'}流量：${target.circuit_name || `线路 #${target.circuit_id}`}`
+    : `采集接口流量：${target.probe_interface_name || '-'}`
+  const trafficBindingExtra = target.circuit_id
+    ? [target.circuit_device_name || target.circuit_device_ip, target.circuit_port_name].filter(Boolean).join(' / ')
+    : [target.device_name || target.device_ip, target.probe_interface_name].filter(Boolean).join(' / ')
+
   const correlation = useMemo(() => {
-    if (!target.circuit_id) return null
-    const lineLabel = target.probe_source === 'device_nqa_snmp' ? '专线' : '公网线路'
-    if (!trafficData.length) return { tone: '#8c8c8c', text: `已关联${lineLabel}，但当前时间范围没有读取到线路流量。` }
+    const hasTrafficBinding = Boolean(target.circuit_id || (target.device_id && target.probe_interface_name))
+    if (!hasTrafficBinding) return null
+    const lineLabel = target.circuit_id
+      ? (target.probe_source === 'device_nqa_snmp' ? '专线' : '公网线路')
+      : '采集接口'
+    if (!trafficData.length) return { tone: '#8c8c8c', text: `已关联${lineLabel}，但当前时间范围没有读取到接口流量。` }
     const latest = trafficData[trafficData.length - 1]
     const currentBps = Math.max(latest.in_bps, latest.out_bps)
     const capacityBps = Number(target.circuit_bandwidth_mbps || 0) * 1_000_000
@@ -467,7 +575,7 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
     if (level === 'healthy' || level === 'notice') {
       return {
         tone: '#237804',
-        text: `当前质量未明显异常；出口流量 ${formatBps(currentBps)}${utilization == null ? '' : `，约占线路带宽 ${utilization.toFixed(1)}%`}。`,
+        text: `当前质量未明显异常；${lineLabel}流量 ${formatBps(currentBps)}${utilization == null ? '' : `，约占线路带宽 ${utilization.toFixed(1)}%`}。`,
       }
     }
     if (utilization !== null && utilization >= 80) {
@@ -478,7 +586,7 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
     }
     return {
       tone: '#d46b08',
-      text: `质量指标异常，但出口流量${utilization == null ? '未配置带宽，无法计算利用率' : `仅约占带宽 ${utilization.toFixed(1)}%`}，建议优先检查运营商路径并执行 MTR。`,
+      text: `质量指标异常，但${lineLabel}流量${utilization == null ? '未配置带宽，无法计算利用率' : `仅约占带宽 ${utilization.toFixed(1)}%`}，建议优先检查路径并执行 MTR。`,
     }
   }, [target, trafficData])
 
@@ -491,6 +599,15 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
     setSelectionStart(null)
     setSelectionEnd(null)
   }
+
+  const hasJitterBreakdown = hasMetricValue(displayChartData as Array<Record<string, any>>, 'jitter_sd_ms')
+    || hasMetricValue(displayChartData as Array<Record<string, any>>, 'jitter_ds_ms')
+  const hasProbeCounts = target.probe_source === 'device_nqa_snmp'
+    && hasJitterBreakdown
+    && (
+      hasMetricValue(displayChartData as Array<Record<string, any>>, 'sent')
+      || hasMetricValue(displayChartData as Array<Record<string, any>>, 'received')
+    )
 
   return (
     <Card
@@ -572,11 +689,11 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
           </div>
         ))}
       </div>
-      <div style={{ height: 320, width: '100%', marginTop: 8, cursor: 'crosshair', userSelect: 'none' }}>
+      <div style={{ height: 360, width: '100%', marginTop: 8, cursor: 'crosshair', userSelect: 'none' }}>
         <ResponsiveContainer width="100%" height="100%">
           <LineChart
             data={displayChartData}
-            margin={{ top: 16, right: 36, left: 8, bottom: 16 }}
+            margin={{ top: 16, right: 88, left: 8, bottom: 16 }}
             onMouseDown={(event: any) => {
               if (Number.isFinite(Number(event?.activeLabel))) {
                 const value = Number(event.activeLabel)
@@ -615,16 +732,24 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
             <YAxis
               yAxisId="percent"
               orientation="right"
-              width={82}
+              width={56}
               tick={{ fontSize: 11 }}
               domain={[0, 100]}
               tickFormatter={(value) => `${value}%`}
             />
+            {hasProbeCounts ? (
+              <YAxis
+                yAxisId="count"
+                hide
+                width={0}
+              />
+            ) : null}
             <ChartTooltip
               labelFormatter={(value) => formatTime(new Date(Number(value)).toISOString())}
               formatter={(value: any, name: string) => {
-                const unit = name.includes('丢包') ? '%' : 'ms'
-                return [`${Number(value).toFixed(2)} ${unit}`, name]
+                if (name.includes('丢包')) return [`${Number(value).toFixed(2)} %`, name]
+                if (name.includes('发送') || name.includes('收到')) return [`${Number(value).toFixed(0)} 个`, name]
+                return [`${Number(value).toFixed(2)} ms`, name]
               }}
             />
             <Legend />
@@ -638,22 +763,33 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
                 fillOpacity={0.16}
               />
             ) : null}
-            <Line yAxisId="ms" type="monotone" dataKey="avg_latency_ms" name="延迟" stroke="#1677ff" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
-            {target.probe_source === 'device_nqa_snmp' ? (
-              <Line yAxisId="ms" type="monotone" dataKey="jitter_ms" name="NQA抖动" stroke="#722ed1" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+            <Line yAxisId="ms" type="monotone" dataKey="min_latency_ms" name="最小RTT" stroke="#91caff" dot={false} strokeWidth={1.4} connectNulls isAnimationActive={false} />
+            <Line yAxisId="ms" type="monotone" dataKey="avg_latency_ms" name="平均RTT" stroke="#1677ff" dot={false} strokeWidth={2.4} connectNulls isAnimationActive={false} />
+            <Line yAxisId="ms" type="monotone" dataKey="max_latency_ms" name="最大RTT" stroke="#0958d9" dot={false} strokeWidth={1.4} connectNulls isAnimationActive={false} />
+            {hasJitterBreakdown ? (
+              <>
+                <Line yAxisId="ms" type="monotone" dataKey="jitter_sd_ms" name="SD抖动" stroke="#722ed1" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+                <Line yAxisId="ms" type="monotone" dataKey="jitter_ds_ms" name="DS抖动" stroke="#eb2f96" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+              </>
             ) : null}
             <Line yAxisId="percent" type="monotone" dataKey="packet_loss_percent" name="丢包率" stroke="#f5222d" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+            {hasProbeCounts ? (
+              <>
+                <Line yAxisId="count" type="monotone" dataKey="sent" name="发送包数" stroke="#8c8c8c" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
+                <Line yAxisId="count" type="monotone" dataKey="received" name="收到包数" stroke="#52c41a" dot={false} strokeWidth={1.8} connectNulls isAnimationActive={false} />
+              </>
+            ) : null}
           </LineChart>
         </ResponsiveContainer>
       </div>
       {!historyLoading && !chartData.length ? (
         <Text type="secondary">当前时间范围内还没有曲线数据，后台任务采集到新点后会自动刷新。</Text>
       ) : null}
-      {target.circuit_id ? (
+      {trafficBindingAvailable ? (
         <Card
           size="small"
-          title={`关联${target.probe_source === 'device_nqa_snmp' ? '专线' : '出口'}流量：${target.circuit_name || `线路 #${target.circuit_id}`}`}
-          extra={<Text type="secondary">{[target.circuit_device_name || target.circuit_device_ip, target.circuit_port_name].filter(Boolean).join(' / ')}</Text>}
+          title={trafficBindingTitle}
+          extra={<Text type="secondary">{trafficBindingExtra}</Text>}
           style={{ marginTop: 12 }}
           loading={trafficLoading}
         >
@@ -687,13 +823,13 @@ const QualityChartPanel = ({ target }: { target: QualityProbeTarget }) => {
                 </LineChart>
               </ResponsiveContainer>
             </div>
-          ) : <Text type="secondary">当前时间范围暂无关联线路流量。</Text>}
+          ) : <Text type="secondary">当前时间范围暂无关联接口流量。</Text>}
         </Card>
       ) : (
         <div style={{ marginTop: 10, padding: '8px 10px', background: '#fafafa', borderRadius: 6 }}>
           <Text type="secondary">
             {target.probe_source === 'device_nqa_snmp'
-              ? '尚未关联专线。编辑该探测目标并选择专线后，可同步查看线路流量及设备、接口信息。'
+              ? '尚未关联专线或采集设备接口。编辑该探测目标并选择专线，或直接选择采集设备接口后，可同步查看接口流量。'
               : '尚未关联公网线路。编辑该探测目标并选择公网线路后，可同步查看出口流量和关联判断。'}
           </Text>
         </div>
@@ -760,6 +896,8 @@ const QualityQuery = () => {
   const [nqaDevicesLoading, setNqaDevicesLoading] = useState(false)
   const [nqaInstances, setNqaInstances] = useState<QualityNqaInstance[]>([])
   const [nqaInstancesLoading, setNqaInstancesLoading] = useState(false)
+  const [nqaDeviceInterfaces, setNqaDeviceInterfaces] = useState<MonitorInterface[]>([])
+  const [nqaDeviceInterfacesLoading, setNqaDeviceInterfacesLoading] = useState(false)
   const nqaDeviceSearchTimer = useRef<number | null>(null)
   const probeSource = Form.useWatch('probe_source', form) || 'server_icmp'
   const selectedNqaDeviceId = Form.useWatch('device_id', form)
@@ -850,6 +988,23 @@ const QualityQuery = () => {
     }
   }
 
+  const fetchNqaDeviceInterfaces = async (deviceId?: number) => {
+    if (!deviceId) {
+      setNqaDeviceInterfaces([])
+      return
+    }
+    setNqaDeviceInterfacesLoading(true)
+    try {
+      const response = await getMonitorDeviceInterfaces(deviceId)
+      setNqaDeviceInterfaces(response.interfaces || [])
+    } catch (error: any) {
+      setNqaDeviceInterfaces([])
+      message.error(error?.response?.data?.detail || '读取采集设备接口失败')
+    } finally {
+      setNqaDeviceInterfacesLoading(false)
+    }
+  }
+
   useEffect(() => {
     void fetchDatacenters()
     void fetchCircuits()
@@ -877,11 +1032,31 @@ const QualityQuery = () => {
       .filter((circuit) => circuit.line_type === (probeSource === 'device_nqa_snmp' ? 'private_line' : 'internet'))
       .map((circuit) => ({
       value: circuit.id,
-      label: [circuit.datacenter_name, circuit.name, circuit.customer_name || circuit.operator_name, circuit.primary_device_ip, circuit.primary_port_name]
-        .filter(Boolean)
-        .join(' / '),
+      label: buildCircuitOptionLabel(circuit, probeSource === 'device_nqa_snmp' ? selectedNqaDeviceId : undefined),
     })),
-    [circuits, probeSource]
+    [circuits, probeSource, selectedNqaDeviceId]
+  )
+  const selectedDeviceCircuitOptions = useMemo(
+    () => circuits
+      .filter((circuit) => circuit.line_type === 'private_line')
+      .filter((circuit) => getCircuitDeviceBindings(circuit, selectedNqaDeviceId).length > 0)
+      .map((circuit) => ({
+        value: circuit.id,
+        label: buildCircuitOptionLabel(circuit, selectedNqaDeviceId),
+      })),
+    [circuits, selectedNqaDeviceId]
+  )
+  const selectedDeviceInterfaceOptions = useMemo(
+    () => nqaDeviceInterfaces.map((item) => {
+      const alias = item.alias && item.alias !== item.name ? ` / ${item.alias}` : ''
+      const status = item.oper_status || item.admin_status || ''
+      const statusText = status ? `（${status}）` : ''
+      return {
+        value: item.name,
+        label: `${item.name}${alias}${statusText}`,
+      }
+    }),
+    [nqaDeviceInterfaces]
   )
 
   const summaryItems = useMemo(() => items.filter((item) => item.is_active), [items])
@@ -907,13 +1082,10 @@ const QualityQuery = () => {
     [expandedRowKeys, items]
   )
 
-  const openTargetChart = (record: QualityProbeTarget) => {
-    setExpandedRowKeys((keys) => Number(keys[0]) === record.id ? [] : [record.id])
-  }
-
   const openCreate = async () => {
     setEditing(null)
     setNqaInstances([])
+    setNqaDeviceInterfaces([])
     form.resetFields()
     form.setFieldsValue({
       probe_source: 'server_icmp',
@@ -953,8 +1125,10 @@ const QualityQuery = () => {
     if (record.probe_source === 'device_nqa_snmp' && record.device_id) {
       void fetchNqaDevices(record.device_name || record.device_ip || '')
       void fetchNqaInstances(record.device_id)
+      void fetchNqaDeviceInterfaces(record.device_id)
     } else {
       setNqaInstances([])
+      setNqaDeviceInterfaces([])
     }
     setTargetAlertSettingsLoading(true)
     try {
@@ -986,11 +1160,16 @@ const QualityQuery = () => {
         nqa_instance_key: _nqaInstanceKey,
         ...targetValues
       } = values
+      const normalizedTargetValues = {
+        ...targetValues,
+        circuit_id: targetValues.circuit_id || null,
+        probe_interface_name: targetValues.probe_interface_name || null,
+      }
       let savedTarget: QualityProbeTarget
       if (editing) {
-        savedTarget = await updateQualityProbeTarget(editing.id, targetValues)
+        savedTarget = await updateQualityProbeTarget(editing.id, normalizedTargetValues)
       } else {
-        savedTarget = await createQualityProbeTarget(targetValues)
+        savedTarget = await createQualityProbeTarget(normalizedTargetValues)
       }
       await saveQualityTargetAlertSettings(savedTarget.id, {
         enabled: alert_enabled,
@@ -1061,10 +1240,7 @@ const QualityQuery = () => {
   }
 
   const renderTargetActions = (record: QualityProbeTarget) => (
-    <Space size={4} wrap>
-      <Button size="small" onClick={() => openTargetChart(record)}>
-        {Number(expandedRowKeys[0]) === record.id ? '收起' : '查看'}
-      </Button>
+    <Space size={4} wrap onClick={(event) => event.stopPropagation()}>
       <Button
         size="small"
         icon={<ThunderboltOutlined />}
@@ -1090,7 +1266,7 @@ const QualityQuery = () => {
         const reason = getQualityHealthReason(record)
         const isExpanded = Number(expandedRowKeys[0]) === record.id
         const binding = source === 'private'
-          ? [record.circuit_name || '未关联专线', record.circuit_device_ip || record.device_ip, record.circuit_port_name].filter(Boolean).join(' / ')
+          ? [record.circuit_name || '未关联专线', record.circuit_device_ip || record.device_ip, record.circuit_port_name || record.probe_interface_name].filter(Boolean).join(' / ')
           : [record.circuit_name, record.operator_name].filter(Boolean).join(' / ')
         return (
           <Popover
@@ -1103,6 +1279,13 @@ const QualityQuery = () => {
             <div
               role="button"
               tabIndex={0}
+              onClick={() => setExpandedRowKeys([record.id])}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  setExpandedRowKeys([record.id])
+                }
+              }}
               style={{
                 minWidth: 0,
                 padding: '10px 12px',
@@ -1254,11 +1437,13 @@ const QualityQuery = () => {
                 { label: '设备 NQA / SNMP', value: 'device_nqa_snmp' },
               ]}
               onChange={(value) => {
-                form.setFieldValue('circuit_id', undefined)
+                form.setFieldsValue({ circuit_id: null, probe_interface_name: null })
                 if (value === 'server_icmp') {
                   setNqaInstances([])
+                  setNqaDeviceInterfaces([])
                   form.setFieldsValue({
                     device_id: undefined,
+                    probe_interface_name: undefined,
                     nqa_instance_key: undefined,
                     nqa_admin_name: undefined,
                     nqa_operation_tag: undefined,
@@ -1300,12 +1485,15 @@ const QualityQuery = () => {
                     onChange={(deviceId) => {
                       setNqaInstances([])
                       form.setFieldsValue({
+                        circuit_id: undefined,
+                        probe_interface_name: undefined,
                         nqa_instance_key: undefined,
                         nqa_admin_name: undefined,
                         nqa_operation_tag: undefined,
                         target: undefined,
                       })
                       void fetchNqaInstances(deviceId)
+                      void fetchNqaDeviceInterfaces(deviceId)
                     }}
                   />
                 </Form.Item>
@@ -1340,22 +1528,11 @@ const QualityQuery = () => {
                       if (!instance) return
                       const targetAddress = String(instance.target || '').trim()
                       const privateCircuits = circuits.filter((item) => item.line_type === 'private_line')
-                      const addressFields = (circuit: Circuit) => [
-                        circuit.primary_remote_interconnect_ip,
-                        circuit.secondary_remote_interconnect_ip,
-                        circuit.remote_interconnect_address,
-                        circuit.primary_interconnect_ip,
-                        circuit.secondary_interconnect_ip,
-                        circuit.interconnect_address,
-                      ].map((item) => String(item || '').trim()).filter(Boolean)
                       const exactCircuit = privateCircuits.find((circuit) => (
                         [circuit.primary_device_id, circuit.secondary_device_id, circuit.aggregation_monitor_device_id].includes(device?.id)
-                        && addressFields(circuit).some((address) => address === targetAddress || address.split('/')[0] === targetAddress)
+                        && circuitAddressMatches(circuit, targetAddress)
                       ))
-                      const deviceCircuit = privateCircuits.find((circuit) => (
-                        [circuit.primary_device_id, circuit.secondary_device_id, circuit.aggregation_monitor_device_id].includes(device?.id)
-                      ))
-                      const matchedCircuit = exactCircuit || deviceCircuit
+                      const exactCircuitBindings = exactCircuit ? getCircuitDeviceBindings(exactCircuit, device?.id) : []
                       form.setFieldsValue({
                         name: form.getFieldValue('name') || `${device?.name || '设备'} NQA`,
                         target: instance.target,
@@ -1364,11 +1541,15 @@ const QualityQuery = () => {
                         interval_seconds: instance.frequency_seconds || 3,
                         packet_count: instance.packet_count || 1,
                         timeout_ms: instance.timeout_ms || 1000,
-                        circuit_id: matchedCircuit?.id,
+                        circuit_id: exactCircuit?.id || null,
+                        probe_interface_name: exactCircuitBindings[0]?.port || form.getFieldValue('probe_interface_name') || null,
                         datacenter_id: device?.datacenter_id || form.getFieldValue('datacenter_id'),
-                        operator_name: matchedCircuit?.operator_name || form.getFieldValue('operator_name'),
+                        operator_name: exactCircuit?.operator_name || form.getFieldValue('operator_name'),
                         description: form.getFieldValue('description') || `设备NQA ${instance.admin_name}/${instance.operation_tag}${instance.source ? `，源地址 ${instance.source}` : ''}`,
                       })
+                      if (!exactCircuit) {
+                        message.info('没有找到目标地址完全匹配的专线，请在下方手动选择该采集设备对应的端口/专线')
+                      }
                     }}
                   />
                 </Form.Item>
@@ -1424,29 +1605,58 @@ const QualityQuery = () => {
 
           <Form.Item
             name="circuit_id"
-            label={probeSource === 'device_nqa_snmp' ? '关联专线' : '关联公网线路'}
+            label={probeSource === 'device_nqa_snmp' ? '手动选择端口 / 关联专线' : '关联公网线路'}
             extra={probeSource === 'device_nqa_snmp'
-              ? '关联专线管理中已启用的线路，用于标识NQA所在设备、接口及互联地址。选择NQA实例时会优先自动匹配。'
+              ? '采集设备已确定后，只列出这台设备在专线管理中记录过的端口/专线。NQA目标地址能精确匹配时会自动带出，未记录时请手动选择，避免关联到别的专线。'
               : '关联后会在质量曲线下同步展示该公网出口的流量，并辅助判断是否存在带宽拥塞。'}
           >
             <Select
               allowClear
               showSearch
               optionFilterProp="label"
-              placeholder={probeSource === 'device_nqa_snmp' ? '选择专线管理中已启用的线路' : '选择公网管理中已启用的线路'}
-              options={circuitOptions}
+              disabled={probeSource === 'device_nqa_snmp' && !selectedNqaDeviceId}
+              placeholder={probeSource === 'device_nqa_snmp' ? '选择当前采集设备上的端口/专线' : '选择公网管理中已启用的线路'}
+              notFoundContent={probeSource === 'device_nqa_snmp' && selectedNqaDeviceId ? '这台采集设备在专线管理中还没有记录端口' : undefined}
+              options={probeSource === 'device_nqa_snmp' ? selectedDeviceCircuitOptions : circuitOptions}
               onChange={(value) => {
+                if (!value) {
+                  form.setFieldsValue({ circuit_id: null })
+                  return
+                }
                 const circuit = circuits.find((item) => item.id === value)
                 if (circuit) {
+                  const bindings = getCircuitDeviceBindings(circuit, selectedNqaDeviceId)
                   form.setFieldsValue({
                     circuit_id: value,
+                    probe_interface_name: bindings[0]?.port || form.getFieldValue('probe_interface_name'),
                     datacenter_id: circuit.datacenter_id || form.getFieldValue('datacenter_id'),
                     operator_name: circuit.operator_name || form.getFieldValue('operator_name'),
                   })
                 }
               }}
+              onClear={() => form.setFieldsValue({ circuit_id: null })}
             />
           </Form.Item>
+
+          {probeSource === 'device_nqa_snmp' ? (
+            <Form.Item
+              name="probe_interface_name"
+              label="采集设备接口"
+              extra="没有录入专线、或不想关联专线时，可以只选择当前NQA采集设备上的接口；清空专线后不会再强制绑定别的专线。"
+            >
+              <Select
+                allowClear
+                showSearch
+                optionFilterProp="label"
+                disabled={!selectedNqaDeviceId}
+                loading={nqaDeviceInterfacesLoading}
+                placeholder="选择当前采集设备接口，可不关联专线"
+                notFoundContent={selectedNqaDeviceId ? '暂无接口缓存，请先刷新设备连接/接口缓存' : '请先选择NQA采集设备'}
+                options={selectedDeviceInterfaceOptions}
+                onClear={() => form.setFieldsValue({ probe_interface_name: null })}
+              />
+            </Form.Item>
+          ) : null}
 
           <Space size="middle" style={{ width: '100%' }} align="start">
             <Form.Item name="interval_seconds" label={probeSource === 'device_nqa_snmp' ? '系统读取间隔(s)' : '采样间隔(s)'} rules={[{ required: true }]} style={{ width: 150 }}>

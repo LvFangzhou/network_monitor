@@ -839,6 +839,41 @@ services:
           cpus: '3'
           memory: 8G
 
+  # BMP BGP Monitoring Protocol 接收器
+  bmp-receiver:
+    profiles:
+      - telemetry
+    build: ./backend
+    image: network_monitor-backend:latest
+    container_name: nm-bmp-receiver
+    command: python -m app.services.bmp_receiver --host 0.0.0.0 --port 1790
+    environment:
+      - TZ=Asia/Shanghai
+      - DEBUG=false
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=network_monitor
+      - POSTGRES_PASSWORD=network_monitor
+      - POSTGRES_DB=network_monitor
+      - LOG_LEVEL=INFO
+      - BMP_RECEIVER_PORT=1790
+    volumes:
+      - ./backend/app:/app/app
+    ports:
+      - "1790:1790"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - network-monitor
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
   # 前端 Web 应用
   frontend:
     build: ./frontend

@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.routers import devices, alerts, auth, metrics, cmdb, resources, tacacs, config_backups, controller
+from app.routers import devices, alerts, auth, metrics, cmdb, resources, tacacs, config_backups, controller, bmp
 
 api_router = APIRouter()
 
@@ -12,5 +12,6 @@ api_router.include_router(metrics.router, prefix="/metrics", tags=["指标查询
 api_router.include_router(tacacs.router, prefix="/tacacs", tags=["Tacacs管理"])
 api_router.include_router(config_backups.router, prefix="/config-backups", tags=["配置备份"])
 api_router.include_router(controller.router, prefix="/controller", tags=["控制器集成"])
+api_router.include_router(bmp.router, prefix="/bmp", tags=["BMP"])
 
 __all__ = ["api_router"]

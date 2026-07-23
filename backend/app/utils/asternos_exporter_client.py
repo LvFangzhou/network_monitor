@@ -213,14 +213,23 @@ class AsterNOSExporterClient:
             "out_bps": "AsterNOS_interface_transmit_rate_bps",
             "in_errors": "AsterNOS_interface_receive_errs_total",
             "out_errors": "AsterNOS_interface_transmit_errs_total",
-            "in_discards": "AsterNOS_interface_receive_drops_total",
-            "out_discards": "AsterNOS_interface_transmit_drops_total",
+            "in_discards": "AsterNOS_interface_receive_drop_pkts_total",
+            "out_discards": "AsterNOS_interface_transmit_drop_pkts_total",
             "in_utilization_percent": "AsterNOS_interface_receive_util",
             "out_utilization_percent": "AsterNOS_interface_transmit_util",
         }
         for field, metric_name in metric_map.items():
             base_name = metric_name.removeprefix(self.ASTERNOS_PREFIX)
-            row = self._by_base_metric_label(metrics, base_name, "device", interface_name)
+            if base_name in {"interface_receive_errs_total", "interface_transmit_errs_total"}:
+                resolved_metric_name = self._metric_name(metrics, base_name)
+                row = None
+                for candidate in metrics.get(resolved_metric_name, []):
+                    labels = candidate.get("metric") or {}
+                    if labels.get("device") == interface_name and labels.get("type") == "error":
+                        row = candidate
+                        break
+            else:
+                row = self._by_base_metric_label(metrics, base_name, "device", interface_name)
             if row:
                 result[field] = row.get("value")
 

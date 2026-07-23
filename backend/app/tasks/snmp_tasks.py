@@ -68,7 +68,7 @@ MONITOR_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 ASTERNOS_TASK_LOCK_TTL_SECONDS = max(45, min(180, ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS * 2))
 INTERFACE_REALTIME_LOCK_TTL_SECONDS = 120
 INTERFACE_REALTIME_MAX_WORKERS = max(1, int(settings.SNMP_INTERFACE_REALTIME_MAX_WORKERS))
-ROCE_INTERFACE_HEALTH_INTERVAL_SECONDS = 5 * 60
+ROCE_INTERFACE_HEALTH_INTERVAL_SECONDS = 60
 ROCE_INTERFACE_HEALTH_BATCH_COUNT = max(1, math.ceil(ROCE_INTERFACE_HEALTH_INTERVAL_SECONDS / SNMP_SCHEDULER_INTERVAL_SECONDS))
 ROCE_INTERFACE_HEALTH_MAX_WORKERS = 6
 INTERFACE_RATE_CAP_MULTIPLIER = 1.03
@@ -82,6 +82,11 @@ DEVICE_DETAIL_PREWARM_LOCK_TTL_SECONDS = 6 * 60 * 60
 DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS = 24 * 60 * 60
 FORWARDING_PREWARM_MAX_WORKERS = 2
 FORWARDING_PREWARM_LOCK_TTL_SECONDS = 3 * 60 * 60
+INTERFACE_QUALITY_DELTA_BANDS = [
+    ("P2", 10.0, 100.0, "10~99"),
+    ("P1", 100.0, 1000.0, "100~999"),
+    ("P0", 1000.0, None, "1000以上"),
+]
 ASTERNOS_COUNTER_METRICS = [
     {
         "field": "queue_egress_dropped_pkts_delta",
@@ -421,32 +426,121 @@ def _build_roce_interface_rule_payload(
     name: str,
     metric_type: str,
     threshold: float,
+    severity: str,
     description: str,
     notification_channels: List[Dict[str, Any]],
+    max_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
+    extra_config = {
+        "applicable_vendors": ["H3C"],
+        "model_regex": "^S9867-128DH$",
+        "monitor_profiles": ["roce_fabric"],
+        "required_features": ["roce"],
+        "time_range": "-15m",
+        "max_sample_age_seconds": 420,
+        "required_samples": 1,
+        "recovery_required_samples": 3,
+        "recovery_requires_zero_delta": True,
+        "interface_regex": "^(FourHundredGigE|HundredGigE|Ten-GigabitEthernet).*",
+        "exclude_interface_regex": "^(NULL|Loop|InLoop|Vlan-interface|M-GigabitEthernet).*",
+        "generated_by": "ensure_h3c_s9867_roce_rules_v2",
+    }
+    if max_threshold is not None:
+        extra_config["max_threshold"] = max_threshold
     return {
         "name": name,
         "description": description,
         "rule_type": "threshold",
         "metric_type": metric_type,
-        "condition": ">",
+        "condition": ">=",
         "threshold": threshold,
-        "duration": 120,
-        "severity": "P1",
+        "duration": 0,
+        "severity": severity,
         "suppress_duration": 300,
         "enabled": 1,
         "device_ids": [],
-        "extra_config": {
-            "applicable_vendors": ["H3C"],
-            "model_regex": "^S9867-128DH$",
-            "monitor_profiles": ["roce_fabric"],
-            "required_features": ["roce"],
-            "time_range": "-15m",
-            "max_sample_age_seconds": 420,
-            "interface_regex": "^(FourHundredGigE|HundredGigE|Ten-GigabitEthernet).*",
-            "exclude_interface_regex": "^(NULL|Loop|InLoop|Vlan-interface|M-GigabitEthernet).*",
-            "generated_by": "ensure_h3c_s9867_roce_rules_v1",
-        },
+        "extra_config": extra_config,
+        "notification_channels": notification_channels,
+    }
+
+
+def _build_up_interface_crc_rule_payload(
+    name: str,
+    description: str,
+    vendor: str,
+    severity: str,
+    threshold: float,
+    notification_channels: List[Dict[str, Any]],
+    max_threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    extra_config = {
+        "applicable_vendors": [vendor],
+        "time_range": "-10m",
+        "max_sample_age_seconds": 420,
+        "require_oper_up": True,
+        "required_samples": 1,
+        "recovery_required_samples": 3,
+        "recovery_requires_zero_delta": True,
+        "interface_regex": "^(FourHundredGigE|HundredGigE|Ten-GigabitEthernet|GigabitEthernet|XGigabitEthernet|FortyGigE|Twenty-FiveGigE|Eth-Trunk|Bridge-Aggregation|ethernet|Ethernet).*",
+        "exclude_interface_regex": "^(NULL|Null|Loop|InLoop|Vlan-interface|Vlanif|M-GigabitEthernet|MGE|mgmt|Management).*",
+        "generated_by": "ensure_up_interface_crc_rules_v2",
+    }
+    if max_threshold is not None:
+        extra_config["max_threshold"] = max_threshold
+    return {
+        "name": name,
+        "description": description,
+        "rule_type": "threshold",
+        "metric_type": "interface_crc_errors_delta",
+        "condition": ">=",
+        "threshold": threshold,
+        "duration": 0,
+        "severity": severity,
+        "suppress_duration": 900,
+        "enabled": 1,
+        "device_ids": [],
+        "extra_config": extra_config,
+        "notification_channels": notification_channels,
+    }
+
+
+def _build_asternos_up_interface_quality_rule_payload(
+    name: str,
+    description: str,
+    metric_type: str,
+    threshold: float,
+    severity: str,
+    notification_channels: List[Dict[str, Any]],
+    max_threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    extra_config = {
+        "applicable_vendors": ["Asteros"],
+        "monitor_sources": ["asternos_exporter"],
+        "time_range": "-10m",
+        "max_sample_age_seconds": 420,
+        "require_oper_up": True,
+        "required_samples": 1,
+        "recovery_required_samples": 3,
+        "recovery_requires_zero_delta": True,
+        "interface_regex": r"^(?:\d+/\d+|ethernet|Ethernet).*",
+        "exclude_interface_regex": "^(NULL|Null|Loop|InLoop|Vlan-interface|Vlanif|M-GigabitEthernet|MGE|mgmt|Management).*",
+        "generated_by": "ensure_asternos_up_interface_quality_rules_v2",
+    }
+    if max_threshold is not None:
+        extra_config["max_threshold"] = max_threshold
+    return {
+        "name": name,
+        "description": description,
+        "rule_type": "threshold",
+        "metric_type": metric_type,
+        "condition": ">=",
+        "threshold": threshold,
+        "duration": 0,
+        "severity": severity,
+        "suppress_duration": 900,
+        "enabled": 1,
+        "device_ids": [],
+        "extra_config": extra_config,
         "notification_channels": notification_channels,
     }
 
@@ -618,20 +712,162 @@ def ensure_h3c_s9867_roce_rules():
         )
         channels = list(source_rule.notification_channels or []) if source_rule else []
         definitions = [
-            ("【H3C S9867 RoCE】接口入方向错误包增长", "interface_in_errors_delta", 0.0, "RoCE物理端口入方向错误包在采集周期内出现增长。"),
-            ("【H3C S9867 RoCE】接口出方向错误包增长", "interface_out_errors_delta", 0.0, "RoCE物理端口出方向错误包在采集周期内出现增长。"),
-            ("【H3C S9867 RoCE】接口入方向丢弃包增长", "interface_in_discards_delta", 60.0, "RoCE物理端口入方向丢弃包在采集周期内增长超过60。"),
-            ("【H3C S9867 RoCE】接口出方向丢弃包增长", "interface_out_discards_delta", 60.0, "RoCE物理端口出方向丢弃包在采集周期内增长超过60。"),
+            ("接口入方向错误包增长", "interface_in_errors_delta", "RoCE物理端口入方向错误包"),
+            ("接口出方向错误包增长", "interface_out_errors_delta", "RoCE物理端口出方向错误包"),
+            ("接口入方向丢弃包增长", "interface_in_discards_delta", "RoCE物理端口入方向丢弃包"),
+            ("接口出方向丢弃包增长", "interface_out_discards_delta", "RoCE物理端口出方向丢弃包"),
         ]
-        results = [
-            _ensure_alert_rule(db, _build_roce_interface_rule_payload(name, metric, threshold, description, channels))
-            for name, metric, threshold, description in definitions
+        results = []
+        for title, metric, description_prefix in definitions:
+            for severity, threshold, max_threshold, band_text in INTERFACE_QUALITY_DELTA_BANDS:
+                results.append(_ensure_alert_rule(db, _build_roce_interface_rule_payload(
+                    f"【H3C S9867 RoCE】{title}-{severity}",
+                    metric,
+                    threshold,
+                    severity,
+                    f"{description_prefix}在采集周期内增长达到{band_text}个，按{severity}级别告警；连续3个新采样周期无新增后自动恢复。",
+                    channels,
+                    max_threshold,
+                )))
+        legacy_names = [
+            "【H3C S9867 RoCE】接口入方向错误包增长",
+            "【H3C S9867 RoCE】接口出方向错误包增长",
+            "【H3C S9867 RoCE】接口入方向丢弃包增长",
+            "【H3C S9867 RoCE】接口出方向丢弃包增长",
         ]
+        disabled_legacy = 0
+        for rule in db.query(AlertRule).filter(AlertRule.name.in_(legacy_names)).all():
+            if rule.enabled:
+                rule.enabled = 0
+                disabled_legacy += 1
         db.commit()
-        return {"success": True, "rules": results}
+        return {"success": True, "rules": results, "disabled_legacy_rules": disabled_legacy}
     except Exception as exc:
         db.rollback()
         logger.error("确保H3C S9867 RoCE规则失败", error=str(exc))
+        return {"success": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+@shared_task(name="app.tasks.snmp_tasks.ensure_up_interface_crc_rules")
+def ensure_up_interface_crc_rules():
+    """创建/修正已经Up接口的厂商独立纯CRC/FCS物理层错包增长告警。"""
+    db = SessionLocal()
+    try:
+        source_rule = (
+            db.query(AlertRule)
+            .filter(AlertRule.metric_type.in_(["interface_crc_errors_delta", "interface_in_errors_delta"]))
+            .order_by(AlertRule.id.asc())
+            .first()
+        )
+        channels = list(source_rule.notification_channels or []) if source_rule else []
+        definitions = [
+            (
+                "【H3C】已Up接口CRC/FCS错误增长",
+                "H3C接口运行状态为Up时，EtherLike-MIB dot3StatsFCSErrors 在采集周期内增长；通常对应CRC/FCS、帧校验、物理层链路质量异常。",
+                "H3C",
+            ),
+            (
+                "【Ruijie】已Up接口CRC/FCS错误增长",
+                "锐捷接口运行状态为Up时，EtherLike-MIB dot3StatsFCSErrors 在采集周期内增长；通常对应CRC/FCS、帧校验、物理层链路质量异常。",
+                "Ruijie",
+            ),
+            (
+                "【Hillstone】已Up接口CRC/FCS错误增长",
+                "山石接口运行状态为Up时，EtherLike-MIB dot3StatsFCSErrors 在采集周期内增长；通常对应CRC/FCS、帧校验、物理层链路质量异常。",
+                "Hillstone",
+            ),
+        ]
+        results = []
+        for name, description, vendor in definitions:
+            for severity, threshold, max_threshold, band_text in INTERFACE_QUALITY_DELTA_BANDS:
+                results.append(_ensure_alert_rule(db, _build_up_interface_crc_rule_payload(
+                    f"{name}-{severity}",
+                    f"{description} 采集周期内增长达到{band_text}个时按{severity}级别告警；连续3个新采样周期无新增后自动恢复。",
+                    vendor,
+                    severity,
+                    threshold,
+                    channels,
+                    max_threshold,
+                )))
+        legacy_names = [
+            "【接口质量】已Up接口入方向CRC/FCS错误增长",
+            "【接口质量】已Up接口出方向错误包增长",
+            "【H3C】已Up接口CRC/FCS错误增长",
+            "【Ruijie】已Up接口CRC/FCS错误增长",
+            "【Hillstone】已Up接口CRC/FCS错误增长",
+        ]
+        disabled_legacy = 0
+        for rule in db.query(AlertRule).filter(AlertRule.name.in_(legacy_names)).all():
+            if rule.enabled:
+                rule.enabled = 0
+                disabled_legacy += 1
+        db.commit()
+        return {"success": True, "rules": results, "disabled_legacy_rules": disabled_legacy}
+    except Exception as exc:
+        db.rollback()
+        logger.error("确保已Up接口CRC/FCS告警规则失败", error=str(exc))
+        return {"success": False, "error": str(exc)}
+    finally:
+        db.close()
+
+
+@shared_task(name="app.tasks.snmp_tasks.ensure_asternos_up_interface_quality_rules")
+def ensure_asternos_up_interface_quality_rules():
+    """创建/修正 Asteros Exporter 的已Up接口错误包/丢弃包增长告警。"""
+    db = SessionLocal()
+    try:
+        source_rule = (
+            db.query(AlertRule)
+            .filter(AlertRule.metric_type.in_(
+                ["interface_in_discards_delta", "interface_in_errors_delta", "interface_crc_errors_delta"]
+            ))
+            .order_by(AlertRule.id.asc())
+            .first()
+        )
+        channels = list(source_rule.notification_channels or []) if source_rule else []
+        definitions = [
+            (
+                "【Asteros】已Up接口入方向丢弃包增长",
+                "Asteros接口运行状态为Up时，Exporter AsterNOS_interface_receive_drop_pkts_total 在采集周期内增长；该指标表示入方向丢弃包，不等同于CRC/FCS。",
+                "interface_in_discards_delta",
+            ),
+            (
+                "【Asteros】已Up接口入方向错误包增长",
+                "Asteros接口运行状态为Up时，Exporter AsterNOS_interface_receive_errs_total 在采集周期内增长；该指标表示入方向错误包总数，不等同于纯CRC/FCS。",
+                "interface_in_errors_delta",
+            ),
+        ]
+        results = []
+        for name, description, metric_type in definitions:
+            for severity, threshold, max_threshold, band_text in INTERFACE_QUALITY_DELTA_BANDS:
+                results.append(_ensure_alert_rule(
+                    db,
+                    _build_asternos_up_interface_quality_rule_payload(
+                        f"{name}-{severity}",
+                        f"{description} 采集周期内增长达到{band_text}个时按{severity}级别告警；连续3个新采样周期无新增后自动恢复。",
+                        metric_type,
+                        threshold,
+                        severity,
+                        channels,
+                        max_threshold,
+                    ),
+                ))
+        legacy_names = [
+            "【Asteros】已Up接口入方向丢弃包增长",
+            "【Asteros】已Up接口入方向错误包增长",
+        ]
+        disabled_legacy = 0
+        for rule in db.query(AlertRule).filter(AlertRule.name.in_(legacy_names)).all():
+            if rule.enabled:
+                rule.enabled = 0
+                disabled_legacy += 1
+        db.commit()
+        return {"success": True, "rules": results, "disabled_legacy_rules": disabled_legacy}
+    except Exception as exc:
+        db.rollback()
+        logger.error("确保Asteros已Up接口质量告警规则失败", error=str(exc))
         return {"success": False, "error": str(exc)}
     finally:
         db.close()
@@ -1136,8 +1372,8 @@ def _build_asternos_interface_stats(
         "out_bps": "interface_transmit_rate_bps",
         "in_errors": "interface_receive_errs_total",
         "out_errors": "interface_transmit_errs_total",
-        "in_discards": "interface_receive_drops_total",
-        "out_discards": "interface_transmit_drops_total",
+        "in_discards": "interface_receive_drop_pkts_total",
+        "out_discards": "interface_transmit_drop_pkts_total",
         "in_utilization_percent": "interface_receive_util",
         "out_utilization_percent": "interface_transmit_util",
     }
@@ -1292,6 +1528,8 @@ def _interface_point(device: Device, stats: Dict[str, Any], timestamp: datetime)
         "out_discards": stats.get("out_discards"),
         "in_discards_delta": stats.get("in_discards_delta"),
         "out_discards_delta": stats.get("out_discards_delta"),
+        "crc_errors": stats.get("crc_errors"),
+        "crc_errors_delta": stats.get("crc_errors_delta"),
         "in_errors": stats.get("in_errors"),
         "out_errors": stats.get("out_errors"),
         "in_errors_delta": stats.get("in_errors_delta"),

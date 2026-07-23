@@ -251,6 +251,7 @@ class QualityProbeTargetBase(BaseModel):
     datacenter_id: Optional[int] = None
     circuit_id: Optional[int] = None
     device_id: Optional[int] = None
+    probe_interface_name: Optional[str] = Field(None, max_length=128)
     probe_source: str = Field(default="server_icmp", pattern="^(server_icmp|device_nqa_snmp)$")
     nqa_admin_name: Optional[str] = Field(None, max_length=32)
     nqa_operation_tag: Optional[str] = Field(None, max_length=32)
@@ -275,6 +276,7 @@ class QualityProbeTargetUpdate(BaseModel):
     datacenter_id: Optional[int] = None
     circuit_id: Optional[int] = None
     device_id: Optional[int] = None
+    probe_interface_name: Optional[str] = Field(None, max_length=128)
     probe_source: Optional[str] = Field(None, pattern="^(server_icmp|device_nqa_snmp)$")
     nqa_admin_name: Optional[str] = Field(None, max_length=32)
     nqa_operation_tag: Optional[str] = Field(None, max_length=32)
@@ -299,6 +301,7 @@ class QualityProbeTargetResponse(QualityProbeTargetBase):
     circuit_port_name: Optional[str] = None
     device_name: Optional[str] = None
     device_ip: Optional[str] = None
+    probe_interface_name: Optional[str] = None
     last_probe_at: Optional[datetime] = None
     last_success: Optional[bool] = None
     last_avg_latency_ms: Optional[float] = None

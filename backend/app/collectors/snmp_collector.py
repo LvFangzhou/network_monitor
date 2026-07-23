@@ -766,6 +766,7 @@ class SNMPCollector(LoggerMixin):
             "oper_status": (self._snmp_int, f"1.3.6.1.2.1.2.2.1.8.{index}"),
             "in_discards": (self._snmp_int, f"1.3.6.1.2.1.2.2.1.13.{index}"),
             "out_discards": (self._snmp_int, f"1.3.6.1.2.1.2.2.1.19.{index}"),
+            "crc_errors": (self._snmp_int, f"1.3.6.1.2.1.10.7.2.1.3.{index}"),
             "in_errors": (self._snmp_int, f"1.3.6.1.2.1.2.2.1.14.{index}"),
             "out_errors": (self._snmp_int, f"1.3.6.1.2.1.2.2.1.20.{index}"),
             "queue_length": (self._snmp_int, f"1.3.6.1.2.1.2.2.1.21.{index}"),
@@ -800,6 +801,7 @@ class SNMPCollector(LoggerMixin):
         oper_status = get_results["oper_status"]
         in_discards = get_results["in_discards"]
         out_discards = get_results["out_discards"]
+        crc_errors = get_results["crc_errors"]
         in_errors = get_results["in_errors"]
         out_errors = get_results["out_errors"]
         queue_length = get_results["queue_length"]
@@ -826,6 +828,7 @@ class SNMPCollector(LoggerMixin):
             "oper_status": status_map.get(oper_status, "unknown"),
             "in_discards": in_discards,
             "out_discards": out_discards,
+            "crc_errors": crc_errors,
             "in_errors": in_errors,
             "out_errors": out_errors,
             "queue_length": queue_length,
@@ -1571,6 +1574,7 @@ class SNMPCollector(LoggerMixin):
             "if_name_map": ("1.3.6.1.2.1.31.1.1.1.1", str),
             "in_discards_map": ("1.3.6.1.2.1.2.2.1.13", int),
             "out_discards_map": ("1.3.6.1.2.1.2.2.1.19", int),
+            "crc_errors_map": ("1.3.6.1.2.1.10.7.2.1.3", int),
             "in_errors_map": ("1.3.6.1.2.1.2.2.1.14", int),
             "out_errors_map": ("1.3.6.1.2.1.2.2.1.20", int),
         }
@@ -1599,6 +1603,7 @@ class SNMPCollector(LoggerMixin):
             current = {
                 "in_discards": walk_results["in_discards_map"].get(index),
                 "out_discards": walk_results["out_discards_map"].get(index),
+                "crc_errors": walk_results["crc_errors_map"].get(index),
                 "in_errors": walk_results["in_errors_map"].get(index),
                 "out_errors": walk_results["out_errors_map"].get(index),
             }
@@ -1618,6 +1623,7 @@ class SNMPCollector(LoggerMixin):
                 **{key: float(value) for key, value in current.items() if value is not None},
                 "in_discards_delta": delta(current["in_discards"], previous.get("in_discards")),
                 "out_discards_delta": delta(current["out_discards"], previous.get("out_discards")),
+                "crc_errors_delta": delta(current["crc_errors"], previous.get("crc_errors")),
                 "in_errors_delta": delta(current["in_errors"], previous.get("in_errors")),
                 "out_errors_delta": delta(current["out_errors"], previous.get("out_errors")),
                 "sample_seconds": round(max(now_ts - float(previous.get("timestamp") or now_ts), 0.0), 2),
@@ -1672,6 +1678,7 @@ class SNMPCollector(LoggerMixin):
             walk_jobs.update({
                 "in_discards_map": ("1.3.6.1.2.1.2.2.1.13", int),
                 "out_discards_map": ("1.3.6.1.2.1.2.2.1.19", int),
+                "crc_errors_map": ("1.3.6.1.2.1.10.7.2.1.3", int),
                 "in_errors_map": ("1.3.6.1.2.1.2.2.1.14", int),
                 "out_errors_map": ("1.3.6.1.2.1.2.2.1.20", int),
                 "queue_length_map": ("1.3.6.1.2.1.2.2.1.21", int),
@@ -1695,6 +1702,7 @@ class SNMPCollector(LoggerMixin):
         for optional_name in (
             "in_discards_map",
             "out_discards_map",
+            "crc_errors_map",
             "in_errors_map",
             "out_errors_map",
             "queue_length_map",
@@ -1765,6 +1773,7 @@ class SNMPCollector(LoggerMixin):
                     "out_octets": current_out,
                     "in_discards": walk_results["in_discards_map"].get(index),
                     "out_discards": walk_results["out_discards_map"].get(index),
+                    "crc_errors": walk_results["crc_errors_map"].get(index),
                     "in_errors": walk_results["in_errors_map"].get(index),
                     "out_errors": walk_results["out_errors_map"].get(index),
                     "in_broadcast": walk_results["in_broadcast_map"].get(index),
@@ -1794,12 +1803,14 @@ class SNMPCollector(LoggerMixin):
                     "out_utilization_percent": round((out_bps / speed_bps) * 100, 2) if speed_bps and out_bps is not None else None,
                     "in_discards": float(walk_results["in_discards_map"].get(index) or 0),
                     "out_discards": float(walk_results["out_discards_map"].get(index) or 0),
+                    "crc_errors": float(walk_results["crc_errors_map"].get(index) or 0),
                     "in_errors": float(walk_results["in_errors_map"].get(index) or 0),
                     "out_errors": float(walk_results["out_errors_map"].get(index) or 0),
                     "queue_length": float(walk_results["queue_length_map"].get(index) or 0),
                     "sample_seconds": 0.0,
                     "in_discards_delta": 0.0,
                     "out_discards_delta": 0.0,
+                    "crc_errors_delta": 0.0,
                     "in_errors_delta": 0.0,
                     "out_errors_delta": 0.0,
                 }
@@ -1834,6 +1845,7 @@ class SNMPCollector(LoggerMixin):
             previous_out = previous.get("out_octets")
             previous_in_discards = previous.get("in_discards")
             previous_out_discards = previous.get("out_discards")
+            previous_crc_errors = previous.get("crc_errors")
             previous_in_errors = previous.get("in_errors")
             previous_out_errors = previous.get("out_errors")
             previous_in_broadcast = previous.get("in_broadcast")
@@ -1868,6 +1880,7 @@ class SNMPCollector(LoggerMixin):
 
             in_discards_delta = compute_delta(walk_results["in_discards_map"].get(index), previous_in_discards)
             out_discards_delta = compute_delta(walk_results["out_discards_map"].get(index), previous_out_discards)
+            crc_errors_delta = compute_delta(walk_results["crc_errors_map"].get(index), previous_crc_errors)
             in_errors_delta = compute_delta(walk_results["in_errors_map"].get(index), previous_in_errors)
             out_errors_delta = compute_delta(walk_results["out_errors_map"].get(index), previous_out_errors)
             in_broadcast_delta = compute_delta(walk_results["in_broadcast_map"].get(index), previous_in_broadcast)
@@ -1893,6 +1906,8 @@ class SNMPCollector(LoggerMixin):
                 "out_discards": walk_results["out_discards_map"].get(index),
                 "in_discards_delta": in_discards_delta,
                 "out_discards_delta": out_discards_delta,
+                "crc_errors": walk_results["crc_errors_map"].get(index),
+                "crc_errors_delta": crc_errors_delta,
                 "in_errors": walk_results["in_errors_map"].get(index),
                 "out_errors": walk_results["out_errors_map"].get(index),
                 "in_errors_delta": in_errors_delta,

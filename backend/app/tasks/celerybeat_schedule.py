@@ -169,6 +169,15 @@ beat_schedule = {
         }
     },
 
+    # 自动维护公网/专线线路使用率规则：50% P2、90% P1
+    'ensure-circuit-utilization-alert-rules-every-10m': {
+        'task': 'app.tasks.alert_tasks.ensure_circuit_utilization_alert_rules',
+        'schedule': 600.0,
+        'options': {
+            'expires': 300.0,
+        },
+    },
+
     # 告警规则详情缓存预热 - 用户首次点击“查看状态”时优先命中Redis缓存
     'prewarm-alert-rule-status-cache-every-3m': {
         'task': 'app.tasks.alert_tasks.prewarm_alert_rule_status_cache',
@@ -265,6 +274,20 @@ beat_schedule = {
     },
     'ensure-h3c-s9867-roce-rules-every-10m': {
         'task': 'app.tasks.snmp_tasks.ensure_h3c_s9867_roce_rules',
+        'schedule': 600.0,
+        'options': {
+            'expires': 300.0,
+        },
+    },
+    'ensure-up-interface-crc-rules-every-10m': {
+        'task': 'app.tasks.snmp_tasks.ensure_up_interface_crc_rules',
+        'schedule': 600.0,
+        'options': {
+            'expires': 300.0,
+        },
+    },
+    'ensure-asternos-up-interface-quality-rules-every-10m': {
+        'task': 'app.tasks.snmp_tasks.ensure_asternos_up_interface_quality_rules',
         'schedule': 600.0,
         'options': {
             'expires': 300.0,

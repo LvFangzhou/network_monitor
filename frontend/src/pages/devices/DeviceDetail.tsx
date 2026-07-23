@@ -1,6 +1,6 @@
 import { Suspense, lazy, type MouseEvent as ReactMouseEvent, type UIEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Alert, Button, Card, Col, DatePicker, Descriptions, Empty, Input, Modal, Progress, Row, Select, Space, Spin, Table, Tabs, Tag, Typography, message } from 'antd'
+import { Alert, Button, Card, Checkbox, Col, DatePicker, Descriptions, Empty, Input, InputNumber, Modal, Popover, Progress, Row, Select, Space, Spin, Table, Tabs, Tag, Typography, message } from 'antd'
 import { ArrowLeftOutlined, CopyOutlined, DownloadOutlined, EditOutlined, FileTextOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import {
@@ -8,10 +8,16 @@ import {
   getDeviceConfigBackups,
   getDeviceConnections,
   getDeviceCurrentConfig,
+  getDeviceBmpMessages,
+  getDeviceBmpPeers,
+  getDeviceBmpSessions,
   getDeviceHardware,
   getDevicePerformance,
   getDeviceSyslog,
   getDeviceTacacs,
+  type BmpMessageRow,
+  type BmpPeerSummaryRow,
+  type BmpSessionRow,
   type Device,
   type DeviceConfigBackupRow,
   type DeviceConnectionRow,
@@ -457,6 +463,7 @@ const DeviceDetail = () => {
           { key: 'traffic', label: '流量', children: <TrafficTab deviceId={device.id} /> },
           { key: 'syslog', label: 'Syslog', children: <SyslogTab deviceId={device.id} /> },
           { key: 'config', label: '配置', children: <ConfigTab deviceId={device.id} /> },
+          { key: 'bmp', label: 'BMP', children: <BmpTab deviceId={device.id} /> },
           { key: 'performance', label: '性能', children: <PerformanceTab deviceId={device.id} /> },
           { key: 'hardware', label: '硬件', children: <HardwareTab deviceId={device.id} /> },
           {
@@ -1130,6 +1137,457 @@ const PerformanceTab = ({ deviceId }: { deviceId: number }) => {
           </Space>
         </Card>
       </Spin>
+    </Space>
+  )
+}
+
+const bmpMessageTypeText = (value?: string | null) => {
+  const map: Record<string, string> = {
+    initiation: '初始化',
+    termination: '终止',
+    peer_up: 'Peer Up',
+    peer_down: 'Peer Down',
+    route_monitoring: 'Route Monitoring',
+    statistics_report: '统计报告',
+    route_mirroring: 'Route Mirroring',
+  }
+  return map[String(value || '')] || value || '-'
+}
+
+const bmpActionText = (value?: string | null) => {
+  const map: Record<string, string> = {
+    announce: '通告路由',
+    withdraw: '撤销路由',
+    announce_and_withdraw: '通告+撤销',
+    attribute_only: '属性变化',
+    mp_bgp_update: 'MP-BGP更新',
+  }
+  return map[String(value || '')] || value || '-'
+}
+
+const bmpActionTag = (value?: string | null) => {
+  const color = value === 'withdraw' ? 'red' : value === 'announce' ? 'green' : value === 'mp_bgp_update' ? 'blue' : 'default'
+  return <Tag color={color}>{bmpActionText(value)}</Tag>
+}
+
+const renderPrefixList = (prefixes?: string[] | null) => {
+  const list = Array.isArray(prefixes) ? prefixes.filter(Boolean) : []
+  if (!list.length) return '-'
+  return (
+    <Space size={[4, 4]} wrap>
+      {list.slice(0, 6).map((item) => <Tag key={item}>{item}</Tag>)}
+      {list.length > 6 ? <Tag>+{list.length - 6}</Tag> : null}
+    </Space>
+  )
+}
+
+const routeSummaryFromExtra = (extra?: Record<string, any>) => {
+  if (!extra || !Object.keys(extra).length) return '-'
+  const prefixes = extra.announced_prefixes?.length ? extra.announced_prefixes : extra.withdrawn_prefixes
+  const prefixText = Array.isArray(prefixes) && prefixes.length ? prefixes.slice(0, 4).join(', ') : '-'
+  const nextHop = extra.next_hop ? `下一跳 ${extra.next_hop}` : ''
+  const asPath = extra.as_path ? `AS_PATH ${extra.as_path}` : ''
+  const error = extra.peer_down_reason_text || extra.bgp_parse_error
+  return [bmpActionText(extra.action), prefixText, nextHop, asPath, error].filter(Boolean).join(' ｜ ')
+}
+
+type BmpColumnSetting = {
+  key: string
+  title: string
+  visible: boolean
+  width?: number
+}
+
+const DEFAULT_BMP_REFRESH_SECONDS = 30
+
+const useBmpColumnSettings = (storageKey: string, defaults: BmpColumnSetting[]) => {
+  const [settings, setSettings] = useState<BmpColumnSetting[]>(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(storageKey) || '[]') as Partial<BmpColumnSetting>[]
+      const defaultByKey = new Map(defaults.map((item) => [item.key, item]))
+      const mergedByKey = new Map(defaults.map((item) => [item.key, item]))
+      saved.forEach((savedItem) => {
+        if (!savedItem.key) return
+        const defaultItem = defaultByKey.get(savedItem.key)
+        if (!defaultItem) return
+        mergedByKey.set(savedItem.key, {
+          ...defaultItem,
+          visible: savedItem.visible !== false,
+          width: Number(savedItem.width || defaultItem.width || 120),
+        })
+      })
+      const ordered = saved
+        .map((savedItem) => savedItem.key ? mergedByKey.get(savedItem.key) : null)
+        .filter(Boolean) as BmpColumnSetting[]
+      const savedKeys = new Set(ordered.map((item) => item.key))
+      return [...ordered, ...defaults.filter((item) => !savedKeys.has(item.key))]
+    } catch {
+      return defaults
+    }
+  })
+
+  useEffect(() => {
+    window.localStorage.setItem(storageKey, JSON.stringify(settings.map(({ key, visible, width }) => ({ key, visible, width }))))
+  }, [settings, storageKey])
+
+  const settingByKey = useMemo(() => new Map(settings.map((item) => [item.key, item])), [settings])
+  const updateVisible = (key: string, visible: boolean) => setSettings((items) => items.map((item) => item.key === key ? { ...item, visible } : item))
+  const updateWidth = (key: string, width?: number | null) => setSettings((items) => items.map((item) => item.key === key ? { ...item, width: Number(width || item.width || 120) } : item))
+  const moveColumn = (dragKey: string, targetKey: string) => setSettings((items) => {
+    if (dragKey === targetKey) return items
+    const dragIndex = items.findIndex((item) => item.key === dragKey)
+    const targetIndex = items.findIndex((item) => item.key === targetKey)
+    if (dragIndex < 0 || targetIndex < 0) return items
+    const next = [...items]
+    const [dragItem] = next.splice(dragIndex, 1)
+    next.splice(targetIndex, 0, dragItem)
+    return next
+  })
+
+  return { settings, settingByKey, updateVisible, updateWidth, moveColumn }
+}
+
+const BmpColumnSettingsPanel = ({ settings, updateVisible, updateWidth, moveColumn }: {
+  settings: BmpColumnSetting[]
+  updateVisible: (key: string, visible: boolean) => void
+  updateWidth: (key: string, width?: number | null) => void
+  moveColumn: (dragKey: string, targetKey: string) => void
+}) => {
+  const [draggingKey, setDraggingKey] = useState<string | null>(null)
+  return (
+    <Space direction="vertical" size={6} style={{ width: 400, maxHeight: 460, overflowY: 'auto' }}>
+      <Text type="secondary" style={{ fontSize: 12 }}>拖动左侧 ☰ 可调整列顺序；宽度会保存到当前浏览器。</Text>
+      {settings.map((item) => (
+        <div
+          key={item.key}
+          draggable
+          onDragStart={() => setDraggingKey(item.key)}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => {
+            event.preventDefault()
+            if (draggingKey) moveColumn(draggingKey, item.key)
+            setDraggingKey(null)
+          }}
+          onDragEnd={() => setDraggingKey(null)}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 8,
+            padding: '4px 6px',
+            borderRadius: 6,
+            background: draggingKey === item.key ? '#f0f5ff' : undefined,
+            cursor: 'grab',
+          }}
+        >
+          <Space size={8} style={{ minWidth: 0, flex: 1 }}>
+            <Text type="secondary" style={{ fontSize: 16, lineHeight: 1 }}>☰</Text>
+            <Checkbox checked={item.visible} onChange={(event) => updateVisible(item.key, event.target.checked)}>{item.title}</Checkbox>
+          </Space>
+          <InputNumber size="small" min={70} max={520} step={10} value={item.width || 120} addonAfter="px" onChange={(value) => updateWidth(item.key, value)} style={{ width: 120 }} />
+        </div>
+      ))}
+    </Space>
+  )
+}
+
+const applyBmpColumnSettings = (columns: any[], settings: BmpColumnSetting[]) => {
+  const columnByKey = new Map(columns.map((column) => [String(column.key || column.dataIndex || column.title), column]))
+  return settings
+    .map((setting) => {
+      const column = columnByKey.get(setting.key)
+      if (!column || !setting.visible) return null
+      return { ...column, key: setting.key, width: setting.width || column.width }
+    })
+    .filter(Boolean) as any[]
+}
+
+const bmpTableScrollX = (settings: BmpColumnSetting[], fallback: number) => {
+  const visibleWidth = settings
+    .filter((item) => item.visible !== false)
+    .reduce((sum, item) => sum + Number(item.width || 120), 0)
+  return Math.max(fallback, visibleWidth + 80)
+}
+
+const useBmpTablePagination = (storageKey: string, defaultPageSize = 20) => {
+  const [current, setCurrent] = useState(1)
+  const [pageSize, setPageSize] = useState(() => {
+    try {
+      return Number(window.localStorage.getItem(storageKey) || defaultPageSize) || defaultPageSize
+    } catch {
+      return defaultPageSize
+    }
+  })
+
+  useEffect(() => {
+    window.localStorage.setItem(storageKey, String(pageSize))
+  }, [pageSize, storageKey])
+
+  return {
+    current,
+    pageSize,
+    onChange: (nextPage: number, nextPageSize: number) => {
+      setCurrent(nextPage)
+      setPageSize(nextPageSize)
+    },
+  }
+}
+
+const buildBmpPagination = (
+  pagination: ReturnType<typeof useBmpTablePagination>,
+  total: number,
+) => ({
+  ...pagination,
+  total,
+  showSizeChanger: true,
+  showQuickJumper: true,
+  pageSizeOptions: [10, 20, 50, 100, 200, 500],
+  showTotal: (value: number) => `共 ${value} 条`,
+})
+
+const bmpSessionColumnDefaults: BmpColumnSetting[] = [
+  { key: 'status', title: '状态', visible: true, width: 110 },
+  { key: 'source_ip', title: '来源IP', visible: true, width: 140 },
+  { key: 'source_port', title: '来源端口', visible: true, width: 100 },
+  { key: 'collector', title: 'Collector', visible: true, width: 180 },
+  { key: 'message_count', title: '消息数', visible: true, width: 100 },
+  { key: 'peer_up_count', title: 'Peer Up', visible: true, width: 100 },
+  { key: 'peer_down_count', title: 'Peer Down', visible: true, width: 110 },
+  { key: 'route_monitoring_count', title: '路由更新', visible: true, width: 120 },
+  { key: 'last_message_type', title: '最后消息', visible: true, width: 150 },
+  { key: 'connected_at', title: '连接时间', visible: true, width: 180 },
+  { key: 'last_seen_at', title: '最近接收', visible: true, width: 180 },
+  { key: 'last_error', title: '断开原因', visible: true, width: 180 },
+]
+
+const bmpPeerColumnDefaults: BmpColumnSetting[] = [
+  { key: 'peer_ip', title: 'Peer IP', visible: true, width: 150 },
+  { key: 'peer_asn', title: 'Peer ASN', visible: true, width: 110 },
+  { key: 'peer_bgp_id', title: 'Peer BGP ID', visible: true, width: 140 },
+  { key: 'last_message_type', title: '最后消息', visible: true, width: 120 },
+  { key: 'last_action', title: '最近动作', visible: true, width: 120 },
+  { key: 'last_prefixes', title: '最近前缀', visible: true, width: 260 },
+  { key: 'last_next_hop', title: '下一跳', visible: true, width: 130 },
+  { key: 'message_count', title: '消息数', visible: true, width: 90 },
+  { key: 'route_monitoring_count', title: '路由更新', visible: true, width: 100 },
+  { key: 'peer_down_count', title: 'Peer Down', visible: true, width: 105 },
+  { key: 'last_seen_at', title: '最近接收', visible: true, width: 170 },
+  { key: 'last_error', title: '异常/原因', visible: true, width: 180 },
+]
+
+const bmpMessageColumnDefaults: BmpColumnSetting[] = [
+  { key: 'created_at', title: '时间', visible: true, width: 180 },
+  { key: 'message_type', title: '消息类型', visible: true, width: 150 },
+  { key: 'peer_ip', title: 'Peer IP', visible: true, width: 150 },
+  { key: 'peer_asn', title: 'Peer ASN', visible: true, width: 120 },
+  { key: 'peer_bgp_id', title: 'Peer BGP ID', visible: true, width: 150 },
+  { key: 'action', title: '动作', visible: true, width: 120 },
+  { key: 'announced_prefixes', title: '通告前缀', visible: true, width: 260 },
+  { key: 'withdrawn_prefixes', title: '撤销前缀', visible: true, width: 260 },
+  { key: 'next_hop', title: '下一跳', visible: true, width: 130 },
+  { key: 'as_path', title: 'AS_PATH', visible: true, width: 260 },
+  { key: 'summary', title: '摘要', visible: true, width: 260 },
+]
+
+const BmpTab = ({ deviceId }: { deviceId: number }) => {
+  const [loading, setLoading] = useState(false)
+  const [sessions, setSessions] = useState<BmpSessionRow[]>([])
+  const [peers, setPeers] = useState<BmpPeerSummaryRow[]>([])
+  const [messages, setMessages] = useState<BmpMessageRow[]>([])
+  const [messageTotal, setMessageTotal] = useState(0)
+  const [messageType, setMessageType] = useState<string | undefined>()
+  const requestSeqRef = useRef(0)
+  const sessionColumnSettings = useBmpColumnSettings(`device-bmp-session-columns-${deviceId}`, bmpSessionColumnDefaults)
+  const peerColumnSettings = useBmpColumnSettings(`device-bmp-peer-columns-${deviceId}`, bmpPeerColumnDefaults)
+  const messageColumnSettings = useBmpColumnSettings(`device-bmp-message-columns-${deviceId}`, bmpMessageColumnDefaults)
+  const sessionPagination = useBmpTablePagination(`device-bmp-session-page-size-${deviceId}`, 20)
+  const peerPagination = useBmpTablePagination(`device-bmp-peer-page-size-${deviceId}`, 20)
+  const messagePagination = useBmpTablePagination(`device-bmp-message-page-size-${deviceId}`, 20)
+
+  const fetchRows = async (
+    nextMessageType = messageType,
+    nextMessagePage = messagePagination.current,
+    nextMessagePageSize = messagePagination.pageSize,
+    options?: { silent?: boolean },
+  ) => {
+    const requestSeq = requestSeqRef.current + 1
+    requestSeqRef.current = requestSeq
+    if (!options?.silent) setLoading(true)
+    try {
+      const messageLimit = nextMessagePageSize
+      const messageOffset = Math.max(0, (nextMessagePage - 1) * nextMessagePageSize)
+      const [sessionResult, peerResult, messageResult] = await Promise.all([
+        getDeviceBmpSessions(deviceId),
+        getDeviceBmpPeers(deviceId, { hours: 24 }),
+        getDeviceBmpMessages(deviceId, { message_type: nextMessageType, hours: 24, limit: messageLimit, offset: messageOffset }),
+      ])
+      if (requestSeqRef.current !== requestSeq) return
+      setSessions(sessionResult.items || [])
+      setPeers(peerResult.items || [])
+      setMessages(messageResult.items || [])
+      setMessageTotal(Number(messageResult.total || 0))
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '读取BMP数据失败')
+    } finally {
+      if (requestSeqRef.current === requestSeq && !options?.silent) setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    setMessageType(undefined)
+    fetchRows(undefined)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deviceId])
+
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => fetchRows(messageType, messagePagination.current, messagePagination.pageSize, { silent: true }),
+      DEFAULT_BMP_REFRESH_SECONDS * 1000,
+    )
+    return () => window.clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deviceId, messageType, messagePagination.current, messagePagination.pageSize])
+
+  const latestSession = sessions[0]
+  const connectedSessions = sessions.filter((item) => item.status === 'connected').length
+  const totalMessages = sessions.reduce((sum, item) => sum + Number(item.message_count || 0), 0)
+  const totalPeerDown = sessions.reduce((sum, item) => sum + Number(item.peer_down_count || 0), 0)
+  const totalRouteMonitoring = sessions.reduce((sum, item) => sum + Number(item.route_monitoring_count || 0), 0)
+  const sessionColumns = applyBmpColumnSettings([
+    { title: '状态', key: 'status', dataIndex: 'status', fixed: 'left', render: (value: string) => <Tag color={value === 'connected' ? 'green' : 'default'}>{value === 'connected' ? '已连接' : '已断开'}</Tag> },
+    { title: '来源IP', key: 'source_ip', dataIndex: 'source_ip' },
+    { title: '来源端口', key: 'source_port', dataIndex: 'source_port' },
+    { title: 'Collector', key: 'collector', render: (_: any, row: BmpSessionRow) => `${row.collector_ip || '-'}:${row.collector_port || '-'}` },
+    { title: '消息数', key: 'message_count', dataIndex: 'message_count', sorter: numberSorter<BmpSessionRow>('message_count') },
+    { title: 'Peer Up', key: 'peer_up_count', dataIndex: 'peer_up_count', sorter: numberSorter<BmpSessionRow>('peer_up_count') },
+    { title: 'Peer Down', key: 'peer_down_count', dataIndex: 'peer_down_count', sorter: numberSorter<BmpSessionRow>('peer_down_count') },
+    { title: '路由更新', key: 'route_monitoring_count', dataIndex: 'route_monitoring_count', sorter: numberSorter<BmpSessionRow>('route_monitoring_count') },
+    { title: '最后消息', key: 'last_message_type', dataIndex: 'last_message_type', render: bmpMessageTypeText },
+    { title: '连接时间', key: 'connected_at', dataIndex: 'connected_at', render: formatDateTimeText },
+    { title: '最近接收', key: 'last_seen_at', dataIndex: 'last_seen_at', render: formatDateTimeText },
+    { title: '断开原因', key: 'last_error', dataIndex: 'last_error', ellipsis: true, render: (value: string) => value || '-' },
+  ], sessionColumnSettings.settings)
+  const peerColumns = applyBmpColumnSettings([
+    { title: 'Peer IP', key: 'peer_ip', dataIndex: 'peer_ip', fixed: 'left', sorter: textSorter<BmpPeerSummaryRow>('peer_ip') },
+    { title: 'Peer ASN', key: 'peer_asn', dataIndex: 'peer_asn', sorter: numberSorter<BmpPeerSummaryRow>('peer_asn') },
+    { title: 'Peer BGP ID', key: 'peer_bgp_id', dataIndex: 'peer_bgp_id', sorter: textSorter<BmpPeerSummaryRow>('peer_bgp_id') },
+    { title: '最后消息', key: 'last_message_type', dataIndex: 'last_message_type', render: bmpMessageTypeText },
+    { title: '最近动作', key: 'last_action', dataIndex: 'last_action', render: bmpActionTag },
+    { title: '最近前缀', key: 'last_prefixes', dataIndex: 'last_prefixes', render: renderPrefixList },
+    { title: '下一跳', key: 'last_next_hop', dataIndex: 'last_next_hop', render: (value: string) => value || '-' },
+    { title: '消息数', key: 'message_count', dataIndex: 'message_count', sorter: numberSorter<BmpPeerSummaryRow>('message_count') },
+    { title: '路由更新', key: 'route_monitoring_count', dataIndex: 'route_monitoring_count', sorter: numberSorter<BmpPeerSummaryRow>('route_monitoring_count') },
+    { title: 'Peer Down', key: 'peer_down_count', dataIndex: 'peer_down_count', sorter: numberSorter<BmpPeerSummaryRow>('peer_down_count'), render: (value: number) => Number(value || 0) ? <Tag color="red">{value}</Tag> : 0 },
+    { title: '最近接收', key: 'last_seen_at', dataIndex: 'last_seen_at', render: formatDateTimeText, sorter: textSorter<BmpPeerSummaryRow>('last_seen_at') },
+    { title: '异常/原因', key: 'last_error', dataIndex: 'last_error', ellipsis: true, render: (value: string) => value || '-' },
+  ], peerColumnSettings.settings)
+  const messageColumns = applyBmpColumnSettings([
+    { title: '时间', key: 'created_at', dataIndex: 'created_at', fixed: 'left', render: formatDateTimeText, sorter: textSorter<BmpMessageRow>('created_at') },
+    { title: '消息类型', key: 'message_type', dataIndex: 'message_type', render: bmpMessageTypeText, filters: Array.from(new Set(messages.map((item) => item.message_type).filter(Boolean))).map((value) => ({ text: bmpMessageTypeText(value), value })), onFilter: (value: any, row: BmpMessageRow) => row.message_type === value },
+    { title: 'Peer IP', key: 'peer_ip', dataIndex: 'peer_ip', sorter: textSorter<BmpMessageRow>('peer_ip') },
+    { title: 'Peer ASN', key: 'peer_asn', dataIndex: 'peer_asn', sorter: numberSorter<BmpMessageRow>('peer_asn') },
+    { title: 'Peer BGP ID', key: 'peer_bgp_id', dataIndex: 'peer_bgp_id', sorter: textSorter<BmpMessageRow>('peer_bgp_id') },
+    { title: '动作', key: 'action', dataIndex: ['extra', 'action'], render: (_value: any, row: BmpMessageRow) => bmpActionTag(row.extra?.action) },
+    { title: '通告前缀', key: 'announced_prefixes', dataIndex: ['extra', 'announced_prefixes'], render: (_value: any, row: BmpMessageRow) => renderPrefixList(row.extra?.announced_prefixes) },
+    { title: '撤销前缀', key: 'withdrawn_prefixes', dataIndex: ['extra', 'withdrawn_prefixes'], render: (_value: any, row: BmpMessageRow) => renderPrefixList(row.extra?.withdrawn_prefixes) },
+    { title: '下一跳', key: 'next_hop', dataIndex: ['extra', 'next_hop'], render: (_value: any, row: BmpMessageRow) => row.extra?.next_hop || '-' },
+    { title: 'AS_PATH', key: 'as_path', dataIndex: ['extra', 'as_path'], ellipsis: true, render: (_value: any, row: BmpMessageRow) => row.extra?.as_path || '-' },
+    { title: '摘要', key: 'summary', dataIndex: 'extra', ellipsis: true, render: routeSummaryFromExtra },
+  ], messageColumnSettings.settings)
+
+  return (
+    <Space direction="vertical" style={{ width: '100%' }} size={12}>
+      <Alert
+        type="info"
+        showIcon
+        message="BMP用于接收设备主动推送的BGP路由监控数据。这里重点展示BGP Peer状态、路由通告/撤销、下一跳和AS_PATH，便于判断哪一个邻居在推送哪些路由变化。"
+      />
+      <Row gutter={[12, 12]}>
+        <Col xs={24} sm={12} xl={6}>
+          <Card size="small"><Text type="secondary">当前会话</Text><div style={{ fontSize: 24, fontWeight: 700 }}>{connectedSessions}</div></Card>
+        </Col>
+        <Col xs={24} sm={12} xl={6}>
+          <Card size="small"><Text type="secondary">累计BMP消息</Text><div style={{ fontSize: 24, fontWeight: 700 }}>{totalMessages}</div></Card>
+        </Col>
+        <Col xs={24} sm={12} xl={6}>
+          <Card size="small"><Text type="secondary">路由更新</Text><div style={{ fontSize: 24, fontWeight: 700 }}>{totalRouteMonitoring}</div></Card>
+        </Col>
+        <Col xs={24} sm={12} xl={6}>
+          <Card size="small"><Text type="secondary">Peer Down</Text><div style={{ fontSize: 24, fontWeight: 700, color: totalPeerDown ? '#cf1322' : undefined }}>{totalPeerDown}</div></Card>
+        </Col>
+      </Row>
+      <Space wrap>
+        <Select
+          allowClear
+          placeholder="消息类型"
+          value={messageType}
+          onChange={(value) => { setMessageType(value); messagePagination.onChange(1, messagePagination.pageSize); fetchRows(value, 1, messagePagination.pageSize) }}
+          style={{ width: 180 }}
+          options={[
+            { value: 'peer_up', label: 'Peer Up' },
+            { value: 'peer_down', label: 'Peer Down' },
+            { value: 'route_monitoring', label: '路由更新' },
+            { value: 'statistics_report', label: '统计报告' },
+            { value: 'initiation', label: '初始化' },
+          ]}
+        />
+        <Button icon={<ReloadOutlined />} loading={loading} onClick={() => fetchRows()}>刷新BMP数据</Button>
+        <Text type="secondary">页面每 {DEFAULT_BMP_REFRESH_SECONDS} 秒自动刷新</Text>
+        {latestSession ? <Text type="secondary">最近接收：{formatDateTimeText(latestSession.last_seen_at)}</Text> : null}
+      </Space>
+      <Card
+        size="small"
+        title="BMP会话"
+        extra={<Popover trigger="click" placement="bottomRight" content={<BmpColumnSettingsPanel {...sessionColumnSettings} />}><Button size="small">列设置</Button></Popover>}
+      >
+        <Table<BmpSessionRow>
+          loading={loading}
+          rowKey="id"
+          dataSource={sessions}
+          size="small"
+          pagination={buildBmpPagination(sessionPagination, sessions.length)}
+          scroll={{ x: bmpTableScrollX(sessionColumnSettings.settings, 1200) }}
+          locale={{ emptyText: '暂无BMP会话。请确认设备已配置BMP server指向本系统1790端口。' }}
+          columns={sessionColumns}
+        />
+      </Card>
+      <Card
+        size="small"
+        title="BGP Peer摘要（最近24小时）"
+        extra={<Popover trigger="click" placement="bottomRight" content={<BmpColumnSettingsPanel {...peerColumnSettings} />}><Button size="small">列设置</Button></Popover>}
+      >
+        <Table<BmpPeerSummaryRow>
+          loading={loading}
+          rowKey="peer_ip"
+          dataSource={peers}
+          size="small"
+          pagination={buildBmpPagination(peerPagination, peers.length)}
+          scroll={{ x: bmpTableScrollX(peerColumnSettings.settings, 1200) }}
+          locale={{ emptyText: '暂无Peer数据。收到Peer Up或Route Monitoring后会自动展示。' }}
+          columns={peerColumns}
+        />
+      </Card>
+      <Card
+        size="small"
+        title="BMP路由消息（24小时内，支持分页查看）"
+        extra={<Popover trigger="click" placement="bottomRight" content={<BmpColumnSettingsPanel {...messageColumnSettings} />}><Button size="small">列设置</Button></Popover>}
+      >
+        <Table<BmpMessageRow>
+          loading={loading}
+          rowKey="id"
+          dataSource={messages}
+          size="small"
+          scroll={{ x: bmpTableScrollX(messageColumnSettings.settings, 1500) }}
+          pagination={{
+            ...buildBmpPagination(messagePagination, messageTotal),
+            onChange: (page, pageSize) => {
+              messagePagination.onChange(page, pageSize)
+              fetchRows(messageType, page, pageSize)
+            },
+          }}
+          columns={messageColumns}
+        />
+      </Card>
     </Space>
   )
 }

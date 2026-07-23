@@ -745,6 +745,7 @@ export interface QualityProbeTarget {
   device_id?: number | null
   device_name?: string | null
   device_ip?: string | null
+  probe_interface_name?: string | null
   probe_source?: 'server_icmp' | 'device_nqa_snmp'
   nqa_admin_name?: string | null
   nqa_operation_tag?: string | null
@@ -813,6 +814,8 @@ export interface QualityProbeHistoryPoint {
   jitter_ds_ms?: number | null
   packet_loss_percent?: number | null
   availability_percent?: number | null
+  sent?: number | null
+  received?: number | null
 }
 
 export interface QualityNqaInstance {

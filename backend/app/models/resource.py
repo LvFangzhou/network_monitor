@@ -349,6 +349,7 @@ class QualityProbeTarget(Base):
     datacenter_id = Column(Integer, ForeignKey("datacenters.id"), nullable=True)
     circuit_id = Column(Integer, ForeignKey("circuits.id", ondelete="SET NULL"), nullable=True, index=True)
     device_id = Column(Integer, ForeignKey("devices.id", ondelete="SET NULL"), nullable=True, index=True)
+    probe_interface_name = Column(String(128))
     probe_source = Column(String(30), default="server_icmp", nullable=False)
     nqa_admin_name = Column(String(32))
     nqa_operation_tag = Column(String(32))
@@ -426,6 +427,7 @@ class QualityProbeTarget(Base):
             "device_id": self.device_id,
             "device_name": self.device_ref.name if self.device_ref else None,
             "device_ip": self.device_ref.ip_address if self.device_ref else None,
+            "probe_interface_name": self.probe_interface_name,
             "probe_source": self.probe_source or "server_icmp",
             "nqa_admin_name": self.nqa_admin_name,
             "nqa_operation_tag": self.nqa_operation_tag,

@@ -55,6 +55,7 @@ const metricOptions = [
   { value: 'telemetry_reachability', label: 'Telemetry 可达状态' },
   { value: 'interface_oper_status', label: '接口 up/down 状态' },
   { value: 'interface_admin_up_oper_down', label: '接口 admin up 但物理 down' },
+  { value: 'interface_crc_errors_delta', label: '接口CRC/FCS错包增量' },
   { value: 'interface_in_errors_delta', label: '接口入错包增量' },
   { value: 'interface_out_errors_delta', label: '接口出错包增量' },
   { value: 'interface_in_discards_delta', label: '接口入丢包增量' },

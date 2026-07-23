@@ -363,6 +363,7 @@ OPTICAL_METRIC_TYPES = {
 INTERFACE_METRIC_TYPES = {
     "interface_oper_status",
     "interface_admin_up_oper_down",
+    "interface_crc_errors_delta",
     "interface_in_errors_delta",
     "interface_out_errors_delta",
     "interface_in_discards_delta",
@@ -384,6 +385,8 @@ DEFAULT_SKIPPED_INTERFACE_MARKERS = (
 CIRCUIT_METRIC_TYPES = {
     "internet_circuit_traffic_floor",
     "private_line_circuit_traffic_floor",
+    "internet_circuit_utilization",
+    "private_line_circuit_utilization",
 }
 
 DEVICE_REACHABILITY_METRIC_TYPES = {
@@ -446,6 +449,8 @@ PERCENT_METRIC_TYPES = {
     "snmp_pak_buffer_usage",
     "snmp_snat_resource_usage",
     "quality_packet_loss",
+    "internet_circuit_utilization",
+    "private_line_circuit_utilization",
 }
 
 NUMERIC_DETAIL_METRIC_TYPES = {
@@ -495,10 +500,20 @@ METRIC_VALUE_LABELS = {
     "optical_rx_power_drop_24h": "24小时收光衰减",
     "optical_rx_fec_correlation": "当前FEC纠错包增长",
     "quality_packet_loss": "最近5分钟丢包率",
+    "internet_circuit_utilization": "当前公网线路使用率",
+    "private_line_circuit_utilization": "当前专线使用率",
+    "interface_crc_errors_delta": "当前CRC/FCS错误增长",
+    "interface_in_errors_delta": "当前入方向错误包增长",
+    "interface_out_errors_delta": "当前出方向错误包增长",
+    "interface_in_discards_delta": "当前入方向丢弃包增长",
+    "interface_out_discards_delta": "当前出方向丢弃包增长",
 }
 
 FAST_ALERT_METRIC_TYPES = {
     "interface_admin_up_oper_down",
+    "interface_crc_errors_delta",
+    "interface_in_errors_delta",
+    "interface_out_errors_delta",
     "interface_in_discards_delta",
     "interface_out_discards_delta",
 }
@@ -554,6 +569,15 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _target_sample_time_or_now(target: Optional[Dict[str, Any]] = None) -> datetime:
+    """Use the metric sample time as the alert occurrence time when available."""
+    if target:
+        sample_time = _parse_row_time(target.get("sample_time"))
+        if sample_time:
+            return sample_time
+    return _utc_now()
+
+
 def _to_local_datetime(value: Optional[datetime]) -> Optional[datetime]:
     if value is None:
         return None
@@ -567,6 +591,12 @@ def _format_local_time(value: Optional[datetime]) -> str:
     if not local_value:
         return "-"
     return local_value.strftime("%Y/%m/%d %H:%M:%S")
+
+
+def _format_target_sample_time(target: Optional[Dict[str, Any]]) -> str:
+    if not target:
+        return "-"
+    return _format_local_time(_parse_row_time(target.get("sample_time")))
 
 
 def _normalize_severity_label(value: Optional[str]) -> str:
@@ -679,6 +709,71 @@ def _target_label(rule: AlertRule, alert: AlertHistory) -> str:
     return ""
 
 
+def _line_type_label(value: Optional[str]) -> str:
+    return "专线" if value == "private_line" else "公网线路"
+
+
+def _compact_mbps(value: Any) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if abs(numeric) >= 1000:
+        return f"{numeric / 1000:.2f} Gbps"
+    return f"{numeric:.2f} Mbps"
+
+
+def _circuit_context_from_alert(alert: AlertHistory) -> Dict[str, str]:
+    """Parse stable circuit-utilization fields from the alert message."""
+    context: Dict[str, str] = {}
+    for line in str(alert.message or "").splitlines():
+        if "：" in line:
+            label, value = line.split("：", 1)
+        elif ":" in line:
+            label, value = line.split(":", 1)
+        else:
+            continue
+        context[label.strip()] = value.strip()
+    return context
+
+
+def _circuit_utilization_content_lines(alert: AlertHistory) -> List[str]:
+    rule = alert.rule
+    context = _circuit_context_from_alert(alert)
+    line_label = context.get("线路类型") or ("专线" if rule and rule.metric_type == "private_line_circuit_utilization" else "公网线路")
+    direction = context.get("计算方向") or "峰值方向"
+    value = _format_numeric_detail_number(rule, float(alert.alert_value)) if rule and alert.alert_value is not None else "-"
+    threshold = _format_numeric_detail_threshold(rule, alert.threshold) if rule else "-"
+    lines = [
+        f"探测名称：{context.get('探测名称') or context.get('线路名称') or alert.alert_target_name or '-'}",
+        f"线路类型：{line_label}",
+        f"所属机房：{context.get('所属机房') or '-'}",
+        f"运营商：{context.get('运营商') or '-'}",
+        f"目标地址：{context.get('对端互联IP') or context.get('目标地址') or '-'}",
+        f"线路接口：{context.get('线路接口') or alert.alert_target_name or '-'}",
+        f"当前{line_label}{direction}使用率：{value}",
+        f"阈值：{threshold}",
+        f"入方向流量：{context.get('入方向流量') or '-'}",
+        f"出方向流量：{context.get('出方向流量') or '-'}",
+        f"线路带宽：{context.get('线路带宽') or '-'}",
+    ]
+    sample_time = context.get("采样时间")
+    if sample_time:
+        lines.append(f"采样时间：{sample_time}")
+    lines.append("处理建议：优先确认该线路入/出方向是否持续接近带宽上限；如确认打满，再排查业务突增、限速策略、运营商侧带宽配置和接口错误包。")
+    return lines
+
+
+def _circuit_utilization_card_rows(alert: AlertHistory) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for line in _circuit_utilization_content_lines(alert):
+        if "：" not in line:
+            continue
+        label, value = line.split("：", 1)
+        rows.append({"label": label, "value": value})
+    return rows
+
+
 def _device_datacenter_text(device: Device) -> str:
     datacenter = getattr(device, "datacenter_ref", None)
     if not datacenter:
@@ -730,7 +825,7 @@ def _reachability_recovery_fault_title(rule: AlertRule) -> str:
     return metric_title.get(rule.metric_type, "设备不可达，已恢复")
 
 
-def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[str]) -> str:
+def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[str], alert: Optional[AlertHistory] = None) -> str:
     severity = _normalize_severity_label(rule.severity)
     mentions = _get_mention_users(rule)
     mention_suffix = f"@{'、'.join(mentions)}" if mentions else ""
@@ -742,9 +837,13 @@ def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[
     if event_type == "ignored":
         return f"{actor or '有人'}忽略了1条故障"
     if rule.metric_type == "quality_packet_loss":
+        quality_label = "公网链路"
+        if alert is not None:
+            context = _quality_probe_context_from_alert(alert)
+            quality_label = context.get("line_label") or quality_label
         if event_type == "auto_resolved":
-            return f"{severity}-公网链路质量恢复{mention_suffix}"
-        return f"{severity}-公网链路质量下降{mention_suffix}"
+            return f"{severity}-{quality_label}质量恢复{mention_suffix}"
+        return f"{severity}-{quality_label}质量下降{mention_suffix}"
     if event_type == "auto_resolved":
         if rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
             return f"{severity}-{_reachability_recovery_fault_title(rule)}{mention_suffix}"
@@ -789,11 +888,21 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
     address = getattr(target, "target", None) or "-"
     if not target and " / " in str(alert.alert_target_name or ""):
         name, address = str(alert.alert_target_name).split(" / ", 1)
+    probe_source = getattr(target, "probe_source", None) or "server_icmp"
+    line_type = getattr(getattr(target, "circuit_ref", None), "line_type", None)
+    is_private_line = probe_source == "device_nqa_snmp" or line_type == "private_line"
+    line_label = "专线" if is_private_line else "公网链路"
     return {
         "name": name,
         "address": address,
         "datacenter": datacenter_text,
         "operator": operator,
+        "probe_source": probe_source,
+        "is_private_line": is_private_line,
+        "line_label": line_label,
+        "circuit_name": getattr(target, "circuit_ref", None).name if getattr(target, "circuit_ref", None) else None,
+        "circuit_port_name": getattr(target, "probe_interface_name", None) or (getattr(target, "circuit_ref", None).primary_port_name if getattr(target, "circuit_ref", None) else None),
+        "circuit_bandwidth_mbps": getattr(getattr(target, "circuit_ref", None), "bandwidth_mbps", None),
         "latency": "-" if latency is None else f"{float(latency):.2f} ms",
         "loss": loss,
         "threshold": threshold,
@@ -809,6 +918,24 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
     }
 
 
+def _quality_probe_context_from_alert(alert: AlertHistory) -> Dict[str, Any]:
+    target = None
+    try:
+        target_id = int(str(alert.alert_target_key or "").strip())
+    except (TypeError, ValueError):
+        target_id = 0
+    if target_id:
+        try:
+            db = Session.object_session(alert)
+            target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first() if db else None
+        except Exception:
+            target = None
+    probe_source = getattr(target, "probe_source", None) or "server_icmp"
+    line_type = getattr(getattr(target, "circuit_ref", None), "line_type", None)
+    is_private_line = probe_source == "device_nqa_snmp" or line_type == "private_line"
+    return {"line_label": "专线" if is_private_line else "公网链路", "is_private_line": is_private_line}
+
+
 def _quality_impact_text(loss_percent: float) -> str:
     if loss_percent >= 100:
         return "目标完全不可达，相关公网访问可能已经中断"
@@ -819,7 +946,13 @@ def _quality_impact_text(loss_percent: float) -> str:
     return "出现持续丢包，请关注链路稳定性"
 
 
-def _quality_action_text() -> str:
+def _quality_action_text(context: Optional[Dict[str, Any]] = None) -> str:
+    context = context or {}
+    if context.get("is_private_line"):
+        port_text = context.get("circuit_port_name") or "关联接口"
+        bandwidth = context.get("circuit_bandwidth_mbps")
+        bandwidth_text = f"（带宽 {bandwidth} Mbps）" if bandwidth else ""
+        return f"优先查看专线{port_text}出入向带宽利用率{bandwidth_text}是否打满；若未打满，再核对两端接口错误包/丢包、运营商专线状态和对端设备。"
     return "先在质量查询执行 MTR，再核对同机房公网出口流量及 BGP 状态"
 
 
@@ -859,8 +992,9 @@ def _build_notification_content(
         started_at_text = _format_local_time(alert.started_at)
         context = _quality_probe_context(db, alert)
         is_recovery = event_type == "auto_resolved"
+        line_label = context.get("line_label") or "公网链路"
         lines = [
-            f"告警事件：{'公网链路质量恢复' if is_recovery else '公网链路质量下降'}",
+            f"告警事件：{line_label}质量恢复" if is_recovery else f"告警事件：{line_label}质量下降",
             f"探测名称：{context['name']}",
             f"目标地址：{context['address']}",
             f"所属机房：{context['datacenter']}",
@@ -880,7 +1014,7 @@ def _build_notification_content(
                 f"连续异常周期：{context['consecutive']} / {context['required_count']}",
                 f"本轮探测：{context['probe_result']}",
                 f"影响判断：{_quality_impact_text(context['loss'])}",
-                f"处理建议：{_quality_action_text()}",
+                f"处理建议：{_quality_action_text(context)}",
             ])
         lines.extend([f"采样方式：{context['sampling']}", f"Alarm ID：{alarm_id}"])
         if event_type == "auto_resolved":
@@ -913,20 +1047,24 @@ def _build_notification_content(
         lines.append(f"故障标题：【{fault_title}】")
     lines.append(f"交换机：{device.name}")
     lines.append(f"管理地址：{device.ip_address}")
-    if target_line and not is_operation:
+    is_circuit_utilization = rule.metric_type in {"internet_circuit_utilization", "private_line_circuit_utilization"}
+    if is_circuit_utilization and not is_operation:
+        lines.extend(_circuit_utilization_content_lines(alert))
+    elif target_line and not is_operation:
         lines.append(target_line)
     if is_operation:
         lines.append(f"变更内容：{_clean_operation_detail(alert)}")
-    numeric_detail = _build_numeric_detail_row(alert)
+    numeric_detail = None if is_circuit_utilization else _build_numeric_detail_row(alert)
     if numeric_detail:
         lines.append(f"{numeric_detail['label']}：{numeric_detail['value']}")
-    for metadata in _alert_message_metadata(alert):
-        lines.append(f"{metadata['label']}：{metadata['value']}")
+    if not is_circuit_utilization:
+        for metadata in _alert_message_metadata(alert):
+            lines.append(f"{metadata['label']}：{metadata['value']}")
     if rule.metric_type in {"interface_oper_status", "interface_admin_up_oper_down"}:
         occurrence_label = "过去1小时down次数"
     elif rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
         occurrence_label = "过去1小时不可达次数"
-    elif rule.metric_type in CIRCUIT_METRIC_TYPES:
+    elif rule.metric_type in {"internet_circuit_traffic_floor", "private_line_circuit_traffic_floor"}:
         occurrence_label = "过去1小时掉底次数"
     else:
         occurrence_label = "过去1小时触发次数"
@@ -972,8 +1110,9 @@ def _build_notification_card_data(
         severity = _normalize_severity_label(rule.severity)
         context = _quality_probe_context(db, alert)
         is_recovery = event_type == "auto_resolved"
+        line_label = context.get("line_label") or "公网链路"
         rows = [
-            {"label": "告警事件", "value": "公网链路质量恢复" if is_recovery else "公网链路质量下降"},
+            {"label": "告警事件", "value": f"{line_label}质量恢复" if is_recovery else f"{line_label}质量下降"},
             {"label": "探测名称", "value": context["name"]},
             {"label": "目标地址", "value": context["address"]},
             {"label": "所属机房", "value": context["datacenter"]},
@@ -993,7 +1132,7 @@ def _build_notification_card_data(
                 {"label": "连续异常周期", "value": f"{context['consecutive']} / {context['required_count']}"},
                 {"label": "本轮探测", "value": context["probe_result"]},
                 {"label": "影响判断", "value": _quality_impact_text(context["loss"])},
-                {"label": "处理建议", "value": _quality_action_text()},
+                {"label": "处理建议", "value": _quality_action_text(context)},
             ])
         rows.extend([
             {"label": "采样方式", "value": context["sampling"]},
@@ -1012,7 +1151,7 @@ def _build_notification_card_data(
             ])
         return {
             "severity": severity,
-            "title": _build_notification_title(rule, event_type, actor),
+            "title": _build_notification_title(rule, event_type, actor, alert),
             "headline": severity,
             "summary": f"quality_packet_loss / {alert.alert_target_name or '-'}",
             "subtitle": _format_local_time(alert.resolved_at if event_type == "auto_resolved" else alert.started_at),
@@ -1035,7 +1174,7 @@ def _build_notification_card_data(
         occurrence_label = "过去1小时down次数"
     elif rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
         occurrence_label = "过去1小时不可达次数"
-    elif rule.metric_type in CIRCUIT_METRIC_TYPES:
+    elif rule.metric_type in {"internet_circuit_traffic_floor", "private_line_circuit_traffic_floor"}:
         occurrence_label = "过去1小时掉底次数"
     else:
         occurrence_label = "过去1小时触发次数"
@@ -1045,17 +1184,21 @@ def _build_notification_card_data(
         {"label": "交换机", "value": device.name},
         {"label": "管理地址", "value": device.ip_address},
     ]
+    is_circuit_utilization = rule.metric_type in {"internet_circuit_utilization", "private_line_circuit_utilization"}
     if is_operation:
         rows.append({"label": "变更内容", "value": _clean_operation_detail(alert)})
+    elif is_circuit_utilization:
+        rows.extend(_circuit_utilization_card_rows(alert))
     elif alert.alert_target_name:
         target_label = "变更内容" if is_operation else ("接口" if rule.metric_type in INTERFACE_METRIC_TYPES else "对象")
         if rule.metric_type in CIRCUIT_METRIC_TYPES:
             target_label = "线路接口"
         rows.append({"label": target_label, "value": alert.alert_target_name})
-    numeric_detail = _build_numeric_detail_row(alert)
+    numeric_detail = None if is_circuit_utilization else _build_numeric_detail_row(alert)
     if numeric_detail:
         rows.append(numeric_detail)
-    rows.extend(_alert_message_metadata(alert))
+    if not is_circuit_utilization:
+        rows.extend(_alert_message_metadata(alert))
     if not is_operation:
         rows.append({"label": occurrence_label, "value": f"{occurrence_count}次"})
     rows.append({"label": "Alarm ID", "value": alarm_id})
@@ -1085,7 +1228,7 @@ def _build_notification_card_data(
 
     return {
         "severity": severity,
-        "title": _build_notification_title(rule, event_type, actor),
+        "title": _build_notification_title(rule, event_type, actor, alert),
         "headline": severity,
         "summary": f"{rule.metric_type} / {device.ip_address}",
         "subtitle": started_at_text if event_type != "ignored" else _format_local_time(datetime.now(timezone.utc)),
@@ -1391,11 +1534,31 @@ def _duration_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
 
 
 def _requires_recovery_confirmation(rule: AlertRule) -> bool:
+    extra_config = rule.extra_config or {}
+    if extra_config.get("recovery_required_samples") is not None or extra_config.get("recovery_requires_zero_delta"):
+        return True
     return (
         rule.metric_type == "interface_admin_up_oper_down"
         or rule.metric_type in PROTOCOL_METRIC_TYPES
         or rule.metric_type in CIRCUIT_METRIC_TYPES
     )
+
+
+def _target_sample_marker(target: Dict[str, Any], now: Optional[float] = None) -> str:
+    """Return a stable marker for one collector sample.
+
+    Some targets, especially Asteros exporter-derived counter deltas, do not
+    carry an upstream sample timestamp.  Alert tasks may evaluate more often
+    than the exporter scrape cache refreshes, so use a wall-clock bucket aligned
+    to the exporter cache TTL as a fallback.  This lets recovery rules count
+    distinct zero-delta cycles without counting the same cached sample twice.
+    """
+    sample_time = str(target.get("sample_time") or "")
+    if sample_time:
+        return sample_time
+    now_value = time.time() if now is None else now
+    bucket_seconds = max(int(EXPORTER_SCRAPE_CACHE_TTL_SECONDS or 60), 1)
+    return f"wall:{int(now_value // bucket_seconds)}"
 
 
 def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any], value: float) -> bool:
@@ -1404,32 +1567,48 @@ def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
     if not _requires_recovery_confirmation(rule):
         return True
 
+    extra_config = rule.extra_config or {}
+    if extra_config.get("recovery_requires_zero_delta"):
+        try:
+            if float(value) != 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+
     duration_seconds = max(int(rule.duration or 0), 0)
     if rule.metric_type == "interface_admin_up_oper_down":
         # 接口 AdminUp/物理Down 依赖高频接口采集。根因修复后如果再额外等待 60s，
         # 实际恢复会变成“采集轮次 + 60s”，现场观感通常超过 1 分钟。
         confirm_seconds = max(15, min(duration_seconds, 30) if duration_seconds else 15)
+    elif extra_config.get("recovery_required_samples") is not None:
+        confirm_seconds = 0
     else:
         confirm_seconds = max(60, duration_seconds)
+    required_samples = max(int(extra_config.get("recovery_required_samples") or 1), 1)
     now = time.time()
     key = _pending_recovery_key(rule, device, target)
     pending_raw = redis_client.get(key)
     first_seen = now
-    sample_time = str(target.get("sample_time") or "")
-    first_sample_time = sample_time
-    latest_sample_time = sample_time
+    sample_marker = _target_sample_marker(target, now)
+    first_sample_time = sample_marker
+    latest_sample_time = sample_marker
+    sample_count = 1
     if pending_raw:
         try:
             pending_payload = json.loads(pending_raw)
             first_seen = float(pending_payload.get("first_seen") or now)
-            first_sample_time = str(pending_payload.get("first_sample_time") or sample_time)
-            latest_sample_time = str(pending_payload.get("latest_sample_time") or first_sample_time or sample_time)
+            stored_first_sample_time = str(pending_payload.get("first_sample_time") or "")
+            stored_latest_sample_time = str(pending_payload.get("latest_sample_time") or "")
+            first_sample_time = stored_first_sample_time or sample_marker
+            latest_sample_time = stored_latest_sample_time or stored_first_sample_time
+            sample_count = max(int(pending_payload.get("sample_count") or 1), 1)
         except (TypeError, ValueError, json.JSONDecodeError):
             first_seen = now
-            first_sample_time = sample_time
-            latest_sample_time = sample_time
-        if sample_time and sample_time != latest_sample_time:
-            latest_sample_time = sample_time
+            first_sample_time = sample_marker
+            latest_sample_time = sample_marker
+            sample_count = 1
+        if not latest_sample_time:
+            latest_sample_time = sample_marker
             redis_client.set(
                 key,
                 json.dumps(
@@ -1442,6 +1621,28 @@ def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
                         "target_key": target.get("target_key"),
                         "target_name": target.get("target_name"),
                         "value": value,
+                        "sample_count": sample_count,
+                    },
+                    ensure_ascii=False,
+                ),
+                ex=max(confirm_seconds * 3, confirm_seconds + 60, PENDING_ALERT_TTL_SECONDS),
+            )
+        elif sample_marker and sample_marker != latest_sample_time:
+            latest_sample_time = sample_marker
+            sample_count += 1
+            redis_client.set(
+                key,
+                json.dumps(
+                    {
+                        "first_seen": first_seen,
+                        "first_sample_time": first_sample_time,
+                        "latest_sample_time": latest_sample_time,
+                        "rule_id": rule.id,
+                        "device_id": device.id,
+                        "target_key": target.get("target_key"),
+                        "target_name": target.get("target_name"),
+                        "value": value,
+                        "sample_count": sample_count,
                     },
                     ensure_ascii=False,
                 ),
@@ -1460,6 +1661,7 @@ def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
                     "target_key": target.get("target_key"),
                     "target_name": target.get("target_name"),
                     "value": value,
+                    "sample_count": sample_count,
                 },
                 ensure_ascii=False,
             ),
@@ -1472,9 +1674,12 @@ def _recovery_confirmed(rule: AlertRule, device: Device, target: Dict[str, Any],
             target=target.get("target_name"),
             confirm_seconds=confirm_seconds,
             value=value,
+            required_samples=required_samples,
         )
 
-    if sample_time and first_sample_time == latest_sample_time:
+    if sample_marker and first_sample_time == latest_sample_time:
+        return False
+    if sample_count < required_samples:
         return False
     return (now - first_seen) >= confirm_seconds
 
@@ -1811,6 +2016,116 @@ def check_optical_alerts():
     )
 
 
+def _default_rule_notification_channels(db: Session) -> List[Dict[str, Any]]:
+    """Reuse an existing global robot channel for generated rules when available."""
+    rules = (
+        db.query(AlertRule)
+        .filter(AlertRule.enabled == 1)
+        .order_by(AlertRule.id.asc())
+        .limit(100)
+        .all()
+    )
+    for rule in rules:
+        channels = getattr(rule, "notification_channels", None)
+        if isinstance(channels, list) and channels:
+            return list(channels)
+    return []
+
+
+def _upsert_circuit_utilization_rule(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    rule = db.query(AlertRule).filter(AlertRule.name == payload["name"]).first()
+    created = False
+    if not rule:
+        rule = AlertRule(
+            name=payload["name"],
+            metric_type=payload["metric_type"],
+            condition=payload["condition"],
+            threshold=payload["threshold"],
+        )
+        db.add(rule)
+        created = True
+    rule.description = payload["description"]
+    rule.rule_type = payload["rule_type"]
+    rule.metric_type = payload["metric_type"]
+    rule.condition = payload["condition"]
+    rule.threshold = payload["threshold"]
+    rule.duration = payload["duration"]
+    rule.severity = payload["severity"]
+    rule.suppress_duration = payload["suppress_duration"]
+    rule.enabled = payload["enabled"]
+    rule.device_ids = payload["device_ids"]
+    rule.extra_config = payload["extra_config"]
+    if created or not rule.notification_channels:
+        rule.notification_channels = payload["notification_channels"]
+    return {"name": payload["name"], "created": created}
+
+
+@shared_task(name="app.tasks.alert_tasks.ensure_circuit_utilization_alert_rules")
+def ensure_circuit_utilization_alert_rules() -> Dict[str, Any]:
+    """Ensure public/private circuit utilization rules exist.
+
+    Values are calculated as max(in_bps, out_bps) / circuit.bandwidth_mbps.
+    P2 covers 50%~90%; P1 covers >=90%, so the 50% rule will not duplicate the
+    90% alarm for the same circuit endpoint.
+    """
+    db = SessionLocal()
+    try:
+        notification_channels = _default_rule_notification_channels(db)
+        common_extra = {
+            "applicable_vendors": ["H3C", "Ruijie", "Asteros", "Hillstone"],
+            "time_range": "-5m",
+            "max_sample_age_seconds": CIRCUIT_MAX_SAMPLE_AGE_SECONDS,
+            "required_samples": 2,
+            "recovery_required_samples": 2,
+            "generated_by": "ensure_circuit_utilization_alert_rules_v1",
+            "unit": "%",
+        }
+        definitions = [
+            ("公网", "internet_circuit_utilization"),
+            ("专线", "private_line_circuit_utilization"),
+        ]
+        results = []
+        for label, metric_type in definitions:
+            results.append(_upsert_circuit_utilization_rule(db, {
+                "name": f"【{label}】线路使用率超过 50%-P2",
+                "description": f"{label}线路绑定端口入/出向最大流量达到录入带宽50%但未到90%",
+                "rule_type": "threshold",
+                "metric_type": metric_type,
+                "condition": ">=",
+                "threshold": 50.0,
+                "duration": 0,
+                "severity": "P2",
+                "suppress_duration": 900,
+                "enabled": 1,
+                "device_ids": [],
+                "extra_config": {**common_extra, "max_threshold": 90.0},
+                "notification_channels": notification_channels,
+            }))
+            results.append(_upsert_circuit_utilization_rule(db, {
+                "name": f"【{label}】线路使用率超过 90%-P1",
+                "description": f"{label}线路绑定端口入/出向最大流量达到录入带宽90%",
+                "rule_type": "threshold",
+                "metric_type": metric_type,
+                "condition": ">=",
+                "threshold": 90.0,
+                "duration": 0,
+                "severity": "P1",
+                "suppress_duration": 900,
+                "enabled": 1,
+                "device_ids": [],
+                "extra_config": common_extra,
+                "notification_channels": notification_channels,
+            }))
+        db.commit()
+        return {"rules": results, "notification_channels": len(notification_channels)}
+    except Exception as exc:
+        db.rollback()
+        logger.error("确保线路使用率告警规则失败", error=str(exc))
+        return {"error": str(exc)}
+    finally:
+        db.close()
+
+
 @shared_task
 def check_alerts():
     """
@@ -2095,6 +2410,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
 
             effective_threshold = _effective_rule_threshold(rule, target)
             should_alert = _evaluate_rule_condition(rule, float(value), target)
+            alert_event_time = _target_sample_time_or_now(target)
 
             target_alert_key = str(target.get("target_key") or "")
             existing = active_alerts_by_target.get(target_alert_key)
@@ -2132,7 +2448,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                             status="ignored",
                             ignored_by="alert_silence",
                             ignored_at=_utc_now(),
-                            started_at=_utc_now(),
+                            started_at=alert_event_time,
                         )
                         db.add(alert)
                         db.commit()
@@ -2163,7 +2479,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                     was_snoozed_expired = existing.status == "snoozed"
                     if was_ignored or was_snoozed_expired:
                         existing.status = "firing"
-                        existing.started_at = _utc_now()
+                        existing.started_at = alert_event_time
                         existing.ignored_by = None
                         existing.ignored_at = None
                         existing.resolved_by = None
@@ -2205,7 +2521,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                         alert_target_key=target.get("target_key"),
                         alert_target_name=target.get("target_name"),
                         status="firing",
-                        started_at=_utc_now()
+                        started_at=alert_event_time
                     )
                     db.add(alert)
                     db.commit()
@@ -2582,6 +2898,44 @@ def _matches_text_filter(value: Optional[str], exact: Optional[str], pattern: Op
     if excludes and re.search(excludes, text):
         return False
     return True
+
+
+def _interface_oper_is_up_from_influx(device_id: int, interface_index: Any, interface_name: Any, time_range: str = "-10m") -> bool:
+    """Return whether the latest cached interface state is oper up.
+
+    CRC/FCS alarms should only fire on active links.  Some vendors keep error
+    counters on unplugged or disabled ports; checking oper_status prevents those
+    stale counters from becoming noisy alerts.
+    """
+    tag_filters: Dict[str, str] = {}
+    if interface_index is not None:
+        tag_filters["interface_index"] = str(interface_index)
+    elif interface_name:
+        tag_filters["interface_name"] = str(interface_name)
+    else:
+        return False
+    try:
+        flux = _build_influx_last_value_query(
+            measurement="interface_monitoring",
+            device_id=device_id,
+            field="oper_status",
+            start=time_range,
+            tag_filters=tag_filters,
+        )
+        result = influx_client.query(flux)
+        if not result:
+            return False
+        value = result[0].get("value")
+        return float(value) >= 1.0
+    except Exception as exc:
+        logger.warning(
+            "接口CRC告警读取运行状态失败",
+            device_id=device_id,
+            interface_index=interface_index,
+            interface_name=interface_name,
+            error=str(exc),
+        )
+        return False
 
 
 def _get_interface_last_fields(
@@ -3012,7 +3366,9 @@ def _get_circuit_targets(
     metric_type: str,
     extra_config: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    line_type = "internet" if metric_type == "internet_circuit_traffic_floor" else "private_line"
+    is_internet_metric = metric_type in {"internet_circuit_traffic_floor", "internet_circuit_utilization"}
+    is_utilization_metric = metric_type in {"internet_circuit_utilization", "private_line_circuit_utilization"}
+    line_type = "internet" if is_internet_metric else "private_line"
     time_range = str(extra_config.get("time_range") or "-10m")
     query = db.query(Circuit).filter(
         Circuit.line_type == line_type,
@@ -3063,15 +3419,61 @@ def _get_circuit_targets(
                 sample_age_seconds = fields.get("_sample_age_seconds")
             if in_bps is None and out_bps is None:
                 continue
-            traffic_floor_value = round(max(in_bps or 0.0, out_bps or 0.0) / 1_000_000, 2)
+            in_mbps = round((in_bps or 0.0) / 1_000_000, 2)
+            out_mbps = round((out_bps or 0.0) / 1_000_000, 2)
+            max_bps = max(in_bps or 0.0, out_bps or 0.0)
+            max_mbps = round(max_bps / 1_000_000, 2)
+            bandwidth_mbps = float(circuit.bandwidth_mbps or 0)
+            if is_utilization_metric:
+                if bandwidth_mbps <= 0:
+                    continue
+                value = round((max_mbps / bandwidth_mbps) * 100.0, 2)
+            else:
+                value = max_mbps
+            direction = "入向" if (in_bps or 0.0) >= (out_bps or 0.0) else "出向"
+            direction_value_mbps = in_mbps if direction == "入向" else out_mbps
+            datacenter = getattr(circuit, "datacenter_ref", None)
+            datacenter_text = "-"
+            if datacenter:
+                datacenter_text = f"{datacenter.name}（{datacenter.code}）" if datacenter.code else (datacenter.name or "-")
+            local_interconnect_ip = (
+                circuit.primary_local_interconnect_ip if role == "primary" else circuit.secondary_local_interconnect_ip
+            ) or circuit.local_interconnect_address or circuit.interconnect_address or "-"
+            remote_interconnect_ip = (
+                circuit.primary_remote_interconnect_ip if role == "primary" else circuit.secondary_remote_interconnect_ip
+            ) or circuit.remote_interconnect_address or circuit.ip_address or "-"
+            line_label = _line_type_label(line_type)
             targets.append(
                 {
                     "target_type": "circuit_port",
                     "target_key": f"circuit:{circuit.id}:{role}",
                     "target_name": f"{circuit.name} / {endpoint_port_name}",
-                    "value": float(traffic_floor_value),
+                    "value": float(value),
                     "sample_time": sample_time,
                     "sample_age_seconds": sample_age_seconds,
+                    "circuit_name": circuit.name,
+                    "line_type": line_type,
+                    "line_label": line_label,
+                    "operator_name": circuit.operator_name or "-",
+                    "datacenter_text": datacenter_text,
+                    "endpoint_role": "主接口" if role == "primary" else "备接口",
+                    "endpoint_interface": endpoint_port_name,
+                    "local_interconnect_ip": local_interconnect_ip,
+                    "remote_interconnect_ip": remote_interconnect_ip,
+                    "bandwidth_mbps": bandwidth_mbps,
+                    "in_mbps": in_mbps,
+                    "out_mbps": out_mbps,
+                    "utilization_direction": direction,
+                    "direction_value_mbps": direction_value_mbps,
+                    "diagnostic_text": (
+                        f"{line_label}：{circuit.name}；"
+                        f"所属机房：{datacenter_text}；"
+                        f"运营商：{circuit.operator_name or '-'}；"
+                        f"本端/对端互联IP：{local_interconnect_ip}/{remote_interconnect_ip}；"
+                        f"线路带宽：{bandwidth_mbps:g}Mbps；"
+                        f"当前入/出向：{in_mbps:g}/{out_mbps:g}Mbps；"
+                        f"按{direction}峰值计算使用率"
+                    ) if is_utilization_metric else None,
                 }
             )
     return targets
@@ -3370,13 +3772,22 @@ def _get_exporter_interface_stats_cached(device: Device, interface_name: str) ->
         "out_bps": "interface_transmit_rate_bps",
         "in_errors": "interface_receive_errs_total",
         "out_errors": "interface_transmit_errs_total",
-        "in_discards": "interface_receive_drops_total",
-        "out_discards": "interface_transmit_drops_total",
+        "in_discards": "interface_receive_drop_pkts_total",
+        "out_discards": "interface_transmit_drop_pkts_total",
         "in_utilization_percent": "interface_receive_util",
         "out_utilization_percent": "interface_transmit_util",
     }
     for field, base_name in metric_map.items():
-        row = asternos_exporter_client._by_base_metric_label(metrics, base_name, "device", interface_name)
+        if base_name in {"interface_receive_errs_total", "interface_transmit_errs_total"}:
+            metric_name = asternos_exporter_client._metric_name(metrics, base_name)
+            row = None
+            for candidate in metrics.get(metric_name, []):
+                labels = candidate.get("metric") or {}
+                if labels.get("device") == interface_name and labels.get("type") == "error":
+                    row = candidate
+                    break
+        else:
+            row = asternos_exporter_client._by_base_metric_label(metrics, base_name, "device", interface_name)
         if row:
             result[field] = row.get("value")
 
@@ -3679,6 +4090,7 @@ def _get_metric_targets(
     measurement_map = {
         "interface_oper_status": ("interface_monitoring", "oper_status"),
         "interface_admin_up_oper_down": ("interface_monitoring", "admin_up_oper_down"),
+        "interface_crc_errors_delta": ("interface_monitoring", "crc_errors_delta"),
         "interface_in_errors_delta": ("interface_monitoring", "in_errors_delta"),
         "interface_out_errors_delta": ("interface_monitoring", "out_errors_delta"),
         "interface_in_discards_delta": ("interface_monitoring", "in_discards_delta"),
@@ -3728,6 +4140,7 @@ def _get_metric_targets(
             metric_field_map = {
                 "interface_oper_status": "oper_status",
                 "interface_admin_up_oper_down": "admin_up_oper_down",
+                "interface_crc_errors_delta": "crc_errors",
                 "interface_in_errors_delta": "in_errors",
                 "interface_out_errors_delta": "out_errors",
                 "interface_in_discards_delta": "in_discards",
@@ -3770,6 +4183,8 @@ def _get_metric_targets(
                 elif metric_type == "interface_oper_status":
                     value = 1.0 if stats.get("oper_status") == "up" else 0.0
                 else:
+                    if extra_config.get("require_oper_up") and stats.get("oper_status") != "up":
+                        continue
                     metric_field = metric_field_map.get(metric_type)
                     raw_value = stats.get(metric_field) if metric_field else None
                     if raw_value is None:
@@ -3778,6 +4193,7 @@ def _get_metric_targets(
                     if metric_type in {
                         "interface_in_errors_delta",
                         "interface_out_errors_delta",
+                        "interface_crc_errors_delta",
                         "interface_in_discards_delta",
                         "interface_out_discards_delta",
                     }:
@@ -3824,6 +4240,13 @@ def _get_metric_targets(
                 continue
             value = item.get("value")
             if value is None:
+                continue
+            if extra_config.get("require_oper_up") and not _interface_oper_is_up_from_influx(
+                device.id,
+                interface_index,
+                interface_name,
+                time_range,
+            ):
                 continue
             if (
                 metric_type == "interface_admin_up_oper_down"
@@ -3930,6 +4353,7 @@ def _get_metric_value(db: Session, device_id: int, metric_type: str, extra_confi
                         metric_value_map = {
                             "interface_oper_status": 1.0 if stats.get("oper_status") == "up" else 0.0,
                             "interface_admin_up_oper_down": 1.0 if stats.get("admin_status") == "up" and stats.get("oper_status") == "down" else 0.0,
+                            "interface_crc_errors_delta": float(stats.get("crc_errors") or 0.0),
                             "interface_in_errors_delta": float(stats.get("in_errors") or 0.0),
                             "interface_out_errors_delta": float(stats.get("out_errors") or 0.0),
                             "interface_in_discards_delta": float(stats.get("in_discards") or 0.0),
@@ -3959,6 +4383,7 @@ def _get_metric_value(db: Session, device_id: int, metric_type: str, extra_confi
             "telemetry_reachability": ("telemetry_reachability", None, "reachable"),
             "interface_oper_status": ("interface_monitoring", None, "oper_status"),
             "interface_admin_up_oper_down": ("interface_monitoring", None, "admin_up_oper_down"),
+            "interface_crc_errors_delta": ("interface_monitoring", None, "crc_errors_delta"),
             "interface_in_errors_delta": ("interface_monitoring", None, "in_errors_delta"),
             "interface_out_errors_delta": ("interface_monitoring", None, "out_errors_delta"),
             "interface_in_discards_delta": ("interface_monitoring", None, "in_discards_delta"),
@@ -4099,7 +4524,22 @@ def _evaluate_rule_condition(rule: AlertRule, value: float, target: Optional[Dic
         # 只有历史规则阈值允许使用 0.7 表示 70%。
         compare_threshold = _normalize_percent_threshold(compare_threshold)
 
-    return _evaluate_condition(compare_value, rule.condition, compare_threshold)
+    if not _evaluate_condition(compare_value, rule.condition, compare_threshold):
+        return False
+
+    extra_config = rule.extra_config or {}
+    max_threshold = extra_config.get("max_threshold")
+    if max_threshold is not None:
+        try:
+            compare_max_threshold = float(max_threshold)
+            if rule.metric_type in PERCENT_METRIC_TYPES:
+                compare_max_threshold = _normalize_percent_threshold(compare_max_threshold)
+            if compare_value >= compare_max_threshold:
+                return False
+        except (TypeError, ValueError):
+            pass
+
+    return True
 
 
 def _exporter_metric_base(rule: AlertRule) -> str:
@@ -4252,11 +4692,37 @@ def _format_alert_threshold(rule: AlertRule, target: Optional[Dict[str, Any]] = 
     threshold = _effective_rule_threshold(rule, target)
     if threshold is None:
         return "-"
+    extra_config = rule.extra_config or {}
+    max_threshold = extra_config.get("max_threshold")
     if _numeric_detail_label(rule):
-        return _format_numeric_detail_threshold(rule, threshold)
+        lower_text = _format_numeric_detail_threshold(rule, threshold)
+        if max_threshold is None:
+            return lower_text
+        try:
+            max_value = float(max_threshold)
+            unit = _numeric_detail_unit(rule)
+            if unit:
+                max_text = f"{int(max_value)}{unit}" if max_value.is_integer() else f"{max_value:.2f}{unit}"
+            else:
+                max_text = f"{max_value:g}"
+            return f"{lower_text} 且 < {max_text}"
+        except (TypeError, ValueError):
+            return lower_text
     if rule.metric_type in PERCENT_METRIC_TYPES:
-        return f"{rule.condition} {_normalize_percent_threshold(float(threshold)):.1f}%"
-    return f"{rule.condition} {threshold}"
+        lower_text = f"{rule.condition} {_normalize_percent_threshold(float(threshold)):.1f}%"
+        if max_threshold is None:
+            return lower_text
+        try:
+            return f"{lower_text} 且 < {_normalize_percent_threshold(float(max_threshold)):.1f}%"
+        except (TypeError, ValueError):
+            return lower_text
+    lower_text = f"{rule.condition} {threshold:g}"
+    if max_threshold is None:
+        return lower_text
+    try:
+        return f"{lower_text} 且 < {float(max_threshold):g}"
+    except (TypeError, ValueError):
+        return lower_text
 
 
 def _build_alert_message(rule: AlertRule, device: Device, value: float, target: Optional[Dict[str, Any]] = None) -> str:
@@ -4292,6 +4758,8 @@ def _build_alert_message(rule: AlertRule, device: Device, value: float, target: 
         "snmp_slb_virtual_server_status": "SLB虚拟服务状态",
         "internet_circuit_traffic_floor": "公网线路流量掉底",
         "private_line_circuit_traffic_floor": "专线流量掉底",
+        "internet_circuit_utilization": "公网线路使用率",
+        "private_line_circuit_utilization": "专线使用率",
         "optical_rx_power": "模块收光功率",
         "optical_tx_power": "模块发光功率",
         "optical_lane_power_delta": "Lane收光功率差",
@@ -4310,12 +4778,32 @@ def _build_alert_message(rule: AlertRule, device: Device, value: float, target: 
     diagnostic_line = ""
     if target and target.get("diagnostic_text"):
         diagnostic_line = f"\n关联判断: {target['diagnostic_text']}"
+    circuit_line = ""
+    if target and rule.metric_type in {"internet_circuit_utilization", "private_line_circuit_utilization"}:
+        line_label = target.get("line_label") or "专线"
+        sample_time_text = _format_target_sample_time(target)
+        circuit_line = "".join([
+            f"\n探测名称: {target.get('circuit_name') or target.get('target_name') or '-'}",
+            f"\n线路类型: {line_label}",
+            f"\n所属机房: {target.get('datacenter_text') or '-'}",
+            f"\n运营商: {target.get('operator_name') or '-'}",
+            f"\n目标地址: {target.get('remote_interconnect_ip') or '-'}",
+            f"\n对端互联IP: {target.get('remote_interconnect_ip') or '-'}",
+            f"\n本端互联IP: {target.get('local_interconnect_ip') or '-'}",
+            f"\n线路接口: {target.get('endpoint_interface') or target.get('target_name') or '-'}",
+            f"\n计算方向: {target.get('utilization_direction') or '-'}",
+            f"\n入方向流量: {_compact_mbps(target.get('in_mbps'))}",
+            f"\n出方向流量: {_compact_mbps(target.get('out_mbps'))}",
+            f"\n线路带宽: {_compact_mbps(target.get('bandwidth_mbps'))}",
+            f"\n采样时间: {sample_time_text}",
+        ])
     return (
         f"设备 {device.name} ({device.ip_address}){target_text} 触发告警\n"
         f"规则: {rule.name}\n"
         f"指标: {metric_label}\n"
         f"当前值: {_format_alert_value(rule, value)}\n"
         f"阈值: {_format_alert_threshold(rule, target)}"
+        f"{circuit_line}"
         f"{threshold_source_line}"
         f"{diagnostic_line}"
         f"{state_line}"
@@ -4393,7 +4881,7 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
                 target=alert.alert_target_name,
             )
             return
-        title = _build_notification_title(rule, event_type, actor)
+        title = _build_notification_title(rule, event_type, actor, alert)
         datacenter_text = _device_datacenter_text(alert.device) if alert.device else "-"
         if datacenter_text and datacenter_text != "-":
             title = f"{title}【{datacenter_text}】"

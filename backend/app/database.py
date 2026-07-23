@@ -273,6 +273,8 @@ def ensure_compatible_schema() -> None:
                 connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN nqa_admin_name VARCHAR(32)"))
             if "nqa_operation_tag" not in quality_probe_columns:
                 connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN nqa_operation_tag VARCHAR(32)"))
+            if "probe_interface_name" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN probe_interface_name VARCHAR(128)"))
             connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_active "
                 "ON quality_probe_targets (is_active, id)"
@@ -320,4 +322,29 @@ def ensure_compatible_schema() -> None:
             connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_alert_silences_created_at "
                 "ON alert_silences (created_at DESC)"
+            ))
+
+        refreshed_table_names = set(inspect(connection).get_table_names())
+        if "bmp_sessions" in refreshed_table_names:
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_bmp_sessions_source_status "
+                "ON bmp_sessions (source_ip, status)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_bmp_sessions_device_last_seen "
+                "ON bmp_sessions (device_id, last_seen_at DESC)"
+            ))
+
+        if "bmp_messages" in refreshed_table_names:
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_bmp_messages_source_created "
+                "ON bmp_messages (source_ip, created_at DESC)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_bmp_messages_device_created "
+                "ON bmp_messages (device_id, created_at DESC)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_bmp_messages_type_created "
+                "ON bmp_messages (message_type, created_at DESC)"
             ))

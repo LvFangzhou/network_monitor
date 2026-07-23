@@ -495,3 +495,79 @@ export const getDeviceTypes = async (): Promise<string[]> => {
 export const getVendors = async (): Promise<string[]> => {
   return await request.get('/cmdb/vendors') as string[]
 }
+
+export interface BmpSessionRow {
+  id: number
+  device_id?: number | null
+  device_name?: string | null
+  device_ip?: string | null
+  source_ip: string
+  source_port?: number | null
+  collector_ip?: string | null
+  collector_port?: number | null
+  status: string
+  connected_at?: string | null
+  disconnected_at?: string | null
+  last_seen_at?: string | null
+  message_count: number
+  peer_up_count: number
+  peer_down_count: number
+  route_monitoring_count: number
+  statistics_count: number
+  last_message_type?: string | null
+  last_error?: string | null
+}
+
+export interface BmpMessageRow {
+  id: number
+  session_id?: number | null
+  device_id?: number | null
+  device_name?: string | null
+  device_ip?: string | null
+  source_ip: string
+  message_type: string
+  bmp_version?: number | null
+  length?: number | null
+  peer_ip?: string | null
+  peer_asn?: number | null
+  peer_bgp_id?: string | null
+  peer_type?: number | null
+  peer_flags?: number | null
+  timestamp_seconds?: number | null
+  timestamp_microseconds?: number | null
+  extra?: Record<string, any>
+  created_at?: string | null
+}
+
+export interface BmpPeerSummaryRow {
+  peer_ip: string
+  peer_asn?: number | null
+  peer_bgp_id?: string | null
+  last_seen_at?: string | null
+  last_message_type?: string | null
+  message_count: number
+  route_monitoring_count: number
+  peer_up_count: number
+  peer_down_count: number
+  last_action?: string | null
+  last_prefixes?: string[]
+  last_next_hop?: string | null
+  last_error?: string | null
+}
+
+export const getDeviceBmpSessions = async (deviceId: number): Promise<{ items: BmpSessionRow[] }> => {
+  return await request.get('/bmp/sessions', { params: { device_id: deviceId, limit: 20 } }) as { items: BmpSessionRow[] }
+}
+
+export const getDeviceBmpMessages = async (deviceId: number, params?: {
+  message_type?: string
+  hours?: number
+  limit?: number
+  offset?: number
+}): Promise<{ items: BmpMessageRow[]; total?: number; limit?: number; offset?: number }> => {
+  return await request.get('/bmp/messages', { params: { device_id: deviceId, hours: 24, limit: 20, offset: 0, ...(params || {}) } }) as { items: BmpMessageRow[]; total?: number; limit?: number; offset?: number }
+}
+
+export const getDeviceBmpPeers = async (deviceId: number, params?: { hours?: number }): Promise<{ items: BmpPeerSummaryRow[] }> => {
+  return await request.get('/bmp/peers', { params: { device_id: deviceId, hours: 24, ...(params || {}) } }) as { items: BmpPeerSummaryRow[] }
+}
