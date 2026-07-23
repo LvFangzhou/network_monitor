@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     """应用配置类"""
     
     # 应用配置
-    APP_NAME: str = "并行网络运营平台"
+    APP_NAME: str = "网络运营平台"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
     SECRET_KEY: str = "your-secret-key-change-in-production"

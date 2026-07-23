@@ -75,7 +75,7 @@ const Login = () => {
               <SafetyOutlined />
             </div>
             <Title level={3} style={{ margin: 0 }}>
-              并行网络运营平台
+              网络运营平台
             </Title>
             <Text type="secondary">Network operations platform</Text>
           </div>

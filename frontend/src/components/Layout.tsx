@@ -309,7 +309,7 @@ const Layout = () => {
               : 'inset 0 1px 0 rgba(255,255,255,0.28), 0 12px 28px rgba(30, 64, 175, 0.18)',
           }}
         >
-          {collapsed ? '并行' : '并行网络运营平台'}
+          {collapsed ? '网络' : '网络运营平台'}
         </div>
         <Menu
           theme="dark"
@@ -346,7 +346,7 @@ const Layout = () => {
               onClick={() => setCollapsed(!collapsed)}
             />
             <div style={{ lineHeight: 1.2 }}>
-              <div style={{ fontSize: 16, fontWeight: 800, color: colorText }}>并行网络运营平台</div>
+              <div style={{ fontSize: 16, fontWeight: 800, color: colorText }}>网络运营平台</div>
               <div style={{ fontSize: 12, color: colorTextSecondary }}>Network operations platform</div>
             </div>
           </div>

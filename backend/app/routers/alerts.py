@@ -1284,8 +1284,8 @@ async def test_notification(
     success = await notification_manager.send_notification(
         channel_type,
         config,
-        "并行网络运营平台测试消息",
-        "并行网络运营平台测试消息\n这是一条测试告警消息，用于验证机器人 webhook 是否配置正确。",
+        "网络运营平台测试消息",
+        "网络运营平台测试消息\n这是一条测试告警消息，用于验证机器人 webhook 是否配置正确。",
         {
             "severity": "P1",
             "title": "P1-故障通知@测试对象",
