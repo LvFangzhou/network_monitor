@@ -41,17 +41,19 @@ def _matches(value: Any, pattern: Any) -> bool:
     return normalized_value == normalized_pattern or normalized_pattern in normalized_value
 
 
-def _canonical_model(value: Any, vendor: Any = None) -> str:
+def canonical_model_name(value: Any, vendor: Any = None) -> str:
     """去掉型号字段里重复携带的厂商前缀。"""
-    text = _normalize(value)
-    vendor_text = _normalize(vendor)
+    text = str(value or "").strip()
+    vendor_text = str(vendor or "").strip()
     prefixes = [vendor_text] if vendor_text else []
-    prefixes.extend(["h3c", "cisco", "ruijie", "hillstone", "asternos", "asteros", "asterfusion"])
+    prefixes.extend(["H3C", "Cisco", "Ruijie", "Hillstone", "AsterNOS", "Asteros", "Asterfusion"])
     changed = True
     while text and changed:
         changed = False
         for prefix in prefixes:
-            if prefix and (text == prefix or text.startswith(f"{prefix} ")):
+            lowered_text = text.lower()
+            lowered_prefix = prefix.lower()
+            if prefix and (lowered_text == lowered_prefix or lowered_text.startswith(f"{lowered_prefix} ")):
                 text = text[len(prefix):].strip()
                 changed = True
                 break
@@ -59,8 +61,8 @@ def _canonical_model(value: Any, vendor: Any = None) -> str:
 
 
 def _model_matches(value: Any, pattern: Any, vendor: Any = None) -> bool:
-    normalized_value = _canonical_model(value, vendor)
-    normalized_pattern = _canonical_model(pattern, vendor)
+    normalized_value = _normalize(canonical_model_name(value, vendor))
+    normalized_pattern = _normalize(canonical_model_name(pattern, vendor))
     if not normalized_pattern:
         return True
     if "*" in normalized_pattern or "?" in normalized_pattern:
@@ -78,7 +80,7 @@ def match_model_profile(device: Device, profiles: Iterable[DeviceModelProfile]) 
     candidates.sort(key=lambda item: (
         item.priority,
         0 if _normalize(device.model) == _normalize(item.model_pattern) else 1,
-        -len(_canonical_model(item.model_pattern, item.vendor)),
+        -len(canonical_model_name(item.model_pattern, item.vendor)),
         item.id,
     ))
     return candidates[0] if candidates else None

@@ -14,7 +14,9 @@ from app.routers.auth import get_current_active_user
 from app.schemas.compliance import (
     ModelProfilePayload, ModelProfileUpdate, VersionBaselinePayload, VersionBaselineUpdate,
 )
-from app.utils.device_compliance import evaluate_device, load_tacacs_device_ips, persist_snapshot
+from app.utils.device_compliance import (
+    canonical_model_name, evaluate_device, load_tacacs_device_ips, persist_snapshot,
+)
 
 
 router = APIRouter()
@@ -26,8 +28,13 @@ def _require_write(user: User):
 
 
 def _apply_updates(instance, payload):
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    values = payload.model_dump(exclude_unset=True)
+    for key, value in values.items():
         setattr(instance, key, value)
+    if isinstance(instance, DeviceModelProfile) and (
+        "model_pattern" in values or "vendor" in values or "name" in values
+    ):
+        instance.name = canonical_model_name(instance.model_pattern, instance.vendor) or instance.name
 
 
 @router.get("/model-profiles")
@@ -57,7 +64,9 @@ async def create_model_profile(
     ).first()
     if duplicate:
         raise HTTPException(status_code=409, detail="相同厂商、型号匹配和网络类型的模板已存在")
-    item = DeviceModelProfile(**payload.model_dump())
+    values = payload.model_dump()
+    values["name"] = canonical_model_name(values["model_pattern"], values["vendor"]) or values["name"]
+    item = DeviceModelProfile(**values)
     db.add(item)
     db.commit()
     db.refresh(item)
@@ -87,7 +96,7 @@ def _inferred_profile(device: Device):
         "config_backup": not asternos,
     }
     return {
-        "name": f"{vendor} {model}",
+        "name": canonical_model_name(model, vendor) or model,
         "vendor": vendor,
         "model_pattern": model,
         "network_type": "roce" if is_s9867 else ("firewall" if hillstone else "general"),

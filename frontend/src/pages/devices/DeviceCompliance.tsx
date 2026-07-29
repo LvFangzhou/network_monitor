@@ -190,7 +190,7 @@ const DeviceCompliancePage = () => {
 
   const deviceColumns = [
     {
-      title: '设备', key: 'device', width: 280,
+      title: '设备', key: 'device', width: 250,
       render: (_: unknown, record: DeviceCompliance) => (
         <Button type="link" style={{ padding: 0, height: 'auto', textAlign: 'left' }} onClick={() => setSelected(record)}>
           <div><strong>{record.device.name}</strong></div>
@@ -198,28 +198,28 @@ const DeviceCompliancePage = () => {
         </Button>
       ),
     },
-    { title: '机房', key: 'datacenter', width: 160, render: (_: unknown, record: DeviceCompliance) => record.device.datacenter?.name || '-' },
-    { title: '厂商', key: 'vendor', width: 100, render: (_: unknown, record: DeviceCompliance) => record.device.vendor || '-' },
-    { title: '型号', key: 'model', width: 180, render: (_: unknown, record: DeviceCompliance) => record.observed_model || record.device.model || '-' },
-    { title: '软件版本', dataIndex: 'observed_version', key: 'version', width: 190, render: (value: string) => value || <Tag>待采集</Tag> },
+    { title: '机房', key: 'datacenter', width: 145, ellipsis: true, render: (_: unknown, record: DeviceCompliance) => record.device.datacenter?.name || '-' },
+    { title: '厂商', key: 'vendor', width: 85, ellipsis: true, render: (_: unknown, record: DeviceCompliance) => record.device.vendor || '-' },
+    { title: '型号', key: 'model', width: 145, ellipsis: true, render: (_: unknown, record: DeviceCompliance) => record.observed_model || record.device.model || '-' },
+    { title: '软件版本', dataIndex: 'observed_version', key: 'version', width: 205, ellipsis: true, render: (value: string) => value || <Tag>待采集</Tag> },
     {
-      title: '上线状态', dataIndex: 'overall_status', key: 'status', width: 120,
+      title: '上线状态', dataIndex: 'overall_status', key: 'status', width: 105,
       render: (value: ComplianceStatus) => <Tag color={STATUS_META[value]?.color}>{STATUS_META[value]?.label || value}</Tag>,
     },
     {
-      title: '合规度', dataIndex: 'score', key: 'score', width: 150,
+      title: '合规度', dataIndex: 'score', key: 'score', width: 135,
       render: (value: number, record: DeviceCompliance) => (
         <Progress percent={value} size="small" status={record.overall_status === 'non_compliant' ? 'exception' : 'normal'} />
       ),
     },
     {
-      title: '阻断项', key: 'blockers', width: 260,
+      title: '阻断项', key: 'blockers', width: 190,
       render: (_: unknown, record: DeviceCompliance) => record.blockers.length
         ? record.blockers.slice(0, 2).map((item) => <Tag key={item.key} color={item.status === 'failed' ? 'red' : 'orange'}>{item.label}</Tag>)
         : <Tag color="green">无</Tag>,
     },
     {
-      title: '操作', key: 'action', fixed: 'right' as const, width: 130,
+      title: '操作', key: 'action', fixed: 'right' as const, width: 110,
       render: (_: unknown, record: DeviceCompliance) => (
         <Space>
           <Button type="link" onClick={() => setSelected(record)}>清单</Button>
@@ -230,21 +230,21 @@ const DeviceCompliancePage = () => {
   ]
 
   const profileColumns = [
-    { title: '模板名称', dataIndex: 'name', key: 'name', width: 180 },
-    { title: '厂商', dataIndex: 'vendor', key: 'vendor', width: 100 },
-    { title: '型号匹配', dataIndex: 'model_pattern', key: 'model_pattern', width: 180 },
-    { title: '网络类型', dataIndex: 'network_type', key: 'network_type', width: 130 },
+    { title: '模板名称', dataIndex: 'name', key: 'name', width: 145, ellipsis: true },
+    { title: '厂商', dataIndex: 'vendor', key: 'vendor', width: 85, ellipsis: true },
+    { title: '型号匹配', dataIndex: 'model_pattern', key: 'model_pattern', width: 145, ellipsis: true },
+    { title: '网络类型', dataIndex: 'network_type', key: 'network_type', width: 110, ellipsis: true },
     {
-      title: '能力', dataIndex: 'capabilities', key: 'capabilities',
+      title: '能力', dataIndex: 'capabilities', key: 'capabilities', width: 330,
       render: (value: Record<string, boolean>) => CAPABILITIES.filter((item) => value?.[item.value]).map((item) => <Tag key={item.value}>{item.label}</Tag>),
     },
     {
-      title: '必检项', dataIndex: 'required_checks', key: 'required_checks', width: 260,
+      title: '必检项', dataIndex: 'required_checks', key: 'required_checks', width: 275,
       render: (value: string[]) => CHECKS.filter((item) => value?.includes(item.value)).map((item) => <Tag key={item.value} color="blue">{item.label}</Tag>),
     },
-    { title: '状态', dataIndex: 'is_active', key: 'is_active', width: 90, render: (value: boolean) => <Tag color={value ? 'green' : 'default'}>{value ? '启用' : '停用'}</Tag> },
+    { title: '状态', dataIndex: 'is_active', key: 'is_active', width: 75, render: (value: boolean) => <Tag color={value ? 'green' : 'default'}>{value ? '启用' : '停用'}</Tag> },
     {
-      title: '操作', key: 'action', width: 130,
+      title: '操作', key: 'action', width: 105,
       render: (_: unknown, record: DeviceModelProfile) => canModify && (
         <Space>
           <Button type="link" icon={<EditOutlined />} onClick={() => openProfile(record)} />
@@ -257,19 +257,19 @@ const DeviceCompliancePage = () => {
   ]
 
   const baselineColumns = [
-    { title: '基线名称', dataIndex: 'name', key: 'name', width: 180 },
+    { title: '基线名称', dataIndex: 'name', key: 'name', width: 155, ellipsis: true },
     {
-      title: '适用型号模板', dataIndex: 'model_profile_id', key: 'profile', width: 180,
+      title: '适用型号模板', dataIndex: 'model_profile_id', key: 'profile', width: 155, ellipsis: true,
       render: (value: number) => profiles.find((item) => item.id === value)?.name || '按厂商/型号匹配',
     },
-    { title: '厂商', dataIndex: 'vendor', key: 'vendor', width: 100, render: (value: string) => value || '-' },
-    { title: '型号匹配', dataIndex: 'model_pattern', key: 'model', width: 160, render: (value: string) => value || '-' },
-    { title: '允许版本', dataIndex: 'allowed_versions', key: 'allowed', render: (value: string[]) => value?.length ? value.map((item) => <Tag color="green" key={item}>{item}</Tag>) : '不限' },
-    { title: '最低版本', dataIndex: 'minimum_version', key: 'minimum', width: 130, render: (value: string) => value || '-' },
-    { title: '必需补丁', dataIndex: 'required_patches', key: 'patches', render: (value: string[]) => value?.length ? value.map((item) => <Tag color="blue" key={item}>{item}</Tag>) : '无' },
-    { title: '禁用版本', dataIndex: 'forbidden_versions', key: 'forbidden', render: (value: string[]) => value?.length ? value.map((item) => <Tag color="red" key={item}>{item}</Tag>) : '无' },
+    { title: '厂商', dataIndex: 'vendor', key: 'vendor', width: 85, ellipsis: true, render: (value: string) => value || '-' },
+    { title: '型号匹配', dataIndex: 'model_pattern', key: 'model', width: 135, ellipsis: true, render: (value: string) => value || '-' },
+    { title: '允许版本', dataIndex: 'allowed_versions', key: 'allowed', width: 245, render: (value: string[]) => value?.length ? value.map((item) => <Tag color="green" key={item}>{item}</Tag>) : '不限' },
+    { title: '最低版本', dataIndex: 'minimum_version', key: 'minimum', width: 190, ellipsis: true, render: (value: string) => value || '-' },
+    { title: '必需补丁', dataIndex: 'required_patches', key: 'patches', width: 180, render: (value: string[]) => value?.length ? value.map((item) => <Tag color="blue" key={item}>{item}</Tag>) : '无' },
+    { title: '禁用版本', dataIndex: 'forbidden_versions', key: 'forbidden', width: 190, render: (value: string[]) => value?.length ? value.map((item) => <Tag color="red" key={item}>{item}</Tag>) : '无' },
     {
-      title: '操作', key: 'action', width: 130,
+      title: '操作', key: 'action', width: 105,
       render: (_: unknown, record: VersionBaseline) => canModify && (
         <Space>
           <Button type="link" icon={<EditOutlined />} onClick={() => openBaseline(record)} />
@@ -326,7 +326,9 @@ const DeviceCompliancePage = () => {
                 </Space>
                 <Table
                   rowKey="device_id" loading={loading} dataSource={devices} columns={deviceColumns}
-                  scroll={{ x: 1650 }}
+                  size="small"
+                  tableLayout="fixed"
+                  scroll={{ x: 1370 }}
                   pagination={{
                     current: page, pageSize, total, showSizeChanger: true, showTotal: (value) => `共 ${value} 台`,
                     onChange: (nextPage, nextPageSize) => {
@@ -353,7 +355,7 @@ const DeviceCompliancePage = () => {
                     }}>从现有设备生成</Button>
                   </Space>
                 )}
-                <Table rowKey="id" dataSource={profiles} columns={profileColumns} scroll={{ x: 1450 }} pagination={false} />
+                <Table rowKey="id" size="small" tableLayout="fixed" dataSource={profiles} columns={profileColumns} scroll={{ x: 1270 }} pagination={false} />
               </>
             ),
           },
@@ -363,7 +365,7 @@ const DeviceCompliancePage = () => {
             children: (
               <>
                 {canModify && <Button type="primary" icon={<PlusOutlined />} onClick={() => openBaseline()} style={{ marginBottom: 12 }}>新增版本基线</Button>}
-                <Table rowKey="id" dataSource={baselines} columns={baselineColumns} scroll={{ x: 1600 }} pagination={false} />
+                <Table rowKey="id" size="small" tableLayout="fixed" dataSource={baselines} columns={baselineColumns} scroll={{ x: 1445 }} pagination={false} />
               </>
             ),
           },
@@ -406,7 +408,7 @@ const DeviceCompliancePage = () => {
       <Modal title={`${editingProfile ? '编辑' : '新增'}型号能力模板`} width={760} open={profileModal} onCancel={() => setProfileModal(false)} onOk={() => void saveProfile()} destroyOnClose>
         <Form form={profileForm} layout="vertical">
           <Row gutter={12}>
-            <Col span={12}><Form.Item name="name" label="模板名称" rules={[{ required: true }]}><Input placeholder="例如 H3C S9867 RoCE" /></Form.Item></Col>
+            <Col span={12}><Form.Item name="name" label="模板名称（仅型号）" rules={[{ required: true }]}><Input placeholder="例如 S9867-128DH" /></Form.Item></Col>
             <Col span={6}><Form.Item name="vendor" label="厂商" rules={[{ required: true }]}><Input placeholder="H3C" /></Form.Item></Col>
             <Col span={6}><Form.Item name="model_pattern" label="型号匹配" rules={[{ required: true }]}><Input placeholder="S9867*" /></Form.Item></Col>
           </Row>
