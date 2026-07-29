@@ -97,7 +97,7 @@ services:
           cpus: '2'
           memory: 2G
 
-  # InfluxDB 每日备份，避免时序数据目录误删后完全不可恢复
+  # InfluxDB 每日备份，只保留最新一份，避免全量快照持续堆积占满磁盘
   influxdb-backup:
     image: influxdb:2.7
     container_name: nm-influxdb-backup
@@ -106,7 +106,6 @@ services:
       INFLUXDB_URL: http://influxdb:8086
       INFLUXDB_TOKEN: network-monitor-token
       INFLUXDB_ORG: network-monitor
-      INFLUXDB_BACKUP_RETENTION_DAYS: 10
     volumes:
       - ${BACKUP_ROOT:-./data/backups}/influxdb:/backups
     command:
@@ -116,19 +115,23 @@ services:
         set -eu
         mkdir -p /backups
         while true; do
-          recent=$$(find /backups -maxdepth 1 -type d -name 'influxdb-*' -mmin -1200 -print -quit)
+          recent=$$(find /backups -maxdepth 1 -type d -name 'influxdb-latest' -mmin -1200 -print -quit)
           if [ -n "$${recent}" ]; then
             echo "Recent InfluxDB backup exists: $${recent}; checking again in one hour"
             sleep 3600
             continue
           fi
-          ts=$$(date +%Y%m%d%H%M%S)
-          target="/backups/influxdb-$${ts}"
-          echo "Starting InfluxDB backup to $${target}"
-          if influx backup "$${target}" --host "$${INFLUXDB_URL}" --token "$${INFLUXDB_TOKEN}" --org "$${INFLUXDB_ORG}"; then
+          tmp="/backups/influxdb-latest.tmp"
+          target="/backups/influxdb-latest"
+          echo "Starting InfluxDB backup to $${tmp}"
+          rm -rf "$${tmp}"
+          if influx backup "$${tmp}" --host "$${INFLUXDB_URL}" --token "$${INFLUXDB_TOKEN}" --org "$${INFLUXDB_ORG}"; then
+            rm -rf "$${target}"
+            mv "$${tmp}" "$${target}"
+            find /backups -maxdepth 1 -type d -name 'influxdb-*' ! -name 'influxdb-latest' ! -name 'influxdb-latest.tmp' -exec rm -rf {} +
             echo "InfluxDB backup completed: $${target}"
-            find /backups -maxdepth 1 -type d -name 'influxdb-*' -mtime +"$${INFLUXDB_BACKUP_RETENTION_DAYS}" -exec rm -rf {} +
           else
+            rm -rf "$${tmp}"
             echo "InfluxDB backup failed" >&2
           fi
           sleep 86400
@@ -209,7 +212,7 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=365
+      - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -231,6 +234,7 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS=10
       - SNMP_MAX_DEVICES_PER_TICK=160
       - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
@@ -289,7 +293,7 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=365
+      - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -303,6 +307,7 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS=10
       - SNMP_MAX_DEVICES_PER_TICK=160
       - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
@@ -345,7 +350,7 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=365
+      - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -359,6 +364,7 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS=10
       - SNMP_MAX_DEVICES_PER_TICK=160
       - SNMP_INTERFACE_REALTIME_MAX_WORKERS=12
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
@@ -418,7 +424,7 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=365
+      - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -478,13 +484,13 @@ services:
   celery-worker-alerts-fast:
     <<: *celery-worker-base
     container_name: nm-celery-worker-alerts-fast
-    command: celery -A app.tasks worker -l info -Q alerts_fast -n worker-alerts-fast@%h --pool=prefork -c 1 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=40 --max-memory-per-child=700000
+    command: celery -A app.tasks worker -l info -Q alerts_fast -n worker-alerts-fast@%h --pool=prefork -c 4 --prefetch-multiplier=1 -Ofair --max-tasks-per-child=40 --max-memory-per-child=700000
     cpu_shares: 1536
     deploy:
       resources:
         limits:
-          cpus: '2'
-          memory: 2G
+          cpus: '6'
+          memory: 4G
 
   # 告警详情缓存预热独立低优先队列，不再影响实时告警检查
   celery-worker-alerts-prewarm:
@@ -552,7 +558,7 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=365
+      - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -566,6 +572,7 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS=10
       - SNMP_MAX_DEVICES_PER_TICK=40
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
       - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
@@ -614,7 +621,7 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=365
+      - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -628,6 +635,7 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS=10
       - SNMP_MAX_DEVICES_PER_TICK=40
       - ASTERNOS_SCHEDULER_INTERVAL_SECONDS=30
       - ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS=60
@@ -676,7 +684,7 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=365
+      - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -734,7 +742,7 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=365
+      - INFLUXDB_RETENTION_DAYS=30
       - INFLUXDB_DATA_PATH=/host-data/influxdb
       - FRONTEND_PUBLIC_URL=${FRONTEND_PUBLIC_URL:-http://172.18.17.250:8080}
       - TACACS_WEBHOOK_URL=${TACACS_WEBHOOK_URL:-}
@@ -748,6 +756,7 @@ services:
       - SNMP_SCHEDULER_INTERVAL_SECONDS=30
       - SNMP_FULL_COLLECTION_INTERVAL_SECONDS=180
       - SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS=60
+      - CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS=10
       - SNMP_MAX_DEVICES_PER_TICK=160
       - SNMP_INTERFACE_REALTIME_MAX_WORKERS=32
       - LOG_LEVEL=INFO
@@ -796,7 +805,7 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-network-monitor-token}
       - INFLUXDB_ORG=network-monitor
       - INFLUXDB_BUCKET=network_metrics
-      - INFLUXDB_RETENTION_DAYS=365
+      - INFLUXDB_RETENTION_DAYS=30
       - LOG_LEVEL=INFO
       - TELEMETRY_RECEIVER_PORT=50051
       - TELEMETRY_RECEIVER_SPOOL_DIR=/app/data/telemetry

@@ -824,7 +824,7 @@ const Settings = () => {
             label: '控制器集成',
             children: <ControllerIntegrationPanel />,
           },
-        ]}
+        ].filter((item) => item.key !== 'controller')}
         onChange={(key) => {
           if (key === 'audit' && !auditLogs.length) {
             fetchAuditLogs(1, auditPageSize, auditFilters)

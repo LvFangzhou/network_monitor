@@ -262,6 +262,8 @@ class QualityProbeTargetBase(BaseModel):
     latency_threshold_ms: int = Field(default=100, ge=1, le=10000)
     loss_threshold_percent: int = Field(default=1, ge=0, le=100)
     jitter_threshold_ms: int = Field(default=30, ge=0, le=10000)
+    mtr_enabled: bool = False
+    mtr_interval_seconds: int = Field(default=300, ge=60, le=86400)
     description: Optional[str] = None
     is_active: bool = True
 
@@ -287,6 +289,8 @@ class QualityProbeTargetUpdate(BaseModel):
     latency_threshold_ms: Optional[int] = Field(None, ge=1, le=10000)
     loss_threshold_percent: Optional[int] = Field(None, ge=0, le=100)
     jitter_threshold_ms: Optional[int] = Field(None, ge=0, le=10000)
+    mtr_enabled: Optional[bool] = None
+    mtr_interval_seconds: Optional[int] = Field(None, ge=60, le=86400)
     description: Optional[str] = None
     is_active: Optional[bool] = None
 
@@ -308,6 +312,11 @@ class QualityProbeTargetResponse(QualityProbeTargetBase):
     last_packet_loss_percent: Optional[float] = None
     last_availability_percent: Optional[float] = None
     last_jitter_ms: Optional[float] = None
+    mtr_enabled: Optional[bool] = None
+    mtr_interval_seconds: Optional[int] = None
+    last_mtr_at: Optional[datetime] = None
+    last_mtr_path_hash: Optional[str] = None
+    last_mtr_final_latency_ms: Optional[float] = None
     last_error: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

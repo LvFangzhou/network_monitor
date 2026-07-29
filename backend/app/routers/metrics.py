@@ -4,7 +4,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import calendar
 import asyncio
 import builtins
 import io
@@ -14,9 +15,7 @@ import math
 import os
 import platform
 import re
-import shutil
 import socket
-import subprocess
 import time
 
 import psutil
@@ -27,7 +26,20 @@ from app.utils import redis_client
 from app.schemas import MetricQuery, MetricResponse, DashboardStats
 from app.schemas.resource import QualityProbeTargetCreate, QualityProbeTargetUpdate
 from app.database import get_db
-from app.models import Device, AlertHistory, AlertRule, Circuit, Customer, Datacenter, QualityProbeTarget
+from app.models import (
+    Device,
+    AlertHistory,
+    AlertRule,
+    BmpMessage,
+    BmpSession,
+    Circuit,
+    Customer,
+    Datacenter,
+    QualityProbeTarget,
+    QualityMtrSnapshot,
+    QualityMtrEvent,
+    SyslogEvent,
+)
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 from app.core import get_logger
@@ -40,8 +52,12 @@ from app.utils.controller_settings import find_controller_settings
 from app.utils.quality_probe import (
     apply_quality_loss_window,
     discover_quality_nqa_snmp_instances,
+    normalize_server_icmp_probe_config,
+    normalize_quality_ping_result,
+    SERVER_ICMP_MIN_PACKET_COUNT,
     run_quality_nqa_snmp,
     run_quality_ping,
+    run_mtr_or_trace,
     write_quality_probe_result,
 )
 from app.utils.telemetry_lossless import LOSSLESS_SENSOR_PATHS, sensor_cache_suffix
@@ -116,8 +132,188 @@ ASTERNOS_COUNTER_METRICS = [
     },
 ]
 
+
+def _parse_iso_age_seconds(value: Any, now: datetime) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - parsed.astimezone(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
+@router.get("/collection-health")
+async def get_collection_health(db: Session = Depends(get_db)):
+    """Expose actual collection freshness instead of only configured capabilities."""
+    devices = (
+        db.query(Device)
+        .filter(Device.is_monitored.is_(True), Device.status.in_(["active", "online"]))
+        .order_by(Device.name.asc())
+        .all()
+    )
+    device_ids = [int(device.id) for device in devices]
+    syslog_last = dict(
+        db.query(SyslogEvent.device_id, func.max(SyslogEvent.created_at))
+        .filter(SyslogEvent.device_id.in_(device_ids))
+        .group_by(SyslogEvent.device_id)
+        .all()
+    ) if device_ids else {}
+    bmp_last = dict(
+        db.query(BmpMessage.device_id, func.max(BmpMessage.created_at))
+        .filter(BmpMessage.device_id.in_(device_ids))
+        .group_by(BmpMessage.device_id)
+        .all()
+    ) if device_ids else {}
+    bmp_sessions = {
+        int(item.device_id): item
+        for item in db.query(BmpSession)
+        .filter(BmpSession.device_id.in_(device_ids))
+        .order_by(BmpSession.last_seen_at.asc())
+        .all()
+        if item.device_id
+    } if device_ids else {}
+
+    now = datetime.now(timezone.utc)
+    rows: List[Dict[str, Any]] = []
+    summary = {"healthy": 0, "delayed": 0, "stale": 0, "unreachable": 0}
+    for device in devices:
+        source = str(device.monitor_source or "snmp")
+        vendor = str(device.vendor or "").lower()
+        if source == "asternos_exporter" or any(value in vendor for value in ("asternos", "asteros", "asterfusion", "星融元")):
+            source = "asternos_exporter"
+            expected_seconds = int(settings.ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS)
+        else:
+            source = "snmp"
+            expected_seconds = int(settings.SNMP_FULL_COLLECTION_INTERVAL_SECONDS)
+
+        raw = redis_client.get(f"monitor:cache:overview:{device.id}")
+        overview: Dict[str, Any] = {}
+        if raw:
+            try:
+                overview = json.loads(raw)
+            except (TypeError, ValueError):
+                overview = {}
+        connectivity = overview.get("connectivity") if isinstance(overview.get("connectivity"), dict) else {}
+        collected_at = overview.get("collected_at")
+        age_seconds = _parse_iso_age_seconds(collected_at, now)
+        connectivity_type = str(connectivity.get("type") or source)
+        if connectivity_type == "telemetry":
+            expected_seconds = 60
+
+        status_value = str(connectivity.get("status") or "")
+        snmp_status = redis_client.get(f"{SNMP_STATUS_KEY_PREFIX}{device.id}") or "unknown"
+        failures_raw = redis_client.get(f"{SNMP_FAILURE_KEY_PREFIX}{device.id}") or "0"
+        try:
+            snmp_failures = int(failures_raw)
+        except (TypeError, ValueError):
+            snmp_failures = 0
+
+        if status_value == "unreachable" or (source == "snmp" and snmp_status == SNMP_STATUS_UNREACHABLE):
+            health = "unreachable"
+        elif age_seconds is None or age_seconds > max(expected_seconds * 6, 600):
+            health = "stale"
+        elif age_seconds > max(expected_seconds * 2.5, 90):
+            health = "delayed"
+        else:
+            health = "healthy"
+        summary[health] += 1
+
+        syslog_time = syslog_last.get(device.id)
+        bmp_time = bmp_last.get(device.id)
+        bmp_session = bmp_sessions.get(device.id)
+        rows.append({
+            "device_id": device.id,
+            "device_name": device.name,
+            "ip_address": device.ip_address,
+            "vendor": device.vendor,
+            "model": device.model,
+            "datacenter": device.datacenter_ref.name if device.datacenter_ref else None,
+            "source": connectivity_type,
+            "configured_source": source,
+            "health": health,
+            "expected_interval_seconds": expected_seconds,
+            "age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
+            "collected_at": collected_at,
+            "connectivity_message": connectivity.get("message"),
+            "snmp_status": snmp_status,
+            "snmp_failures": snmp_failures,
+            "syslog_last_at": syslog_time.isoformat() if syslog_time else None,
+            "bmp_last_at": bmp_time.isoformat() if bmp_time else None,
+            "bmp_status": bmp_session.status if bmp_session else None,
+            "bmp_message_count": bmp_session.message_count if bmp_session else 0,
+        })
+
+    alert_tasks = []
+    for raw in (redis_client.hgetall("monitor:alert_task_runtimes") or {}).values():
+        try:
+            alert_tasks.append(json.loads(raw))
+        except (TypeError, ValueError):
+            continue
+    alert_tasks.sort(key=lambda item: float(item.get("elapsed_seconds") or 0), reverse=True)
+    return {
+        "summary": {**summary, "total": len(rows)},
+        "items": rows,
+        "alert_tasks": alert_tasks,
+        "profiles": {
+            "event_driven": "Syslog / Trap / Telemetry / BMP：到达即处理，秒级",
+            "incident_interface": "P0/P1活动告警接口：临时5秒，恢复后自动降频",
+            "critical_circuit": f"公网/专线绑定端口：{int(settings.CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS)}秒",
+            "normal_interface": f"普通SNMP接口：约{int(settings.SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS)}秒一轮",
+            "slow_metrics": f"CPU/内存/硬件等全量SNMP：约{int(settings.SNMP_FULL_COLLECTION_INTERVAL_SECONDS)}秒一轮",
+        },
+        "generated_at": now.isoformat(),
+    }
+
+def _latest_quality_loss_from_window(target_id: Any) -> Optional[float]:
+    try:
+        raw_items = redis_client.lrange(
+            f"quality_probe:loss_window:{target_id}",
+            0,
+            1199,
+        ) or []
+        if not raw_items:
+            return None
+    except Exception:
+        return None
+
+    cutoff = time.time() - 5 * 60
+    total_sent = 0
+    total_received = 0
+    for raw in raw_items:
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            item = json.loads(raw)
+            if float(item.get("ts") or 0) < cutoff:
+                continue
+            sent = int(float(item.get("sent") or 0))
+            received = int(float(item.get("received") or 0))
+        except Exception:
+            continue
+        if sent <= 0:
+            continue
+        total_sent += sent
+        total_received += max(0, min(received, sent))
+    if total_sent <= 0:
+        return None
+    total_received = max(0, min(total_received, total_sent))
+    return round((total_sent - total_received) * 100.0 / total_sent, 2)
+
+
 def _quality_target_payload(target: QualityProbeTarget) -> Dict[str, Any]:
-    return target.to_dict()
+    payload = target.to_dict()
+    # 公网卡片与历史曲线统一使用近 5 分钟 sent/received 口径，避免出现
+    # “卡片最近一轮 100%，曲线近 5 分钟仍有丢包”的互相矛盾展示。
+    # 专线 NQA 保持设备最近一次回显口径，不套用公网 ICMP 的滚动窗口。
+    if (getattr(target, "probe_source", None) or "server_icmp") == "server_icmp":
+        latest_loss = _latest_quality_loss_from_window(target.id)
+        if latest_loss is not None:
+            payload["last_packet_loss_percent"] = latest_loss
+            payload["last_availability_percent"] = round(max(0.0, 100.0 - latest_loss), 2)
+    return payload
 
 
 def _safe_flux_duration(value: str, default: str = "-24h") -> str:
@@ -128,6 +324,10 @@ def _safe_flux_duration(value: str, default: str = "-24h") -> str:
 def _safe_flux_interval(value: str, default: str = "1m") -> str:
     text = str(value or default).strip()
     return text if re.fullmatch(r"\d+[smhdw]", text) else default
+
+
+def _normalize_quality_interface_name(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip().lower()
 
 
 @router.get("/modules")
@@ -272,41 +472,6 @@ def list_local_optical_modules(
         "vendors": vendor_options,
         "datacenters": datacenter_options,
     }
-
-
-def _run_mtr_or_trace(target: str) -> Dict[str, Any]:
-    target_text = str(target or "").strip()
-    if not target_text or not re.fullmatch(r"[A-Za-z0-9_.:-]+", target_text):
-        return {"command": "", "output": "目标地址不合法", "tool": "none"}
-
-    candidates = []
-    if shutil.which("mtr"):
-        candidates.append(("mtr", ["mtr", "-r", "-n", "-c", "5", "-w", target_text]))
-    if shutil.which("traceroute"):
-        candidates.append(("traceroute", ["traceroute", "-n", "-m", "20", "-w", "2", target_text]))
-    if shutil.which("ping"):
-        candidates.append(("ping", ["ping", "-c", "5", "-W", "2", target_text]))
-
-    if not candidates:
-        return {"command": "", "output": "服务器未安装 mtr/traceroute/ping 工具", "tool": "none"}
-
-    for tool, command in candidates:
-        try:
-            completed = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=25,
-                check=False,
-            )
-            output = (completed.stdout or "").strip()
-            if output:
-                return {"command": " ".join(command), "output": output, "tool": tool}
-        except Exception as e:
-            last_error = str(e)
-            continue
-    return {"command": "", "output": f"MTR/Trace 执行失败: {last_error if 'last_error' in locals() else 'unknown'}", "tool": "none"}
 
 
 def _normalize_vendor_text(value: Optional[str]) -> str:
@@ -1396,6 +1561,20 @@ def _parse_history_time(row: Dict[str, Any]) -> Optional[datetime]:
         return None
 
 
+# 2026-07-29 12:05 Asia/Shanghai 起，真正执行质量任务的 system Worker
+# 已切换为低并发系统 ping。此前旧 fping/高并发历史点存在批量误判丢包：
+# 保留延迟数据，但不再用于公网丢包率图表与统计。
+QUALITY_SERVER_ICMP_LOSS_CUTOFF = datetime(2026, 7, 29, 4, 5, 45, tzinfo=timezone.utc)
+
+
+def _should_hide_legacy_server_icmp_loss(target: QualityProbeTarget, item_time: Optional[datetime]) -> bool:
+    return (
+        (getattr(target, "probe_source", None) or "server_icmp") == "server_icmp"
+        and item_time is not None
+        and item_time < QUALITY_SERVER_ICMP_LOSS_CUTOFF
+    )
+
+
 def _parse_query_datetime(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -1439,6 +1618,16 @@ def _traffic_summary_cache_ttl(range_seconds: int, use_absolute_range: bool) -> 
 
 def _circuit_traffic_targets(circuit: Circuit) -> List[Dict[str, Any]]:
     targets: List[Dict[str, Any]] = []
+    # 已指定聚合监控接口时，它代表整条线路的权威流量。不能再把成员主/备
+    # 端口叠加，否则同一份业务流量会在线路图和汇总图中被重复计算。
+    if circuit.aggregation_monitor_device_id and circuit.aggregation_interface_name:
+        return [{
+            "device_id": circuit.aggregation_monitor_device_id,
+            "device_name": circuit.aggregation_monitor_device_ref.name if circuit.aggregation_monitor_device_ref else None,
+            "device_ip": circuit.aggregation_monitor_device_ref.ip_address if circuit.aggregation_monitor_device_ref else None,
+            "port_name": circuit.aggregation_interface_name,
+            "side": "聚合",
+        }]
     if circuit.primary_device_id and circuit.primary_port_name:
         targets.append({
             "device_id": circuit.primary_device_id,
@@ -1454,14 +1643,6 @@ def _circuit_traffic_targets(circuit: Circuit) -> List[Dict[str, Any]]:
             "device_ip": circuit.secondary_device_ref.ip_address if circuit.secondary_device_ref else None,
             "port_name": circuit.secondary_port_name,
             "side": "备线",
-        })
-    if circuit.aggregation_monitor_device_id and circuit.aggregation_interface_name:
-        targets.append({
-            "device_id": circuit.aggregation_monitor_device_id,
-            "device_name": circuit.aggregation_monitor_device_ref.name if circuit.aggregation_monitor_device_ref else None,
-            "device_ip": circuit.aggregation_monitor_device_ref.ip_address if circuit.aggregation_monitor_device_ref else None,
-            "port_name": circuit.aggregation_interface_name,
-            "side": "聚合",
         })
     return targets
 
@@ -4600,6 +4781,238 @@ async def list_quality_probe_targets(
     return {"total": len(items), "items": [_quality_target_payload(item) for item in items]}
 
 
+@router.get("/quality/probe-targets-sla")
+async def get_quality_probe_targets_sla(
+    range: str = Query("-1h", description="统计范围，例如 -1h/-6h/-24h/-7d/-30d"),
+    db: Session = Depends(get_db),
+):
+    """批量计算质量目标SLA，供质量看板统一使用，避免逐卡查询InfluxDB。"""
+    safe_range = _safe_flux_duration(range, "-1h")
+    cache_key = f"quality_probe:sla_summary:v4:{safe_range}"
+    cached = redis_client.get(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            redis_client.delete(cache_key)
+
+    targets = db.query(QualityProbeTarget).filter(QualityProbeTarget.is_active.is_(True)).all()
+    target_map = {str(target.id): target for target in targets}
+    duration_seconds = _parse_flux_duration_seconds(safe_range, 3600)
+
+    def collect_values(range_clause: str) -> Dict[str, Dict[str, float]]:
+        flux = f'''
+    base = from(bucket: "{influx_client.bucket}")
+      |> range({range_clause})
+      |> filter(fn: (r) => r._measurement == "quality_probe")
+    sent = base
+      |> filter(fn: (r) => r._field == "sent")
+      |> group(columns: ["target_id", "_field"])
+      |> sum()
+    received = base
+      |> filter(fn: (r) => r._field == "received")
+      |> group(columns: ["target_id", "_field"])
+      |> sum()
+    samples = base
+      |> filter(fn: (r) => r._field == "sent")
+      |> group(columns: ["target_id"])
+      |> count()
+      |> set(key: "_field", value: "sample_count")
+    latency = base
+      |> filter(fn: (r) => r._field == "avg_latency_ms")
+      |> group(columns: ["target_id", "_field"])
+      |> mean()
+    jitter = base
+      |> filter(fn: (r) => r._field == "jitter_ms")
+      |> group(columns: ["target_id", "_field"])
+      |> mean()
+    union(tables: [sent, received, samples, latency, jitter])
+    '''
+        collected: Dict[str, Dict[str, float]] = {}
+        try:
+            for row in influx_client.query(flux):
+                target_id = str(row.get("target_id") or "")
+                field = str(row.get("_field") or "")
+                value = _safe_float(row.get("_value"))
+                if target_id in target_map and field and value is not None:
+                    collected.setdefault(target_id, {})[field] = value
+        except Exception as exc:
+            logger.warning("批量计算质量SLA失败", range=range_clause, error=str(exc))
+        return collected
+
+    values = collect_values(f"start: {safe_range}")
+    previous_values = collect_values(f"start: -{duration_seconds * 2}s, stop: -{duration_seconds}s")
+    now_utc = datetime.now(timezone.utc)
+    month_start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_days = calendar.monthrange(now_utc.year, now_utc.month)[1]
+    month_total_minutes = month_days * 24 * 60
+    month_elapsed_minutes = max(1.0, (now_utc - month_start).total_seconds() / 60.0)
+
+    device_ids = [target.device_id for target in targets if target.device_id]
+    related_alerts: Dict[int, List[Dict[str, Any]]] = {}
+    if device_ids:
+        rows = (
+            db.query(AlertHistory, AlertRule)
+            .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+            .filter(
+                AlertHistory.device_id.in_(device_ids),
+                AlertHistory.started_at >= now_utc - timedelta(seconds=duration_seconds),
+            )
+            .order_by(AlertHistory.started_at.desc())
+            .limit(2000)
+            .all()
+        )
+        for history, rule in rows:
+            if "高低阈值目标缓存串用" in str(history.resolution_note or ""):
+                continue
+            related_alerts.setdefault(int(history.device_id), []).append({
+                "alarm_id": history.alarm_id,
+                "status": history.status,
+                "name": rule.name,
+                "metric_type": rule.metric_type,
+                "target_name": history.alert_target_name,
+                "message": history.message,
+                "started_at": history.started_at.isoformat() if history.started_at else None,
+                "resolved_at": history.resolved_at.isoformat() if history.resolved_at else None,
+            })
+
+    latest_mtr_events: Dict[int, Dict[str, Any]] = {}
+    mtr_rows = (
+        db.query(QualityMtrEvent)
+        .filter(QualityMtrEvent.target_id.in_([target.id for target in targets]))
+        .order_by(QualityMtrEvent.created_at.desc(), QualityMtrEvent.id.desc())
+        .all()
+    )
+    for event in mtr_rows:
+        if event.target_id in latest_mtr_events:
+            continue
+        latest_mtr_events[event.target_id] = event.to_dict()
+
+    items: List[Dict[str, Any]] = []
+    for target in targets:
+        base_payload = _quality_target_payload(target)
+        metrics = values.get(str(target.id), {})
+        previous_metrics = previous_values.get(str(target.id), {})
+        sent = max(0.0, metrics.get("sent", 0.0))
+        received = max(0.0, min(metrics.get("received", 0.0), sent)) if sent > 0 else 0.0
+        previous_sent = max(0.0, previous_metrics.get("sent", 0.0))
+        previous_received = (
+            max(0.0, min(previous_metrics.get("received", 0.0), previous_sent))
+            if previous_sent > 0 else 0.0
+        )
+        sample_count = max(0, int(metrics.get("sample_count", 0)))
+        # 这是“系统采集完整率”，不是设备内部NQA发包完整率。质量任务按秒调度，
+        # SNMP/NQA读取还存在任务与网络开销，因此预期读取周期不低于5秒。
+        effective_collection_interval = max(5, int(target.interval_seconds or 1))
+        expected_samples = max(1, int(duration_seconds / effective_collection_interval))
+        availability = round(received * 100.0 / sent, 3) if sent > 0 else None
+        previous_availability = (
+            round(previous_received * 100.0 / previous_sent, 3)
+            if previous_sent > 0 else None
+        )
+        # 原始点整月扫描在当前数据量下会超过InfluxDB查询超时。
+        # 先按用户选定周期的实际SLA估算月度消耗，并明确返回估算口径；
+        # 后续接入小时级降采样后可无缝切换为精确月累计。
+        month_availability = availability
+        sla_target_percent = 99.9
+        allowed_downtime_minutes = month_total_minutes * (100.0 - sla_target_percent) / 100.0
+        used_downtime_minutes = (
+            month_elapsed_minutes * (100.0 - month_availability) / 100.0
+            if month_availability is not None else None
+        )
+        budget_used_percent = (
+            min(999.0, used_downtime_minutes * 100.0 / allowed_downtime_minutes)
+            if used_downtime_minutes is not None and allowed_downtime_minutes > 0 else None
+        )
+
+        target_alerts: List[Dict[str, Any]] = []
+        normalized_interface = _normalize_quality_interface_name(
+            target.probe_interface_name or base_payload.get("circuit_port_name")
+        )
+        for alert in related_alerts.get(int(target.device_id or 0), []):
+            alert_interface = _normalize_quality_interface_name(alert.get("target_name"))
+            if normalized_interface and alert_interface and normalized_interface != alert_interface:
+                continue
+            target_alerts.append(alert)
+            if len(target_alerts) >= 12:
+                break
+
+        collection_age_seconds = (
+            max(0.0, (now_utc - target.last_probe_at).total_seconds())
+            if target.last_probe_at else None
+        )
+        if sample_count <= 0:
+            collection_health = "no_data"
+            collection_health_text = "所选范围无采集数据"
+        elif collection_age_seconds is not None and collection_age_seconds > max(120, effective_collection_interval * 4):
+            collection_health = "collector_stale"
+            collection_health_text = f"采集结果已{int(collection_age_seconds)}秒未更新"
+        elif sample_count < 3 or sample_count * 100.0 / expected_samples < 60:
+            collection_health = "insufficient"
+            collection_health_text = "系统采集样本不足"
+        else:
+            collection_health = "healthy"
+            collection_health_text = "系统采集正常"
+
+        root_cause_categories: List[str] = []
+        metric_text = " ".join(str(alert.get("metric_type") or "") + " " + str(alert.get("name") or "") for alert in target_alerts).lower()
+        if any(marker in metric_text for marker in ("crc", "error", "discard", "drop", "no_buffer", "丢弃", "错包")):
+            root_cause_categories.append("接口错包/丢弃")
+        if any(marker in metric_text for marker in ("optical", "fec", "光模块", "光功率")):
+            root_cause_categories.append("光模块/FEC")
+        if any(marker in metric_text for marker in ("bgp", "bfd", "protocol")):
+            root_cause_categories.append("BGP/BFD")
+        if availability is not None and availability < 99.9 and not root_cause_categories:
+            root_cause_categories.append("质量下降，暂未发现同周期设备侧异常")
+        payload = base_payload
+        payload.update({
+            "sla_availability_percent": availability,
+            "sla_packet_loss_percent": round(100.0 - availability, 3) if availability is not None else None,
+            "sla_sent": int(round(sent)),
+            "sla_received": int(round(received)),
+            "sla_lost": int(round(max(0.0, sent - received))),
+            "sla_sample_count": sample_count,
+            "sla_expected_samples": expected_samples,
+            "sla_data_completeness_percent": round(min(100.0, sample_count * 100.0 / expected_samples), 2),
+            "sla_avg_latency_ms": round(metrics["avg_latency_ms"], 2) if "avg_latency_ms" in metrics else None,
+            "sla_avg_jitter_ms": round(metrics["jitter_ms"], 2) if "jitter_ms" in metrics else None,
+            "sla_previous_availability_percent": previous_availability,
+            "sla_availability_change_percent": (
+                round(availability - previous_availability, 3)
+                if availability is not None and previous_availability is not None else None
+            ),
+            "sla_previous_avg_latency_ms": (
+                round(previous_metrics["avg_latency_ms"], 2)
+                if "avg_latency_ms" in previous_metrics else None
+            ),
+            "sla_latency_change_ms": (
+                round(metrics["avg_latency_ms"] - previous_metrics["avg_latency_ms"], 2)
+                if "avg_latency_ms" in metrics and "avg_latency_ms" in previous_metrics else None
+            ),
+            "sla_target_percent": sla_target_percent,
+            "sla_month_availability_percent": month_availability,
+            "sla_error_budget_allowed_minutes": round(allowed_downtime_minutes, 2),
+            "sla_error_budget_used_minutes": round(used_downtime_minutes, 2) if used_downtime_minutes is not None else None,
+            "sla_error_budget_remaining_minutes": (
+                round(allowed_downtime_minutes - used_downtime_minutes, 2)
+                if used_downtime_minutes is not None else None
+            ),
+            "sla_error_budget_used_percent": round(budget_used_percent, 1) if budget_used_percent is not None else None,
+            "sla_error_budget_estimated": True,
+            "sla_error_budget_basis_range": safe_range,
+            "collection_health": collection_health,
+            "collection_health_text": collection_health_text,
+            "collection_age_seconds": round(collection_age_seconds, 1) if collection_age_seconds is not None else None,
+            "related_alerts": target_alerts,
+            "root_cause_categories": root_cause_categories,
+            "latest_mtr_event": latest_mtr_events.get(target.id),
+        })
+        items.append(payload)
+    response = {"range": safe_range, "duration_seconds": duration_seconds, "total": len(items), "items": items}
+    redis_client.setex(cache_key, 30, json.dumps(response, ensure_ascii=False, default=str))
+    return response
+
+
 def _quality_alert_settings_payload(rule: Optional[AlertRule]) -> Dict[str, Any]:
     extra_config = (rule.extra_config or {}) if rule else {}
     channels = (rule.notification_channels or []) if rule else []
@@ -4809,6 +5222,7 @@ async def create_quality_probe_target(
     data = payload.model_dump()
     data["target"] = data["target"].strip()
     data["name"] = data["name"].strip()
+    data = normalize_server_icmp_probe_config(data)
     if data.get("probe_source") == "device_nqa_snmp":
         device = db.query(Device).filter(Device.id == data.get("device_id")).first()
         if not device:
@@ -4893,6 +5307,18 @@ async def update_quality_probe_target(
         raise HTTPException(status_code=404, detail="质量探测目标不存在")
     update_data = payload.model_dump(exclude_unset=True)
     effective_source = update_data.get("probe_source", db_target.probe_source or "server_icmp")
+    if effective_source == "server_icmp":
+        if "interval_seconds" in update_data:
+            update_data["interval_seconds"] = max(int(update_data.get("interval_seconds") or 60), 30)
+        if "packet_count" in update_data:
+            update_data["packet_count"] = max(int(update_data.get("packet_count") or SERVER_ICMP_MIN_PACKET_COUNT), SERVER_ICMP_MIN_PACKET_COUNT)
+        if "timeout_ms" in update_data:
+            update_data["timeout_ms"] = max(int(update_data.get("timeout_ms") or 1500), 1500)
+        if bool(update_data.get("mtr_enabled", db_target.mtr_enabled)):
+            update_data["mtr_interval_seconds"] = max(
+                int(update_data.get("mtr_interval_seconds", db_target.mtr_interval_seconds) or 300),
+                300,
+            )
     if effective_source == "device_nqa_snmp":
         device_id = update_data.get("device_id", db_target.device_id)
         admin_name = update_data.get("nqa_admin_name", db_target.nqa_admin_name)
@@ -4953,14 +5379,16 @@ async def test_quality_probe_target(target_id: int, db: Session = Depends(get_db
         result = await asyncio.to_thread(
             run_quality_ping,
             db_target.target,
-            db_target.packet_count or 5,
+            db_target.packet_count or SERVER_ICMP_MIN_PACKET_COUNT,
             db_target.timeout_ms or 1000,
         )
-    result = apply_quality_loss_window(db_target.id, result)
+    raw_result = normalize_quality_ping_result(result or {})
+    result = apply_quality_loss_window(db_target.id, raw_result)
     db_target.last_probe_at = datetime.now(timezone.utc)
     db_target.last_success = bool(result.get("success"))
     db_target.last_avg_latency_ms = result.get("avg_latency_ms")
-    db_target.last_packet_loss_percent = result.get("packet_loss_percent")
+    # 立即测试后卡片显示最近一次探测丢包率；历史图仍使用滚动窗口值。
+    db_target.last_packet_loss_percent = result.get("current_packet_loss_percent", raw_result.get("packet_loss_percent"))
     db_target.last_jitter_ms = result.get("jitter_ms")
     db_target.last_error = result.get("error")
     db.commit()
@@ -4975,11 +5403,49 @@ async def run_quality_probe_mtr(target_id: int, db: Session = Depends(get_db)):
     db_target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
     if not db_target:
         raise HTTPException(status_code=404, detail="质量探测目标不存在")
-    result = await asyncio.to_thread(_run_mtr_or_trace, db_target.target)
+    result = await asyncio.to_thread(run_mtr_or_trace, db_target.target, 5, 30, False)
     return {
         "target": _quality_target_payload(db_target),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         **result,
+    }
+
+
+@router.get("/quality/probe-targets/{target_id}/mtr-observation")
+async def get_quality_probe_mtr_observation(
+    target_id: int,
+    snapshot_limit: int = Query(10, ge=1, le=50),
+    event_limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """查看质量目标的周期MTR路径观察结果。"""
+    target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="质量探测目标不存在")
+    snapshots = (
+        db.query(QualityMtrSnapshot)
+        .filter(QualityMtrSnapshot.target_id == target_id)
+        .order_by(QualityMtrSnapshot.created_at.desc(), QualityMtrSnapshot.id.desc())
+        .limit(snapshot_limit)
+        .all()
+    )
+    events = (
+        db.query(QualityMtrEvent)
+        .filter(QualityMtrEvent.target_id == target_id)
+        .order_by(QualityMtrEvent.created_at.desc(), QualityMtrEvent.id.desc())
+        .limit(event_limit)
+        .all()
+    )
+    latest = snapshots[0] if snapshots else None
+    previous = next((item for item in snapshots[1:] if item.path_hash != (latest.path_hash if latest else None)), None) if latest else None
+    return {
+        "target": _quality_target_payload(target),
+        "enabled": bool(target.mtr_enabled),
+        "interval_seconds": int(target.mtr_interval_seconds or 300),
+        "latest_snapshot": latest.to_dict() if latest else None,
+        "previous_different_snapshot": previous.to_dict() if previous else None,
+        "snapshots": [item.to_dict() for item in snapshots],
+        "events": [item.to_dict() for item in events],
     }
 
 
@@ -5002,7 +5468,7 @@ async def get_quality_probe_history(
     safe_interval = _safe_flux_interval(interval, "1m")
     range_clause, use_absolute_range, start_time, end_time = _build_query_range_clause(safe_range, start, end, start_ts, end_ts)
     cache_range_key = f"abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}" if use_absolute_range and start_time and end_time else safe_range
-    cache_key = f"quality_probe:history:v5:{target_id}:{cache_range_key}:{safe_interval}"
+    cache_key = f"quality_probe:history:v8:{target_id}:{cache_range_key}:{safe_interval}"
     cached = redis_client.get(cache_key)
     if cached:
         try:
@@ -5025,11 +5491,12 @@ async def get_quality_probe_history(
       |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "quality_probe")
       |> filter(fn: (r) => r.target_id == {escaped_id})
-      |> filter(fn: (r) => r._field == "sent" or r._field == "received")
+      |> filter(fn: (r) => r._field == "sent" or r._field == "received" or r._field == "packet_loss_percent" or r._field == "availability_percent" or r._field == "rolling_packet_loss_percent" or r._field == "rolling_availability_percent")
       |> aggregateWindow(every: {safe_interval}, fn: mean, createEmpty: false)
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> sort(columns: ["_time"])
     '''
+    is_server_icmp_target = (getattr(db_target, "probe_source", None) or "server_icmp") == "server_icmp"
     rows_by_time: Dict[str, Dict[str, Any]] = {}
     for row in influx_client.query(metrics_flux):
         ts = row.get("_time") or row.get("time")
@@ -5065,6 +5532,15 @@ async def get_quality_probe_history(
         received = _safe_float(row.get("received")) or 0.0
         item["sent"] = sent
         item["received"] = max(0.0, min(received, sent)) if sent > 0 else 0.0
+        loss_value = _safe_float(row.get("packet_loss_percent"))
+        availability_value = _safe_float(row.get("availability_percent"))
+        if is_server_icmp_target:
+            loss_value = _safe_float(row.get("rolling_packet_loss_percent"))
+            availability_value = _safe_float(row.get("rolling_availability_percent"))
+        if loss_value is not None:
+            item["packet_loss_percent"] = round(max(0.0, min(loss_value, 100.0)), 2)
+        if availability_value is not None:
+            item["availability_percent"] = round(max(0.0, min(availability_value, 100.0)), 2)
     data = sorted(rows_by_time.values(), key=lambda item: str(item.get("_time") or ""))
     rolling_window_seconds = max(300, _history_interval_seconds(safe_interval) * 3)
     rolling_counts: deque[Tuple[datetime, float, float]] = deque()
@@ -5072,9 +5548,13 @@ async def get_quality_probe_history(
     rolling_received = 0.0
     for item in data:
         item_time = _parse_history_time(item)
+        hide_legacy_loss = _should_hide_legacy_server_icmp_loss(db_target, item_time)
         sent = _safe_float(item.get("sent")) or 0.0
         received = _safe_float(item.get("received")) or 0.0
-        if item_time is not None and sent > 0:
+        if hide_legacy_loss:
+            item["packet_loss_percent"] = None
+            item["availability_percent"] = None
+        elif item_time is not None and sent > 0:
             rolling_counts.append((item_time, sent, received))
             rolling_sent += sent
             rolling_received += received
@@ -5082,7 +5562,7 @@ async def get_quality_probe_history(
                 _, old_sent, old_received = rolling_counts.popleft()
                 rolling_sent -= old_sent
                 rolling_received -= old_received
-        if rolling_sent > 0:
+        if not hide_legacy_loss and not is_server_icmp_target and item.get("packet_loss_percent") is None and rolling_sent > 0:
             bounded_received = max(0.0, min(rolling_received, rolling_sent))
             item["packet_loss_percent"] = round((rolling_sent - bounded_received) * 100.0 / rolling_sent, 2)
             item["availability_percent"] = round(bounded_received * 100.0 / rolling_sent, 2)

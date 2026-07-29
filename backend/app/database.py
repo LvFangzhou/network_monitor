@@ -275,6 +275,16 @@ def ensure_compatible_schema() -> None:
                 connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN nqa_operation_tag VARCHAR(32)"))
             if "probe_interface_name" not in quality_probe_columns:
                 connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN probe_interface_name VARCHAR(128)"))
+            if "mtr_enabled" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN mtr_enabled BOOLEAN DEFAULT FALSE"))
+            if "mtr_interval_seconds" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN mtr_interval_seconds INTEGER DEFAULT 300"))
+            if "last_mtr_at" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN last_mtr_at TIMESTAMP WITH TIME ZONE"))
+            if "last_mtr_path_hash" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN last_mtr_path_hash VARCHAR(64)"))
+            if "last_mtr_final_latency_ms" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN last_mtr_final_latency_ms DOUBLE PRECISION"))
             connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_active "
                 "ON quality_probe_targets (is_active, id)"
@@ -290,6 +300,30 @@ def ensure_compatible_schema() -> None:
             connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_device "
                 "ON quality_probe_targets (device_id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_mtr_due "
+                "ON quality_probe_targets (mtr_enabled, is_active, last_mtr_at)"
+            ))
+
+        if "quality_mtr_snapshots" in table_names:
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_quality_mtr_snapshots_target_time "
+                "ON quality_mtr_snapshots (target_id, created_at DESC)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_quality_mtr_snapshots_path_hash "
+                "ON quality_mtr_snapshots (path_hash)"
+            ))
+
+        if "quality_mtr_events" in table_names:
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_quality_mtr_events_target_time "
+                "ON quality_mtr_events (target_id, created_at DESC)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_quality_mtr_events_type_time "
+                "ON quality_mtr_events (event_type, created_at DESC)"
             ))
 
         if "alert_histories" in table_names:

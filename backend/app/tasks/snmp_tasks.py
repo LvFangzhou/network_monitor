@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 import json
 import math
+import os
 import re
 import subprocess
 import time
@@ -16,7 +17,7 @@ import uuid
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models import Device, Circuit, AlertRule
+from app.models import Device, Circuit, AlertHistory, AlertRule
 from app.collectors import snmp_collector
 from app.core import get_logger
 from app.utils import redis_client, influx_client
@@ -57,6 +58,7 @@ ASTERNOS_BATCH_COUNT = max(
 )
 ASTERNOS_MAX_DEVICES_PER_TICK = max(1, int(settings.ASTERNOS_MAX_DEVICES_PER_TICK))
 SNMP_VERIFY_OID = "1.3.6.1.2.1.1.3.0"
+SNMP_LIGHTWEIGHT_DEVICE_SET_KEY = "snmp_collect:lightweight_devices"
 SNMP_FAILURE_THRESHOLD = 3
 SNMP_STATUS_REACHABLE = "reachable"
 SNMP_STATUS_UNREACHABLE = "unreachable"
@@ -204,6 +206,49 @@ def _telemetry_snmp_optical_fallback_enabled(device: Device) -> bool:
         return False
     telemetry = monitoring.get("telemetry") or {}
     return isinstance(telemetry, dict) and telemetry.get("snmp_fallback_optical") is True
+
+
+def _split_csv_values(raw: Any) -> set[str]:
+    if raw is None:
+        return set()
+    return {item.strip() for item in str(raw).split(",") if item.strip()}
+
+
+def _redis_set_members(key: str) -> set[str]:
+    try:
+        members = redis_client.smembers(key)
+    except Exception as exc:
+        logger.debug("读取SNMP轻量采集名单失败", key=key, error=str(exc))
+        return set()
+    result: set[str] = set()
+    for member in members or []:
+        if isinstance(member, bytes):
+            result.add(member.decode("utf-8", errors="ignore"))
+        else:
+            result.add(str(member))
+    return {item.strip() for item in result if item and item.strip()}
+
+
+def _snmp_lightweight_members() -> set[str]:
+    members = _redis_set_members(SNMP_LIGHTWEIGHT_DEVICE_SET_KEY)
+    members.update(_split_csv_values(os.getenv("SNMP_LIGHTWEIGHT_DEVICE_IDS")))
+    members.update(_split_csv_values(os.getenv("SNMP_LIGHTWEIGHT_DEVICE_IPS")))
+    return members
+
+
+def _is_lightweight_snmp_device(device: Device) -> bool:
+    """Whether this SNMP device should avoid expensive table walks.
+
+    Used for low-end or already stressed devices where full interface/optical/
+    protocol walks can noticeably increase device CPU.  The allow-list accepts
+    either device id or management IP so operations can add devices quickly.
+    """
+    if not device:
+        return False
+    members = _snmp_lightweight_members()
+    if not members:
+        return False
+    return str(device.id) in members or str(device.ip_address) in members
 
 
 def _protocol_summary_has_data(summary: Dict[str, Any]) -> bool:
@@ -778,6 +823,11 @@ def ensure_up_interface_crc_rules():
                 "山石接口运行状态为Up时，EtherLike-MIB dot3StatsFCSErrors 在采集周期内增长；通常对应CRC/FCS、帧校验、物理层链路质量异常。",
                 "Hillstone",
             ),
+            (
+                "【Cisco】已Up接口CRC/FCS错误增长",
+                "Cisco/Nexus接口运行状态为Up时，EtherLike-MIB dot3StatsFCSErrors 在采集周期内增长；通常对应CRC/FCS、帧校验、物理层链路质量异常。",
+                "Cisco",
+            ),
         ]
         results = []
         for name, description, vendor in definitions:
@@ -797,6 +847,7 @@ def ensure_up_interface_crc_rules():
             "【H3C】已Up接口CRC/FCS错误增长",
             "【Ruijie】已Up接口CRC/FCS错误增长",
             "【Hillstone】已Up接口CRC/FCS错误增长",
+            "【Cisco】已Up接口CRC/FCS错误增长",
         ]
         disabled_legacy = 0
         for rule in db.query(AlertRule).filter(AlertRule.name.in_(legacy_names)).all():
@@ -1907,6 +1958,7 @@ def collect_snmp_for_device(self, device_id: int):
         protocol_status_result: Dict[str, Any] = {}
         optical_result: Dict[str, Any] = {}
         telemetry_primary = _telemetry_primary_enabled(device) or _telemetry_snmp_disabled(device)
+        lightweight_snmp = (not telemetry_primary) and _is_lightweight_snmp_device(device)
 
         if telemetry_primary:
             logger.info(
@@ -1918,19 +1970,29 @@ def collect_snmp_for_device(self, device_id: int):
                 gap_fill_result = snmp_collector.collect_overview_gap_fill(device)
             except Exception as exc:
                 logger.error("Telemetry设备SNMP缺口补采失败", device_id=device_id, error=str(exc))
+        elif lightweight_snmp:
+            logger.info(
+                "设备已加入SNMP轻量采集名单，跳过接口/协议/光模块全量walk，仅保留总览缺口补采",
+                device_id=device_id,
+                ip=device.ip_address,
+            )
+            try:
+                gap_fill_result = snmp_collector.collect_overview_gap_fill(device)
+            except Exception as exc:
+                logger.error("SNMP轻量采集失败", device_id=device_id, error=str(exc))
         else:
             try:
                 result = snmp_collector.collect_device(device)
             except Exception as exc:
                 logger.error("设备SNMP指标采集失败", device_id=device_id, error=str(exc))
 
-        if (not telemetry_primary) or _telemetry_snmp_protocol_fallback_enabled(device):
+        if (not lightweight_snmp) and ((not telemetry_primary) or _telemetry_snmp_protocol_fallback_enabled(device)):
             try:
                 protocol_status_result = snmp_collector.collect_protocol_status(device)
             except Exception as exc:
                 logger.error("协议状态采集失败", device_id=device_id, error=str(exc))
 
-        if (not telemetry_primary) or _telemetry_snmp_optical_fallback_enabled(device):
+        if (not lightweight_snmp) and ((not telemetry_primary) or _telemetry_snmp_optical_fallback_enabled(device)):
             try:
                 optical_result = snmp_collector.collect_optical_monitoring(device)
             except Exception as exc:
@@ -1940,6 +2002,7 @@ def collect_snmp_for_device(self, device_id: int):
             "SNMP采集完成",
             device_id=device_id,
             telemetry_primary=telemetry_primary,
+            lightweight_snmp=lightweight_snmp,
             points=result.get("points_written", 0),
             gap_fill_points=gap_fill_result.get("points_written", 0),
             interface_points=0,
@@ -1992,6 +2055,23 @@ def collect_snmp_for_device(self, device_id: int):
                 "protocol_points_written": protocol_status_result.get("points_written", 0),
                 "optical_points_written": optical_result.get("points_written", 0),
                 "snmp_mode": "fallback_only",
+            }
+
+        if lightweight_snmp:
+            _merge_snmp_gap_fill_into_overview_cache(device, gap_fill_result)
+            return {
+                "device_id": device_id,
+                "success": True,
+                "telemetry_primary": False,
+                "lightweight_snmp": True,
+                "points_written": gap_fill_result.get("points_written", 0),
+                "gap_fill_points_written": gap_fill_result.get("points_written", 0),
+                "hardware_count": gap_fill_result.get("hardware_count", 0),
+                "interface_points_written": 0,
+                "interfaces_monitored": 0,
+                "protocol_points_written": 0,
+                "optical_points_written": 0,
+                "snmp_mode": "lightweight",
             }
 
         memory = result.get("memory") or {}
@@ -2581,7 +2661,19 @@ def collect_circuit_interface_realtime():
 
             if not device.snmp_version:
                 return {"points": device_points, "matched_ports": matched}
-            interfaces = snmp_collector.list_interfaces(device)
+            interface_cache = _load_monitor_cache("interfaces", device.id)
+            interfaces = (
+                interface_cache.get("interfaces")
+                if isinstance(interface_cache, dict) and isinstance(interface_cache.get("interfaces"), list)
+                else None
+            )
+            if not interfaces:
+                interfaces = snmp_collector.list_interfaces(device)
+                _set_monitor_cache(
+                    "interfaces",
+                    device.id,
+                    {"interfaces": interfaces, "collected_at": collected_at},
+                )
             for interface in interfaces:
                 names = {str(interface.get("name") or ""), str(interface.get("description") or ""), str(interface.get("alias") or "")}
                 if not names.intersection(port_names):
@@ -2636,6 +2728,124 @@ def collect_circuit_interface_realtime():
         return {"error": str(exc)}
     finally:
         _release_interface_realtime_lock("circuit", lock_token)
+        db.close()
+
+
+@shared_task
+def collect_incident_interface_realtime():
+    """Temporarily collect P0/P1 incident interfaces every five seconds.
+
+    The target set is derived from active alerts and disappears automatically
+    after recovery. Hard caps prevent an alert storm from becoming a poll storm.
+    """
+    lock_token = _try_lock_interface_realtime("incident")
+    if not lock_token:
+        return {"skipped": True, "reason": "上一轮故障接口提频采集未完成"}
+
+    db = SessionLocal()
+    try:
+        active_rows = (
+            db.query(AlertHistory, AlertRule)
+            .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+            .filter(
+                AlertHistory.status.in_(["firing", "acknowledged"]),
+                AlertHistory.alert_target_type == "interface",
+                AlertRule.severity.in_(["P0", "P1"]),
+            )
+            .order_by(AlertHistory.started_at.desc())
+            .limit(200)
+            .all()
+        )
+        target_map: Dict[int, set[str]] = {}
+        for alert, _rule in active_rows:
+            if not alert.device_id:
+                continue
+            name = str(alert.alert_target_name or alert.alert_target_key or "").strip()
+            if not name:
+                continue
+            # Some target keys append queue/direction metadata; the display name
+            # remains the safest interface identifier.
+            target_map.setdefault(int(alert.device_id), set()).add(name)
+        if not target_map:
+            return {"devices": 0, "interfaces": 0, "points_written": 0}
+
+        selected_ids = list(target_map.keys())[:20]
+        devices = (
+            db.query(Device)
+            .filter(
+                Device.id.in_(selected_ids),
+                Device.status.in_(["active", "online"]),
+                Device.is_monitored.is_(True),
+            )
+            .all()
+        )
+        now = datetime.utcnow()
+        collected_at = datetime.now(timezone.utc).isoformat()
+
+        def collect_device(device: Device) -> Dict[str, Any]:
+            port_names = target_map.get(int(device.id), set())
+            points: List[Dict[str, Any]] = []
+            monitor_source = str(device.monitor_source or "snmp")
+            if monitor_source == "asternos_exporter":
+                metrics = asyncio.run(asternos_exporter_client.scrape(device))
+                interfaces = _build_asternos_interfaces(metrics)
+                for interface in interfaces:
+                    names = {
+                        str(interface.get("name") or ""),
+                        str(interface.get("description") or ""),
+                        str(interface.get("alias") or ""),
+                    }
+                    if not names.intersection(port_names):
+                        continue
+                    stats = _build_asternos_interface_stats(device.id, metrics, interface)
+                    point = _interface_point(device, stats, now)
+                    if point:
+                        points.append(point)
+                        _cache_interface_stats(device.id, stats, collected_at)
+                return {"points": points}
+
+            if not device.snmp_version or _get_device_status(device.id) == SNMP_STATUS_UNREACHABLE:
+                return {"points": points}
+            interface_cache = _load_monitor_cache("interfaces", device.id)
+            interfaces = (
+                interface_cache.get("interfaces")
+                if isinstance(interface_cache, dict) and isinstance(interface_cache.get("interfaces"), list)
+                else snmp_collector.list_interfaces(device)
+            )
+            for interface in interfaces:
+                names = {
+                    str(interface.get("name") or ""),
+                    str(interface.get("description") or ""),
+                    str(interface.get("alias") or ""),
+                }
+                if not names.intersection(port_names):
+                    continue
+                stats = snmp_collector.get_interface_snapshot(device, int(interface["index"]))
+                point = _interface_point(device, stats, now)
+                if point:
+                    points.append(point)
+                    _cache_interface_stats(device.id, stats, collected_at)
+            return {"points": points}
+
+        points: List[Dict[str, Any]] = []
+        workers = min(8, max(1, len(devices)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(collect_device, device) for device in devices]
+            for future in as_completed(futures):
+                try:
+                    points.extend(future.result().get("points") or [])
+                except Exception as exc:
+                    logger.warning("故障接口提频采集失败", error=str(exc))
+        if points:
+            influx_client.write_points(points, sync=False)
+        return {
+            "devices": len(devices),
+            "interfaces": len(points),
+            "points_written": len(points),
+            "profile": "incident-5s",
+        }
+    finally:
+        _release_interface_realtime_lock("incident", lock_token)
         db.close()
 
 

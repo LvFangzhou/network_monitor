@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useState, type Key } from 'react'
+import { startTransition, useEffect, useState } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
 import {
   Layout as AntLayout,
@@ -116,6 +116,8 @@ const Layout = () => {
       label: '监控中心',
       children: [
         { key: '/device-overview', label: '设备总览' },
+        { key: '/collection-health', label: '采集健康' },
+        { key: '/telemetry-status', label: 'Telemetry状态' },
         { key: '/grafana', label: '接口查询' },
         { key: '/ip-flow-query', label: 'IP查询' },
         { key: '/quality-query', label: '质量查询' },
@@ -151,47 +153,8 @@ const Layout = () => {
     }
   })
 
-  const fullMenuItems = addMenuTooltips(filterMenuItems(baseMenuItems))
-  const firstRouteKey = (item: ItemType): string | null => {
-    if (!item || !('key' in item)) return null
-    if (String(item.key).startsWith('/')) return String(item.key)
-    if ('children' in item && item.children?.length) {
-      for (const child of item.children as ItemType[]) {
-        const route = firstRouteKey(child)
-        if (route) return route
-      }
-    }
-    return null
-  }
-  const collapsedMenuItems = fullMenuItems
-    .map((item) => {
-      if (!item || !('key' in item)) return item
-      const routeKey = firstRouteKey(item)
-      const label = 'label' in item ? item.label : undefined
-      return {
-        key: routeKey || String(item.key),
-        icon: 'icon' in item ? item.icon : undefined,
-        label,
-        title: typeof label === 'string' ? label : undefined,
-      }
-    })
-    .filter((item) => item && 'key' in item && String(item.key).startsWith('/')) as ItemType[]
-  const menuItems = collapsed ? collapsedMenuItems : fullMenuItems
-  const selectedCollapsedKey = collapsedMenuItems.find((item) => {
-    if (!item || !('key' in item)) return false
-    const itemKey = String(item.key)
-    const sourceItem = fullMenuItems.find((fullItem) => firstRouteKey(fullItem) === itemKey)
-    if (!sourceItem || !('children' in sourceItem) || !sourceItem.children) {
-      return selectedMenuKey === itemKey
-    }
-    const childKeys = (sourceItem.children as ItemType[])
-      .filter((child) => child && 'key' in child)
-      .map((child) => String((child as { key: Key }).key))
-    return childKeys.some((key) => selectedMenuKey === key || selectedMenuKey.startsWith(`${key}/`))
-  })
-  const activeMenuKey = collapsed && selectedCollapsedKey && 'key' in selectedCollapsedKey
-    ? String(selectedCollapsedKey.key)
-    : selectedMenuKey
+  const menuItems = addMenuTooltips(filterMenuItems(baseMenuItems))
+  const activeMenuKey = selectedMenuKey
   const routeParentKey = (items: ItemType[], route: string): string | null => {
     for (const item of items) {
       if (!item || !('key' in item)) continue
@@ -267,12 +230,13 @@ const Layout = () => {
         collapsedWidth={72}
         theme="dark"
         style={{
-          overflow: 'auto',
+          overflow: collapsed ? 'visible' : 'auto',
           height: '100vh',
           position: 'fixed',
           left: 0,
           top: 0,
           bottom: 0,
+          zIndex: 20,
           padding: collapsed ? '14px 6px' : '14px 12px',
           background: appTheme === 'dark'
             ? 'linear-gradient(180deg, #102a43 0%, #12395c 50%, #0f4c75 100%)'
@@ -313,11 +277,16 @@ const Layout = () => {
         </div>
         <Menu
           theme="dark"
-          mode="inline"
+          mode={collapsed ? 'vertical' : 'inline'}
           inlineCollapsed={false}
           selectedKeys={[activeMenuKey]}
-          openKeys={collapsed ? [] : openKeys}
-          onOpenChange={(keys) => setOpenKeys(keys.map(String))}
+          openKeys={collapsed ? undefined : openKeys}
+          triggerSubMenuAction="hover"
+          subMenuOpenDelay={0}
+          subMenuCloseDelay={0.12}
+          onOpenChange={(keys) => {
+            if (!collapsed) setOpenKeys(keys.map(String))
+          }}
           items={menuItems}
           onClick={handleMenuClick}
           style={{ borderRight: 0, background: 'transparent', fontWeight: 600 }}

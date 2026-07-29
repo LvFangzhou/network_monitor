@@ -49,6 +49,8 @@ const loadQualityQuery = () => import('./pages/metrics/QualityQuery')
 const loadTrafficQuery = () => import('./pages/metrics/TrafficQuery')
 const loadModuleInfoQuery = () => import('./pages/metrics/ModuleInfoQuery')
 const loadLosslessInfoQuery = () => import('./pages/metrics/LosslessInfoQuery')
+const loadCollectionHealth = () => import('./pages/metrics/CollectionHealth')
+const loadTelemetryStatus = () => import('./pages/metrics/TelemetryStatus')
 const loadGrafanaDashboard = () => import('./pages/metrics/GrafanaDashboard')
 const loadSettings = () => import('./pages/Settings')
 const loadTacacsManager = () => import('./pages/TacacsManager')
@@ -76,6 +78,8 @@ const QualityQuery = lazyWithReload(loadQualityQuery)
 const TrafficQuery = lazyWithReload(loadTrafficQuery)
 const ModuleInfoQuery = lazyWithReload(loadModuleInfoQuery)
 const LosslessInfoQuery = lazyWithReload(loadLosslessInfoQuery)
+const CollectionHealth = lazyWithReload(loadCollectionHealth)
+const TelemetryStatus = lazyWithReload(loadTelemetryStatus)
 const GrafanaDashboard = lazyWithReload(loadGrafanaDashboard)
 const Settings = lazyWithReload(loadSettings)
 const TacacsManager = lazyWithReload(loadTacacsManager)
@@ -97,10 +101,13 @@ const preloadHighFrequencyRoutes = () => {
   window.setTimeout(preload, 1200)
 }
 
-const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/grafana', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
+const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/collection-health', '/telemetry-status', '/grafana', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/grafana']
 const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
-const ROUTE_ALIASES: Record<string, string[]> = {}
+const ROUTE_ALIASES: Record<string, string[]> = {
+  '/collection-health': ['/device-overview'],
+  '/telemetry-status': ['/lossless-info-query'],
+}
 
 const getInitialRoute = (allowedMenus: string[] = []) => {
   const savedRoute = localStorage.getItem('lastVisitedRoute')
@@ -273,6 +280,8 @@ function App() {
             <Route path="quality-query" element={<MenuRoute menuPath="/quality-query"><QualityQuery /></MenuRoute>} />
             <Route path="traffic-query" element={<MenuRoute menuPath="/traffic-query"><TrafficQuery /></MenuRoute>} />
             <Route path="device-overview" element={<MenuRoute menuPath="/device-overview"><DeviceOverview /></MenuRoute>} />
+            <Route path="collection-health" element={<MenuRoute menuPath="/collection-health"><CollectionHealth /></MenuRoute>} />
+            <Route path="telemetry-status" element={<MenuRoute menuPath="/telemetry-status"><TelemetryStatus /></MenuRoute>} />
             <Route path="module-info-query" element={<MenuRoute menuPath="/module-info-query"><ModuleInfoQuery /></MenuRoute>} />
             <Route path="lossless-info-query" element={<MenuRoute menuPath="/lossless-info-query"><LosslessInfoQuery /></MenuRoute>} />
             <Route path="grafana" element={<MenuRoute menuPath="/grafana"><GrafanaDashboard /></MenuRoute>} />

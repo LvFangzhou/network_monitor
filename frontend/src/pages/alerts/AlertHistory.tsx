@@ -41,7 +41,7 @@ const statusColors: Record<string, string> = {
 const statusLabels: Record<string, string> = {
   firing: '触发中',
   acknowledged: '已确认',
-  resolved: '已解决',
+  resolved: '已恢复',
   ignored: '已忽略',
   snoozed: '暂停复查',
 }
@@ -248,7 +248,7 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
   const initialAlertId = new URLSearchParams(window.location.search).get('alert_id')
 
   const isAuditMode = mode === 'audit'
-  const tableTitle = isAuditMode ? '告警日志详情' : '正在触发告警'
+  const tableTitle = isAuditMode ? '告警日志详情' : (statusFilter ? `${statusLabels[statusFilter] || statusFilter}告警` : '正在触发告警')
   const statusCounts = summary?.statuses || {}
   const severityCounts = summary?.severities || {}
 
@@ -279,8 +279,8 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
   }
 
   const buildFilterParams = () => ({
-    view: mode,
-    status: isAuditMode ? statusFilter : undefined,
+    view: isAuditMode ? mode : (statusFilter ? undefined : mode),
+    status: statusFilter,
     severity: isAuditMode ? severityFilter : undefined,
     datacenter: datacenterFilter,
     alert_id: initialAlertId ? Number(initialAlertId) : undefined,
@@ -639,7 +639,6 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
         title={tableTitle}
         extra={
           <Space>
-            {isAuditMode ? (
             <Select
               allowClear
               placeholder="状态"
@@ -649,12 +648,11 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
               options={[
                 { value: 'firing', label: '触发中' },
                 { value: 'acknowledged', label: '已确认' },
-                { value: 'resolved', label: '已解决' },
+                { value: 'resolved', label: '已恢复' },
                 { value: 'ignored', label: '已忽略' },
                 { value: 'snoozed', label: '暂停复查' },
               ]}
             />
-            ) : null}
             {isAuditMode ? (
             <Select
               allowClear

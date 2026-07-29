@@ -68,6 +68,8 @@ export interface Device {
   description?: string
   status: string
   is_monitored: boolean
+  syslog_received?: boolean
+  last_syslog_at?: string | null
   last_seen?: string
   created_at: string
   updated_at: string

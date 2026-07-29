@@ -31,13 +31,13 @@ import { updateDevice } from '../../api/devices'
 
 const { Text } = Typography
 
-const VENDOR_OPTIONS = [
-  { value: '', label: '全部厂商' },
-  { value: 'Aster', label: 'AsterNOS/AsterOS' },
-  { value: 'H3C', label: 'H3C' },
-  { value: '华为', label: '华为' },
-  { value: '锐捷', label: '锐捷' },
-  { value: 'Hillstone', label: 'Hillstone/山石' },
+const VENDOR_ALL_OPTION = { value: '', label: '全部厂商' }
+const BASE_VENDOR_OPTIONS = [
+  { value: 'h3c', label: 'H3C' },
+  { value: 'ruijie', label: '锐捷' },
+  { value: 'aster', label: 'AsterNOS/AsterOS' },
+  { value: 'hillstone', label: 'Hillstone/山石' },
+  { value: 'cisco', label: 'Cisco' },
 ]
 
 const DATACENTER_ALL_VALUE = '__all__'
@@ -460,6 +460,7 @@ const normalizeVendorText = (value?: string | null) => {
   if (!text) return ''
   if (['ruijie', '锐捷', 'rgos'].some((marker) => text.includes(marker))) return 'ruijie 锐捷 rgos'
   if (['h3c', '华三', '新华三', 'comware'].some((marker) => text.includes(marker))) return 'h3c 华三 新华三 comware'
+  if (['cisco', 'nexus', 'nx-os', 'nxos', 'n9k'].some((marker) => text.includes(marker))) return 'cisco nexus nx-os nxos n9k'
   if (['hillstone', '山石'].some((marker) => text.includes(marker))) return 'hillstone 山石'
   if (['aster', 'asternos', 'asterfusion', '星融元'].some((marker) => text.includes(marker))) return 'aster asternos asterfusion 星融元'
   return text
@@ -473,7 +474,7 @@ const matchesVendorFilter = (rawVendor?: string | null, keyword?: string) => {
   return normalizedVendor.includes(key) || normalizedVendor.includes(normalizedKey.split(' ')[0])
 }
 
-const OVERVIEW_CACHE_KEY = 'device-overview:last-success'
+const OVERVIEW_CACHE_KEY = 'device-overview:last-success-v2'
 const COLUMN_ORDER_STORAGE_KEY = 'device-overview:visible-column-order-v2'
 const COLUMN_WIDTH_STORAGE_KEY = 'device-overview:column-widths-v1'
 
@@ -809,6 +810,34 @@ const DeviceOverview = () => {
       ...Array.from(unique.values())
         .sort((left, right) => left.localeCompare(right, 'zh-CN'))
         .map((value) => ({ value, label: value })),
+    ]
+  }, [items])
+
+  const vendorOptions = useMemo(() => {
+    const unique = new Map<string, string>()
+    BASE_VENDOR_OPTIONS.forEach((option) => unique.set(option.value, option.label))
+    for (const item of items) {
+      const value = String(item.device.vendor || '').trim()
+      if (!value) continue
+      const normalized = normalizeVendorText(value).split(' ')[0] || value.toLowerCase()
+      const label = normalized === 'cisco'
+        ? 'Cisco'
+        : normalized === 'ruijie'
+          ? '锐捷'
+          : normalized === 'h3c'
+            ? 'H3C'
+            : normalized === 'hillstone'
+              ? 'Hillstone/山石'
+              : normalized === 'aster'
+                ? 'AsterNOS/AsterOS'
+                : value
+      unique.set(normalized, label)
+    }
+    return [
+      VENDOR_ALL_OPTION,
+      ...Array.from(unique.entries())
+        .sort((left, right) => left[1].localeCompare(right[1], 'zh-CN'))
+        .map(([value, label]) => ({ value, label })),
     ]
   }, [items])
 
@@ -1452,7 +1481,7 @@ const DeviceOverview = () => {
             onChange={(event) => setSearch(event.target.value)}
             style={{ flex: '1 1 300px', minWidth: 260, maxWidth: 460 }}
           />
-          <Select style={{ width: 180 }} options={VENDOR_OPTIONS} value={vendor} onChange={setVendor} />
+          <Select style={{ width: 180 }} options={vendorOptions} value={vendor} onChange={setVendor} />
           <Select style={{ width: 180 }} options={datacenterOptions} value={datacenter} onChange={setDatacenter} />
           <Input allowClear placeholder="筛选型号" value={model} onChange={(event) => setModel(event.target.value)} style={{ width: 220 }} />
           <Select style={{ width: 180 }} options={CONNECTIVITY_OPTIONS} value={connectivity} onChange={setConnectivity} />

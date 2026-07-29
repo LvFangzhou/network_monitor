@@ -319,7 +319,7 @@ docker compose down
 
 ## 9. 数据备份
 
-项目已经包含 `influxdb-backup` 服务，会每天执行 InfluxDB 备份，并按保留天数清理旧备份。
+项目已经包含 `influxdb-backup` 服务，会每天执行 InfluxDB 备份。当前策略只保留最新一份本地全量备份：先备份到 `influxdb-latest.tmp`，成功后替换 `influxdb-latest`，避免每日全量快照持续堆积占满磁盘。
 
 手工备份 PostgreSQL：
 
@@ -421,3 +421,24 @@ tail -f /opt/network_monitor_data/tacacs/logs/tacacs.log
 - 对外只开放必要端口
 - 定期验证备份是否可恢复
 - GitHub Token 使用后及时撤销或最小化权限
+
+## 14. 颗粒度与压力检查
+
+生产默认采用分层采集：
+
+- 线路绑定端口：10 秒
+- P0/P1 活动接口：临时 5 秒，恢复后自动降频
+- 普通 SNMP 接口：60 秒完整一轮
+- SNMP 全量资源：180 秒完整一轮
+- AsterNOS Exporter：60 秒
+- Syslog、Trap、Telemetry、BMP：事件到达即处理
+
+发布提频后检查：
+
+```bash
+docker logs --since 10m nm-celery-worker-snmp-circuit | grep '线路绑定端口实时采集完成'
+docker stats --no-stream nm-celery-worker-snmp-circuit nm-influxdb nm-postgres
+docker logs --since 10m nm-celery-beat | grep collect-circuit-interface-realtime
+```
+
+如果线路任务单轮耗时接近或超过 10 秒，任务锁会阻止重叠，但应先回退周期或减少目标，不应继续全局提频。

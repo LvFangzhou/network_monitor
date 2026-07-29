@@ -43,6 +43,14 @@ def _query_interface_average_fields(device_id: int, interface_name: str, start: 
 
 
 def _circuit_endpoint_rows(circuit: Circuit) -> List[Dict[str, Any]]:
+    if circuit.aggregation_monitor_device_id and circuit.aggregation_interface_name:
+        return [{
+            "role": "aggregation",
+            "device_id": circuit.aggregation_monitor_device_id,
+            "device_name": circuit.aggregation_monitor_device_ref.name if circuit.aggregation_monitor_device_ref else None,
+            "device_ip": circuit.aggregation_monitor_device_ref.ip_address if circuit.aggregation_monitor_device_ref else None,
+            "port_name": circuit.aggregation_interface_name,
+        }]
     return [
         {
             "role": "primary",

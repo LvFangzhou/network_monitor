@@ -280,6 +280,15 @@ def _canonical_target_key(definition: TrapDefinition, trap_oid: str, detail_text
             # BFD Down Trap 的原文包含设备名和 "UP -> DOWN"。只用会话两端地址
             # 作为对象键，避免同一会话因文案变化生成多条活动告警。
             return f"hillstone_trap:bfd:local={local}|neighbor={neighbor}"
+    if definition.category == "bgp":
+        peer_match = re.search(r"\bBGP\s+peer\s+((?:\d{1,3}\.){3}\d{1,3})", detail, re.IGNORECASE)
+        vr_match = re.search(r"\bvirtual\s+router\s+([^\s]+)", detail, re.IGNORECASE)
+        if peer_match:
+            peer = peer_match.group(1).lower()
+            vr = (vr_match.group(1).lower() if vr_match else "default")
+            # BGP 状态变化 Trap 的原文包含状态迁移方向，只用 VR + peer 作为对象键，
+            # 避免 Established -> Idle 与 Idle -> Established 被当成两个不同对象。
+            return f"hillstone_trap:bgp:vr={vr}|peer={peer}"
     return f"hillstone_trap:{category}:{detail}"
 
 

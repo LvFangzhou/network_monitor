@@ -158,6 +158,17 @@ const statusColorMap: Record<string, string> = {
   '已收到，待接入告警中心': 'orange',
   '已收到，待关联模块信息': 'purple',
   '已收到，待专题展示': 'cyan',
+  '设备实际未上送': 'default',
+}
+
+const capabilityPathMarkers: Record<string, string[]> = {
+  PFC: ['pfcstatistics', 'pfcspeeds', 'pfcports', 'portdeadlocks'],
+  Buffer: ['commbufferusages', 'commheadroomusages', 'ingressdrops', 'egressdrops'],
+  Queue: ['qstat/queuestat', 'qos/interfaces'],
+  'ECN / WRED': ['ecnandwredstatistics', 'wred/'],
+  无损事件: ['portquedropevent', 'portqueoverrunevent', 'resourceevent', 'telemetryftrace'],
+  'FEC / BER / ESNR': ['iffecdata', 'pre-fec-ber', '/esnr'],
+  'MQC / QoS': ['mqc/'],
 }
 
 const LosslessInfoQuery = () => {
@@ -245,6 +256,16 @@ const LosslessInfoQuery = () => {
     () => (telemetrySnapshot.ports || []).find((row: any) => row.interface_name === telemetryDetailPortName),
     [telemetrySnapshot.ports, telemetryDetailPortName],
   )
+  const actualCapabilities = useMemo(() => {
+    const receivedPaths = (telemetrySnapshot.path_status || [])
+      .filter((item: any) => item.received)
+      .map((item: any) => String(item.sensor_path || '').toLowerCase())
+    return telemetryLosslessCapabilities.map((item) => {
+      const markers = capabilityPathMarkers[item.category] || []
+      const received = markers.some((marker) => receivedPaths.some((path: string) => path.includes(marker)))
+      return { ...item, status: received ? item.status : '设备实际未上送' }
+    })
+  }, [telemetrySnapshot.path_status])
 
   const openTelemetryPortDetail = (interfaceName: string) => {
     setTelemetryDetailPortName(interfaceName)
@@ -555,48 +576,6 @@ const LosslessInfoQuery = () => {
             ),
           },
           {
-            key: 'telemetry-paths',
-            label: 'Telemetry路径接收状态',
-            children: (
-              <Space direction="vertical" size={16} style={{ width: '100%' }}>
-                <Card>
-                  <Space wrap>
-                    <Select
-                      showSearch
-                      optionFilterProp="label"
-                      style={{ minWidth: 460 }}
-                      placeholder="选择已接入Telemetry的H3C设备"
-                      value={telemetryDeviceId}
-                      options={telemetryDevices.map((item) => ({
-                        value: item.id,
-                        label: `${item.name} / ${item.ip_address} / ${item.model || '-'}`,
-                      }))}
-                      onChange={setTelemetryDeviceId}
-                    />
-                    <Button icon={<ReloadOutlined />} onClick={loadTelemetrySnapshot} loading={telemetryLoading}>刷新状态</Button>
-                    <Tag color="green">已接入 {telemetryDevices.length} 台</Tag>
-                    {telemetrySnapshot.collected_at && <Text type="secondary">最新采集：{new Date(telemetrySnapshot.collected_at).toLocaleString()}</Text>}
-                  </Space>
-                </Card>
-                <Card title="Telemetry路径接收状态">
-                  <Table<any>
-                    size="small"
-                    rowKey="sensor_path"
-                    loading={telemetryLoading}
-                    pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
-                    dataSource={telemetrySnapshot.path_status || []}
-                    columns={[
-                      { title: 'Sensor Path', dataIndex: 'sensor_path' },
-                      { title: '状态', dataIndex: 'received', width: 100, render: (v) => <Tag color={v ? 'green' : 'default'}>{v ? '已收到' : '暂无'}</Tag> },
-                      { title: '有效行数', dataIndex: 'row_count', width: 100 },
-                      { title: '采集时间', dataIndex: 'collected_at', width: 200, render: (v) => v ? new Date(v).toLocaleString() : '-' },
-                    ]}
-                  />
-                </Card>
-              </Space>
-            ),
-          },
-          {
             key: 'telemetry-plan',
             label: 'Telemetry 接入规划',
             children: (
@@ -610,7 +589,7 @@ const LosslessInfoQuery = () => {
                 <Card title="待接入无损 Telemetry 数据源">
                   <Table
                     rowKey={(record) => record.category}
-                    dataSource={telemetryLosslessCapabilities}
+                    dataSource={actualCapabilities}
                     pagination={false}
                     scroll={{ x: 1200 }}
                     columns={[

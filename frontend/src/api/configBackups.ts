@@ -36,7 +36,7 @@ export interface ConfigBackupResult {
   startup_config_content?: string | null
   startup_config_hash?: string | null
   startup_line_count?: number | null
-  config_sync_status?: 'matched' | 'changed_saved' | 'changed_save_failed' | 'check_failed' | 'unsupported' | null
+  config_sync_status?: 'matched' | 'changed_saved' | 'changed_save_failed' | 'changed_not_saved' | 'check_failed' | 'unsupported' | null
   config_sync_diff?: string | null
   config_save_command?: string | null
   config_save_status?: 'success' | 'failed' | null

@@ -38,7 +38,7 @@ const { Search } = Input
 const { Text } = Typography
 const { Option } = Select
 const DEVICE_LIST_STORAGE_KEY = 'resource-network-device-list-state'
-const DEVICE_LIST_STORAGE_VERSION = 8
+const DEVICE_LIST_STORAGE_VERSION = 9
 const COLUMN_FILTER_KEYS = ['name', 'ip_address', 'status', 'is_monitored', 'datacenter', 'model', 'device_type', 'serial_number'] as const
 type ColumnFilterKey = typeof COLUMN_FILTER_KEYS[number]
 type SortField = ColumnFilterKey
@@ -48,6 +48,7 @@ const DEFAULT_VISIBLE_COLUMNS = [
   'ip_address',
   'status',
   'is_monitored',
+  'syslog_received',
   'datacenter',
   'model',
   'device_type',
@@ -59,6 +60,7 @@ const DEFAULT_COLUMN_WIDTHS = {
   name: 240,
   status: 110,
   is_monitored: 100,
+  syslog_received: 120,
   ip_address: 120,
   datacenter: 240,
   device_type: 120,
@@ -69,7 +71,7 @@ const DEFAULT_COLUMN_WIDTHS = {
   created_at: 170,
   action: 150,
 }
-const COLUMN_ORDER = ['name', 'ip_address', 'status', 'is_monitored', 'datacenter', 'device_role', 'model', 'device_type', 'vendor', 'serial_number', 'created_at', 'action']
+const COLUMN_ORDER = ['name', 'ip_address', 'status', 'is_monitored', 'syslog_received', 'datacenter', 'device_role', 'model', 'device_type', 'vendor', 'serial_number', 'created_at', 'action']
 const DEVICE_EXPORT_FIELDS = [
   { value: 'name', label: '设备名称' },
   { value: 'status', label: '运行状态' },
@@ -935,6 +937,39 @@ const DeviceList = () => {
       ),
     },
     {
+      title: '是否接收Syslog',
+      dataIndex: 'syslog_received',
+      key: 'syslog_received',
+      width: columnWidths.syslog_received,
+      render: (value: boolean, record: Device) => {
+        const lastSeen = formatDateTimeText(record.last_syslog_at)
+        const title = value ? `最近接收：${lastSeen}` : '暂无Syslog入库记录'
+        return (
+          <Tooltip title={title}>
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                minWidth: 54,
+                padding: '2px 8px',
+                fontSize: 12,
+                lineHeight: 1.4,
+                fontWeight: 700,
+                borderRadius: 4,
+                background: value ? '#e6fffb' : '#fff1f0',
+                color: value ? '#08979c' : '#cf1322',
+                border: `1px solid ${value ? '#87e8de' : '#ffa39e'}`,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {value ? '已接收' : '未接收'}
+            </span>
+          </Tooltip>
+        )
+      },
+    },
+    {
       title: '设备类型',
       dataIndex: 'device_type',
       key: 'device_type',
@@ -1062,6 +1097,7 @@ const DeviceList = () => {
     { key: 'ip_address', label: '管理地址' },
     { key: 'status', label: '运行状态' },
     { key: 'is_monitored', label: '是否监控' },
+    { key: 'syslog_received', label: '是否接收Syslog' },
     { key: 'datacenter', label: '机房' },
     { key: 'device_role', label: '设备角色' },
     { key: 'model', label: '型号' },

@@ -31,12 +31,17 @@ logger = get_logger(__name__)
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 CHECK_ALERTS_LOCK_KEY = "alerts:check_alerts:lock"
 FAST_CHECK_ALERTS_LOCK_KEY = "alerts:check_fast_alerts:lock"
+FAST_STATE_ALERTS_LOCK_KEY = "alerts:check_fast_state_alerts:lock"
+FAST_CRC_ALERTS_LOCK_KEY = "alerts:check_fast_crc_alerts:lock"
+FAST_ERROR_ALERTS_LOCK_KEY = "alerts:check_fast_error_alerts:lock"
+FAST_DISCARD_ALERTS_LOCK_KEY = "alerts:check_fast_discard_alerts:lock"
 REACHABILITY_CHECK_ALERTS_LOCK_KEY = "alerts:check_reachability_alerts:lock"
 PROTOCOL_CHECK_ALERTS_LOCK_KEY = "alerts:check_protocol_alerts:lock"
 DEVICE_HEALTH_CHECK_ALERTS_LOCK_KEY = "alerts:check_device_health_alerts:lock"
 OPTICAL_CHECK_ALERTS_LOCK_KEY = "alerts:check_optical_alerts:lock"
 INTERFACE_ALERT_RECOVERY_LOCK_KEY = "alerts:resolve_interface_alerts_quick:lock"
 HILLSTONE_BFD_RECOVERY_LOCK_KEY = "alerts:reconcile_hillstone_bfd_traps:lock"
+HILLSTONE_BGP_RECOVERY_LOCK_KEY = "alerts:reconcile_hillstone_bgp_traps:lock"
 CHECK_ALERTS_LOCK_TTL_SECONDS = 900
 FAST_CHECK_ALERTS_LOCK_TTL_SECONDS = 300
 REACHABILITY_CHECK_ALERTS_LOCK_TTL_SECONDS = 180
@@ -55,10 +60,24 @@ OPTICAL_MAX_SAMPLE_AGE_SECONDS = 420
 PROTOCOL_MAX_SAMPLE_AGE_SECONDS = 420
 CIRCUIT_MAX_SAMPLE_AGE_SECONDS = 180
 GENERAL_METRIC_MAX_SAMPLE_AGE_SECONDS = 420
+EVENT_DRIVEN_METRIC_TYPES = {
+    "snmp_trap",
+    "syslog_interface_phy_down",
+    "syslog_bgp_state_change",
+    "syslog_bfd_state_change",
+    "syslog_optical_module_event",
+    "syslog_power_event",
+    "syslog_fan_event",
+    "syslog_temperature_event",
+    "syslog_device_critical_event",
+}
 _EXPORTER_SCRAPE_CACHE: Dict[int, Dict[str, Any]] = {}
 _EXPORTER_SCRAPE_CACHE_LOCK = threading.Lock()
 _ALERT_RUN_EXPORTER_CACHE: contextvars.ContextVar[Optional[Dict[int, Dict[str, List[Dict[str, Any]]]]]] = (
     contextvars.ContextVar("alert_run_exporter_cache", default=None)
+)
+_ALERT_RUN_TARGET_CACHE: contextvars.ContextVar[Optional[Dict[str, List[Dict[str, Any]]]]] = (
+    contextvars.ContextVar("alert_run_target_cache", default=None)
 )
 EXPORTER_DELTA_CACHE_TTL_SECONDS = 86400
 RULE_STATUS_PREWARM_URL = "http://api:8000/api/v1/alerts/rules/{rule_id}/status?limit={limit}&max_runtime_seconds={max_runtime_seconds}"
@@ -170,6 +189,70 @@ def _collect_hillstone_bfd_sessions(device: Device) -> Dict[tuple[str, str], str
     return _parse_hillstone_bfd_sessions(output)
 
 
+def _parse_hillstone_bgp_summary(output: str) -> Dict[str, str]:
+    """解析山石 ``show ip bgp summary``，返回 peer -> 状态。
+
+    山石 Established 时 State/PfxRcd 列通常显示前缀数量；非 Established 时显示
+    Idle/Active/Connect 等文本状态。
+    """
+    peers: Dict[str, str] = {}
+    for line in str(output or "").splitlines():
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        peer = parts[0].strip().lower()
+        if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", peer):
+            continue
+        state = parts[-1].strip().lower()
+        peers[peer] = "established" if re.fullmatch(r"\d+", state) else state
+    return peers
+
+
+def _hillstone_bgp_alert_peer(alert: AlertHistory) -> Optional[str]:
+    text = "\n".join(
+        str(value or "")
+        for value in (alert.alert_target_key, alert.alert_target_name, alert.message)
+    )
+    match = re.search(r"\bpeer\s*[=:]?\s*((?:\d{1,3}\.){3}\d{1,3})", text, re.IGNORECASE)
+    if not match:
+        match = re.search(r"\bBGP\s+peer\s+((?:\d{1,3}\.){3}\d{1,3})", text, re.IGNORECASE)
+    if not match:
+        match = re.search(r"\bBGP\s+邻居\s*((?:\d{1,3}\.){3}\d{1,3})", text, re.IGNORECASE)
+    return match.group(1).lower() if match else None
+
+
+def _collect_hillstone_bgp_peers(device: Device) -> Dict[str, str]:
+    """通过山石 CLI 查询当前 BGP 邻居状态；查询失败时抛错，不误恢复告警。"""
+    from netmiko import ConnectHandler
+    from app.tasks.config_backup_tasks import _netmiko_device_type
+
+    username = str(device.ssh_username or "").strip()
+    if not username or not device.ssh_password:
+        raise RuntimeError("设备未配置可用的 SSH 用户名/密码")
+    connection = ConnectHandler(
+        device_type=_netmiko_device_type(device),
+        host=device.ip_address,
+        port=int(device.ssh_port or 22),
+        username=username,
+        password=device.ssh_password,
+        timeout=20,
+        conn_timeout=15,
+        banner_timeout=15,
+        auth_timeout=15,
+        fast_cli=False,
+    )
+    try:
+        output = connection.send_command(
+            "show ip bgp summary",
+            read_timeout=30,
+            strip_prompt=True,
+            strip_command=True,
+        )
+    finally:
+        connection.disconnect()
+    return _parse_hillstone_bgp_summary(output)
+
+
 @shared_task(name="app.tasks.alert_tasks.reconcile_hillstone_bfd_trap_alerts", time_limit=50, soft_time_limit=45)
 def reconcile_hillstone_bfd_trap_alerts():
     """山石只发送 BFD Down Trap；定期用当前 CLI 状态补齐真实恢复。"""
@@ -239,6 +322,75 @@ def reconcile_hillstone_bfd_trap_alerts():
     finally:
         db.close()
         redis_client.delete(HILLSTONE_BFD_RECOVERY_LOCK_KEY)
+
+
+@shared_task(name="app.tasks.alert_tasks.reconcile_hillstone_bgp_trap_alerts", time_limit=50, soft_time_limit=45)
+def reconcile_hillstone_bgp_trap_alerts():
+    """山石 BGP Down Trap 没有稳定配对恢复 Trap；定期用当前 CLI 状态补齐真实恢复。"""
+    if not redis_client.set(HILLSTONE_BGP_RECOVERY_LOCK_KEY, uuid.uuid4().hex, ex=55, nx=True):
+        return {"skipped": "locked"}
+
+    db = SessionLocal()
+    resolved_ids: List[int] = []
+    checked_devices = 0
+    try:
+        active = (
+            db.query(AlertHistory)
+            .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+            .filter(
+                AlertRule.metric_type == "snmp_trap",
+                AlertRule.name.ilike("%BGP%Down%"),
+                AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+            )
+            .order_by(AlertHistory.device_id, AlertHistory.started_at)
+            .all()
+        )
+        alerts_by_device: Dict[int, List[AlertHistory]] = {}
+        for alert in active:
+            alerts_by_device.setdefault(int(alert.device_id), []).append(alert)
+
+        for device_id, alerts in alerts_by_device.items():
+            device = db.query(Device).filter(Device.id == device_id).first()
+            if not device or not _is_hillstone_vendor(device.vendor):
+                continue
+            try:
+                peers = _collect_hillstone_bgp_peers(device)
+                checked_devices += 1
+            except Exception as exc:
+                logger.warning(
+                    "山石BGP恢复回查失败，保留原告警",
+                    device_id=device_id,
+                    ip=getattr(device, "ip_address", None),
+                    error=str(exc),
+                )
+                continue
+
+            now = _utc_now()
+            for alert in alerts:
+                peer = _hillstone_bgp_alert_peer(alert)
+                if not peer:
+                    continue
+                state = peers.get(peer)
+                if state != "established":
+                    continue
+                alert.status = "resolved"
+                alert.resolved_by = "hillstone_bgp_cli"
+                alert.resolved_at = now
+                alert.updated_at = now
+                alert.resolution_note = f"设备当前 BGP 邻居 {peer} 状态已恢复为 Established（CLI核验）"
+                resolved_ids.append(int(alert.id))
+            if resolved_ids:
+                db.commit()
+
+        for alert_id in resolved_ids:
+            enqueue_alert_notification(alert_id, "auto_resolved", "hillstone_bgp_cli")
+        return {"checked_devices": checked_devices, "resolved": len(resolved_ids)}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+        redis_client.delete(HILLSTONE_BGP_RECOVERY_LOCK_KEY)
 
 
 
@@ -389,6 +541,11 @@ CIRCUIT_METRIC_TYPES = {
     "private_line_circuit_utilization",
 }
 
+CIRCUIT_UTILIZATION_METRIC_TYPES = {
+    "internet_circuit_utilization",
+    "private_line_circuit_utilization",
+}
+
 DEVICE_REACHABILITY_METRIC_TYPES = {
     "device_reachability",
     "snmp_reachability",
@@ -441,6 +598,12 @@ EXPORTER_METRIC_TYPES = {
     "exporter_metric",
 }
 
+QUALITY_PROBE_METRIC_TYPES = {
+    "quality_packet_loss",
+    "quality_latency",
+    "quality_jitter",
+}
+
 PERCENT_METRIC_TYPES = {
     "snmp_cpu",
     "snmp_memory",
@@ -476,6 +639,8 @@ NUMERIC_DETAIL_METRIC_TYPES = {
     "optical_rx_fec_correlation",
     "exporter_metric",
     "quality_packet_loss",
+    "quality_latency",
+    "quality_jitter",
 }
 
 METRIC_VALUE_LABELS = {
@@ -500,6 +665,8 @@ METRIC_VALUE_LABELS = {
     "optical_rx_power_drop_24h": "24小时收光衰减",
     "optical_rx_fec_correlation": "当前FEC纠错包增长",
     "quality_packet_loss": "最近5分钟丢包率",
+    "quality_latency": "当前平均延迟",
+    "quality_jitter": "当前抖动",
     "internet_circuit_utilization": "当前公网线路使用率",
     "private_line_circuit_utilization": "当前专线使用率",
     "interface_crc_errors_delta": "当前CRC/FCS错误增长",
@@ -517,6 +684,10 @@ FAST_ALERT_METRIC_TYPES = {
     "interface_in_discards_delta",
     "interface_out_discards_delta",
 }
+FAST_STATE_METRIC_TYPES = {"interface_admin_up_oper_down"}
+FAST_CRC_METRIC_TYPES = {"interface_crc_errors_delta"}
+FAST_ERROR_METRIC_TYPES = {"interface_in_errors_delta", "interface_out_errors_delta"}
+FAST_DISCARD_METRIC_TYPES = {"interface_in_discards_delta", "interface_out_discards_delta"}
 
 REACHABILITY_ALERT_METRIC_TYPES = {
     "device_reachability",
@@ -608,6 +779,16 @@ def _is_operation_notification(rule: Optional[AlertRule]) -> bool:
     return _normalize_severity_label(rule.severity if rule else None) == "P3"
 
 
+def _is_resource_notification(rule: Optional[AlertRule]) -> bool:
+    """Resource-watermark notices are monitoring messages, not fault incidents."""
+    if not rule:
+        return False
+    if rule.metric_type in CIRCUIT_UTILIZATION_METRIC_TYPES:
+        return True
+    extra_config = rule.extra_config or {}
+    return str(extra_config.get("notification_kind") or "").strip() == "resource_notice"
+
+
 def _operation_notification_name(rule: Optional[AlertRule]) -> str:
     text = " ".join(
         str(value or "")
@@ -649,10 +830,27 @@ def _get_mention_users(rule: AlertRule) -> List[str]:
 
 
 def _quality_target_notification(rule: AlertRule, alert: AlertHistory) -> Dict[str, Any]:
-    if rule.metric_type != "quality_packet_loss" or alert.alert_target_type != "quality_probe":
+    if rule.metric_type not in QUALITY_PROBE_METRIC_TYPES or alert.alert_target_type != "quality_probe":
         return {}
     target_notifications = (rule.extra_config or {}).get("target_notifications") or {}
-    return target_notifications.get(str(alert.alert_target_key or "")) or {}
+    target_notification = target_notifications.get(str(alert.alert_target_key or "")) or {}
+    if target_notification:
+        return target_notification
+    if rule.metric_type in {"quality_latency", "quality_jitter"}:
+        try:
+            db = Session.object_session(alert)
+            fallback_rule = (
+                db.query(AlertRule)
+                .filter(AlertRule.metric_type == "quality_packet_loss")
+                .order_by(AlertRule.id.asc())
+                .first()
+                if db else None
+            )
+            fallback_notifications = (fallback_rule.extra_config or {}).get("target_notifications") or {} if fallback_rule else {}
+            return fallback_notifications.get(str(alert.alert_target_key or "")) or {}
+        except Exception:
+            return {}
+    return {}
 
 
 def _notification_channels_for_alert(rule: AlertRule, alert: AlertHistory) -> List[Dict[str, Any]]:
@@ -737,7 +935,7 @@ def _circuit_context_from_alert(alert: AlertHistory) -> Dict[str, str]:
     return context
 
 
-def _circuit_utilization_content_lines(alert: AlertHistory) -> List[str]:
+def _circuit_utilization_content_lines(alert: AlertHistory, include_action: bool = True) -> List[str]:
     rule = alert.rule
     context = _circuit_context_from_alert(alert)
     line_label = context.get("线路类型") or ("专线" if rule and rule.metric_type == "private_line_circuit_utilization" else "公网线路")
@@ -760,13 +958,14 @@ def _circuit_utilization_content_lines(alert: AlertHistory) -> List[str]:
     sample_time = context.get("采样时间")
     if sample_time:
         lines.append(f"采样时间：{sample_time}")
-    lines.append("处理建议：优先确认该线路入/出方向是否持续接近带宽上限；如确认打满，再排查业务突增、限速策略、运营商侧带宽配置和接口错误包。")
+    if include_action:
+        lines.append("处理建议：优先确认该线路入/出方向是否持续接近带宽上限；如确认打满，再排查业务突增、限速策略、运营商侧带宽配置和接口错误包。")
     return lines
 
 
-def _circuit_utilization_card_rows(alert: AlertHistory) -> List[Dict[str, str]]:
+def _circuit_utilization_card_rows(alert: AlertHistory, include_action: bool = True) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
-    for line in _circuit_utilization_content_lines(alert):
+    for line in _circuit_utilization_content_lines(alert, include_action=include_action):
         if "：" not in line:
             continue
         label, value = line.split("：", 1)
@@ -829,6 +1028,12 @@ def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[
     severity = _normalize_severity_label(rule.severity)
     mentions = _get_mention_users(rule)
     mention_suffix = f"@{'、'.join(mentions)}" if mentions else ""
+    if _is_resource_notification(rule):
+        if event_type == "ignored":
+            return f"{actor or '有人'}忽略了1条资源水位通知"
+        if event_type == "auto_resolved":
+            return f"{severity}-资源水位恢复通知{mention_suffix}"
+        return f"{severity}-资源水位通知{mention_suffix}"
     if _is_operation_notification(rule):
         operation_name = _operation_notification_name(rule)
         if event_type == "ignored":
@@ -836,7 +1041,7 @@ def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[
         return f"{severity}-{operation_name}{mention_suffix}"
     if event_type == "ignored":
         return f"{actor or '有人'}忽略了1条故障"
-    if rule.metric_type == "quality_packet_loss":
+    if rule.metric_type in QUALITY_PROBE_METRIC_TYPES:
         quality_label = "公网链路"
         if alert is not None:
             context = _quality_probe_context_from_alert(alert)
@@ -859,15 +1064,25 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
         target_id = 0
     target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first() if target_id else None
     rule = alert.rule
+    metric_type = rule.metric_type if rule else "quality_packet_loss"
     extra_config = (rule.extra_config or {}) if rule else {}
     message = str(alert.message or "")
     resolution_note = str(alert.resolution_note or "")
     match = re.search(r"连续\s*(\d+)\s*个探测周期", message)
     consecutive = int(match.group(1)) if match else 0
     target_notification = (extra_config.get("target_notifications") or {}).get(str(target_id)) or {}
+    if not target_notification and metric_type in {"quality_latency", "quality_jitter"}:
+        fallback_rule = db.query(AlertRule).filter(AlertRule.metric_type == "quality_packet_loss").order_by(AlertRule.id.asc()).first()
+        target_notification = ((fallback_rule.extra_config or {}).get("target_notifications") or {}).get(str(target_id)) or {} if fallback_rule else {}
     required_match = re.search(r"告警要求连续\s*(\d+)\s*个周期", message)
+    consecutive_key = "consecutive_samples"
+    if metric_type == "quality_latency":
+        consecutive_key = "latency_consecutive_samples"
+    elif metric_type == "quality_jitter":
+        consecutive_key = "jitter_consecutive_samples"
     required_count = int(required_match.group(1)) if required_match else int(
-        target_notification.get("consecutive_samples") or extra_config.get("consecutive_samples") or 5
+        target_notification.get(consecutive_key) if target_notification.get(consecutive_key) is not None
+        else target_notification.get("consecutive_samples") or extra_config.get("consecutive_samples") or 5
     )
     recovery_count_match = re.search(r"当前连续异常周期\s*(\d+)/(\d+)", resolution_note)
     current_consecutive = int(recovery_count_match.group(1)) if recovery_count_match else consecutive
@@ -875,9 +1090,23 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
     received = int(io_match.group(1)) if io_match else None
     sent = int(io_match.group(2)) if io_match else None
     latency_match = re.search(r"当前延迟[：:]\s*([\d.]+)\s*ms", message, re.IGNORECASE)
-    loss = float(alert.alert_value or 0)
+    jitter_match = re.search(r"当前抖动[：:]\s*([\d.]+)\s*ms", message, re.IGNORECASE)
+    loss_match = re.search(r"最近5分钟丢包率[：:]\s*([\d.]+)\s*%", message, re.IGNORECASE)
+    latency_alert_value = float(alert.alert_value or 0) if metric_type == "quality_latency" else None
+    jitter_alert_value = float(alert.alert_value or 0) if metric_type == "quality_jitter" else None
+    loss_alert_value = float(alert.alert_value or 0) if metric_type == "quality_packet_loss" else None
+    loss = loss_alert_value if loss_alert_value is not None else (
+        float(loss_match.group(1)) if loss_match else getattr(target, "last_packet_loss_percent", None)
+    )
+    if loss is None:
+        loss = 0.0
     threshold = float(alert.threshold or (rule.threshold if rule else 0) or 0)
-    latency = float(latency_match.group(1)) if latency_match else getattr(target, "last_avg_latency_ms", None)
+    latency = latency_alert_value if latency_alert_value is not None else (
+        float(latency_match.group(1)) if latency_match else getattr(target, "last_avg_latency_ms", None)
+    )
+    jitter = jitter_alert_value if jitter_alert_value is not None else (
+        float(jitter_match.group(1)) if jitter_match else getattr(target, "last_jitter_ms", None)
+    )
     datacenter = getattr(target, "datacenter_ref", None)
     datacenter_text = getattr(datacenter, "name", None) or "-"
     operator = getattr(target, "operator_name", None) or "-"
@@ -892,6 +1121,18 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
     line_type = getattr(getattr(target, "circuit_ref", None), "line_type", None)
     is_private_line = probe_source == "device_nqa_snmp" or line_type == "private_line"
     line_label = "专线" if is_private_line else "公网链路"
+    if metric_type == "quality_latency":
+        metric_label = "延迟"
+        current_value = float(latency or 0)
+        current_unit = "ms"
+    elif metric_type == "quality_jitter":
+        metric_label = "抖动"
+        current_value = float(jitter or 0)
+        current_unit = "ms"
+    else:
+        metric_label = "丢包率"
+        current_value = float(loss or 0)
+        current_unit = "%"
     return {
         "name": name,
         "address": address,
@@ -904,8 +1145,15 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
         "circuit_port_name": getattr(target, "probe_interface_name", None) or (getattr(target, "circuit_ref", None).primary_port_name if getattr(target, "circuit_ref", None) else None),
         "circuit_bandwidth_mbps": getattr(getattr(target, "circuit_ref", None), "bandwidth_mbps", None),
         "latency": "-" if latency is None else f"{float(latency):.2f} ms",
-        "loss": loss,
+        "jitter": "-" if jitter is None else f"{float(jitter):.2f} ms",
+        "loss": float(loss or 0),
         "threshold": threshold,
+        "metric_type": metric_type,
+        "metric_label": metric_label,
+        "current_value": current_value,
+        "current_unit": current_unit,
+        "current_value_text": f"{current_value:.2f}{current_unit}",
+        "threshold_text": f"{threshold:.2f}{current_unit}",
         "consecutive": consecutive,
         "current_consecutive": current_consecutive,
         "required_count": required_count,
@@ -944,6 +1192,18 @@ def _quality_impact_text(loss_percent: float) -> str:
     if loss_percent >= 3:
         return "链路质量下降，可能出现访问变慢、卡顿或重传"
     return "出现持续丢包，请关注链路稳定性"
+
+
+def _quality_latency_impact_text(latency_ms: float, threshold_ms: float) -> str:
+    if threshold_ms > 0 and latency_ms >= threshold_ms * 2:
+        return "延迟明显高于阈值，业务访问、跨域同步或实时交互可能受到影响"
+    return "链路延迟持续偏高，请关注路径拥塞、绕路或专线运营商侧质量"
+
+
+def _quality_jitter_impact_text(jitter_ms: float, threshold_ms: float) -> str:
+    if threshold_ms > 0 and jitter_ms >= threshold_ms * 2:
+        return "抖动明显高于阈值，实时业务、跨域同步或专线稳定性可能受到影响"
+    return "链路抖动持续偏高，请关注接口拥塞、队列排队、运营商侧质量或路径变化"
 
 
 def _quality_action_text(context: Optional[Dict[str, Any]] = None) -> str:
@@ -987,7 +1247,7 @@ def _build_notification_content(
 ) -> str:
     rule = alert.rule
     device = alert.device
-    if rule and rule.metric_type == "quality_packet_loss" and not device:
+    if rule and rule.metric_type in QUALITY_PROBE_METRIC_TYPES and not device:
         alarm_id = _ensure_alarm_id(db, alert)
         started_at_text = _format_local_time(alert.started_at)
         context = _quality_probe_context(db, alert)
@@ -999,23 +1259,53 @@ def _build_notification_content(
             f"目标地址：{context['address']}",
             f"所属机房：{context['datacenter']}",
             f"运营商：{context['operator']}",
-            f"{'恢复时延迟' if is_recovery else '当前延迟'}：{context['latency']}",
+            f"{'恢复时' if is_recovery else '当前'}{context['metric_label']}：{context['current_value_text']}",
         ]
         if is_recovery:
+            recovery_metric_label = (
+                "恢复时平均延迟" if context["metric_type"] == "quality_latency"
+                else "恢复时抖动" if context["metric_type"] == "quality_jitter"
+                else "恢复时5分钟丢包率"
+            )
             lines.extend([
                 f"恢复原因：{context['recovery_reason']}",
-                f"恢复时5分钟丢包率：{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%",
+                f"{recovery_metric_label}：{context['current_value_text']} / 阈值 {context['threshold_text']}",
+                f"恢复时延迟：{context['latency']}",
+                f"恢复时5分钟丢包率：{context['loss']:.2f}%",
                 f"当前连续异常周期：{context['current_consecutive']} / {context['required_count']}",
             ])
         else:
-            lines.extend([
-                "触发原因：5分钟丢包率超阈值，并且连续异常周期达到要求（两个条件同时满足）",
-                f"5分钟丢包率：{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%",
-                f"连续异常周期：{context['consecutive']} / {context['required_count']}",
-                f"本轮探测：{context['probe_result']}",
-                f"影响判断：{_quality_impact_text(context['loss'])}",
-                f"处理建议：{_quality_action_text(context)}",
-            ])
+            if context["metric_type"] == "quality_latency":
+                lines.extend([
+                    "触发原因：平均延迟超阈值，并且连续异常周期达到要求（两个条件同时满足）",
+                    f"平均延迟：{context['current_value_text']} / 阈值 {context['threshold_text']}",
+                    f"参考丢包率：{context['loss']:.2f}%",
+                    f"连续异常周期：{context['consecutive']} / {context['required_count']}",
+                    f"本轮探测：{context['probe_result']}",
+                    f"影响判断：{_quality_latency_impact_text(context['current_value'], context['threshold'])}",
+                    f"处理建议：{_quality_action_text(context)}",
+                ])
+            elif context["metric_type"] == "quality_jitter":
+                lines.extend([
+                    "触发原因：抖动超阈值，并且连续异常周期达到要求（两个条件同时满足）",
+                    f"当前抖动：{context['current_value_text']} / 阈值 {context['threshold_text']}",
+                    f"当前延迟：{context['latency']}",
+                    f"参考丢包率：{context['loss']:.2f}%",
+                    f"连续异常周期：{context['consecutive']} / {context['required_count']}",
+                    f"本轮探测：{context['probe_result']}",
+                    f"影响判断：{_quality_jitter_impact_text(context['current_value'], context['threshold'])}",
+                    f"处理建议：{_quality_action_text(context)}",
+                ])
+            else:
+                lines.extend([
+                    "触发原因：5分钟丢包率超阈值，并且连续异常周期达到要求（两个条件同时满足）",
+                    f"5分钟丢包率：{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%",
+                    f"当前延迟：{context['latency']}",
+                    f"连续异常周期：{context['consecutive']} / {context['required_count']}",
+                    f"本轮探测：{context['probe_result']}",
+                    f"影响判断：{_quality_impact_text(context['loss'])}",
+                    f"处理建议：{_quality_action_text(context)}",
+                ])
         lines.extend([f"采样方式：{context['sampling']}", f"Alarm ID：{alarm_id}"])
         if event_type == "auto_resolved":
             lines.extend([
@@ -1035,12 +1325,15 @@ def _build_notification_content(
     detail_url = _build_detail_url(alert)
     fault_title = rule.name or rule.metric_type
     is_operation = _is_operation_notification(rule)
+    is_resource_notice = _is_resource_notification(rule)
     target_line = _target_label(rule, alert)
     started_at_text = _format_local_time(alert.started_at)
 
     lines = []
     if event_type == "ignored":
         lines.append(f"【{fault_title}】")
+    elif is_resource_notice:
+        lines.append(f"通知标题：【{fault_title}】")
     elif is_operation:
         lines.append(f"记录类型：【{fault_title}】")
     else:
@@ -1049,7 +1342,7 @@ def _build_notification_content(
     lines.append(f"管理地址：{device.ip_address}")
     is_circuit_utilization = rule.metric_type in {"internet_circuit_utilization", "private_line_circuit_utilization"}
     if is_circuit_utilization and not is_operation:
-        lines.extend(_circuit_utilization_content_lines(alert))
+        lines.extend(_circuit_utilization_content_lines(alert, include_action=event_type != "auto_resolved"))
     elif target_line and not is_operation:
         lines.append(target_line)
     if is_operation:
@@ -1073,11 +1366,11 @@ def _build_notification_content(
     lines.append(f"Alarm ID：{alarm_id}")
 
     if event_type == "firing":
-        lines.append(f"{'记录时间' if is_operation else '发生时间'}：{started_at_text}")
-        if not is_operation:
+        lines.append(f"{'记录时间' if is_operation else '通知时间' if is_resource_notice else '发生时间'}：{started_at_text}")
+        if not is_operation and not is_resource_notice:
             lines.append(f"当前处理人：{_current_handler_text(alert)}")
         lines.append("")
-        lines.append(f"{'记录详情' if is_operation else '故障详情'}：{detail_url}")
+        lines.append(f"{'记录详情' if is_operation else '通知详情' if is_resource_notice else '故障详情'}：{detail_url}")
     elif event_type == "ignored":
         if actor:
             lines.insert(0, f"{actor}忽略了1条{'操作记录' if is_operation else '故障'}：")
@@ -1087,12 +1380,13 @@ def _build_notification_content(
             return ""
         elif rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
             lines[0] = f"故障标题：【{_reachability_recovery_fault_title(rule)}】"
-        lines.append(f"发生时间：{started_at_text}")
+        lines.append(f"{'通知时间' if is_resource_notice else '发生时间'}：{started_at_text}")
         lines.append(f"恢复时间：{resolved_at_text}")
         lines.append(f"持续时间：{_format_duration(alert.started_at, alert.resolved_at)}")
-        lines.append(f"当前处理人：{_current_handler_text(alert)}")
+        if not is_resource_notice:
+            lines.append(f"当前处理人：{_current_handler_text(alert)}")
         lines.append("")
-        lines.append(f"{'操作详情' if is_operation else '故障详情'}：{detail_url}")
+        lines.append(f"{'操作详情' if is_operation else '通知详情' if is_resource_notice else '故障详情'}：{detail_url}")
 
     return "\n".join(lines)
 
@@ -1105,7 +1399,7 @@ def _build_notification_card_data(
 ) -> Dict[str, Any]:
     rule = alert.rule
     device = alert.device
-    if rule and rule.metric_type == "quality_packet_loss" and not device:
+    if rule and rule.metric_type in QUALITY_PROBE_METRIC_TYPES and not device:
         alarm_id = _ensure_alarm_id(db, alert)
         severity = _normalize_severity_label(rule.severity)
         context = _quality_probe_context(db, alert)
@@ -1117,23 +1411,52 @@ def _build_notification_card_data(
             {"label": "目标地址", "value": context["address"]},
             {"label": "所属机房", "value": context["datacenter"]},
             {"label": "运营商", "value": context["operator"]},
-            {"label": "恢复时延迟" if is_recovery else "当前延迟", "value": context["latency"]},
+            {"label": f"{'恢复时' if is_recovery else '当前'}{context['metric_label']}", "value": context["current_value_text"]},
         ]
         if is_recovery:
+            recovery_metric_label = (
+                "恢复时平均延迟" if context["metric_type"] == "quality_latency"
+                else "恢复时抖动" if context["metric_type"] == "quality_jitter"
+                else "恢复时5分钟丢包率"
+            )
             rows.extend([
                 {"label": "恢复原因", "value": context["recovery_reason"]},
-                {"label": "恢复时5分钟丢包率", "value": f"{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%"},
+                {"label": recovery_metric_label, "value": f"{context['current_value_text']} / 阈值 {context['threshold_text']}"},
+                {"label": "恢复时延迟", "value": context["latency"]},
+                {"label": "恢复时5分钟丢包率", "value": f"{context['loss']:.2f}%"},
                 {"label": "当前连续异常周期", "value": f"{context['current_consecutive']} / {context['required_count']}"},
             ])
         else:
-            rows.extend([
-                {"label": "触发原因", "value": "5分钟丢包率超阈值 + 连续异常周期达标（同时满足）"},
-                {"label": "5分钟丢包率", "value": f"{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%"},
-                {"label": "连续异常周期", "value": f"{context['consecutive']} / {context['required_count']}"},
-                {"label": "本轮探测", "value": context["probe_result"]},
-                {"label": "影响判断", "value": _quality_impact_text(context["loss"])},
-                {"label": "处理建议", "value": _quality_action_text(context)},
-            ])
+            if context["metric_type"] == "quality_latency":
+                rows.extend([
+                    {"label": "触发原因", "value": "平均延迟超阈值 + 连续异常周期达标（同时满足）"},
+                    {"label": "平均延迟", "value": f"{context['current_value_text']} / 阈值 {context['threshold_text']}"},
+                    {"label": "参考丢包率", "value": f"{context['loss']:.2f}%"},
+                    {"label": "连续异常周期", "value": f"{context['consecutive']} / {context['required_count']}"},
+                    {"label": "本轮探测", "value": context["probe_result"]},
+                    {"label": "影响判断", "value": _quality_latency_impact_text(context["current_value"], context["threshold"])},
+                    {"label": "处理建议", "value": _quality_action_text(context)},
+                ])
+            elif context["metric_type"] == "quality_jitter":
+                rows.extend([
+                    {"label": "触发原因", "value": "抖动超阈值 + 连续异常周期达标（同时满足）"},
+                    {"label": "当前抖动", "value": f"{context['current_value_text']} / 阈值 {context['threshold_text']}"},
+                    {"label": "当前延迟", "value": context["latency"]},
+                    {"label": "参考丢包率", "value": f"{context['loss']:.2f}%"},
+                    {"label": "连续异常周期", "value": f"{context['consecutive']} / {context['required_count']}"},
+                    {"label": "本轮探测", "value": context["probe_result"]},
+                    {"label": "影响判断", "value": _quality_jitter_impact_text(context["current_value"], context["threshold"])},
+                    {"label": "处理建议", "value": _quality_action_text(context)},
+                ])
+            else:
+                rows.extend([
+                    {"label": "触发原因", "value": "5分钟丢包率超阈值 + 连续异常周期达标（同时满足）"},
+                    {"label": "5分钟丢包率", "value": f"{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%"},
+                    {"label": "连续异常周期", "value": f"{context['consecutive']} / {context['required_count']}"},
+                    {"label": "本轮探测", "value": context["probe_result"]},
+                    {"label": "影响判断", "value": _quality_impact_text(context["loss"])},
+                    {"label": "处理建议", "value": _quality_action_text(context)},
+                ])
         rows.extend([
             {"label": "采样方式", "value": context["sampling"]},
             {"label": "Alarm ID", "value": alarm_id},
@@ -1153,7 +1476,7 @@ def _build_notification_card_data(
             "severity": severity,
             "title": _build_notification_title(rule, event_type, actor, alert),
             "headline": severity,
-            "summary": f"quality_packet_loss / {alert.alert_target_name or '-'}",
+            "summary": f"{rule.metric_type} / {alert.alert_target_name or '-'}",
             "subtitle": _format_local_time(alert.resolved_at if event_type == "auto_resolved" else alert.started_at),
             "rows": rows,
             "detail_url": _build_detail_url(alert),
@@ -1167,6 +1490,7 @@ def _build_notification_card_data(
     occurrence_count = _get_recent_occurrence_count(db, alert)
     severity = _normalize_severity_label(rule.severity)
     is_operation = _is_operation_notification(rule)
+    is_resource_notice = _is_resource_notification(rule)
     started_at_text = _format_local_time(alert.started_at)
     resolved_at_text = _format_local_time(alert.resolved_at)
 
@@ -1180,7 +1504,7 @@ def _build_notification_card_data(
         occurrence_label = "过去1小时触发次数"
 
     rows = [
-        {"label": "记录类型" if is_operation else "故障标题", "value": f"【{rule.name or rule.metric_type}】"},
+        {"label": "记录类型" if is_operation else "通知标题" if is_resource_notice else "故障标题", "value": f"【{rule.name or rule.metric_type}】"},
         {"label": "交换机", "value": device.name},
         {"label": "管理地址", "value": device.ip_address},
     ]
@@ -1188,7 +1512,7 @@ def _build_notification_card_data(
     if is_operation:
         rows.append({"label": "变更内容", "value": _clean_operation_detail(alert)})
     elif is_circuit_utilization:
-        rows.extend(_circuit_utilization_card_rows(alert))
+        rows.extend(_circuit_utilization_card_rows(alert, include_action=event_type != "auto_resolved"))
     elif alert.alert_target_name:
         target_label = "变更内容" if is_operation else ("接口" if rule.metric_type in INTERFACE_METRIC_TYPES else "对象")
         if rule.metric_type in CIRCUIT_METRIC_TYPES:
@@ -1204,8 +1528,8 @@ def _build_notification_card_data(
     rows.append({"label": "Alarm ID", "value": alarm_id})
 
     if event_type == "firing":
-        rows.append({"label": "记录时间" if is_operation else "发生时间", "value": started_at_text})
-        if not is_operation:
+        rows.append({"label": "记录时间" if is_operation else "通知时间" if is_resource_notice else "发生时间", "value": started_at_text})
+        if not is_operation and not is_resource_notice:
             rows.append({"label": "当前处理人", "value": _current_handler_text(alert)})
     elif event_type == "ignored":
         rows.insert(0, {"label": "处理动作", "value": f"{actor or '有人'}忽略了1条{'操作记录' if is_operation else '故障'}"})
@@ -1219,12 +1543,13 @@ def _build_notification_card_data(
             }
         rows.extend(
             [
-                {"label": "发生时间", "value": started_at_text},
+                {"label": "通知时间" if is_resource_notice else "发生时间", "value": started_at_text},
                 {"label": "恢复时间", "value": resolved_at_text},
                 {"label": "持续时间", "value": _format_duration(alert.started_at, alert.resolved_at)},
-                {"label": "当前处理人", "value": _current_handler_text(alert)},
             ]
         )
+        if not is_resource_notice:
+            rows.append({"label": "当前处理人", "value": _current_handler_text(alert)})
 
     return {
         "severity": severity,
@@ -1235,7 +1560,7 @@ def _build_notification_card_data(
         "rows": rows,
         "detail_url": _build_detail_url(alert),
         "event_type": event_type,
-        "notification_kind": "operation" if is_operation else "alert",
+        "notification_kind": "operation" if is_operation else "resource_notice" if is_resource_notice else "alert",
     }
 
 
@@ -1871,6 +2196,7 @@ def _run_alert_checks(
 
     db = SessionLocal()
     exporter_cache_token = _ALERT_RUN_EXPORTER_CACHE.set({})
+    target_cache_token = _ALERT_RUN_TARGET_CACHE.set({})
     try:
         _resolve_alerts_for_disabled_rules(db)
         if not metric_types or metric_types & INTERFACE_METRIC_TYPES:
@@ -1885,6 +2211,7 @@ def _run_alert_checks(
         logger.info(f"开始{task_label}，共{len(rules)}条规则")
         
         triggered = 0
+        rule_runtimes: List[Dict[str, Any]] = []
         for rule in rules:
             rule_started_at = time.time()
             try:
@@ -1892,6 +2219,20 @@ def _run_alert_checks(
                 if result:
                     triggered += 1
                 rule_elapsed = time.time() - rule_started_at
+                runtime_item = {
+                    "rule_id": rule.id,
+                    "rule_name": rule.name,
+                    "metric_type": rule.metric_type,
+                    "elapsed_seconds": round(rule_elapsed, 3),
+                    "triggered": bool(result),
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                }
+                rule_runtimes.append(runtime_item)
+                redis_client.hset(
+                    "monitor:alert_rule_runtimes",
+                    str(rule.id),
+                    json.dumps(runtime_item, ensure_ascii=False),
+                )
                 if rule_elapsed >= 3:
                     logger.info(
                         "告警规则检查耗时较长",
@@ -1905,6 +2246,25 @@ def _run_alert_checks(
                            rule_id=rule.id, 
                            error=str(e))
         elapsed_seconds = round(time.time() - started_at, 3)
+        task_runtime = {
+            "task": task_label,
+            "total_rules": len(rules),
+            "triggered": triggered,
+            "elapsed_seconds": elapsed_seconds,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "slowest_rules": sorted(
+                rule_runtimes,
+                key=lambda item: item["elapsed_seconds"],
+                reverse=True,
+            )[:10],
+        }
+        redis_client.hset(
+            "monitor:alert_task_runtimes",
+            task_label,
+            json.dumps(task_runtime, ensure_ascii=False),
+        )
+        redis_client.expire("monitor:alert_task_runtimes", 7 * 24 * 60 * 60)
+        redis_client.expire("monitor:alert_rule_runtimes", 7 * 24 * 60 * 60)
         logger.info(
             f"{task_label}完成",
             total_rules=len(rules),
@@ -1922,6 +2282,7 @@ def _run_alert_checks(
         return {"error": str(e)}
     finally:
         _ALERT_RUN_EXPORTER_CACHE.reset(exporter_cache_token)
+        _ALERT_RUN_TARGET_CACHE.reset(target_cache_token)
         db.close()
         if redis_client.get(lock_key) == lock_value:
             redis_client.delete(lock_key)
@@ -1953,6 +2314,120 @@ def _resolve_alerts_for_disabled_rules(db: Session) -> int:
     return len(active_alerts)
 
 
+def _is_circuit_utilization_rule(rule: AlertRule) -> bool:
+    return rule.metric_type in CIRCUIT_UTILIZATION_METRIC_TYPES
+
+
+def _is_blocked_by_circuit_max_threshold(rule: AlertRule, value: float) -> bool:
+    """Return True when a banded circuit utilization rule is superseded.
+
+    Example: the generated 50% rule covers 50%~90%. Once the same endpoint is at
+    90% or above, the 90% rule owns the alert lifecycle. The lower band should be
+    closed silently instead of sending an extra recovery notification.
+    """
+    if not _is_circuit_utilization_rule(rule):
+        return False
+    extra_config = rule.extra_config or {}
+    max_threshold = extra_config.get("max_threshold")
+    if max_threshold is None:
+        return False
+    try:
+        compare_max_threshold = float(max_threshold)
+        if rule.metric_type in PERCENT_METRIC_TYPES:
+            compare_max_threshold = _normalize_percent_threshold(compare_max_threshold)
+        return float(value) >= compare_max_threshold
+    except (TypeError, ValueError):
+        return False
+
+
+def _silently_resolve_circuit_utilization_alert(
+    db: Session,
+    alert: AlertHistory,
+    *,
+    value: Optional[float],
+    threshold: Optional[float],
+    message: Optional[str],
+    target: Optional[Dict[str, Any]],
+    note: str,
+) -> None:
+    now = _utc_now()
+    if value is not None:
+        alert.alert_value = float(value)
+    alert.threshold = threshold
+    if message:
+        alert.message = message
+    if target:
+        alert.alert_target_type = target.get("target_type")
+        alert.alert_target_key = target.get("target_key")
+        alert.alert_target_name = target.get("target_name")
+    alert.status = "resolved"
+    alert.resolved_at = now
+    alert.resolved_by = "system"
+    alert.resolution_note = note
+    alert.updated_at = now
+    db.commit()
+
+
+def _resolve_lower_circuit_utilization_alerts(
+    db: Session,
+    *,
+    rule: AlertRule,
+    device: Device,
+    target: Dict[str, Any],
+    value: float,
+) -> int:
+    """Close lower utilization-band alerts for the same circuit endpoint.
+
+    This prevents the generated 50% and 90% rules from notifying as two separate
+    incidents for the same line/interface/direction.
+    """
+    if not _is_circuit_utilization_rule(rule):
+        return 0
+    current_threshold = _effective_rule_threshold(rule, target)
+    if current_threshold is None:
+        return 0
+    target_key = str(target.get("target_key") or "")
+    if not target_key:
+        return 0
+    lower_alerts = (
+        db.query(AlertHistory, AlertRule)
+        .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+        .filter(
+            AlertHistory.device_id == device.id,
+            AlertHistory.alert_target_key == target_key,
+            AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+            AlertRule.metric_type == rule.metric_type,
+            AlertRule.id != rule.id,
+            AlertRule.threshold.isnot(None),
+            AlertRule.threshold < float(current_threshold),
+        )
+        .all()
+    )
+    resolved = 0
+    for lower_alert, lower_rule in lower_alerts:
+        lower_threshold = _effective_rule_threshold(lower_rule, target)
+        _silently_resolve_circuit_utilization_alert(
+            db,
+            lower_alert,
+            value=value,
+            threshold=lower_threshold,
+            message=_build_alert_message(lower_rule, device, float(value), target),
+            target=target,
+            note="线路使用率进入更高阈值区间，低阈值告警已合并静默恢复",
+        )
+        resolved += 1
+    if resolved:
+        logger.info(
+            "已合并线路使用率低阈值告警",
+            rule_id=rule.id,
+            device_id=device.id,
+            target=target.get("target_name"),
+            value=value,
+            resolved=resolved,
+        )
+    return resolved
+
+
 @shared_task
 def check_fast_alerts():
     """
@@ -1963,6 +2438,46 @@ def check_fast_alerts():
         lock_ttl_seconds=FAST_CHECK_ALERTS_LOCK_TTL_SECONDS,
         metric_types=FAST_ALERT_METRIC_TYPES,
         task_label="快速告警检查",
+    )
+
+
+@shared_task
+def check_fast_state_alerts():
+    return _run_alert_checks(
+        lock_key=FAST_STATE_ALERTS_LOCK_KEY,
+        lock_ttl_seconds=FAST_CHECK_ALERTS_LOCK_TTL_SECONDS,
+        metric_types=FAST_STATE_METRIC_TYPES,
+        task_label="接口状态快速告警检查",
+    )
+
+
+@shared_task
+def check_fast_crc_alerts():
+    return _run_alert_checks(
+        lock_key=FAST_CRC_ALERTS_LOCK_KEY,
+        lock_ttl_seconds=FAST_CHECK_ALERTS_LOCK_TTL_SECONDS,
+        metric_types=FAST_CRC_METRIC_TYPES,
+        task_label="接口CRC快速告警检查",
+    )
+
+
+@shared_task
+def check_fast_error_alerts():
+    return _run_alert_checks(
+        lock_key=FAST_ERROR_ALERTS_LOCK_KEY,
+        lock_ttl_seconds=FAST_CHECK_ALERTS_LOCK_TTL_SECONDS,
+        metric_types=FAST_ERROR_METRIC_TYPES,
+        task_label="接口错包快速告警检查",
+    )
+
+
+@shared_task
+def check_fast_discard_alerts():
+    return _run_alert_checks(
+        lock_key=FAST_DISCARD_ALERTS_LOCK_KEY,
+        lock_ttl_seconds=FAST_CHECK_ALERTS_LOCK_TTL_SECONDS,
+        metric_types=FAST_DISCARD_METRIC_TYPES,
+        task_label="接口丢弃快速告警检查",
     )
 
 
@@ -2033,7 +2548,29 @@ def _default_rule_notification_channels(db: Session) -> List[Dict[str, Any]]:
 
 
 def _upsert_circuit_utilization_rule(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
-    rule = db.query(AlertRule).filter(AlertRule.name == payload["name"]).first()
+    extra_config = payload.get("extra_config") or {}
+    rule_key = str(extra_config.get("rule_key") or "").strip()
+    rule = None
+    if rule_key:
+        candidates = (
+            db.query(AlertRule)
+            .filter(
+                AlertRule.metric_type == payload["metric_type"],
+                AlertRule.condition == payload["condition"],
+                AlertRule.threshold == payload["threshold"],
+            )
+            .order_by(AlertRule.enabled.desc(), AlertRule.id.asc())
+            .all()
+        )
+        for candidate in candidates:
+            candidate_extra = candidate.extra_config or {}
+            if str(candidate_extra.get("rule_key") or "").strip() == rule_key:
+                rule = candidate
+                break
+        if rule is None and candidates:
+            rule = candidates[0]
+    if rule is None:
+        rule = db.query(AlertRule).filter(AlertRule.name == payload["name"]).first()
     created = False
     if not rule:
         rule = AlertRule(
@@ -2044,6 +2581,8 @@ def _upsert_circuit_utilization_rule(db: Session, payload: Dict[str, Any]) -> Di
         )
         db.add(rule)
         created = True
+    if created:
+        rule.name = payload["name"]
     rule.description = payload["description"]
     rule.rule_type = payload["rule_type"]
     rule.metric_type = payload["metric_type"]
@@ -2054,30 +2593,60 @@ def _upsert_circuit_utilization_rule(db: Session, payload: Dict[str, Any]) -> Di
     rule.suppress_duration = payload["suppress_duration"]
     rule.enabled = payload["enabled"]
     rule.device_ids = payload["device_ids"]
-    rule.extra_config = payload["extra_config"]
+    current_extra = rule.extra_config or {}
+    preserved = {
+        key: current_extra.get(key)
+        for key in ["mention_users", "mention_targets", "target_notifications"]
+        if key in current_extra
+    }
+    rule.extra_config = {**payload["extra_config"], **preserved}
     if created or not rule.notification_channels:
         rule.notification_channels = payload["notification_channels"]
-    return {"name": payload["name"], "created": created}
+    return {"id": rule.id, "name": rule.name, "rule_key": rule_key, "created": created}
 
 
 @shared_task(name="app.tasks.alert_tasks.ensure_circuit_utilization_alert_rules")
 def ensure_circuit_utilization_alert_rules() -> Dict[str, Any]:
-    """Ensure public/private circuit utilization rules exist.
+    """No-op compatibility task for old beat messages.
 
-    Values are calculated as max(in_bps, out_bps) / circuit.bandwidth_mbps.
-    P2 covers 50%~90%; P1 covers >=90%, so the 50% rule will not duplicate the
-    90% alarm for the same circuit endpoint.
+    Circuit utilization rules are now managed explicitly. This task only disables
+    stale auto-generated rules without stable rule_key, and never creates rules.
     """
     db = SessionLocal()
     try:
+        allowed_rule_keys = {
+            "internet_circuit_utilization:70",
+            "internet_circuit_utilization:90",
+            "private_line_circuit_utilization:70",
+            "private_line_circuit_utilization:90",
+        }
+        disabled_legacy_rules = 0
+        for legacy_rule in db.query(AlertRule).filter(
+            AlertRule.metric_type.in_(list(CIRCUIT_UTILIZATION_METRIC_TYPES)),
+            AlertRule.enabled == 1,
+        ).all():
+            extra = legacy_rule.extra_config or {}
+            rule_key = str(extra.get("rule_key") or "").strip()
+            generated_by = str(extra.get("generated_by") or "").strip()
+            if rule_key in allowed_rule_keys:
+                continue
+            if generated_by != "ensure_circuit_utilization_alert_rules_v1" and rule_key:
+                continue
+            legacy_rule.enabled = 0
+            legacy_rule.description = f"{legacy_rule.description or ''}\n已停止自动创建线路使用率规则；该旧规则已禁用，避免重复播报。".strip()
+            disabled_legacy_rules += 1
+        db.commit()
+        return {"status": "disabled_auto_create", "disabled_legacy_rules": disabled_legacy_rules}
+
         notification_channels = _default_rule_notification_channels(db)
         common_extra = {
-            "applicable_vendors": ["H3C", "Ruijie", "Asteros", "Hillstone"],
+            "applicable_vendors": ["H3C", "Ruijie", "Asteros", "Hillstone", "Cisco"],
             "time_range": "-5m",
             "max_sample_age_seconds": CIRCUIT_MAX_SAMPLE_AGE_SECONDS,
             "required_samples": 2,
             "recovery_required_samples": 2,
             "generated_by": "ensure_circuit_utilization_alert_rules_v1",
+            "notification_kind": "resource_notice",
             "unit": "%",
         }
         definitions = [
@@ -2087,18 +2656,18 @@ def ensure_circuit_utilization_alert_rules() -> Dict[str, Any]:
         results = []
         for label, metric_type in definitions:
             results.append(_upsert_circuit_utilization_rule(db, {
-                "name": f"【{label}】线路使用率超过 50%-P2",
-                "description": f"{label}线路绑定端口入/出向最大流量达到录入带宽50%但未到90%",
+                "name": f"【{label}】线路使用率超过 70%-P2",
+                "description": f"{label}线路绑定端口入/出向最大流量达到录入带宽70%但未到90%",
                 "rule_type": "threshold",
                 "metric_type": metric_type,
                 "condition": ">=",
-                "threshold": 50.0,
+                "threshold": 70.0,
                 "duration": 0,
                 "severity": "P2",
                 "suppress_duration": 900,
                 "enabled": 1,
                 "device_ids": [],
-                "extra_config": {**common_extra, "max_threshold": 90.0},
+                "extra_config": {**common_extra, "rule_key": f"{metric_type}:70", "max_threshold": 90.0},
                 "notification_channels": notification_channels,
             }))
             results.append(_upsert_circuit_utilization_rule(db, {
@@ -2113,11 +2682,45 @@ def ensure_circuit_utilization_alert_rules() -> Dict[str, Any]:
                 "suppress_duration": 900,
                 "enabled": 1,
                 "device_ids": [],
-                "extra_config": common_extra,
+                "extra_config": {**common_extra, "rule_key": f"{metric_type}:90"},
                 "notification_channels": notification_channels,
             }))
+        legacy_names = [
+            "公网线路使用率超过 50%",
+            "公网使用率超过 50%",
+            "【公网】线路使用率超过 50%-P2",
+            "【公网】线路使用率超过 90%-P1",
+            "专线线路使用率超过 50%",
+            "客户专线使用率超过 50%",
+            "客户专线使用率超过 90%",
+            "【专线】线路使用率超过 50%-P2",
+            "【专线】线路使用率超过 90%-P1",
+        ]
+        disabled_legacy_rules = 0
+        legacy_candidates = db.query(AlertRule).filter(
+            AlertRule.metric_type.in_(list(CIRCUIT_UTILIZATION_METRIC_TYPES)),
+            AlertRule.enabled == 1,
+        ).all()
+        for legacy_rule in legacy_candidates:
+            extra = legacy_rule.extra_config or {}
+            rule_key = str(extra.get("rule_key") or "").strip()
+            generated_by = str(extra.get("generated_by") or "").strip()
+            is_legacy_name = legacy_rule.name in legacy_names
+            is_generated_without_stable_key = (
+                generated_by == "ensure_circuit_utilization_alert_rules_v1"
+                and not rule_key
+            )
+            if not is_legacy_name and not is_generated_without_stable_key:
+                continue
+            legacy_rule.enabled = 0
+            legacy_rule.description = f"{legacy_rule.description or ''}\n已由线路使用率分级合并规则替代，避免同一线路重复播报。".strip()
+            disabled_legacy_rules += 1
         db.commit()
-        return {"rules": results, "notification_channels": len(notification_channels)}
+        return {
+            "rules": results,
+            "disabled_legacy_rules": disabled_legacy_rules,
+            "notification_channels": len(notification_channels),
+        }
     except Exception as exc:
         db.rollback()
         logger.error("确保线路使用率告警规则失败", error=str(exc))
@@ -2135,7 +2738,12 @@ def check_alerts():
     return _run_alert_checks(
         lock_key=CHECK_ALERTS_LOCK_KEY,
         lock_ttl_seconds=CHECK_ALERTS_LOCK_TTL_SECONDS,
-        exclude_metric_types=FAST_ALERT_METRIC_TYPES | REACHABILITY_ALERT_METRIC_TYPES | PROTOCOL_METRIC_TYPES | DEVICE_HEALTH_ALERT_METRIC_TYPES | OPTICAL_METRIC_TYPES,
+        exclude_metric_types=FAST_ALERT_METRIC_TYPES
+        | REACHABILITY_ALERT_METRIC_TYPES
+        | PROTOCOL_METRIC_TYPES
+        | DEVICE_HEALTH_ALERT_METRIC_TYPES
+        | OPTICAL_METRIC_TYPES
+        | EVENT_DRIVEN_METRIC_TYPES,
         task_label="常规告警检查",
     )
 
@@ -2253,7 +2861,7 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
         是否触发告警
     """
     # 质量探测没有关联网络设备，由 quality_tasks 在每次 Ping 后直接评估。
-    if rule.metric_type == "quality_packet_loss":
+    if rule.metric_type in QUALITY_PROBE_METRIC_TYPES:
         return False
 
     # 获取规则适用的设备
@@ -2376,7 +2984,51 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
     triggered = False
     
     for device in devices:
-        targets = _get_metric_targets(db, device, rule.metric_type, rule.extra_config or {}, rule)
+        extra_config = rule.extra_config or {}
+        targets: List[Dict[str, Any]]
+        run_target_cache = _ALERT_RUN_TARGET_CACHE.get()
+        # Optical targets depend on each rule's comparison direction and severity:
+        # low rules select the minimum lane/LOW DDM threshold, while high rules
+        # select the maximum lane/HIGH DDM threshold. Never share those targets.
+        cacheable_metric = (
+            rule.metric_type in CIRCUIT_METRIC_TYPES
+            or (
+                rule.metric_type in INTERFACE_METRIC_TYPES
+                and rule.metric_type not in OPTICAL_METRIC_TYPES
+            )
+        )
+        cache_key = ""
+        if run_target_cache is not None and cacheable_metric:
+            # P2/P1/P0 分档规则通常只在 max_threshold 等评估字段上不同，
+            # 目标采集查询完全相同。单轮共享查询结果，避免每档重复扫描 Influx/Exporter。
+            query_config = {
+                key: value
+                for key, value in extra_config.items()
+                if key not in {
+                    "max_threshold",
+                    "required_samples",
+                    "recovery_required_samples",
+                    "recovery_requires_zero_delta",
+                    "generated_by",
+                    "mention_users",
+                    "mention_targets",
+                    "target_notifications",
+                }
+            }
+            cache_key = json.dumps(
+                [device.id, rule.metric_type, query_config],
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            cached_targets = run_target_cache.get(cache_key)
+            if cached_targets is not None:
+                targets = cached_targets
+            else:
+                targets = _get_metric_targets(db, device, rule.metric_type, extra_config, rule)
+                run_target_cache[cache_key] = targets
+        else:
+            targets = _get_metric_targets(db, device, rule.metric_type, extra_config, rule)
         if rule.metric_type in OPTICAL_METRIC_TYPES:
             _resolve_optical_alerts_on_inactive_interfaces(db, rule, device)
         if rule.metric_type in PROTOCOL_METRIC_TYPES or rule.metric_type in INTERFACE_METRIC_TYPES:
@@ -2417,6 +3069,13 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
 
             if should_alert:
                 _clear_pending_recovery(rule, device, target)
+                _resolve_lower_circuit_utilization_alerts(
+                    db,
+                    rule=rule,
+                    device=device,
+                    target=target,
+                    value=float(value),
+                )
                 if _is_silenced(db, rule, device, target):
                     if existing:
                         _clear_pending_alert(rule, device, target)
@@ -2511,6 +3170,22 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
                     if not _duration_confirmed(rule, device, target, float(value)):
                         continue
                     _clear_pending_alert(rule, device, target)
+                    if rule.metric_type == "interface_admin_up_oper_down":
+                        syslog_alert = _find_active_syslog_interface_alert(db, device, target)
+                        if syslog_alert:
+                            alert = _merge_syslog_interface_alert_into_state_alert(
+                                db,
+                                syslog_alert,
+                                rule,
+                                device,
+                                target,
+                                float(value),
+                                effective_threshold,
+                                alert_event_time,
+                            )
+                            active_alerts_by_target[target_alert_key] = alert
+                            triggered = True
+                            continue
                     alert = AlertHistory(
                         rule_id=rule.id,
                         device_id=device.id,
@@ -2543,6 +3218,25 @@ def _check_single_rule(db: Session, rule: AlertRule) -> bool:
             else:
                 _clear_pending_alert(rule, device, target)
                 if existing and existing.status in {"firing", "acknowledged", "ignored", "snoozed"}:
+                    if _is_blocked_by_circuit_max_threshold(rule, float(value)):
+                        _clear_pending_recovery(rule, device, target)
+                        _silently_resolve_circuit_utilization_alert(
+                            db,
+                            existing,
+                            value=float(value),
+                            threshold=effective_threshold,
+                            message=_build_alert_message(rule, device, float(value), target),
+                            target=target,
+                            note="线路使用率进入更高阈值区间，低阈值告警已合并静默恢复",
+                        )
+                        logger.info(
+                            "线路使用率低阈值告警进入更高区间，静默恢复",
+                            rule_id=rule.id,
+                            device_id=device.id,
+                            target=target.get("target_name"),
+                            value=value,
+                        )
+                        continue
                     if not _recovery_confirmed(rule, device, target, float(value)):
                         continue
                     _clear_pending_recovery(rule, device, target)
@@ -2609,6 +3303,112 @@ def _resolve_disappeared_target_alerts(
             alert_id=alert.id,
             target_key=alert.alert_target_key,
         )
+
+
+def _normalize_interface_key_for_event(value: Optional[str]) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip()).lower()
+
+
+def _syslog_interface_key_for_target(target: Dict[str, Any]) -> str:
+    interface_name = target.get("target_name") or target.get("target_key") or ""
+    return f"syslog:h3c:interface:{_normalize_interface_key_for_event(interface_name)}"
+
+
+def _alert_matches_interface(alert: AlertHistory, normalized_interface: str) -> bool:
+    if not normalized_interface:
+        return False
+    for value in (alert.alert_target_name, alert.alert_target_key):
+        normalized_value = _normalize_interface_key_for_event(value)
+        if normalized_value == normalized_interface:
+            return True
+        if normalized_value.endswith(f":{normalized_interface}"):
+            return True
+    return False
+
+
+def _find_active_syslog_interface_alert(
+    db: Session,
+    device: Device,
+    target: Dict[str, Any],
+) -> Optional[AlertHistory]:
+    """Find a recent Syslog interface event alert for the same device/interface."""
+    normalized_interface = _normalize_interface_key_for_event(target.get("target_name") or target.get("target_key"))
+    if not normalized_interface:
+        return None
+    direct_key = _syslog_interface_key_for_target(target)
+    rows = (
+        db.query(AlertHistory)
+        .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+        .filter(
+            AlertHistory.device_id == device.id,
+            AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+            AlertHistory.alert_target_type == "interface",
+            AlertRule.metric_type == "syslog_interface_phy_down",
+        )
+        .order_by(AlertHistory.started_at.desc())
+        .limit(50)
+        .all()
+    )
+    for alert in rows:
+        if alert.alert_target_key == direct_key or _alert_matches_interface(alert, normalized_interface):
+            return alert
+    return None
+
+
+def _merge_syslog_interface_alert_into_state_alert(
+    db: Session,
+    syslog_alert: AlertHistory,
+    rule: AlertRule,
+    device: Device,
+    target: Dict[str, Any],
+    value: float,
+    threshold: Optional[float],
+    alert_event_time: datetime,
+) -> AlertHistory:
+    """
+    Upgrade an interface flap Syslog alert into the sustained interface-down alert.
+
+    This keeps one alarm ID/one robot thread for the same physical event: Syslog catches
+    the instant down event, then SNMP/Telemetry confirms whether it became a long outage.
+    """
+    base_message = _build_alert_message(rule, device, float(value), target)
+    merge_note = (
+        "告警合并：该接口已先由 Syslog 捕获瞬断事件；周期采集确认持续异常后，"
+        "已升级为持续接口状态告警，不再重复发送新的触发机器人消息。"
+    )
+    now = _utc_now()
+    syslog_alert.rule_id = rule.id
+    syslog_alert.alert_value = float(value)
+    syslog_alert.threshold = threshold
+    syslog_alert.message = f"{base_message}\n{merge_note}"
+    syslog_alert.alert_target_type = target.get("target_type")
+    syslog_alert.alert_target_key = target.get("target_key")
+    syslog_alert.alert_target_name = target.get("target_name")
+    if not syslog_alert.started_at:
+        syslog_alert.started_at = alert_event_time
+    if syslog_alert.status == "snoozed" and _is_snoozed_now(syslog_alert):
+        pass
+    elif syslog_alert.status == "ignored" and syslog_alert.ignored_by == "alert_silence":
+        pass
+    else:
+        syslog_alert.status = "firing"
+        syslog_alert.ignored_by = None
+        syslog_alert.ignored_at = None
+        syslog_alert.resolved_by = None
+        syslog_alert.resolved_at = None
+        syslog_alert.resolution_note = None
+    syslog_alert.updated_at = now
+    db.commit()
+    db.refresh(syslog_alert)
+    _ensure_alarm_id(db, syslog_alert)
+    logger.info(
+        "Syslog接口瞬断告警已合并升级为持续接口Down告警",
+        alert_id=syslog_alert.id,
+        rule_id=rule.id,
+        device_id=device.id,
+        target=target.get("target_name"),
+    )
+    return syslog_alert
 
 
 def _is_default_skipped_interface(interface_name: Optional[str]) -> bool:
@@ -2936,6 +3736,156 @@ def _interface_oper_is_up_from_influx(device_id: int, interface_index: Any, inte
             error=str(exc),
         )
         return False
+
+
+def _get_cached_interface_metric_targets(
+    db: Session,
+    device: Device,
+    metric_type: str,
+    extra_config: Dict[str, Any],
+) -> Optional[List[Dict[str, Any]]]:
+    """Use collector snapshots for fast rules; return None to fall back to Influx."""
+    if metric_type not in FAST_ALERT_METRIC_TYPES:
+        return None
+    snapshot_kind = "state" if metric_type == "interface_admin_up_oper_down" else "quality"
+    raw_snapshot = redis_client.get(f"monitor:alert_interface_{snapshot_kind}:{device.id}")
+    if raw_snapshot:
+        try:
+            snapshot_payload = json.loads(raw_snapshot)
+            snapshot_interfaces = snapshot_payload.get("interfaces")
+        except (TypeError, ValueError):
+            snapshot_payload = {}
+            snapshot_interfaces = None
+        if isinstance(snapshot_interfaces, list):
+            valid_interfaces = [
+                item for item in snapshot_interfaces
+                if isinstance(item, dict) and item.get("index") is not None
+            ]
+            raw_rows = [
+                json.dumps({
+                    "interface": item,
+                    "collected_at": snapshot_payload.get("collected_at"),
+                }, ensure_ascii=False)
+                for item in valid_interfaces
+            ]
+        else:
+            valid_interfaces = []
+            raw_rows = []
+    else:
+        valid_interfaces = []
+        raw_rows = []
+    if valid_interfaces and raw_rows:
+        pass
+    else:
+        raw_interfaces = redis_client.get(f"monitor:cache:interfaces:{device.id}")
+        if not raw_interfaces:
+            return None
+        try:
+            interface_payload = json.loads(raw_interfaces)
+            interfaces = interface_payload.get("interfaces") if isinstance(interface_payload, dict) else None
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(interfaces, list) or not interfaces:
+            return None
+        valid_interfaces = [item for item in interfaces if isinstance(item, dict) and item.get("index") is not None]
+        if not valid_interfaces:
+            return None
+        keys = [f"monitor:cache:interface_stats:{device.id}:{item['index']}" for item in valid_interfaces]
+        try:
+            raw_rows = redis_client.mget(keys)
+        except Exception:
+            return None
+        if not raw_rows or not any(raw_rows):
+            return None
+
+    field_map = {
+        "interface_crc_errors_delta": "crc_errors_delta",
+        "interface_in_errors_delta": "in_errors_delta",
+        "interface_out_errors_delta": "out_errors_delta",
+        "interface_in_discards_delta": "in_discards_delta",
+        "interface_out_discards_delta": "out_discards_delta",
+    }
+    now = datetime.now(timezone.utc)
+    state_by_index: Dict[str, Dict[str, Any]] = {}
+    raw_state = redis_client.get(f"monitor:alert_interface_state:{device.id}")
+    if raw_state:
+        try:
+            state_payload = json.loads(raw_state)
+            state_by_index = {
+                str(item.get("index")): item
+                for item in (state_payload.get("interfaces") or [])
+                if isinstance(item, dict) and item.get("index") is not None
+            }
+        except (TypeError, ValueError):
+            state_by_index = {}
+    circuit_map = _device_interface_circuit_map(db, device.id)
+    targets: List[Dict[str, Any]] = []
+    for interface, raw_stats in zip(valid_interfaces, raw_rows):
+        if not raw_stats:
+            continue
+        try:
+            payload = json.loads(raw_stats)
+            stats = payload.get("interface") if isinstance(payload, dict) else None
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(stats, dict):
+            continue
+        interface_name = stats.get("name") or interface.get("name")
+        interface_index = stats.get("index") or interface.get("index")
+        state_row = state_by_index.get(str(interface_index)) or {}
+        if stats.get("admin_status") is None:
+            stats["admin_status"] = state_row.get("admin_status")
+        if stats.get("oper_status") is None:
+            stats["oper_status"] = state_row.get("oper_status")
+        if not _matches_text_filter(
+            interface_name,
+            str(extra_config.get("interface_name")) if extra_config.get("interface_name") else None,
+            str(extra_config.get("interface_regex")) if extra_config.get("interface_regex") else None,
+            str(extra_config.get("exclude_interface_regex")) if extra_config.get("exclude_interface_regex") else None,
+        ):
+            continue
+        if extra_config.get("interface_index") and str(interface_index) != str(extra_config.get("interface_index")):
+            continue
+        if _is_default_skipped_interface(interface_name) and not extra_config.get("include_logical_interfaces"):
+            continue
+        if not is_interface_monitored(device, interface_name, interface_index):
+            continue
+        if extra_config.get("require_oper_up") and stats.get("oper_status") != "up":
+            continue
+        if metric_type == "interface_admin_up_oper_down":
+            value = 1.0 if stats.get("admin_status") == "up" and stats.get("oper_status") != "up" else 0.0
+        else:
+            value = stats.get(field_map.get(metric_type, ""))
+            if value is None:
+                continue
+
+        collected_at = payload.get("collected_at")
+        sample_age_seconds = None
+        if collected_at:
+            try:
+                sample_time = datetime.fromisoformat(str(collected_at).replace("Z", "+00:00"))
+                if sample_time.tzinfo is None:
+                    sample_time = sample_time.replace(tzinfo=timezone.utc)
+                sample_age_seconds = max(0.0, (now - sample_time.astimezone(timezone.utc)).total_seconds())
+            except (TypeError, ValueError):
+                sample_age_seconds = None
+        if sample_age_seconds is not None and sample_age_seconds > INTERFACE_MAX_SAMPLE_AGE_SECONDS:
+            continue
+        targets.append(_enrich_interface_target_with_resources(
+            db,
+            device,
+            {
+                "target_type": "interface",
+                "target_key": str(interface_index or interface_name),
+                "target_name": interface_name or f"if{interface_index}",
+                "value": float(value),
+                "sample_time": str(collected_at) if collected_at else None,
+                "sample_age_seconds": round(sample_age_seconds, 3) if sample_age_seconds is not None else None,
+                "source": "redis_snapshot",
+            },
+            circuit_map=circuit_map,
+        ))
+    return targets
 
 
 def _get_interface_last_fields(
@@ -3373,7 +4323,11 @@ def _get_circuit_targets(
     query = db.query(Circuit).filter(
         Circuit.line_type == line_type,
         Circuit.status == "active",
-        or_(Circuit.primary_device_id == device.id, Circuit.secondary_device_id == device.id),
+        or_(
+            Circuit.primary_device_id == device.id,
+            Circuit.secondary_device_id == device.id,
+            Circuit.aggregation_monitor_device_id == device.id,
+        ),
     )
 
     if extra_config.get("circuit_id"):
@@ -3387,10 +4341,14 @@ def _get_circuit_targets(
 
     targets: List[Dict[str, Any]] = []
     for circuit in query.all():
-        endpoints = [
-            ("primary", circuit.primary_device_id, circuit.primary_port_name),
-            ("secondary", circuit.secondary_device_id, circuit.secondary_port_name),
-        ]
+        endpoints = (
+            [("aggregation", circuit.aggregation_monitor_device_id, circuit.aggregation_interface_name)]
+            if circuit.aggregation_monitor_device_id and circuit.aggregation_interface_name
+            else [
+                ("primary", circuit.primary_device_id, circuit.primary_port_name),
+                ("secondary", circuit.secondary_device_id, circuit.secondary_port_name),
+            ]
+        )
         for role, endpoint_device_id, endpoint_port_name in endpoints:
             if endpoint_device_id != device.id or not endpoint_port_name:
                 continue
@@ -3437,10 +4395,14 @@ def _get_circuit_targets(
             if datacenter:
                 datacenter_text = f"{datacenter.name}（{datacenter.code}）" if datacenter.code else (datacenter.name or "-")
             local_interconnect_ip = (
-                circuit.primary_local_interconnect_ip if role == "primary" else circuit.secondary_local_interconnect_ip
+                circuit.primary_local_interconnect_ip
+                if role in {"primary", "aggregation"}
+                else circuit.secondary_local_interconnect_ip
             ) or circuit.local_interconnect_address or circuit.interconnect_address or "-"
             remote_interconnect_ip = (
-                circuit.primary_remote_interconnect_ip if role == "primary" else circuit.secondary_remote_interconnect_ip
+                circuit.primary_remote_interconnect_ip
+                if role in {"primary", "aggregation"}
+                else circuit.secondary_remote_interconnect_ip
             ) or circuit.remote_interconnect_address or circuit.ip_address or "-"
             line_label = _line_type_label(line_type)
             targets.append(
@@ -3456,7 +4418,7 @@ def _get_circuit_targets(
                     "line_label": line_label,
                     "operator_name": circuit.operator_name or "-",
                     "datacenter_text": datacenter_text,
-                    "endpoint_role": "主接口" if role == "primary" else "备接口",
+                    "endpoint_role": "聚合接口" if role == "aggregation" else ("主接口" if role == "primary" else "备接口"),
                     "endpoint_interface": endpoint_port_name,
                     "local_interconnect_ip": local_interconnect_ip,
                     "remote_interconnect_ip": remote_interconnect_ip,
@@ -4212,13 +5174,34 @@ def _get_metric_targets(
                 }))
             return targets
 
-        flux = _build_influx_grouped_last_query(
-            measurement=measurement,
-            device_id=device.id,
-            field=field,
-            group_columns=["interface_index", "interface_name"],
-            start=time_range,
-        )
+        cached_targets = _get_cached_interface_metric_targets(db, device, metric_type, extra_config)
+        if cached_targets is not None:
+            return cached_targets
+
+        require_oper_up = bool(extra_config.get("require_oper_up"))
+        if require_oper_up:
+            # Fetch metric and link state in one query. The old implementation
+            # issued another Influx query for every interface (tens of thousands
+            # of queries per cycle), which made a "fast" cycle take minutes.
+            flux = f'''
+            from(bucket: "{influx_client.bucket}")
+              |> range(start: {time_range})
+              |> filter(fn: (r) => r._measurement == "{measurement}")
+              |> filter(fn: (r) => r.device_id == "{device.id}")
+              |> filter(fn: (r) => r._field == "{field}" or r._field == "oper_status")
+              |> group(columns: ["interface_index", "interface_name", "_field"])
+              |> last()
+              |> group(columns: ["interface_index", "interface_name"])
+              |> pivot(rowKey: ["interface_index", "interface_name"], columnKey: ["_field"], valueColumn: "_value")
+            '''
+        else:
+            flux = _build_influx_grouped_last_query(
+                measurement=measurement,
+                device_id=device.id,
+                field=field,
+                group_columns=["interface_index", "interface_name"],
+                start=time_range,
+            )
         result = influx_client.query(flux)
         for item in result:
             interface_name = item.get("interface_name")
@@ -4238,15 +5221,10 @@ def _get_metric_targets(
                 continue
             if not is_interface_monitored(device, interface_name, interface_index):
                 continue
-            value = item.get("value")
+            value = item.get(field) if require_oper_up else item.get("value")
             if value is None:
                 continue
-            if extra_config.get("require_oper_up") and not _interface_oper_is_up_from_influx(
-                device.id,
-                interface_index,
-                interface_name,
-                time_range,
-            ):
+            if require_oper_up and float(item.get("oper_status") or 0.0) < 1.0:
                 continue
             if (
                 metric_type == "interface_admin_up_oper_down"
@@ -4667,14 +5645,14 @@ def _alert_message_metadata(alert: AlertHistory) -> List[Dict[str, str]]:
     labels = {"阈值来源", "关联判断"}
     rows: List[Dict[str, str]] = []
     for line in str(alert.message or "").splitlines():
-        if "：" in line:
-            label, value = line.split("：", 1)
-        elif ":" in line:
-            label, value = line.split(":", 1)
-        else:
+        # The value can itself contain a Chinese colon, for example:
+        # `关联判断: Lane最大/最小收光：2.47/-2.67dBm`.
+        # Always split on the first ASCII/Chinese colon in the line.
+        match = re.match(r"^\s*([^:：]+?)\s*[:：]\s*(.*?)\s*$", line)
+        if not match:
             continue
-        label = label.strip()
-        value = value.strip()
+        label = match.group(1).strip()
+        value = match.group(2).strip()
         if label in labels and value:
             rows.append({"label": label, "value": value})
     return rows

@@ -88,6 +88,9 @@ export const getLosslessTelemetrySnapshot = (deviceId: number, search?: string) 
     params: { search: search || undefined },
   })
 
+export const getCollectionHealth = () =>
+  request.get<any, any>('/metrics/collection-health')
+
 export const getLocalOpticalModules = (params?: {
   page?: number
   page_size?: number
@@ -756,6 +759,11 @@ export interface QualityProbeTarget {
   latency_threshold_ms: number
   loss_threshold_percent: number
   jitter_threshold_ms: number
+  mtr_enabled?: boolean | null
+  mtr_interval_seconds?: number | null
+  last_mtr_at?: string | null
+  last_mtr_path_hash?: string | null
+  last_mtr_final_latency_ms?: number | null
   description?: string | null
   is_active: boolean
   last_probe_at?: string | null
@@ -765,8 +773,94 @@ export interface QualityProbeTarget {
   last_availability_percent?: number | null
   last_jitter_ms?: number | null
   last_error?: string | null
+  sla_availability_percent?: number | null
+  sla_packet_loss_percent?: number | null
+  sla_sent?: number
+  sla_received?: number
+  sla_lost?: number
+  sla_sample_count?: number
+  sla_expected_samples?: number
+  sla_data_completeness_percent?: number | null
+  sla_avg_latency_ms?: number | null
+  sla_avg_jitter_ms?: number | null
+  sla_previous_availability_percent?: number | null
+  sla_availability_change_percent?: number | null
+  sla_previous_avg_latency_ms?: number | null
+  sla_latency_change_ms?: number | null
+  sla_target_percent?: number
+  sla_month_availability_percent?: number | null
+  sla_error_budget_allowed_minutes?: number | null
+  sla_error_budget_used_minutes?: number | null
+  sla_error_budget_remaining_minutes?: number | null
+  sla_error_budget_used_percent?: number | null
+  sla_error_budget_estimated?: boolean
+  sla_error_budget_basis_range?: string | null
+  collection_health?: 'healthy' | 'no_data' | 'collector_stale' | 'insufficient'
+  collection_health_text?: string | null
+  collection_age_seconds?: number | null
+  root_cause_categories?: string[]
+  related_alerts?: Array<{
+    alarm_id?: string | null
+    status?: string | null
+    name?: string | null
+    metric_type?: string | null
+    target_name?: string | null
+    message?: string | null
+    started_at?: string | null
+    resolved_at?: string | null
+  }>
+  latest_mtr_event?: QualityMtrEvent | null
   created_at?: string | null
   updated_at?: string | null
+}
+
+export interface QualityMtrHop {
+  hop: number
+  ip?: string | null
+  asn?: string | null
+  as_info?: string | null
+  loss_percent?: number | null
+  sent?: number | null
+  last_ms?: number | null
+  avg_ms?: number | null
+  best_ms?: number | null
+  worst_ms?: number | null
+  stdev_ms?: number | null
+}
+
+export interface QualityMtrSnapshot {
+  id: number
+  target_id: number
+  target: string
+  path_hash: string
+  hop_count: number
+  final_hop_ip?: string | null
+  final_avg_latency_ms?: number | null
+  final_loss_percent?: number | null
+  max_avg_latency_ms?: number | null
+  command?: string | null
+  tool?: string | null
+  raw_output?: string | null
+  hops: QualityMtrHop[]
+  success: boolean
+  error?: string | null
+  created_at?: string | null
+}
+
+export interface QualityMtrEvent {
+  id: number
+  target_id: number
+  event_type: string
+  title: string
+  previous_snapshot_id?: number | null
+  current_snapshot_id?: number | null
+  previous_path_hash?: string | null
+  current_path_hash?: string | null
+  previous_final_latency_ms?: number | null
+  current_final_latency_ms?: number | null
+  latency_delta_ms?: number | null
+  detail?: Record<string, any>
+  created_at?: string | null
 }
 
 export interface QualityAlertSettings {
@@ -798,6 +892,8 @@ export interface QualityProbeResult {
   jitter_sd_ms?: number | null
   jitter_ds_ms?: number | null
   packet_loss_percent?: number | null
+  current_packet_loss_percent?: number | null
+  rolling_packet_loss_percent?: number | null
   availability_percent?: number | null
   received: number
   sent: number
@@ -861,6 +957,17 @@ export const getQualityProbeTargets = async (params?: {
   return await request.get('/metrics/quality/probe-targets', { params }) as { total: number; items: QualityProbeTarget[] }
 }
 
+export const getQualityProbeTargetsSla = async (
+  range: string
+): Promise<{ range: string; duration_seconds: number; total: number; items: QualityProbeTarget[] }> => {
+  return await request.get('/metrics/quality/probe-targets-sla', { params: { range } }) as {
+    range: string
+    duration_seconds: number
+    total: number
+    items: QualityProbeTarget[]
+  }
+}
+
 export const getQualityAlertSettings = async (): Promise<QualityAlertSettings> => {
   return await request.get('/metrics/quality/alert-settings') as QualityAlertSettings
 }
@@ -917,6 +1024,28 @@ export const runQualityProbeMtr = async (
     command: string
     output: string
     tool: string
+  }
+}
+
+export const getQualityMtrObservation = async (
+  id: number
+): Promise<{
+  target: QualityProbeTarget
+  enabled: boolean
+  interval_seconds: number
+  latest_snapshot?: QualityMtrSnapshot | null
+  previous_different_snapshot?: QualityMtrSnapshot | null
+  snapshots: QualityMtrSnapshot[]
+  events: QualityMtrEvent[]
+}> => {
+  return await request.get(`/metrics/quality/probe-targets/${id}/mtr-observation`) as {
+    target: QualityProbeTarget
+    enabled: boolean
+    interval_seconds: number
+    latest_snapshot?: QualityMtrSnapshot | null
+    previous_different_snapshot?: QualityMtrSnapshot | null
+    snapshots: QualityMtrSnapshot[]
+    events: QualityMtrEvent[]
   }
 }
 

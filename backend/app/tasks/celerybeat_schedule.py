@@ -9,9 +9,20 @@ SNMP_SCHEDULER_INTERVAL_SECONDS = max(1.0, float(settings.SNMP_SCHEDULER_INTERVA
 SNMP_TASK_EXPIRES_SECONDS = max(1.0, SNMP_SCHEDULER_INTERVAL_SECONDS - 1.0)
 ASTERNOS_SCHEDULER_INTERVAL_SECONDS = max(1.0, float(settings.ASTERNOS_SCHEDULER_INTERVAL_SECONDS))
 ASTERNOS_TASK_EXPIRES_SECONDS = max(1.0, ASTERNOS_SCHEDULER_INTERVAL_SECONDS - 1.0)
+CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS = max(
+    5.0,
+    float(settings.CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS),
+)
 
 # 定时任务配置
 beat_schedule = {
+    'cleanup-monitoring-history-daily-03-20': {
+        'task': 'app.tasks.system_tasks.cleanup_monitoring_history',
+        'schedule': crontab(minute=20, hour=3),
+        'options': {
+            'expires': 6 * 60 * 60,
+        },
+    },
     'collect-server-resources-every-30s': {
         'task': 'app.tasks.system_tasks.collect_server_resources',
         'schedule': 30.0,
@@ -43,12 +54,19 @@ beat_schedule = {
         },
     },
     # 线路绑定端口轻量采集 - 重点公网/专线端口保持10秒级曲线
-    'collect-circuit-interface-realtime-every-30s': {
+    'collect-circuit-interface-realtime': {
         'task': 'app.tasks.snmp_tasks.collect_circuit_interface_realtime',
-        'schedule': SNMP_SCHEDULER_INTERVAL_SECONDS,
+        'schedule': CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS,
         'options': {
-            'expires': SNMP_TASK_EXPIRES_SECONDS,
+            'expires': max(4.0, CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS - 1.0),
         }
+    },
+    'collect-incident-interface-realtime-every-5s': {
+        'task': 'app.tasks.snmp_tasks.collect_incident_interface_realtime',
+        'schedule': 5.0,
+        'options': {
+            'expires': 4.0,
+        },
     },
     'collect-asternos-interface-realtime-every-30s': {
         'task': 'app.tasks.snmp_tasks.collect_all_asternos_interface_realtime',
@@ -98,12 +116,27 @@ beat_schedule = {
     },
     
     # 关键接口告警检查 - 每30秒执行一次，避免采集/告警检查重叠导致页面卡顿
-    'check-fast-alerts-every-30s': {
-        'task': 'app.tasks.alert_tasks.check_fast_alerts',
+    'check-fast-state-alerts-every-30s': {
+        'task': 'app.tasks.alert_tasks.check_fast_state_alerts',
         'schedule': 30.0,
         'options': {
-            'expires': 25.0,
+            'expires': 28.0,
         }
+    },
+    'check-fast-crc-alerts-every-30s': {
+        'task': 'app.tasks.alert_tasks.check_fast_crc_alerts',
+        'schedule': 30.0,
+        'options': {'expires': 28.0},
+    },
+    'check-fast-error-alerts-every-30s': {
+        'task': 'app.tasks.alert_tasks.check_fast_error_alerts',
+        'schedule': 30.0,
+        'options': {'expires': 28.0},
+    },
+    'check-fast-discard-alerts-every-30s': {
+        'task': 'app.tasks.alert_tasks.check_fast_discard_alerts',
+        'schedule': 30.0,
+        'options': {'expires': 28.0},
     },
 
     # 接口告警快速恢复 - 只扫描当前活动接口告警，端口排除/AdminDown 后不等待全量规则慢扫
@@ -127,6 +160,15 @@ beat_schedule = {
     # 山石仅上报 BFD Down Trap，没有配对的恢复 Trap；回查当前会话状态后再真实恢复。
     'reconcile-hillstone-bfd-traps-every-60s': {
         'task': 'app.tasks.alert_tasks.reconcile_hillstone_bfd_trap_alerts',
+        'schedule': 60.0,
+        'options': {
+            'expires': 50.0,
+        }
+    },
+
+    # 山石 BGP Down Trap 可能没有配对恢复 Trap；回查当前邻居状态后再真实恢复。
+    'reconcile-hillstone-bgp-traps-every-60s': {
+        'task': 'app.tasks.alert_tasks.reconcile_hillstone_bgp_trap_alerts',
         'schedule': 60.0,
         'options': {
             'expires': 50.0,
@@ -167,15 +209,6 @@ beat_schedule = {
         'options': {
             'expires': 50.0,
         }
-    },
-
-    # 自动维护公网/专线线路使用率规则：50% P2、90% P1
-    'ensure-circuit-utilization-alert-rules-every-10m': {
-        'task': 'app.tasks.alert_tasks.ensure_circuit_utilization_alert_rules',
-        'schedule': 600.0,
-        'options': {
-            'expires': 300.0,
-        },
     },
 
     # 告警规则详情缓存预热 - 用户首次点击“查看状态”时优先命中Redis缓存
@@ -299,6 +332,14 @@ beat_schedule = {
         'schedule': 1.0,
         'options': {
             'expires': 5.0,
+        },
+    },
+    # 公网路径观察 - 只处理开启了MTR观察的公网质量目标，目标自身控制执行间隔
+    'collect-quality-mtr-paths-every-30s': {
+        'task': 'app.tasks.quality_tasks.collect_quality_mtr_paths',
+        'schedule': 30.0,
+        'options': {
+            'expires': 25.0,
         },
     },
 }

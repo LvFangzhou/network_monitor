@@ -9,12 +9,16 @@ from celery import shared_task
 
 from app.core import get_logger
 from app.database import SessionLocal
-from app.models import AlertHistory, AlertRule, Device, QualityProbeTarget
+from app.models import AlertHistory, AlertRule, Device, QualityProbeTarget, QualityMtrSnapshot, QualityMtrEvent
 from app.utils import redis_client
 from app.utils.quality_probe import (
     apply_quality_loss_window,
+    normalize_server_icmp_probe_config,
     run_quality_nqa_snmp,
     run_quality_ping,
+    run_quality_ping_batch,
+    run_mtr_or_trace,
+    normalize_quality_ping_result,
     write_quality_probe_result,
 )
 
@@ -23,12 +27,56 @@ logger = get_logger(__name__)
 QUALITY_PROBE_LOCK_KEY = "quality_probe:collect:lock"
 QUALITY_PROBE_LOCK_TTL_SECONDS = 15
 QUALITY_PROBE_MAX_WORKERS = 20
-QUALITY_ALERT_METRIC_TYPE = "quality_packet_loss"
+QUALITY_LOSS_ALERT_METRIC_TYPE = "quality_packet_loss"
+QUALITY_LATENCY_ALERT_METRIC_TYPE = "quality_latency"
+QUALITY_JITTER_ALERT_METRIC_TYPE = "quality_jitter"
 QUALITY_ALERT_ACTIVE_STATUSES = ("firing", "acknowledged", "ignored", "snoozed")
+QUALITY_MTR_LOCK_KEY = "quality_probe:mtr:collect:lock"
+QUALITY_MTR_LOCK_TTL_SECONDS = 120
+QUALITY_MTR_MAX_WORKERS = 4
+QUALITY_MTR_LATENCY_EVENT_THRESHOLD_MS = 50.0
 
 
 def _quality_loss_counter_key(target_id: int) -> str:
     return f"quality_probe:consecutive_loss:{target_id}"
+
+
+def _quality_latency_counter_key(target_id: int) -> str:
+    return f"quality_probe:consecutive_latency:{target_id}"
+
+
+def _quality_latency_recovery_counter_key(target_id: int) -> str:
+    return f"quality_probe:latency_recovery:{target_id}"
+
+
+def _quality_jitter_counter_key(target_id: int) -> str:
+    return f"quality_probe:consecutive_jitter:{target_id}"
+
+
+def _quality_jitter_recovery_counter_key(target_id: int) -> str:
+    return f"quality_probe:jitter_recovery:{target_id}"
+
+
+def _update_consecutive_threshold_count(target_id: int, metric_name: str, is_abnormal: bool) -> int:
+    if metric_name == "latency":
+        key = _quality_latency_counter_key(target_id)
+    elif metric_name == "jitter":
+        key = _quality_jitter_counter_key(target_id)
+    else:
+        key = _quality_loss_counter_key(target_id)
+    if not is_abnormal:
+        try:
+            redis_client.delete(key)
+        except Exception:
+            pass
+        return 0
+    try:
+        count = int(redis_client.incr(key))
+        redis_client.expire(key, 24 * 60 * 60)
+        return count
+    except Exception:
+        # Redis异常时宁可保守，只按本周期异常计 1 次。
+        return 1
 
 
 def _update_consecutive_loss_count(target_id: int, raw_result: Dict[str, Any]) -> int:
@@ -76,6 +124,115 @@ def _quality_target_thresholds(rule: AlertRule, target_notification: Dict[str, A
     return max(1, min(required_count, 60)), max(0.01, min(threshold, 100.0))
 
 
+def _quality_latency_thresholds(rule: AlertRule, target_notification: Dict[str, Any], target: QualityProbeTarget) -> tuple[int, float]:
+    extra_config = rule.extra_config or {}
+    try:
+        required_count = int(
+            target_notification.get("latency_consecutive_samples")
+            if target_notification.get("latency_consecutive_samples") is not None
+            else target_notification.get("consecutive_samples")
+            if target_notification.get("consecutive_samples") is not None
+            else extra_config.get("consecutive_samples") or 5
+        )
+    except (TypeError, ValueError):
+        required_count = 5
+    try:
+        threshold = float(
+            target_notification.get("latency_threshold_ms")
+            if target_notification.get("latency_threshold_ms") is not None
+            else getattr(target, "latency_threshold_ms", None)
+            if getattr(target, "latency_threshold_ms", None) is not None
+            else rule.threshold or 100.0
+        )
+    except (TypeError, ValueError):
+        threshold = 100.0
+    return max(1, min(required_count, 60)), max(1.0, min(threshold, 10000.0))
+
+
+def _quality_latency_recovery_required(rule: AlertRule) -> int:
+    extra_config = rule.extra_config or {}
+    try:
+        return max(1, min(int(extra_config.get("recovery_required_samples") or 2), 10))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _quality_jitter_thresholds(rule: AlertRule, target_notification: Dict[str, Any], target: QualityProbeTarget) -> tuple[int, float]:
+    extra_config = rule.extra_config or {}
+    try:
+        required_count = int(
+            target_notification.get("jitter_consecutive_samples")
+            if target_notification.get("jitter_consecutive_samples") is not None
+            else target_notification.get("consecutive_samples")
+            if target_notification.get("consecutive_samples") is not None
+            else extra_config.get("consecutive_samples") or 5
+        )
+    except (TypeError, ValueError):
+        required_count = 5
+    try:
+        threshold = float(
+            target_notification.get("jitter_threshold_ms")
+            if target_notification.get("jitter_threshold_ms") is not None
+            else getattr(target, "jitter_threshold_ms", None)
+            if getattr(target, "jitter_threshold_ms", None) is not None
+            else rule.threshold or 30.0
+        )
+    except (TypeError, ValueError):
+        threshold = 30.0
+    return max(1, min(required_count, 60)), max(0.1, min(threshold, 10000.0))
+
+
+def _quality_jitter_recovery_required(rule: AlertRule) -> int:
+    extra_config = rule.extra_config or {}
+    try:
+        return max(1, min(int(extra_config.get("recovery_required_samples") or 2), 10))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _quality_target_notification(rule: AlertRule | None, target: QualityProbeTarget, fallback_rule: AlertRule | None = None) -> Dict[str, Any]:
+    if not rule:
+        return {}
+    extra_config = rule.extra_config or {}
+    target_notification = (extra_config.get("target_notifications") or {}).get(str(target.id)) or {}
+    if target_notification:
+        return target_notification
+    # 延迟/抖动告警复用质量探测目标里已经配置的机器人，避免同一个探测目标重复配置机器人。
+    if rule.metric_type in {QUALITY_LATENCY_ALERT_METRIC_TYPE, QUALITY_JITTER_ALERT_METRIC_TYPE} and fallback_rule:
+        fallback_extra = fallback_rule.extra_config or {}
+        return (fallback_extra.get("target_notifications") or {}).get(str(target.id)) or {}
+    return {}
+
+
+def _quality_alert_message(
+    target: QualityProbeTarget,
+    metric_label: str,
+    current_value: float,
+    threshold: float,
+    consecutive_count: int,
+    required_count: int,
+    raw_result: Dict[str, Any],
+    smoothed_result: Dict[str, Any],
+) -> str:
+    datacenter = target.datacenter_ref.name if target.datacenter_ref else "-"
+    latency = smoothed_result.get("avg_latency_ms")
+    latency_text = "-" if latency is None else f"{float(latency):.2f} ms"
+    loss = smoothed_result.get("packet_loss_percent")
+    loss_text = "-" if loss is None else f"{float(loss):.2f}%"
+    sent = int(float(raw_result.get("sent") or 0))
+    received = int(float(raw_result.get("received") or 0))
+    unit = "ms" if metric_label in {"延迟", "抖动"} else "%"
+    value_text = f"{current_value:.2f}{unit}"
+    threshold_text = f"{threshold:.2f}{unit}"
+    return (
+        f"探测目标 {target.name} ({target.target}) {metric_label} {value_text}，"
+        f"已连续 {consecutive_count} 个探测周期{metric_label}异常，告警要求连续 {required_count} 个周期，"
+        f"{metric_label}阈值为 {threshold_text}；"
+        f"当前延迟：{latency_text}，最近5分钟丢包率：{loss_text}，本轮收发：{received}/{sent}；"
+        f"机房：{datacenter}，运营商：{target.operator_name or '-'}"
+    )
+
+
 def _evaluate_quality_loss_alert(
     db,
     rule: AlertRule | None,
@@ -85,8 +242,7 @@ def _evaluate_quality_loss_alert(
 ) -> None:
     if not rule:
         return
-    extra_config = rule.extra_config or {}
-    target_notification = (extra_config.get("target_notifications") or {}).get(str(target.id)) or {}
+    target_notification = _quality_target_notification(rule, target)
     if not target_notification.get("enabled") or not str(target_notification.get("webhook_url") or "").strip():
         return
     required_count, threshold = _quality_target_thresholds(rule, target_notification)
@@ -108,20 +264,13 @@ def _evaluate_quality_loss_alert(
         .order_by(AlertHistory.id.desc())
         .first()
     )
-    datacenter = target.datacenter_ref.name if target.datacenter_ref else "-"
-    latency = smoothed_result.get("avg_latency_ms")
-    latency_text = "-" if latency is None else f"{float(latency):.2f} ms"
-    sent = int(float(raw_result.get("sent") or 0))
-    received = int(float(raw_result.get("received") or 0))
-    message = (
-        f"探测目标 {target.name} ({target.target}) 最近5分钟丢包率 {loss_percent:.2f}%，"
-        f"已连续 {consecutive_count} 个探测周期发生丢包，告警要求连续 {required_count} 个周期，"
-        f"丢包率阈值为 {threshold:.2f}%；"
-        f"当前延迟：{latency_text}，本轮收发：{received}/{sent}；"
-        f"机房：{datacenter}，运营商：{target.operator_name or '-'}"
-    )
+    message = _quality_alert_message(target, "丢包率", loss_percent, threshold, consecutive_count, required_count, raw_result, smoothed_result)
     now = datetime.now(timezone.utc)
     if should_alert:
+        try:
+            redis_client.delete(_quality_latency_recovery_counter_key(target.id))
+        except Exception:
+            pass
         if active_alert:
             active_alert.alert_value = loss_percent
             active_alert.threshold = threshold
@@ -179,6 +328,246 @@ def _evaluate_quality_loss_alert(
         logger.info("公网质量连续丢包告警恢复", target_id=target.id, alert_id=active_alert.id)
 
 
+def _evaluate_quality_latency_alert(
+    db,
+    rule: AlertRule | None,
+    fallback_channel_rule: AlertRule | None,
+    target: QualityProbeTarget,
+    raw_result: Dict[str, Any],
+    smoothed_result: Dict[str, Any],
+) -> None:
+    if not rule:
+        return
+    target_notification = _quality_target_notification(rule, target, fallback_channel_rule)
+    if not target_notification.get("enabled") or not str(target_notification.get("webhook_url") or "").strip():
+        return
+    required_count, threshold = _quality_latency_thresholds(rule, target_notification, target)
+    latency_value = smoothed_result.get("avg_latency_ms")
+    try:
+        latency_ms = float(latency_value)
+    except (TypeError, ValueError):
+        latency_ms = 0.0
+        is_abnormal = False
+    else:
+        is_abnormal = latency_ms >= threshold
+    consecutive_count = _update_consecutive_threshold_count(target.id, "latency", is_abnormal)
+    should_alert = consecutive_count >= required_count and is_abnormal
+    target_key = str(target.id)
+    active_alert = (
+        db.query(AlertHistory)
+        .filter(
+            AlertHistory.rule_id == rule.id,
+            AlertHistory.alert_target_type == "quality_probe",
+            AlertHistory.alert_target_key == target_key,
+            AlertHistory.status.in_(QUALITY_ALERT_ACTIVE_STATUSES),
+        )
+        .order_by(AlertHistory.id.desc())
+        .first()
+    )
+    message = _quality_alert_message(target, "延迟", latency_ms, threshold, consecutive_count, required_count, raw_result, smoothed_result)
+    now = datetime.now(timezone.utc)
+    if should_alert:
+        if active_alert:
+            active_alert.alert_value = latency_ms
+            active_alert.threshold = threshold
+            active_alert.message = message
+            active_alert.alert_target_name = f"{target.name} / {target.target}"
+            active_alert.updated_at = now
+            db.commit()
+            return
+        alert = AlertHistory(
+            rule_id=rule.id,
+            device_id=None,
+            alert_value=latency_ms,
+            threshold=threshold,
+            message=message,
+            alert_target_type="quality_probe",
+            alert_target_key=target_key,
+            alert_target_name=f"{target.name} / {target.target}",
+            status="firing",
+            started_at=now,
+        )
+        db.add(alert)
+        db.commit()
+        db.refresh(alert)
+        from app.tasks.alert_tasks import enqueue_alert_notification
+        enqueue_alert_notification(alert.id)
+        logger.warning(
+            "质量探测连续延迟超阈值告警触发",
+            target_id=target.id,
+            target=target.target,
+            consecutive_count=consecutive_count,
+            latency_ms=latency_ms,
+            threshold=threshold,
+            alert_id=alert.id,
+        )
+        return
+    if active_alert:
+        recovery_key = _quality_latency_recovery_counter_key(target.id)
+        recovery_required = _quality_latency_recovery_required(rule)
+        if is_abnormal:
+            try:
+                redis_client.delete(recovery_key)
+            except Exception:
+                pass
+            return
+        try:
+            recovery_count = int(redis_client.incr(recovery_key))
+            redis_client.expire(recovery_key, 24 * 60 * 60)
+        except Exception:
+            recovery_count = 1
+        if recovery_count < recovery_required:
+            active_alert.alert_value = latency_ms
+            active_alert.message = message
+            active_alert.updated_at = now
+            db.commit()
+            return
+        recovered_reasons = []
+        if consecutive_count < required_count:
+            recovered_reasons.append(f"连续异常周期已降至 {consecutive_count}/{required_count}")
+        if not is_abnormal:
+            recovered_reasons.append(f"平均延迟已降至 {latency_ms:.2f}ms（阈值 {threshold:.2f}ms）")
+            recovered_reasons.append(f"已连续 {recovery_count}/{recovery_required} 个周期恢复正常")
+        active_alert.status = "resolved"
+        active_alert.resolved_at = now
+        active_alert.resolved_by = "system"
+        active_alert.resolution_note = (
+            f"质量探测延迟已恢复：{'；'.join(recovered_reasons) or '触发条件已不再满足'}；"
+            f"当前连续异常周期 {consecutive_count}/{required_count}，"
+            f"当前平均延迟 {latency_ms:.2f}ms（阈值 {threshold:.2f}ms）"
+        )
+        active_alert.alert_value = latency_ms
+        active_alert.updated_at = now
+        db.commit()
+        try:
+            redis_client.delete(recovery_key)
+        except Exception:
+            pass
+        from app.tasks.alert_tasks import enqueue_alert_notification
+        enqueue_alert_notification(active_alert.id, "auto_resolved", "system")
+        logger.info("质量探测连续延迟超阈值告警恢复", target_id=target.id, alert_id=active_alert.id)
+
+
+def _evaluate_quality_jitter_alert(
+    db,
+    rule: AlertRule | None,
+    fallback_channel_rule: AlertRule | None,
+    target: QualityProbeTarget,
+    raw_result: Dict[str, Any],
+    smoothed_result: Dict[str, Any],
+) -> None:
+    if not rule:
+        return
+    target_notification = _quality_target_notification(rule, target, fallback_channel_rule)
+    if not target_notification.get("enabled") or not str(target_notification.get("webhook_url") or "").strip():
+        return
+    required_count, threshold = _quality_jitter_thresholds(rule, target_notification, target)
+    jitter_value = smoothed_result.get("jitter_ms")
+    try:
+        jitter_ms = float(jitter_value)
+    except (TypeError, ValueError):
+        jitter_ms = 0.0
+        is_abnormal = False
+    else:
+        is_abnormal = jitter_ms >= threshold
+    consecutive_count = _update_consecutive_threshold_count(target.id, "jitter", is_abnormal)
+    should_alert = consecutive_count >= required_count and is_abnormal
+    target_key = str(target.id)
+    active_alert = (
+        db.query(AlertHistory)
+        .filter(
+            AlertHistory.rule_id == rule.id,
+            AlertHistory.alert_target_type == "quality_probe",
+            AlertHistory.alert_target_key == target_key,
+            AlertHistory.status.in_(QUALITY_ALERT_ACTIVE_STATUSES),
+        )
+        .order_by(AlertHistory.id.desc())
+        .first()
+    )
+    message = _quality_alert_message(target, "抖动", jitter_ms, threshold, consecutive_count, required_count, raw_result, smoothed_result)
+    now = datetime.now(timezone.utc)
+    if should_alert:
+        if active_alert:
+            active_alert.alert_value = jitter_ms
+            active_alert.threshold = threshold
+            active_alert.message = message
+            active_alert.alert_target_name = f"{target.name} / {target.target}"
+            active_alert.updated_at = now
+            db.commit()
+            return
+        alert = AlertHistory(
+            rule_id=rule.id,
+            device_id=None,
+            alert_value=jitter_ms,
+            threshold=threshold,
+            message=message,
+            alert_target_type="quality_probe",
+            alert_target_key=target_key,
+            alert_target_name=f"{target.name} / {target.target}",
+            status="firing",
+            started_at=now,
+        )
+        db.add(alert)
+        db.commit()
+        db.refresh(alert)
+        from app.tasks.alert_tasks import enqueue_alert_notification
+        enqueue_alert_notification(alert.id)
+        logger.warning(
+            "质量探测连续抖动超阈值告警触发",
+            target_id=target.id,
+            target=target.target,
+            consecutive_count=consecutive_count,
+            jitter_ms=jitter_ms,
+            threshold=threshold,
+            alert_id=alert.id,
+        )
+        return
+    if active_alert:
+        recovery_key = _quality_jitter_recovery_counter_key(target.id)
+        recovery_required = _quality_jitter_recovery_required(rule)
+        if is_abnormal:
+            try:
+                redis_client.delete(recovery_key)
+            except Exception:
+                pass
+            return
+        try:
+            recovery_count = int(redis_client.incr(recovery_key))
+            redis_client.expire(recovery_key, 24 * 60 * 60)
+        except Exception:
+            recovery_count = 1
+        if recovery_count < recovery_required:
+            active_alert.alert_value = jitter_ms
+            active_alert.message = message
+            active_alert.updated_at = now
+            db.commit()
+            return
+        recovered_reasons = []
+        if consecutive_count < required_count:
+            recovered_reasons.append(f"连续异常周期已降至 {consecutive_count}/{required_count}")
+        if not is_abnormal:
+            recovered_reasons.append(f"抖动已降至 {jitter_ms:.2f}ms（阈值 {threshold:.2f}ms）")
+            recovered_reasons.append(f"已连续 {recovery_count}/{recovery_required} 个周期恢复正常")
+        active_alert.status = "resolved"
+        active_alert.resolved_at = now
+        active_alert.resolved_by = "system"
+        active_alert.resolution_note = (
+            f"质量探测抖动已恢复：{'；'.join(recovered_reasons) or '触发条件已不再满足'}；"
+            f"当前连续异常周期 {consecutive_count}/{required_count}，"
+            f"当前抖动 {jitter_ms:.2f}ms（阈值 {threshold:.2f}ms）"
+        )
+        active_alert.alert_value = jitter_ms
+        active_alert.updated_at = now
+        db.commit()
+        try:
+            redis_client.delete(recovery_key)
+        except Exception:
+            pass
+        from app.tasks.alert_tasks import enqueue_alert_notification
+        enqueue_alert_notification(active_alert.id, "auto_resolved", "system")
+        logger.info("质量探测连续抖动超阈值告警恢复", target_id=target.id, alert_id=active_alert.id)
+
+
 def _seconds_since(value: datetime | None) -> float:
     if not value:
         return 10**9
@@ -228,34 +617,48 @@ def collect_quality_probes(self) -> Dict[str, Any]:
             device.id: device
             for device in db.query(Device).filter(Device.id.in_(device_ids)).all()
         } if device_ids else {}
-        max_workers = max(1, min(QUALITY_PROBE_MAX_WORKERS, len(due_targets)))
+        server_ping_targets: List[Dict[str, Any]] = []
+        for target in due_targets:
+            if (target.probe_source or "server_icmp") != "server_icmp":
+                continue
+            safe_config = normalize_server_icmp_probe_config({
+                "probe_source": "server_icmp",
+                "packet_count": target.packet_count,
+                "timeout_ms": target.timeout_ms,
+            })
+            server_ping_targets.append({
+                "id": target.id,
+                "target": target.target,
+                "packet_count": safe_config["packet_count"],
+                "timeout_ms": safe_config["timeout_ms"],
+            })
+        if server_ping_targets:
+            probe_results.update(run_quality_ping_batch(server_ping_targets))
+
+        nqa_targets = [
+            target for target in due_targets
+            if (target.probe_source or "server_icmp") == "device_nqa_snmp"
+        ]
+        max_workers = max(1, min(QUALITY_PROBE_MAX_WORKERS, len(nqa_targets) or 1))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
-            for target in due_targets:
-                if (target.probe_source or "server_icmp") == "device_nqa_snmp":
-                    device = devices_by_id.get(target.device_id)
-                    if not device:
-                        probe_results[target.id] = {
-                            "success": False,
-                            "avg_latency_ms": None,
-                            "min_latency_ms": None,
-                            "max_latency_ms": None,
-                            "jitter_ms": None,
-                            "packet_loss_percent": None,
-                            "availability_percent": None,
-                            "received": 0,
-                            "sent": 0,
-                            "error": "NQA采集设备不存在",
-                        }
-                        continue
-                    future = executor.submit(run_quality_nqa_snmp, target, device)
-                else:
-                    future = executor.submit(
-                        run_quality_ping,
-                        target.target,
-                        target.packet_count or 1,
-                        target.timeout_ms or 1000,
-                    )
+            for target in nqa_targets:
+                device = devices_by_id.get(target.device_id)
+                if not device:
+                    probe_results[target.id] = {
+                        "success": False,
+                        "avg_latency_ms": None,
+                        "min_latency_ms": None,
+                        "max_latency_ms": None,
+                        "jitter_ms": None,
+                        "packet_loss_percent": None,
+                        "availability_percent": None,
+                        "received": 0,
+                        "sent": 0,
+                        "error": "NQA采集设备不存在",
+                    }
+                    continue
+                future = executor.submit(run_quality_nqa_snmp, target, device)
                 futures[future] = target.id
             for future in as_completed(futures):
                 target_id = futures[future]
@@ -275,25 +678,42 @@ def collect_quality_probes(self) -> Dict[str, Any]:
                         "error": str(e),
                     }
 
-        quality_alert_rule = (
+        quality_loss_alert_rule = (
             db.query(AlertRule)
-            .filter(AlertRule.metric_type == QUALITY_ALERT_METRIC_TYPE)
+            # 丢包率不再独立触发告警；这里仅保留为每个探测对象的机器人/负责人配置来源。
+            .filter(AlertRule.metric_type == QUALITY_LOSS_ALERT_METRIC_TYPE)
+            .order_by(AlertRule.id.asc())
+            .first()
+        )
+        quality_latency_alert_rule = (
+            db.query(AlertRule)
+            .filter(AlertRule.metric_type == QUALITY_LATENCY_ALERT_METRIC_TYPE, AlertRule.enabled == 1)
+            .order_by(AlertRule.id.asc())
+            .first()
+        )
+        quality_jitter_alert_rule = (
+            db.query(AlertRule)
+            .filter(AlertRule.metric_type == QUALITY_JITTER_ALERT_METRIC_TYPE, AlertRule.enabled == 1)
             .order_by(AlertRule.id.asc())
             .first()
         )
         for target in due_targets:
-            raw_result = probe_results.get(target.id) or {}
+            raw_result = normalize_quality_ping_result(probe_results.get(target.id) or {})
             result = apply_quality_loss_window(target.id, raw_result)
             target.last_probe_at = datetime.now(timezone.utc)
             target.last_success = bool(result.get("success"))
             target.last_avg_latency_ms = result.get("avg_latency_ms")
-            target.last_packet_loss_percent = result.get("packet_loss_percent")
+            # 卡片上的“当前丢包率”应表示最近一次探测，不使用滚动窗口值；
+            # 滚动窗口丢包率仍写入 Influx，用于历史趋势图和避免单包毛刺。
+            target.last_packet_loss_percent = result.get("current_packet_loss_percent", raw_result.get("packet_loss_percent"))
             target.last_jitter_ms = result.get("jitter_ms")
             target.last_error = result.get("error")
             db.commit()
             db.refresh(target)
             write_quality_probe_result(target, result)
-            _evaluate_quality_loss_alert(db, quality_alert_rule, target, raw_result, result)
+            # 当前质量告警仅启用延迟/抖动阈值；丢包率只作为图表和机器人参考字段保留。
+            _evaluate_quality_latency_alert(db, quality_latency_alert_rule, quality_loss_alert_rule, target, raw_result, result)
+            _evaluate_quality_jitter_alert(db, quality_jitter_alert_rule, quality_loss_alert_rule, target, raw_result, result)
             collected += 1
             if not result.get("success"):
                 failed += 1
@@ -314,5 +734,149 @@ def collect_quality_probes(self) -> Dict[str, Any]:
         db.close()
         try:
             redis_client.delete(QUALITY_PROBE_LOCK_KEY)
+        except Exception:
+            pass
+
+
+def _create_mtr_event_if_needed(db, target: QualityProbeTarget, previous: QualityMtrSnapshot | None, current: QualityMtrSnapshot) -> QualityMtrEvent | None:
+    if not previous or not current.success:
+        return None
+    path_changed = bool(previous.path_hash and current.path_hash and previous.path_hash != current.path_hash)
+    previous_latency = previous.final_avg_latency_ms
+    current_latency = current.final_avg_latency_ms
+    latency_delta = None
+    latency_increased = False
+    if previous_latency is not None and current_latency is not None:
+        latency_delta = float(current_latency) - float(previous_latency)
+        latency_increased = latency_delta >= QUALITY_MTR_LATENCY_EVENT_THRESHOLD_MS
+    if not path_changed and not latency_increased:
+        return None
+
+    event_type = "path_changed" if path_changed else "latency_increased"
+    title = "公网路径发生变化" if path_changed else "公网路径延迟升高"
+    event = QualityMtrEvent(
+        target_id=target.id,
+        event_type=event_type,
+        title=title,
+        previous_snapshot_id=previous.id,
+        current_snapshot_id=current.id,
+        previous_path_hash=previous.path_hash,
+        current_path_hash=current.path_hash,
+        previous_final_latency_ms=previous_latency,
+        current_final_latency_ms=current_latency,
+        latency_delta_ms=latency_delta,
+        detail={
+            "target_name": target.name,
+            "target": target.target,
+            "previous_path": [hop.get("ip") for hop in (previous.hops or []) if hop.get("ip")],
+            "current_path": [hop.get("ip") for hop in (current.hops or []) if hop.get("ip")],
+            "path_changed": path_changed,
+            "latency_increased": latency_increased,
+        },
+    )
+    db.add(event)
+    return event
+
+
+@shared_task(bind=True, name="app.tasks.quality_tasks.collect_quality_mtr_paths")
+def collect_quality_mtr_paths(self) -> Dict[str, Any]:
+    """Periodically observe MTR paths for enabled public quality targets."""
+    try:
+        acquired = redis_client.set(QUALITY_MTR_LOCK_KEY, self.request.id or "1", ex=QUALITY_MTR_LOCK_TTL_SECONDS, nx=True)
+    except Exception:
+        acquired = True
+    if not acquired:
+        return {"status": "locked", "collected": 0}
+
+    db = SessionLocal()
+    collected = 0
+    failed = 0
+    events = 0
+    rows: List[Dict[str, Any]] = []
+    try:
+        targets = (
+            db.query(QualityProbeTarget)
+            .filter(QualityProbeTarget.is_active == True)  # noqa: E712
+            .filter(QualityProbeTarget.probe_source == "server_icmp")
+            .filter(QualityProbeTarget.mtr_enabled == True)  # noqa: E712
+            .order_by(QualityProbeTarget.id.asc())
+            .all()
+        )
+        due_targets = []
+        for target in targets:
+            interval = max(int(target.mtr_interval_seconds or 300), 60)
+            if _seconds_since(target.last_mtr_at) < interval:
+                continue
+            due_targets.append(target)
+        if not due_targets:
+            return {"status": "ok", "collected": 0, "failed": 0, "events": 0, "items": []}
+
+        results: Dict[int, Dict[str, Any]] = {}
+        max_workers = max(1, min(QUALITY_MTR_MAX_WORKERS, len(due_targets)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(run_mtr_or_trace, target.target, 5, 35, False): target.id for target in due_targets}
+            for future in as_completed(futures):
+                target_id = futures[future]
+                try:
+                    results[target_id] = future.result()
+                except Exception as exc:
+                    results[target_id] = {"success": False, "error": str(exc), "hops": [], "output": str(exc), "tool": "none"}
+
+        now = datetime.now(timezone.utc)
+        for target in due_targets:
+            result = results.get(target.id) or {}
+            previous = (
+                db.query(QualityMtrSnapshot)
+                .filter(QualityMtrSnapshot.target_id == target.id)
+                .order_by(QualityMtrSnapshot.created_at.desc(), QualityMtrSnapshot.id.desc())
+                .first()
+            )
+            snapshot = QualityMtrSnapshot(
+                target_id=target.id,
+                target=target.target,
+                path_hash=result.get("path_hash") or "",
+                hop_count=int(result.get("hop_count") or 0),
+                final_hop_ip=result.get("final_hop_ip"),
+                final_avg_latency_ms=result.get("final_avg_latency_ms"),
+                final_loss_percent=result.get("final_loss_percent"),
+                max_avg_latency_ms=result.get("max_avg_latency_ms"),
+                command=result.get("command"),
+                tool=result.get("tool"),
+                raw_output=result.get("output"),
+                hops=result.get("hops") or [],
+                success=bool(result.get("success")) and bool(result.get("hops")),
+                error=result.get("error"),
+                created_at=now,
+            )
+            db.add(snapshot)
+            db.flush()
+            event = _create_mtr_event_if_needed(db, target, previous, snapshot)
+            if event:
+                events += 1
+            target.last_mtr_at = now
+            target.last_mtr_path_hash = snapshot.path_hash
+            target.last_mtr_final_latency_ms = snapshot.final_avg_latency_ms
+            if not snapshot.success:
+                failed += 1
+            collected += 1
+            rows.append({
+                "id": target.id,
+                "name": target.name,
+                "target": target.target,
+                "success": snapshot.success,
+                "hop_count": snapshot.hop_count,
+                "final_avg_latency_ms": snapshot.final_avg_latency_ms,
+                "path_hash": snapshot.path_hash,
+            })
+        db.commit()
+        return {"status": "ok", "collected": collected, "failed": failed, "events": events, "items": rows[:20]}
+    except Exception as exc:
+        db.rollback()
+        logger.error("公网MTR路径观察失败", error=str(exc))
+        return {"status": "error", "error": str(exc), "collected": collected, "failed": failed, "events": events}
+    finally:
+        db.close()
+        try:
+            redis_client.delete(QUALITY_MTR_LOCK_KEY)
         except Exception:
             pass

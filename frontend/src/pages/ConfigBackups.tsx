@@ -51,6 +51,7 @@ const syncStatusMeta: Record<string, { label: string; color: string }> = {
   matched: { label: '一致', color: 'green' },
   changed_saved: { label: '不一致/已保存', color: 'orange' },
   changed_save_failed: { label: '不一致/保存失败', color: 'red' },
+  changed_not_saved: { label: '不一致/未自动保存', color: 'gold' },
   check_failed: { label: '检查失败', color: 'red' },
   unsupported: { label: '暂不支持', color: 'default' },
 }

@@ -4,13 +4,15 @@ System self-check tasks.
 import asyncio
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from celery import shared_task
 
 from app.config import settings
 from app.core import get_logger
+from app.database import SessionLocal
+from app.models import AlertHistory, AuditLog, BmpMessage, QualityMtrEvent, SyslogEvent
 from app.utils import influx_client, notification_manager, redis_client
 from app.utils.server_resources import collect_host_resource_sample, store_host_resource_sample
 
@@ -168,3 +170,64 @@ def check_influxdb_storage_health() -> Dict[str, Any]:
         return {"status": "healthy"}
     finally:
         redis_client.delete(INFLUX_HEALTH_LOCK_KEY)
+
+
+@shared_task
+def cleanup_monitoring_history() -> Dict[str, int]:
+    """每日清理低价值历史；活动告警永不删除。"""
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    deleted: Dict[str, int] = {}
+    try:
+        # 已明确由光模块HIGH/LOW缓存串用造成的误报，可直接清理。
+        deleted["confirmed_false_optical_alerts"] = (
+            db.query(AlertHistory)
+            .filter(
+                AlertHistory.status == "resolved",
+                AlertHistory.resolution_note == "修复光模块高低阈值目标缓存串用导致的误报",
+            )
+            .delete(synchronize_session=False)
+        )
+        deleted["resolved_alerts_180d"] = (
+            db.query(AlertHistory)
+            .filter(
+                AlertHistory.status.in_(["resolved", "ignored"]),
+                AlertHistory.started_at < now - timedelta(days=180),
+            )
+            .delete(synchronize_session=False)
+        )
+        deleted["read_audits_7d"] = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "view", AuditLog.created_at < now - timedelta(days=7))
+            .delete(synchronize_session=False)
+        )
+        deleted["write_audits_180d"] = (
+            db.query(AuditLog)
+            .filter(AuditLog.action != "view", AuditLog.created_at < now - timedelta(days=180))
+            .delete(synchronize_session=False)
+        )
+        deleted["syslog_90d"] = (
+            db.query(SyslogEvent)
+            .filter(SyslogEvent.created_at < now - timedelta(days=90))
+            .delete(synchronize_session=False)
+        )
+        deleted["bmp_30d"] = (
+            db.query(BmpMessage)
+            .filter(BmpMessage.created_at < now - timedelta(days=30))
+            .delete(synchronize_session=False)
+        )
+        deleted["mtr_events_90d"] = (
+            db.query(QualityMtrEvent)
+            .filter(QualityMtrEvent.created_at < now - timedelta(days=90))
+            .delete(synchronize_session=False)
+        )
+        # MTR snapshot 可能仍被较新的路径变化事件引用；快照随目标级联删除，
+        # 此处只清事件，避免破坏外键或历史路径对比。
+        db.commit()
+        logger.info("监控历史保留策略执行完成", **deleted)
+        return deleted
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()

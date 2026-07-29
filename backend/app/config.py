@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     INFLUXDB_TOKEN: str = "network-monitor-token"
     INFLUXDB_ORG: str = "network-monitor"
     INFLUXDB_BUCKET: str = "network_metrics"
-    INFLUXDB_RETENTION_DAYS: int = 365
+    INFLUXDB_RETENTION_DAYS: int = 30
     INFLUXDB_DATA_PATH: str = "/host-data/influxdb"
     
     # Redis配置
@@ -97,6 +97,8 @@ class Settings(BaseSettings):
     # 端口流量历史要持续可见，因此接口高频采集与全量资源采集拆分。
     # 这里保持约 60 秒内完整轮一遍所有 SNMP 设备端口基础流量数据。
     SNMP_INTERFACE_REALTIME_INTERVAL_SECONDS: int = 60
+    # 仅线路绑定端口使用更细颗粒度。接口索引会缓存，不会每轮 walk 全设备。
+    CIRCUIT_INTERFACE_REALTIME_INTERVAL_SECONDS: int = 10
     SNMP_MAX_DEVICES_PER_TICK: int = 40
     SNMP_INTERFACE_REALTIME_MAX_WORKERS: int = 4
     # Asteros Exporter 全量资源/协议/队列指标也按批次分摊，避免和端口流量采集抢队列。

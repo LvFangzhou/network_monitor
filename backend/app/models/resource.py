@@ -360,6 +360,11 @@ class QualityProbeTarget(Base):
     latency_threshold_ms = Column(Integer, default=100)
     loss_threshold_percent = Column(Integer, default=1)
     jitter_threshold_ms = Column(Integer, default=30)
+    mtr_enabled = Column(Boolean, default=False)
+    mtr_interval_seconds = Column(Integer, default=300)
+    last_mtr_at = Column(DateTime(timezone=True))
+    last_mtr_path_hash = Column(String(64))
+    last_mtr_final_latency_ms = Column(Float)
     description = Column(Text)
     is_active = Column(Boolean, default=True)
     last_probe_at = Column(DateTime(timezone=True))
@@ -438,6 +443,11 @@ class QualityProbeTarget(Base):
             "latency_threshold_ms": self.latency_threshold_ms,
             "loss_threshold_percent": self.loss_threshold_percent,
             "jitter_threshold_ms": self.jitter_threshold_ms,
+            "mtr_enabled": self.mtr_enabled,
+            "mtr_interval_seconds": self.mtr_interval_seconds,
+            "last_mtr_at": self.last_mtr_at.isoformat() if self.last_mtr_at else None,
+            "last_mtr_path_hash": self.last_mtr_path_hash,
+            "last_mtr_final_latency_ms": self.last_mtr_final_latency_ms,
             "description": self.description,
             "is_active": self.is_active,
             "last_probe_at": self.last_probe_at.isoformat() if self.last_probe_at else None,
@@ -449,4 +459,88 @@ class QualityProbeTarget(Base):
             "last_error": self.last_error,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class QualityMtrSnapshot(Base):
+    """公网质量目标的 MTR 路径快照。"""
+    __tablename__ = "quality_mtr_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_id = Column(Integer, ForeignKey("quality_probe_targets.id", ondelete="CASCADE"), nullable=False, index=True)
+    target = Column(String(255), nullable=False)
+    path_hash = Column(String(64), nullable=False, index=True)
+    hop_count = Column(Integer, default=0)
+    final_hop_ip = Column(String(64))
+    final_avg_latency_ms = Column(Float)
+    final_loss_percent = Column(Float)
+    max_avg_latency_ms = Column(Float)
+    command = Column(String(255))
+    tool = Column(String(30))
+    raw_output = Column(Text)
+    hops = Column(JSON, default=list)
+    success = Column(Boolean, default=True)
+    error = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    target_ref = relationship("QualityProbeTarget")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "target_id": self.target_id,
+            "target": self.target,
+            "path_hash": self.path_hash,
+            "hop_count": self.hop_count,
+            "final_hop_ip": self.final_hop_ip,
+            "final_avg_latency_ms": self.final_avg_latency_ms,
+            "final_loss_percent": self.final_loss_percent,
+            "max_avg_latency_ms": self.max_avg_latency_ms,
+            "command": self.command,
+            "tool": self.tool,
+            "raw_output": self.raw_output,
+            "hops": self.hops or [],
+            "success": self.success,
+            "error": self.error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class QualityMtrEvent(Base):
+    """MTR 路径变化/质量变化事件。"""
+    __tablename__ = "quality_mtr_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_id = Column(Integer, ForeignKey("quality_probe_targets.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    previous_snapshot_id = Column(Integer, ForeignKey("quality_mtr_snapshots.id", ondelete="SET NULL"), nullable=True)
+    current_snapshot_id = Column(Integer, ForeignKey("quality_mtr_snapshots.id", ondelete="SET NULL"), nullable=True)
+    previous_path_hash = Column(String(64))
+    current_path_hash = Column(String(64))
+    previous_final_latency_ms = Column(Float)
+    current_final_latency_ms = Column(Float)
+    latency_delta_ms = Column(Float)
+    detail = Column(JSON, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    target_ref = relationship("QualityProbeTarget")
+    previous_snapshot_ref = relationship("QualityMtrSnapshot", foreign_keys=[previous_snapshot_id])
+    current_snapshot_ref = relationship("QualityMtrSnapshot", foreign_keys=[current_snapshot_id])
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "target_id": self.target_id,
+            "event_type": self.event_type,
+            "title": self.title,
+            "previous_snapshot_id": self.previous_snapshot_id,
+            "current_snapshot_id": self.current_snapshot_id,
+            "previous_path_hash": self.previous_path_hash,
+            "current_path_hash": self.current_path_hash,
+            "previous_final_latency_ms": self.previous_final_latency_ms,
+            "current_final_latency_ms": self.current_final_latency_ms,
+            "latency_delta_ms": self.latency_delta_ms,
+            "detail": self.detail or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }

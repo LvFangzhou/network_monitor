@@ -844,7 +844,7 @@ from(bucket: "{influx_client.bucket}")
             "time": row.get("time"),
         })
         field = str(row.get("field") or "")
-        if field in {"rx_power", "tx_power"}:
+        if field in {"rx_power", "tx_power", "temperature", "voltage"}:
             item[field] = row.get("value")
     return list(grouped.values())
 
@@ -1080,6 +1080,8 @@ def infer_device_vendor(raw_vendor: Optional[str], *hints: Optional[str]) -> Opt
         return "H3C"
     if re.search(r"\b(?:s|ce|ls)-(?:s)?\d{4}", text) or re.search(r"\bs(?:51|55|58|65|68)\d{2}", text):
         return "H3C"
+    if any(marker in text for marker in ["cisco", "nexus", "nx-os", "nxos", "n9k", "9364d"]):
+        return "Cisco"
     if any(marker in text for marker in ["asternos", "asterfusion", "cx308", "cx532", "cx564", "cx664"]):
         return "Asteros"
     if any(marker in text for marker in ["hillstone", "sg-6000", "山石"]):
@@ -1278,10 +1280,44 @@ async def list_devices(
 
     total = query.count()
     devices = query.offset(skip).limit(limit).all()
+
+    latest_syslog_by_device_id: Dict[int, datetime] = {}
+    latest_syslog_by_source_ip: Dict[str, datetime] = {}
+    if devices:
+        device_ids = [device.id for device in devices]
+        device_ips = [device.ip_address for device in devices if device.ip_address]
+        for device_id, last_seen in db.query(
+            SyslogEvent.device_id,
+            func.max(SyslogEvent.created_at),
+        ).filter(
+            SyslogEvent.device_id.in_(device_ids)
+        ).group_by(SyslogEvent.device_id).all():
+            if device_id and last_seen:
+                latest_syslog_by_device_id[int(device_id)] = last_seen
+
+        if device_ips:
+            for source_ip, last_seen in db.query(
+                SyslogEvent.source_ip,
+                func.max(SyslogEvent.created_at),
+            ).filter(
+                SyslogEvent.source_ip.in_(device_ips)
+            ).group_by(SyslogEvent.source_ip).all():
+                if source_ip and last_seen:
+                    latest_syslog_by_source_ip[str(source_ip)] = last_seen
+
+    items = []
+    for device in devices:
+        payload = device.to_dict()
+        last_syslog_at = latest_syslog_by_device_id.get(device.id)
+        if not last_syslog_at and device.ip_address:
+            last_syslog_at = latest_syslog_by_source_ip.get(device.ip_address)
+        payload["syslog_received"] = bool(last_syslog_at)
+        payload["last_syslog_at"] = last_syslog_at.isoformat() if last_syslog_at else None
+        items.append(payload)
     
     return {
         "total": total,
-        "items": [device.to_dict() for device in devices]
+        "items": items
     }
 
 

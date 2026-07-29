@@ -6,6 +6,10 @@ from __future__ import annotations
 import time
 import json
 import re
+import hashlib
+import shutil
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -26,6 +30,151 @@ QUALITY_LOSS_WINDOW_MAX_SAMPLES = 1200
 QUALITY_LOSS_WINDOW_TTL_SECONDS = 24 * 60 * 60
 DISMAN_PING_RESULTS_ENTRY_OID = "1.3.6.1.2.1.80.1.3.1"
 DISMAN_PING_CONTROL_ENTRY_OID = "1.3.6.1.2.1.80.1.2.1"
+
+
+def _safe_mtr_target(target: str) -> str:
+    target_text = str(target or "").strip()
+    if not target_text or not re.fullmatch(r"[A-Za-z0-9_.:-]+", target_text):
+        raise ValueError("目标地址不合法")
+    return target_text
+
+
+def _normalize_mtr_asn(as_info: str | None) -> str | None:
+    as_text = str(as_info or "").strip()
+    if not as_text or as_text in {"-", "???", "AS???"}:
+        return None
+    match = re.search(r"AS\s*(\d+)", as_text, re.IGNORECASE)
+    if match:
+        return f"AS{match.group(1)}"
+    if re.fullmatch(r"\d+", as_text):
+        return f"AS{as_text}"
+    return as_text
+
+
+def _parse_mtr_number(value: str) -> float:
+    return float(str(value).strip().rstrip("%"))
+
+
+def parse_mtr_report(output: str) -> List[Dict[str, Any]]:
+    """Parse `mtr -r -n -z -c N -w` report into hop rows.
+
+    mtr output differs by version. Without `-z` rows look like:
+      1.|-- 172.18.0.1 0.0% 5 ...
+    With `-z` rows usually look like:
+      1. AS9808 111.4.243.193 0.0% 5 ...
+    Keep the parser position-based around the Loss% column so old snapshots and
+    newer AS-enabled reports are both accepted.
+    """
+    hops: List[Dict[str, Any]] = []
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        row_match = re.match(r"^(?P<hop>\d+)\.(?:\|--)?\s+(?P<rest>.+)$", line)
+        if not row_match:
+            continue
+        tokens = row_match.group("rest").split()
+        loss_index = next(
+            (idx for idx, token in enumerate(tokens) if re.fullmatch(r"\d+(?:\.\d+)?%?", token) and idx + 6 < len(tokens)),
+            None,
+        )
+        if loss_index is None or loss_index < 1:
+            continue
+        host = tokens[loss_index - 1]
+        as_info = " ".join(tokens[:loss_index - 1]).strip() or None
+        asn = _normalize_mtr_asn(as_info)
+        if host in {"???", "*"}:
+            host = None
+        try:
+            hops.append({
+                "hop": int(row_match.group("hop")),
+                "ip": host,
+                "asn": asn,
+                "as_info": as_info,
+                "loss_percent": _parse_mtr_number(tokens[loss_index]),
+                "sent": int(tokens[loss_index + 1]),
+                "last_ms": _parse_mtr_number(tokens[loss_index + 2]),
+                "avg_ms": _parse_mtr_number(tokens[loss_index + 3]),
+                "best_ms": _parse_mtr_number(tokens[loss_index + 4]),
+                "worst_ms": _parse_mtr_number(tokens[loss_index + 5]),
+                "stdev_ms": _parse_mtr_number(tokens[loss_index + 6]),
+            })
+        except (TypeError, ValueError):
+            continue
+    return hops
+
+
+def summarize_mtr_path(hops: List[Dict[str, Any]]) -> Dict[str, Any]:
+    visible_hops = [hop for hop in hops if hop.get("ip")]
+    path_ips = [str(hop.get("ip")) for hop in visible_hops]
+    path_hash = hashlib.sha256("|".join(path_ips).encode("utf-8")).hexdigest()[:32] if path_ips else ""
+    final_hop = visible_hops[-1] if visible_hops else None
+    avg_values = [float(hop.get("avg_ms")) for hop in visible_hops if hop.get("avg_ms") is not None]
+    return {
+        "path_hash": path_hash,
+        "hop_count": len(visible_hops),
+        "final_hop_ip": final_hop.get("ip") if final_hop else None,
+        "final_avg_latency_ms": final_hop.get("avg_ms") if final_hop else None,
+        "final_loss_percent": final_hop.get("loss_percent") if final_hop else None,
+        "max_avg_latency_ms": max(avg_values) if avg_values else None,
+        "path_ips": path_ips,
+    }
+
+
+def run_mtr_or_trace(target: str, count: int = 5, timeout_seconds: int = 30, allow_ping_fallback: bool = True) -> Dict[str, Any]:
+    """Run MTR/traceroute/ping once and return raw output plus parsed hops when possible."""
+    try:
+        target_text = _safe_mtr_target(target)
+    except ValueError as exc:
+        return {"success": False, "command": "", "output": str(exc), "tool": "none", "hops": [], "error": str(exc)}
+
+    candidates = []
+    if shutil.which("mtr"):
+        sample_count = str(max(1, min(int(count or 5), 20)))
+        candidates.append(("mtr", ["mtr", "-r", "-n", "-z", "-c", sample_count, "-w", target_text]))
+        candidates.append(("mtr", ["mtr", "-r", "-n", "-c", sample_count, "-w", target_text]))
+    if shutil.which("traceroute"):
+        candidates.append(("traceroute", ["traceroute", "-n", "-m", "20", "-w", "2", target_text]))
+    if allow_ping_fallback and shutil.which("ping"):
+        candidates.append(("ping", ["ping", "-c", "5", "-W", "2", target_text]))
+    if not candidates:
+        missing_tools = "mtr/traceroute" if not allow_ping_fallback else "mtr/traceroute/ping"
+        return {
+            "success": False,
+            "command": "",
+            "output": f"服务器未安装 {missing_tools} 工具，无法执行路径探测。请在后端容器中安装 mtr 或 traceroute。",
+            "tool": "none",
+            "hops": [],
+            "error": f"缺少{missing_tools}工具",
+        }
+
+    last_error = "unknown"
+    for tool, command in candidates:
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=max(5, min(int(timeout_seconds or 30), 120)),
+                check=False,
+            )
+            output = (completed.stdout or "").strip()
+            if not output:
+                continue
+            hops = parse_mtr_report(output) if tool == "mtr" else []
+            summary = summarize_mtr_path(hops)
+            return {
+                "success": completed.returncode == 0 or bool(output),
+                "command": " ".join(command),
+                "output": output,
+                "tool": tool,
+                "hops": hops,
+                "error": None if completed.returncode == 0 else None,
+                **summary,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+    return {"success": False, "command": "", "output": f"MTR/Trace 执行失败: {last_error}", "tool": "none", "hops": [], "error": last_error}
 
 
 def _decode_disman_ping_index(parts: List[int]) -> tuple[str, str] | None:
@@ -280,10 +429,359 @@ def run_quality_nqa_snmp(target: Any, device: Any) -> Dict[str, Any]:
     }
 
 
-def run_quality_ping(target_host: str, packet_count: int = 5, timeout_ms: int = 1000) -> Dict[str, Any]:
-    """Run one ICMP quality probe and return latency/loss/jitter."""
+SERVER_ICMP_MIN_INTERVAL_SECONDS = 30
+SERVER_ICMP_MIN_PACKET_COUNT = 10
+SERVER_ICMP_MIN_TIMEOUT_MS = 1500
+SERVER_ICMP_MIN_MTR_INTERVAL_SECONDS = 300
+SERVER_ICMP_PING_BATCH_WORKERS = 3
+
+
+def normalize_server_icmp_probe_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Clamp server-side ICMP quality probe settings to avoid single-packet false positives."""
+    normalized = dict(config or {})
+    probe_source = str(normalized.get("probe_source") or "server_icmp")
+    if probe_source != "server_icmp":
+        return normalized
+    normalized["interval_seconds"] = max(int(normalized.get("interval_seconds") or 60), SERVER_ICMP_MIN_INTERVAL_SECONDS)
+    normalized["packet_count"] = max(int(normalized.get("packet_count") or SERVER_ICMP_MIN_PACKET_COUNT), SERVER_ICMP_MIN_PACKET_COUNT)
+    normalized["timeout_ms"] = max(int(normalized.get("timeout_ms") or 1000), SERVER_ICMP_MIN_TIMEOUT_MS)
+    if bool(normalized.get("mtr_enabled")):
+        normalized["mtr_interval_seconds"] = max(
+            int(normalized.get("mtr_interval_seconds") or SERVER_ICMP_MIN_MTR_INTERVAL_SECONDS),
+            SERVER_ICMP_MIN_MTR_INTERVAL_SECONDS,
+        )
+    return normalized
+
+
+def _run_fping(target_host: str, packet_count: int, timeout_ms: int) -> Dict[str, Any] | None:
+    """Run fping as the preferred server-side ICMP probe engine.
+
+    fping is a small native tool designed for repeated/batch ICMP probes. It is
+    less prone than in-process raw-socket libraries to producing false loss when
+    many targets are collected concurrently.
+    """
+    fping_bin = shutil.which("fping")
+    if not fping_bin:
+        return None
+    host = _safe_mtr_target(target_host)
+    sent = max(1, min(int(packet_count or SERVER_ICMP_MIN_PACKET_COUNT), 50))
+    timeout_ms_int = max(200, min(int(timeout_ms or 1000), 10000))
+    interval_ms = max(50, min(timeout_ms_int // 10, 300))
+    command = [
+        fping_bin,
+        "-C",
+        str(sent),
+        "-q",
+        "-p",
+        str(interval_ms),
+        "-t",
+        str(timeout_ms_int),
+        host,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(5, int((sent * interval_ms + timeout_ms_int + 3000) / 1000)),
+            check=False,
+        )
+    except Exception as exc:
+        logger.debug("fping执行失败，回退到系统ping", target=host, error=str(exc))
+        return None
+
+    output = "\n".join(part.strip() for part in (completed.stdout, completed.stderr) if part and part.strip())
+    result_line = next((line for line in output.splitlines() if ":" in line), "")
+    samples_text = result_line.split(":", 1)[1].strip() if result_line else ""
+    sample_tokens = samples_text.split()
+    latencies: List[float] = []
+    for token in sample_tokens:
+        token_text = token.strip()
+        if token_text in {"-", "-nan", "nan"}:
+            continue
+        try:
+            latencies.append(float(token_text))
+        except (TypeError, ValueError):
+            continue
+
+    transmitted = len(sample_tokens) if sample_tokens else sent
+    received = len(latencies)
+    loss = round((transmitted - received) * 100.0 / transmitted, 2) if transmitted else 100.0
+    avg_latency = round(sum(latencies) / received, 2) if received else None
+    min_latency = round(min(latencies), 2) if received else None
+    max_latency = round(max(latencies), 2) if received else None
+    if len(latencies) >= 2:
+        diffs = [abs(latencies[index] - latencies[index - 1]) for index in range(1, len(latencies))]
+        jitter = round(sum(diffs) / len(diffs), 2)
+    elif len(latencies) == 1:
+        jitter = 0.0
+    else:
+        jitter = None
+
+    if not sample_tokens and completed.returncode not in (0, 1):
+        logger.debug("fping未返回可解析结果，回退到系统ping", target=host, output=output[-500:])
+        return None
+
+    return {
+        "success": received > 0,
+        "avg_latency_ms": avg_latency,
+        "min_latency_ms": min_latency,
+        "max_latency_ms": max_latency,
+        "jitter_ms": jitter,
+        "packet_loss_percent": loss,
+        "availability_percent": round(received * 100.0 / transmitted, 2) if transmitted else 0.0,
+        "received": received,
+        "sent": transmitted,
+        "error": None if received > 0 else (output.strip().splitlines()[-1] if output.strip() else "fping未收到响应"),
+        "probe_source": "server_icmp",
+        "probe_engine": "fping",
+    }
+
+
+def _quality_ping_result_from_latencies(
+    latencies: List[float],
+    transmitted: int,
+    engine: str,
+    error: str | None = None,
+) -> Dict[str, Any]:
+    received = len(latencies)
+    safe_sent = max(0, int(transmitted or 0))
+    loss = round((safe_sent - received) * 100.0 / safe_sent, 2) if safe_sent else 100.0
+    avg_latency = round(sum(latencies) / received, 2) if received else None
+    min_latency = round(min(latencies), 2) if received else None
+    max_latency = round(max(latencies), 2) if received else None
+    if len(latencies) >= 2:
+        diffs = [abs(latencies[index] - latencies[index - 1]) for index in range(1, len(latencies))]
+        jitter = round(sum(diffs) / len(diffs), 2)
+    elif len(latencies) == 1:
+        jitter = 0.0
+    else:
+        jitter = None
+    return {
+        "success": received > 0,
+        "avg_latency_ms": avg_latency,
+        "min_latency_ms": min_latency,
+        "max_latency_ms": max_latency,
+        "jitter_ms": jitter,
+        "packet_loss_percent": loss,
+        "availability_percent": round(received * 100.0 / safe_sent, 2) if safe_sent else 0.0,
+        "received": received,
+        "sent": safe_sent,
+        "error": None if received > 0 else (error or "目标无响应"),
+        "probe_source": "server_icmp",
+        "probe_engine": engine,
+    }
+
+
+def normalize_quality_ping_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize ICMP probe loss/availability from sent/received counters.
+
+    fping/system ping output can vary across versions/locales. The reliable
+    source for the current card is the packet accounting we store with every
+    probe sample, so keep packet_loss_percent derived from sent/received.
+    """
+    normalized = dict(result or {})
+    try:
+        sent = int(float(normalized.get("sent") or 0))
+        received = int(float(normalized.get("received") or 0))
+    except (TypeError, ValueError):
+        return normalized
+    if sent <= 0:
+        return normalized
+    received = max(0, min(received, sent))
+    loss = round((sent - received) * 100.0 / sent, 2)
+    normalized["sent"] = sent
+    normalized["received"] = received
+    normalized["packet_loss_percent"] = loss
+    normalized["availability_percent"] = round(received * 100.0 / sent, 2)
+    return normalized
+
+
+def _parse_fping_sample_tokens(samples_text: str) -> tuple[int, List[float]]:
+    sample_tokens = str(samples_text or "").split()
+    latencies: List[float] = []
+    for token in sample_tokens:
+        token_text = token.strip()
+        if token_text in {"-", "-nan", "nan"}:
+            continue
+        try:
+            latencies.append(float(token_text))
+        except (TypeError, ValueError):
+            continue
+    return len(sample_tokens), latencies
+
+
+def run_quality_ping_batch(targets: List[Dict[str, Any]]) -> Dict[Any, Dict[str, Any]]:
+    """Run server-side ICMP quality probes with limited concurrent system ping.
+
+    In this deployment fping has repeatedly shown false packet loss while host
+    ping remains stable, so system ping is the authoritative periodic engine.
+    Concurrency is capped to avoid probe bursts and process pressure.
+    """
+    results: Dict[Any, Dict[str, Any]] = {}
+    valid_items: List[Dict[str, Any]] = []
+    for item in targets:
+        target_id = item.get("id")
+        if target_id is None:
+            continue
+        try:
+            host = _safe_mtr_target(str(item.get("target") or ""))
+        except ValueError as exc:
+            results[target_id] = {
+                "success": False,
+                "avg_latency_ms": None,
+                "min_latency_ms": None,
+                "max_latency_ms": None,
+                "jitter_ms": None,
+                "packet_loss_percent": 100.0,
+                "availability_percent": 0.0,
+                "received": 0,
+                "sent": 0,
+                "error": str(exc) or "目标地址不合法",
+                "probe_source": "server_icmp",
+                "probe_engine": "system_ping_batch",
+            }
+            continue
+        valid_items.append({**item, "_host": host})
+
+    def _probe_one(item: Dict[str, Any]) -> tuple[Any, Dict[str, Any]]:
+        target_id = item.get("id")
+        host = str(item.get("_host") or "")
+        # 周期任务固定控制在每轮最多 10 包；用户手工“立即测试”仍可按配置
+        # 发更多包。这样可以避免旧目标保留 packet_count=20 时继续形成批量突发。
+        sent = max(5, min(int(item.get("packet_count") or SERVER_ICMP_MIN_PACKET_COUNT), SERVER_ICMP_MIN_PACKET_COUNT))
+        timeout_ms_int = max(200, min(int(item.get("timeout_ms") or 1000), 10000))
+        result = _run_system_ping(host, sent, timeout_ms_int)
+        if result is not None:
+            result = normalize_quality_ping_result(result or {})
+            try:
+                result_sent = int(float(result.get("sent") or 0))
+                result_received = int(float(result.get("received") or 0))
+            except (TypeError, ValueError):
+                result_sent, result_received = 0, 0
+            # 公网 ICMP 偶发会出现单轮系统 ping 进程被调度/超时影响，造成与人工连续 ping
+            # 不一致的假丢包。异常样本立即二次确认：只有复测仍异常，才把丢包写入结果。
+            if result_sent > 0 and result_received < result_sent:
+                confirm = _run_system_ping(host, sent, timeout_ms_int)
+                if confirm is not None:
+                    confirm = normalize_quality_ping_result(confirm or {})
+                    try:
+                        confirm_received = int(float(confirm.get("received") or 0))
+                    except (TypeError, ValueError):
+                        confirm_received = 0
+                    if confirm_received >= result_received:
+                        confirm["probe_confirmation"] = "system_ping_recheck"
+                        confirm["probe_first_received"] = result_received
+                        confirm["probe_first_sent"] = result_sent
+                        result = confirm
+        if result is None:
+            result = _run_fping(host, sent, timeout_ms_int)
+        if result is None:
+            result = run_quality_ping(host, sent, timeout_ms_int)
+        result = normalize_quality_ping_result(result or {})
+        result["probe_engine"] = f"{result.get('probe_engine') or 'unknown'}_limited_batch"
+        return target_id, result
+
+    max_workers = max(1, min(SERVER_ICMP_PING_BATCH_WORKERS, len(valid_items) or 1))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_probe_one, item) for item in valid_items]
+        for future in as_completed(futures):
+            try:
+                target_id, result = future.result()
+                results[target_id] = result
+            except Exception as exc:
+                logger.warning("系统ping批量探测失败", error=str(exc))
+
+    return results
+
+
+def _run_system_ping(target_host: str, packet_count: int, timeout_ms: int) -> Dict[str, Any] | None:
+    """Run iputils ping as the primary server-side ICMP engine."""
+    ping_bin = shutil.which("ping")
+    if not ping_bin:
+        return None
+    host = _safe_mtr_target(target_host)
+    sent = max(1, min(int(packet_count or SERVER_ICMP_MIN_PACKET_COUNT), 50))
+    timeout_seconds = max(1, int(round(max(float(timeout_ms or 1000), 1000.0) / 1000.0)))
+    # 公网目标集中到期时，过密的并发 ICMP burst 容易被中间设备或目标侧
+    # ICMP policer 丢弃，形成与人工 ping 不一致的假丢包。保持每目标 2pps，
+    # 再配合较低批量并发，15 个目标的总速率也只有约 6pps。
+    interval_seconds = 0.5
+    command = [ping_bin, "-c", str(sent), "-i", str(interval_seconds), "-W", str(timeout_seconds), host]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=max(int(sent * interval_seconds + timeout_seconds + 5), timeout_seconds + 3),
+            check=False,
+        )
+    except Exception as exc:
+        logger.debug("系统ping执行失败，回退到fping/ping3", target=host, error=str(exc))
+        return None
+
+    output = completed.stdout or ""
+    summary_match = re.search(
+        r"(\d+)\s+packets transmitted,\s+(\d+)\s+(?:packets\s+)?received,\s+([0-9.]+)%\s+packet loss",
+        output,
+    )
+    if not summary_match:
+        summary_match = re.search(
+            r"(\d+)\s+packets transmitted,\s+(\d+)\s+received,.*?([0-9.]+)%\s+packet loss",
+            output,
+            re.S,
+        )
+    if summary_match:
+        transmitted = int(summary_match.group(1))
+        received = int(summary_match.group(2))
+        loss = round(float(summary_match.group(3)), 2)
+    else:
+        transmitted = sent
+        received = len(re.findall(r"time[=<]([0-9.]+)\s*ms", output))
+        loss = round((transmitted - received) * 100.0 / transmitted, 2)
+
+    rtt_match = re.search(r"(?:rtt|round-trip) min/avg/max/(?:mdev|stddev) = ([0-9.]+)/([0-9.]+)/([0-9.]+)/([0-9.]+) ms", output)
+    latencies = [float(value) for value in re.findall(r"time[=<]([0-9.]+)\s*ms", output)]
+    if rtt_match:
+        min_latency = round(float(rtt_match.group(1)), 2)
+        avg_latency = round(float(rtt_match.group(2)), 2)
+        max_latency = round(float(rtt_match.group(3)), 2)
+        jitter = round(float(rtt_match.group(4)), 2)
+    elif latencies:
+        min_latency = round(min(latencies), 2)
+        avg_latency = round(sum(latencies) / len(latencies), 2)
+        max_latency = round(max(latencies), 2)
+        jitter = round(max_latency - min_latency, 2)
+    else:
+        min_latency = avg_latency = max_latency = jitter = None
+
+    return normalize_quality_ping_result({
+        "success": received > 0,
+        "avg_latency_ms": avg_latency,
+        "min_latency_ms": min_latency,
+        "max_latency_ms": max_latency,
+        "jitter_ms": jitter,
+        "packet_loss_percent": loss,
+        "availability_percent": round(received * 100.0 / transmitted, 2) if transmitted else 0.0,
+        "received": received,
+        "sent": transmitted,
+        "error": None if received > 0 else (output.strip().splitlines()[-1] if output.strip() else "ping未收到响应"),
+        "probe_source": "server_icmp",
+        "probe_engine": "system_ping",
+    })
+
+
+def run_quality_ping(target_host: str, packet_count: int = SERVER_ICMP_MIN_PACKET_COUNT, timeout_ms: int = 1000) -> Dict[str, Any]:
+    """Run one ICMP quality probe and return latency/loss/jitter.
+
+    Probe engine priority: system ping -> fping -> ping3. ping3 is kept only as
+    a final compatibility fallback because it can report false packet loss under
+    concurrent raw-socket probing.
+    """
     host = str(target_host or "").strip()
-    sent = max(1, min(int(packet_count or 5), 20))
+    sent = max(1, min(int(packet_count or SERVER_ICMP_MIN_PACKET_COUNT), 50))
     if not host:
         return {
             "success": False,
@@ -297,6 +795,15 @@ def run_quality_ping(target_host: str, packet_count: int = 5, timeout_ms: int = 
             "sent": 0,
             "error": "目标地址为空",
         }
+
+    system_result = _run_system_ping(host, sent, timeout_ms)
+    if system_result is not None:
+        return system_result
+
+    fping_result = _run_fping(host, sent, timeout_ms)
+    if fping_result is not None:
+        return normalize_quality_ping_result(fping_result)
+
     if not PING3_AVAILABLE or ping is None:
         return {
             "success": False,
@@ -308,7 +815,7 @@ def run_quality_ping(target_host: str, packet_count: int = 5, timeout_ms: int = 
             "availability_percent": 0.0,
             "received": 0,
             "sent": sent,
-            "error": "服务器缺少 ping3 依赖，无法执行 ICMP 探测",
+            "error": "服务器缺少 fping/ping/ping3，无法执行 ICMP 探测",
         }
 
     timeout_seconds = max(0.2, min(float(timeout_ms or 1000) / 1000.0, 10.0))
@@ -325,6 +832,7 @@ def run_quality_ping(target_host: str, packet_count: int = 5, timeout_ms: int = 
 
     received = len(latencies)
     packet_loss = round((sent - received) * 100.0 / sent, 2)
+
     availability = round(received * 100.0 / sent, 2)
     avg_latency = round(sum(latencies) / received, 2) if received else None
     min_latency = round(min(latencies), 2) if received else None
@@ -348,6 +856,8 @@ def run_quality_ping(target_host: str, packet_count: int = 5, timeout_ms: int = 
         "received": received,
         "sent": sent,
         "error": None if received > 0 else (errors[-1] if errors else "目标无响应"),
+        "probe_source": "server_icmp",
+        "probe_engine": "ping3",
     }
 
 
@@ -408,8 +918,12 @@ def apply_quality_loss_window(
 
     if total_sent > 0:
         total_received = max(0, min(total_received, total_sent))
+        current_loss = smoothed.get("packet_loss_percent")
+        current_availability = smoothed.get("availability_percent")
         smoothed["packet_loss_percent"] = round((total_sent - total_received) * 100.0 / total_sent, 2)
         smoothed["availability_percent"] = round(total_received * 100.0 / total_sent, 2)
+        smoothed["current_packet_loss_percent"] = current_loss
+        smoothed["current_availability_percent"] = current_availability
         smoothed["loss_window_seconds"] = max(30, int(window_seconds or QUALITY_LOSS_WINDOW_SECONDS))
         smoothed["loss_window_sent"] = total_sent
         smoothed["loss_window_received"] = total_received
@@ -439,8 +953,10 @@ def write_quality_probe_result(target: Any, result: Dict[str, Any]) -> None:
                 "jitter_ms": result.get("jitter_ms"),
                 "jitter_sd_ms": result.get("jitter_sd_ms"),
                 "jitter_ds_ms": result.get("jitter_ds_ms"),
-                "packet_loss_percent": result.get("packet_loss_percent"),
-                "availability_percent": result.get("availability_percent"),
+                "packet_loss_percent": result.get("current_packet_loss_percent", result.get("packet_loss_percent")),
+                "availability_percent": result.get("current_availability_percent", result.get("availability_percent")),
+                "rolling_packet_loss_percent": result.get("packet_loss_percent"),
+                "rolling_availability_percent": result.get("availability_percent"),
                 "received": result.get("received"),
                 "sent": result.get("sent"),
             },

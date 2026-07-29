@@ -413,6 +413,15 @@ async def enforce_read_only_accounts(request: Request, call_next):
 async def audit_requests(request: Request, call_next):
     if not request.url.path.startswith(settings.API_PREFIX):
         return await call_next(request)
+    # 高频监控页面会每10～60秒轮询一次。逐条记录普通GET既没有审计价值，
+    # 又会让审计表以每天数万条的速度增长。只保留敏感读取和所有变更操作。
+    if request.method == "GET":
+        sensitive_read_markers = (
+            "/export",
+            "/config-backups/results/",
+        )
+        if not any(marker in request.url.path for marker in sensitive_read_markers):
+            return await call_next(request)
 
     request_id = getattr(request.state, "request_id", None) or request.headers.get(settings.REQUEST_ID_HEADER) or build_request_id()
     request.state.request_id = request_id

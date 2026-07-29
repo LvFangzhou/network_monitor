@@ -49,6 +49,8 @@ def _startup_config_command(device: Device) -> Optional[str]:
         return "show startup-config"
     if _is_hillstone(device):
         return "show configuration startup"
+    if _is_cisco(device):
+        return "show startup-config"
     return None
 
 
@@ -83,6 +85,10 @@ def _is_hillstone(device: Device) -> bool:
 
 def _is_ruijie(device: Device) -> bool:
     return any(marker in _vendor_text(device) for marker in ["ruijie", "锐捷", "rgos"])
+
+
+def _is_cisco(device: Device) -> bool:
+    return any(marker in _vendor_text(device) for marker in ["cisco", "nexus", "ios", "nx-os"])
 
 
 def _prefer_paramiko_shell(device: Device) -> bool:
@@ -635,6 +641,9 @@ def _build_sync_payload(
     elif running_normalized == startup_normalized:
         sync_status = "matched"
         diff = None
+    elif save_command is None:
+        sync_status = "changed_not_saved"
+        diff = _config_diff_summary(running_config, startup_config or "", device=device)
     else:
         sync_status = "changed_saved" if save_status == "success" else "changed_save_failed"
         diff = _config_diff_summary(running_config, startup_config or "", device=device)
@@ -728,10 +737,11 @@ def _collect_config(device: Device) -> Tuple[str, str]:
 
 def _collect_config_with_sync(device: Device) -> Dict[str, Any]:
     """采集 running 配置，并检查 startup 是否一致；不一致时自动保存。"""
-    # 目前只有 H3C/Asteros 明确要求自动保存。其他厂商仍走原有备份逻辑，避免误操作。
+    # 支持 startup 命令但未配置 save 命令的厂商（例如 Cisco）只做读取和一致性检查，
+    # 不自动修改设备配置。
     startup_command = _startup_config_command(device)
     save_command = _save_config_command(device)
-    if not startup_command or not save_command:
+    if not startup_command:
         command, config = _collect_config(device)
         return _build_sync_payload(device, command, config, None, None, None, None, None)
 
@@ -796,7 +806,7 @@ def _collect_config_with_sync(device: Device) -> Dict[str, Any]:
             startup_config = _run_shell_config_command(shell, device, startup_command)
             running_normalized = _normalize_config_for_compare(running_config, device)
             startup_normalized = _normalize_config_for_compare(startup_config, device)
-            if running_normalized != startup_normalized:
+            if running_normalized != startup_normalized and save_command:
                 try:
                     save_message = _run_shell_save_command(shell, device, save_command)
                     save_status = "success"
@@ -1139,7 +1149,7 @@ def run_config_backup(self, job_id: Optional[int] = None, trigger_type: str = "m
                         datacenter_stats[datacenter]["success"] += 1
                         sync_status = result.config_sync_status or ""
                         save_status = result.config_save_status or ""
-                        if sync_status in {"changed_saved", "changed_save_failed"}:
+                        if sync_status in {"changed_saved", "changed_save_failed", "changed_not_saved"}:
                             job.config_changed_count = (job.config_changed_count or 0) + 1
                             datacenter_stats[datacenter]["changed"] += 1
                         if save_status == "success":

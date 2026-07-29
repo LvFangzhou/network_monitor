@@ -11,6 +11,7 @@ from app.config import settings
 from app.core import get_logger
 from app.database import SessionLocal
 from app.models import Device, SyslogEvent
+from app.services.syslog_alert_engine import process_syslog_alert_event
 
 logger = get_logger(__name__)
 
@@ -87,6 +88,12 @@ def _persist_syslog_event(source_ip: str, raw_message: str) -> None:
         )
         db.add(event)
         db.commit()
+        db.refresh(event)
+        try:
+            process_syslog_alert_event(db, event, device)
+        except Exception as exc:
+            db.rollback()
+            logger.error("处理Syslog辅助告警失败", source_ip=source_ip, event_id=event.id, error=str(exc))
     except Exception as exc:
         db.rollback()
         logger.error("写入Syslog事件失败", source_ip=source_ip, error=str(exc))

@@ -168,6 +168,44 @@ class SNMPCollector(LoggerMixin):
         "optical_vendor": "h3c",
     }
 
+    CISCO_PRIVATE_OIDS = {
+        # Cisco Nexus/NX-OS keeps interface counters on standard IF-MIB/IF-X-MIB.
+        # Hardware inventory is exposed through ENTITY-MIB. NX-OS Nexus 9K
+        # sensors commonly use CISCO-ENTITY-SENSOR-MIB instead of the standard
+        # ENTITY-SENSOR-MIB table.
+        "cpu_usage_oids": [
+            "1.3.6.1.4.1.9.9.109.1.1.1.1.7.1",  # cpmCPUTotal1minRev
+        ],
+        "memory_used_oid": "1.3.6.1.4.1.9.9.48.1.1.1.5.1",  # ciscoMemoryPoolUsed
+        "memory_free_oid": "1.3.6.1.4.1.9.9.48.1.1.1.6.1",  # ciscoMemoryPoolFree
+        # NX-OS 10.x on Nexus 9K may not expose CISCO-MEMORY-POOL-MIB
+        # (.9.9.48), but does expose CISCO-ENHANCED-MEMPOOL-MIB (.9.9.221).
+        # Walk and aggregate all processor pools so the device detail/resource
+        # pages can show memory even when the legacy scalar OIDs are absent.
+        "memory_pool_used_oid": "1.3.6.1.4.1.9.9.221.1.1.1.1.7",
+        "memory_pool_free_oid": "1.3.6.1.4.1.9.9.221.1.1.1.1.8",
+        "entity_class_oid": "1.3.6.1.2.1.47.1.1.1.1.5",
+        "entity_descr_oid": "1.3.6.1.2.1.47.1.1.1.1.2",
+        "entity_name_oid": "1.3.6.1.2.1.47.1.1.1.1.7",
+        "entity_software_oid": "1.3.6.1.2.1.47.1.1.1.1.10",
+        "entity_serial_oid": "1.3.6.1.2.1.47.1.1.1.1.11",
+        "entity_model_oid": "1.3.6.1.2.1.47.1.1.1.1.13",
+        "entity_sensor_type_oid": "1.3.6.1.4.1.9.9.91.1.1.1.1.1",
+        "entity_sensor_scale_oid": "1.3.6.1.4.1.9.9.91.1.1.1.1.2",
+        "entity_sensor_precision_oid": "1.3.6.1.4.1.9.9.91.1.1.1.1.3",
+        "entity_sensor_value_oid": "1.3.6.1.4.1.9.9.91.1.1.1.1.4",
+        "entity_sensor_status_oid": "1.3.6.1.4.1.9.9.91.1.1.1.1.5",
+        "optical_entity_sensor": True,
+        "cisco_power_status_oid": "1.3.6.1.4.1.9.9.117.1.1.2.1.2",  # cefcFRUPowerOperStatus
+        "cisco_power_ok_values": [2],  # on(2)
+        "cisco_fan_status_oid": "1.3.6.1.4.1.9.9.117.1.4.1.1.1",  # cefcFanTrayOperStatus
+        "cisco_fan_ok_values": [1, 2],  # up/ok values differ slightly between NX-OS trains
+        "bgp_state_oids": [
+            "1.3.6.1.2.1.15.3.1.2",
+            "1.3.6.1.4.1.9.9.187.1.2.5.1.3",  # cbgpPeer2State
+        ],
+    }
+
 
 
     RUIJIE_PRIVATE_OIDS = {
@@ -261,6 +299,8 @@ class SNMPCollector(LoggerMixin):
         ]).lower()
         if any(marker in identity for marker in ["hillstone", "sg-6000", "山石"]):
             defaults = self.HILLSTONE_PRIVATE_OIDS.copy()
+        elif any(marker in identity for marker in ["cisco", "nexus", "nx-os", "nxos", "n9k", "9364d"]):
+            defaults = self.CISCO_PRIVATE_OIDS.copy()
         elif any(marker in identity for marker in ["ruijie", "锐捷", "rgos"]):
             defaults = self.RUIJIE_PRIVATE_OIDS.copy()
         elif any(marker in identity for marker in ["densivelo", "yillion", "deepcompute", "s9867"]):
@@ -320,6 +360,72 @@ class SNMPCollector(LoggerMixin):
         if mode == "first":
             return round(cleaned[0], 2)
         return round(max(cleaned), 2)
+
+    def _entity_sensor_scale_multiplier(self, scale: Any) -> float:
+        """ENTITY-SENSOR-MIB EntitySensorDataScale enum to numeric multiplier."""
+        scale_map = {
+            1: 1e-24, 2: 1e-21, 3: 1e-18, 4: 1e-15, 5: 1e-12, 6: 1e-9,
+            7: 1e-6, 8: 1e-3, 9: 1.0, 10: 1e3, 11: 1e6, 12: 1e9,
+            13: 1e12, 14: 1e15, 15: 1e18, 16: 1e21, 17: 1e24,
+        }
+        try:
+            return scale_map.get(int(scale), 1.0)
+        except Exception:
+            return 1.0
+
+    def _convert_entity_sensor_value(self, value: Any, scale: Any = None, precision: Any = None) -> Optional[float]:
+        try:
+            numeric = float(value)
+            numeric *= self._entity_sensor_scale_multiplier(scale)
+            numeric /= 10 ** int(precision or 0)
+            return round(numeric, 4)
+        except Exception:
+            return None
+
+    def _first_entity_inventory_value(
+        self,
+        class_map: Dict[str, Any],
+        value_map: Dict[str, Any],
+        preferred_classes: Optional[set[int]] = None,
+        name_map: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        preferred_classes = preferred_classes or {3}
+        preferred_indexes = [
+            index for index, entity_class in class_map.items()
+            if entity_class in preferred_classes and str(value_map.get(index) or "").strip()
+        ]
+        if name_map:
+            chassis_like = [
+                index for index in preferred_indexes
+                if any(marker in str(name_map.get(index) or "").lower() for marker in ["chassis", "switch", "module"])
+            ]
+            if chassis_like:
+                preferred_indexes = chassis_like
+        for index in preferred_indexes:
+            text = str(value_map.get(index) or "").strip()
+            if text:
+                return text
+        for value in value_map.values():
+            text = str(value or "").strip()
+            if text:
+                return text
+        return None
+
+    def _normalize_interface_token(self, value: Any) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+    def _extract_cisco_interface_from_sensor_name(self, sensor_name: str, if_name_map: Dict[str, str]) -> Optional[Tuple[str, str]]:
+        text = str(sensor_name or "").strip()
+        if not text:
+            return None
+        for index, if_name in sorted(if_name_map.items(), key=lambda item: len(str(item[1])), reverse=True):
+            if if_name and self._normalize_interface_token(if_name) in self._normalize_interface_token(text):
+                return str(index), str(if_name)
+        match = re.search(r"\b(?:Eth|Ethernet)\s*\d+(?:/\d+){1,3}\b", text, re.IGNORECASE)
+        if not match:
+            return None
+        interface_name = re.sub(r"\s+", "", match.group(0))
+        return "0", interface_name
 
     def _collect_private_numeric_metric(
         self,
@@ -1198,6 +1304,8 @@ class SNMPCollector(LoggerMixin):
         table_oid = private_oids.get("optical_info_table_oid")
         if table_oid:
             return self._collect_h3c_optical_monitoring(device, str(table_oid))
+        if private_oids.get("optical_entity_sensor"):
+            return self._collect_cisco_entity_sensor_optical_monitoring(device, private_oids)
 
         rx_oid = private_oids.get("optical_rx_oid")
         tx_oid = private_oids.get("optical_tx_oid")
@@ -1231,6 +1339,87 @@ class SNMPCollector(LoggerMixin):
                     "rx_power": rx_power,
                     "tx_power": tx_power,
                 },
+                "timestamp": now,
+            })
+
+        if points:
+            influx_client.write_points(points, sync=False)
+        return {"points_written": len(points)}
+
+    def _collect_cisco_entity_sensor_optical_monitoring(self, device: Any, private_oids: Dict[str, Any]) -> Dict[str, Any]:
+        """Collect Nexus optical DOM values from ENTITY-SENSOR-MIB when available."""
+        value_oid = private_oids.get("entity_sensor_value_oid")
+        if not value_oid:
+            return {"points_written": 0}
+
+        if_name_map = self._walk_indexed_map(device, "1.3.6.1.2.1.31.1.1.1.1", str)
+        name_map = self._walk_indexed_map(device, str(private_oids.get("entity_name_oid")), str) if private_oids.get("entity_name_oid") else {}
+        descr_map = self._walk_indexed_map(device, str(private_oids.get("entity_descr_oid")), str) if private_oids.get("entity_descr_oid") else {}
+        type_map = self._walk_indexed_map(device, str(private_oids.get("entity_sensor_type_oid")), int) if private_oids.get("entity_sensor_type_oid") else {}
+        scale_map = self._walk_indexed_map(device, str(private_oids.get("entity_sensor_scale_oid")), int) if private_oids.get("entity_sensor_scale_oid") else {}
+        precision_map = self._walk_indexed_map(device, str(private_oids.get("entity_sensor_precision_oid")), int) if private_oids.get("entity_sensor_precision_oid") else {}
+        status_map = self._walk_indexed_map(device, str(private_oids.get("entity_sensor_status_oid")), int) if private_oids.get("entity_sensor_status_oid") else {}
+        value_map = self._walk_indexed_map(device, str(value_oid), float)
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for index, raw_value in value_map.items():
+            sensor_name = name_map.get(index) or descr_map.get(index) or str(index)
+            resolved_interface = self._extract_cisco_interface_from_sensor_name(str(sensor_name), if_name_map)
+            if not resolved_interface:
+                continue
+            if status_map.get(index) not in {None, 1}:
+                continue
+            converted = self._convert_entity_sensor_value(raw_value, scale_map.get(index), precision_map.get(index))
+            if converted is None:
+                continue
+            interface_index, interface_name = resolved_interface
+            item = grouped.setdefault(interface_name, {
+                "interface_index": interface_index,
+                "interface_name": interface_name,
+                "rx_values": [],
+                "tx_values": [],
+                "temperature_values": [],
+                "voltage_values": [],
+            })
+            sensor_type = type_map.get(index)
+            sensor_text = str(sensor_name or "").lower()
+            if sensor_type == 14:  # dBm
+                if re.search(r"\b(rx|receive|received|input)\b", sensor_text):
+                    item["rx_values"].append(converted)
+                elif re.search(r"\b(tx|transmit|transmitted|output)\b", sensor_text):
+                    item["tx_values"].append(converted)
+            elif sensor_type == 8:
+                item["temperature_values"].append(converted)
+            elif sensor_type == 4:
+                item["voltage_values"].append(converted)
+
+        now = datetime.utcnow()
+        points: List[Dict[str, Any]] = []
+        for item in grouped.values():
+            fields: Dict[str, Any] = {}
+            if item["rx_values"]:
+                fields["rx_power"] = round(sum(item["rx_values"]) / len(item["rx_values"]), 2)
+                fields["rx_power_min"] = round(min(item["rx_values"]), 2)
+                fields["rx_power_max"] = round(max(item["rx_values"]), 2)
+            if item["tx_values"]:
+                fields["tx_power"] = round(sum(item["tx_values"]) / len(item["tx_values"]), 2)
+                fields["tx_power_min"] = round(min(item["tx_values"]), 2)
+                fields["tx_power_max"] = round(max(item["tx_values"]), 2)
+            if item["temperature_values"]:
+                fields["temperature"] = round(max(item["temperature_values"]), 2)
+            if item["voltage_values"]:
+                fields["voltage"] = round(sum(item["voltage_values"]) / len(item["voltage_values"]), 4)
+            if not fields:
+                continue
+            points.append({
+                "measurement": "optical_monitoring",
+                "tags": {
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                    "interface_index": str(item["interface_index"]),
+                    "interface_name": item["interface_name"],
+                },
+                "fields": fields,
                 "timestamp": now,
             })
 
@@ -1643,6 +1832,21 @@ class SNMPCollector(LoggerMixin):
             })
 
         if points:
+            redis_client.setex(
+                f"monitor:alert_interface_quality:{device.id}",
+                10 * 60,
+                json.dumps({
+                    "collected_at": datetime.utcnow().isoformat() + "Z",
+                    "interfaces": [
+                        {
+                            "index": (point.get("tags") or {}).get("interface_index"),
+                            "name": (point.get("tags") or {}).get("interface_name"),
+                            **(point.get("fields") or {}),
+                        }
+                        for point in points
+                    ],
+                }, ensure_ascii=False),
+            )
             influx_client.write_points(points, sync=True)
         return {
             "device_id": device.id,
@@ -1820,6 +2024,10 @@ class SNMPCollector(LoggerMixin):
                         "oper_status_code": float(walk_results["oper_status_map"][index]),
                         "admin_up": 1.0 if admin_status == "up" else 0.0,
                         "oper_up": 1.0 if oper_status == "up" else 0.0,
+                        "admin_status": 1.0 if admin_status == "up" else 0.0,
+                        "oper_status": 1.0 if oper_status == "up" else 0.0,
+                        "admin_up_oper_down": 1.0 if admin_status == "up" and oper_status != "up" else 0.0,
+                        # 兼容早期字段名，避免已有查询或面板短期内断层。
                         "interface_admin_up_oper_down": 1.0 if admin_status == "up" and oper_status != "up" else 0.0,
                     })
                 points.append({
@@ -1869,7 +2077,8 @@ class SNMPCollector(LoggerMixin):
                 if delta_out >= 0:
                     out_bps = round((delta_out * 8) / elapsed, 2)
 
-            if in_bps is None and out_bps is None:
+            admin_status_text, oper_status_text = valid_status_pair(index)
+            if in_bps is None and out_bps is None and admin_status_text is None:
                 continue
 
             def compute_delta(current: Any, old: Any) -> Optional[float]:
@@ -1895,8 +2104,6 @@ class SNMPCollector(LoggerMixin):
             in_bps, out_bps = self._sanitize_interface_rates(in_bps, out_bps, speed_bps)
             in_utilization = round((in_bps / speed_bps) * 100, 2) if in_bps is not None and speed_bps else None
             out_utilization = round((out_bps / speed_bps) * 100, 2) if out_bps is not None and speed_bps else None
-            admin_status_text, oper_status_text = valid_status_pair(index)
-
             fields = {
                 "in_bps": in_bps,
                 "out_bps": out_bps,
@@ -1942,6 +2149,28 @@ class SNMPCollector(LoggerMixin):
             })
 
         if points:
+            snapshot_rows = []
+            for point in points:
+                tags = point.get("tags") or {}
+                fields = dict(point.get("fields") or {})
+                if fields.get("admin_status") is not None:
+                    fields["admin_status"] = "up" if float(fields["admin_status"]) >= 1.0 else "down"
+                if fields.get("oper_status") is not None:
+                    fields["oper_status"] = "up" if float(fields["oper_status"]) >= 1.0 else "down"
+                snapshot_rows.append({
+                    "index": tags.get("interface_index"),
+                    "name": tags.get("interface_name"),
+                    **fields,
+                })
+            snapshot_kind = "state" if realtime else "quality"
+            redis_client.setex(
+                f"monitor:alert_interface_{snapshot_kind}:{device.id}",
+                10 * 60,
+                json.dumps({
+                    "collected_at": datetime.utcnow().isoformat() + "Z",
+                    "interfaces": snapshot_rows,
+                }, ensure_ascii=False),
+            )
             influx_client.write_points(points, sync=True)
 
         return {
@@ -2005,9 +2234,35 @@ class SNMPCollector(LoggerMixin):
         if private_memory is not None:
             return {"usage_percent": round(private_memory, 2)}
 
+        pool_used_oid = private_oids.get("memory_pool_used_oid")
+        pool_free_oid = private_oids.get("memory_pool_free_oid")
+        if pool_used_oid and pool_free_oid:
+            try:
+                used_map = self._walk_indexed_map(device, str(pool_used_oid), float)
+                free_map = self._walk_indexed_map(device, str(pool_free_oid), float)
+                used_total = 0.0
+                free_total = 0.0
+                for index, used_value in used_map.items():
+                    free_value = free_map.get(index)
+                    if used_value is None or free_value is None:
+                        continue
+                    used_total += float(used_value)
+                    free_total += float(free_value)
+                total = used_total + free_total
+                if total > 0:
+                    usage_percent = (used_total / total) * 100
+                    return {
+                        "used": used_total,
+                        "free": free_total,
+                        "total": total,
+                        "usage_percent": round(usage_percent, 2),
+                    }
+            except Exception as exc:
+                logger.debug("私有内存池采集失败", device_id=getattr(device, "id", None), error=str(exc))
+
         # 尝试Cisco方式 (used/free)
-        used_oid = "1.3.6.1.4.1.9.9.48.1.1.1.5.1"
-        free_oid = "1.3.6.1.4.1.9.9.48.1.1.1.6.1"
+        used_oid = private_oids.get("memory_used_oid") or "1.3.6.1.4.1.9.9.48.1.1.1.5.1"
+        free_oid = private_oids.get("memory_free_oid") or "1.3.6.1.4.1.9.9.48.1.1.1.6.1"
         
         used = self.snmp_get(device, used_oid)
         free = self.snmp_get(device, free_oid)
@@ -2043,6 +2298,29 @@ class SNMPCollector(LoggerMixin):
     def collect_temperature(self, device: Any) -> List[Dict[str, Any]]:
         """采集设备温度，支持私有OID walk配置。"""
         private_oids = self._get_private_oid_config(device)
+        sensor_value_oid = private_oids.get("entity_sensor_value_oid")
+        if sensor_value_oid:
+            type_map = self._walk_indexed_map(device, str(private_oids.get("entity_sensor_type_oid")), int) if private_oids.get("entity_sensor_type_oid") else {}
+            scale_map = self._walk_indexed_map(device, str(private_oids.get("entity_sensor_scale_oid")), int) if private_oids.get("entity_sensor_scale_oid") else {}
+            precision_map = self._walk_indexed_map(device, str(private_oids.get("entity_sensor_precision_oid")), int) if private_oids.get("entity_sensor_precision_oid") else {}
+            value_map = self._walk_indexed_map(device, str(sensor_value_oid), float)
+            status_map = self._walk_indexed_map(device, str(private_oids.get("entity_sensor_status_oid")), int) if private_oids.get("entity_sensor_status_oid") else {}
+            name_map = self._walk_indexed_map(device, str(private_oids.get("entity_name_oid")), str) if private_oids.get("entity_name_oid") else {}
+            sensor_rows: List[Dict[str, Any]] = []
+            for index, raw_value in value_map.items():
+                # ENTITY-SENSOR-MIB::EntitySensorDataType celsius(8).
+                if type_map and type_map.get(index) != 8:
+                    continue
+                # entPhySensorOperStatus ok(1); keep unknown/missing statuses, skip known bad ones.
+                if status_map.get(index) not in {None, 1}:
+                    continue
+                converted = self._convert_entity_sensor_value(raw_value, scale_map.get(index), precision_map.get(index))
+                if converted is None:
+                    continue
+                sensor_rows.append({"sensor": name_map.get(index) or str(index), "temperature": round(float(converted), 2)})
+            if sensor_rows:
+                return sensor_rows
+
         temperature_oid = private_oids.get("temperature_oid") or private_oids.get("temperature_oids")
         if not temperature_oid:
             return []
@@ -2259,13 +2537,46 @@ class SNMPCollector(LoggerMixin):
         """采集风扇、电源状态。"""
         private_oids = self._get_private_oid_config(device)
         rows: List[Dict[str, Any]] = []
+        entity_name_map = self._walk_indexed_map(device, str(private_oids.get("entity_name_oid")), str) if private_oids.get("entity_name_oid") else {}
+        entity_descr_map = self._walk_indexed_map(device, str(private_oids.get("entity_descr_oid")), str) if private_oids.get("entity_descr_oid") else {}
+
+        cisco_power_status_oid = private_oids.get("cisco_power_status_oid")
+        if cisco_power_status_oid:
+            ok_values = set(private_oids.get("cisco_power_ok_values") or [2])
+            for index, state in self._walk_indexed_map(device, str(cisco_power_status_oid), int).items():
+                rows.append({
+                    "component_type": "power",
+                    "component": entity_name_map.get(index) or entity_descr_map.get(index) or str(index),
+                    "state": float(state),
+                    "up": 1.0 if state in ok_values else 0.0,
+                    "speed": None,
+                    "present": 1.0,
+                    "status_known": 1.0,
+                })
+
+        cisco_fan_status_oid = private_oids.get("cisco_fan_status_oid")
+        if cisco_fan_status_oid:
+            ok_values = set(private_oids.get("cisco_fan_ok_values") or [1, 2])
+            for index, state in self._walk_indexed_map(device, str(cisco_fan_status_oid), int).items():
+                rows.append({
+                    "component_type": "fan",
+                    "component": entity_name_map.get(index) or entity_descr_map.get(index) or str(index),
+                    "state": float(state),
+                    "up": 1.0 if state in ok_values else 0.0,
+                    "speed": None,
+                    "present": 1.0,
+                    "status_known": 1.0,
+                })
+            if rows:
+                return rows
+
         entity_class_oid = private_oids.get("entity_class_oid")
         entity_name_oid = private_oids.get("entity_name_oid")
         entity_oper_status_oid = private_oids.get("entity_oper_status_oid")
         entity_error_status_oid = private_oids.get("entity_error_status_oid")
         if entity_class_oid:
             class_map = self._walk_indexed_map(device, str(entity_class_oid), int)
-            name_map = self._walk_indexed_map(device, str(entity_name_oid), str) if entity_name_oid else {}
+            name_map = entity_name_map or (self._walk_indexed_map(device, str(entity_name_oid), str) if entity_name_oid else {})
             if entity_oper_status_oid or entity_error_status_oid:
                 oper_map = self._walk_indexed_map(device, str(entity_oper_status_oid), int) if entity_oper_status_oid else {}
                 error_map = self._walk_indexed_map(device, str(entity_error_status_oid), int) if entity_error_status_oid else {}
@@ -2302,7 +2613,7 @@ class SNMPCollector(LoggerMixin):
                     "status_known": 0.0,
                 })
             if inventory_rows:
-                return inventory_rows
+                return rows + inventory_rows if rows else inventory_rows
 
         fan_state_oid = private_oids.get("fan_state_oid")
         fan_speed_oid = private_oids.get("fan_speed_oid")
@@ -2429,6 +2740,25 @@ class SNMPCollector(LoggerMixin):
             if private_oids.get("system_serial_oid")
             else None
         )
+
+        if private_oids.get("entity_class_oid") and (
+            private_oids.get("entity_model_oid")
+            or private_oids.get("entity_serial_oid")
+            or private_oids.get("entity_software_oid")
+        ):
+            class_map = self._walk_indexed_map(device, str(private_oids["entity_class_oid"]), int)
+            name_map = self._walk_indexed_map(device, str(private_oids.get("entity_name_oid")), str) if private_oids.get("entity_name_oid") else {}
+            if not snmp_model and private_oids.get("entity_model_oid"):
+                model_map = self._walk_indexed_map(device, str(private_oids["entity_model_oid"]), str)
+                entity_model = self._first_entity_inventory_value(class_map, model_map, {3}, name_map)
+                if entity_model:
+                    snmp_model = extract_snmp_model(entity_model) or entity_model
+            if not serial_number and private_oids.get("entity_serial_oid"):
+                serial_map = self._walk_indexed_map(device, str(private_oids["entity_serial_oid"]), str)
+                serial_number = self._first_entity_inventory_value(class_map, serial_map, {3}, name_map)
+            if not software_version and private_oids.get("entity_software_oid"):
+                software_map = self._walk_indexed_map(device, str(private_oids["entity_software_oid"]), str)
+                software_version = self._first_entity_inventory_value(class_map, software_map, {3}, name_map)
         return {
             "sys_descr": sys_descr_text,
             "sys_name": sys_name_text,
@@ -2447,7 +2777,7 @@ class SNMPCollector(LoggerMixin):
         walks so Telemetry devices do not fall back to the expensive full SNMP
         collector.
         """
-        timestamp = datetime.now()
+        timestamp = datetime.utcnow()
         points: List[Dict[str, Any]] = []
 
         hardware_rows = self.collect_hardware_status(device)
@@ -2526,7 +2856,7 @@ class SNMPCollector(LoggerMixin):
     
     def collect_device(self, device: Any) -> Dict[str, Any]:
         """采集设备所有SNMP指标"""
-        timestamp = datetime.now()
+        timestamp = datetime.utcnow()
         points = []
         
         # 采集CPU

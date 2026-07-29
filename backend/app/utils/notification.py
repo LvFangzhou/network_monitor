@@ -164,7 +164,7 @@ class NotificationManager:
                 value = value[:300] + "..."
             lines.append(f"**{label}：**{value}")
         if card_data and card_data.get("detail_url"):
-            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "故障详情"
+            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "通知详情" if card_data.get("notification_kind") == "resource_notice" else "故障详情"
             lines.append(f"[{detail_label}]({card_data['detail_url']})")
         return "\n".join(lines)
 
@@ -368,7 +368,7 @@ class NotificationManager:
 
         if card_data:
             severity_style = self._severity_style(card_data)
-            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "故障详情"
+            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "通知详情" if card_data.get("notification_kind") == "resource_notice" else "故障详情"
             markdown_lines = [
                 f"## <font color=\"{severity_style['hex']}\">{title}</font>",
             ]
@@ -451,7 +451,7 @@ class NotificationManager:
 
         if card_data:
             severity_style = self._severity_style(card_data)
-            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "故障详情"
+            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "通知详情" if card_data.get("notification_kind") == "resource_notice" else "故障详情"
             elements = [{
                 "tag": "div",
                 "text": {
