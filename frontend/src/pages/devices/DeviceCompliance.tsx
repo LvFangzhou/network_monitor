@@ -434,13 +434,23 @@ const DeviceCompliancePage = () => {
             <Col span={6}><Form.Item name="model_pattern" label="型号匹配"><Input placeholder="支持 * 通配符" /></Form.Item></Col>
           </Row>
           <Form.Item name="device_role" label="设备角色"><Input placeholder="可选，Spine / Leaf等" /></Form.Item>
-          <Form.Item name="allowed_versions" label="允许版本"><Select mode="tags" tokenSeparators={[',']} placeholder="输入版本或通配符后回车，例如 10.6*" /></Form.Item>
+          <Form.Item
+            name="allowed_versions"
+            label="允许版本"
+            extra="每个完整版本输入后按回车；版本中的逗号属于版本内容，不会再被拆分。"
+          >
+            <Select mode="tags" placeholder="例如：Software Version 7.1.070, Release 6715P01" />
+          </Form.Item>
           <Row gutter={12}>
             <Col span={12}><Form.Item name="minimum_version" label="最低版本"><Input /></Form.Item></Col>
             <Col span={12}><Form.Item name="priority" label="匹配优先级"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item></Col>
           </Row>
-          <Form.Item name="required_patches" label="必需补丁"><Select mode="tags" tokenSeparators={[',']} placeholder="输入补丁名称后回车" /></Form.Item>
-          <Form.Item name="forbidden_versions" label="禁止版本"><Select mode="tags" tokenSeparators={[',']} placeholder="输入已知故障版本后回车" /></Form.Item>
+          <Form.Item name="required_patches" label="必需补丁" extra="只填写独立补丁名称；版本号中的P01等后缀不需要重复填在这里。">
+            <Select mode="tags" placeholder="输入独立补丁名称后按回车；没有则留空" />
+          </Form.Item>
+          <Form.Item name="forbidden_versions" label="禁止版本">
+            <Select mode="tags" placeholder="输入完整的已知故障版本后按回车" />
+          </Form.Item>
           <Form.Item name="recommendation" label="整改建议"><Input.TextArea rows={3} /></Form.Item>
           <Form.Item name="is_active" label="启用" valuePropName="checked"><Switch /></Form.Item>
         </Form>

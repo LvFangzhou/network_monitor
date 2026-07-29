@@ -41,14 +41,46 @@ def _matches(value: Any, pattern: Any) -> bool:
     return normalized_value == normalized_pattern or normalized_pattern in normalized_value
 
 
+def _canonical_model(value: Any, vendor: Any = None) -> str:
+    """去掉型号字段里重复携带的厂商前缀。"""
+    text = _normalize(value)
+    vendor_text = _normalize(vendor)
+    prefixes = [vendor_text] if vendor_text else []
+    prefixes.extend(["h3c", "cisco", "ruijie", "hillstone", "asternos", "asteros", "asterfusion"])
+    changed = True
+    while text and changed:
+        changed = False
+        for prefix in prefixes:
+            if prefix and (text == prefix or text.startswith(f"{prefix} ")):
+                text = text[len(prefix):].strip()
+                changed = True
+                break
+    return text
+
+
+def _model_matches(value: Any, pattern: Any, vendor: Any = None) -> bool:
+    normalized_value = _canonical_model(value, vendor)
+    normalized_pattern = _canonical_model(pattern, vendor)
+    if not normalized_pattern:
+        return True
+    if "*" in normalized_pattern or "?" in normalized_pattern:
+        return fnmatch.fnmatch(normalized_value, normalized_pattern)
+    return normalized_value == normalized_pattern or normalized_pattern in normalized_value
+
+
 def match_model_profile(device: Device, profiles: Iterable[DeviceModelProfile]) -> Optional[DeviceModelProfile]:
     candidates = [
         profile for profile in profiles
         if profile.is_active
         and _matches(device.vendor, profile.vendor)
-        and _matches(device.model, profile.model_pattern)
+        and _model_matches(device.model, profile.model_pattern, device.vendor)
     ]
-    candidates.sort(key=lambda item: (item.priority, -len(item.model_pattern or ""), item.id))
+    candidates.sort(key=lambda item: (
+        item.priority,
+        0 if _normalize(device.model) == _normalize(item.model_pattern) else 1,
+        -len(_canonical_model(item.model_pattern, item.vendor)),
+        item.id,
+    ))
     return candidates[0] if candidates else None
 
 
@@ -62,10 +94,14 @@ def match_version_baseline(
         if not baseline.is_active:
             continue
         if baseline.model_profile_id and (not profile or baseline.model_profile_id != profile.id):
-            continue
+            # 历史CMDB里同一型号可能同时存在“S6805-54HF”和
+            # “H3C S6805-54HF”两种写法。基线同时填写了厂商/型号范围时，
+            # 允许按显式范围回退匹配，避免仅因模板ID不同而漏判。
+            if not (baseline.vendor or baseline.model_pattern):
+                continue
         if baseline.vendor and not _matches(device.vendor, baseline.vendor):
             continue
-        if baseline.model_pattern and not _matches(device.model, baseline.model_pattern):
+        if baseline.model_pattern and not _model_matches(device.model, baseline.model_pattern, device.vendor):
             continue
         if baseline.device_role and not _matches(device.device_role, baseline.device_role):
             continue

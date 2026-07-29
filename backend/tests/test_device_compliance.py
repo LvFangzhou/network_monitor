@@ -137,3 +137,41 @@ def test_asternos_can_skip_unsupported_snmp_and_tacacs(monkeypatch):
     assert checks["snmp"]["status"] == "skipped"
     assert checks["tacacs"]["status"] == "skipped"
     assert result["overall_status"] == "compliant"
+
+
+def test_vendor_prefixed_duplicate_model_can_use_explicit_baseline_scope(monkeypatch):
+    device = Device(
+        id=4,
+        name="s6805",
+        ip_address="192.0.2.13",
+        vendor="H3C",
+        model="S6805-54HF",
+        is_monitored=True,
+        monitor_source="snmp",
+        custom_fields={},
+    )
+    matched_profile = DeviceModelProfile(
+        id=4, name="H3C S6805-54HF", vendor="H3C", model_pattern="S6805-54HF",
+        network_type="general", capabilities={"snmp": False, "syslog": False, "tacacs": False},
+        required_checks=["model_profile", "version"], priority=100, is_active=True,
+    )
+    duplicate_profile = DeviceModelProfile(
+        id=3, name="H3C H3C S6805-54HF", vendor="H3C", model_pattern="H3C S6805-54HF",
+        network_type="general", capabilities={}, required_checks=[], priority=100, is_active=True,
+    )
+    baseline = VersionBaseline(
+        id=1, name="S6805版本", model_profile_id=3, vendor="H3C", model_pattern="6805",
+        allowed_versions=["Software Version 7.1.070, Release 6715P01"],
+        required_patches=[], forbidden_versions=[], priority=100, is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "system_info": {"software_version": "Software Version 7.1.070, Release 6715P01"},
+    })
+
+    result = device_compliance.evaluate_device(
+        device, [duplicate_profile, matched_profile], [baseline], None, set(),
+    )
+
+    assert result["model_profile_id"] == 4
+    assert result["version_baseline_id"] == 1
+    assert _check_map(result)["version"]["status"] == "passed"
