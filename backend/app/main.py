@@ -56,6 +56,7 @@ SENSITIVE_AUDIT_KEYS = {
 
 AUDIT_MENU_PREFIXES = [
     ("/api/v1/devices", "网络设备"),
+    ("/api/v1/compliance", "上线合规"),
     ("/api/v1/cmdb", "CMDB"),
     ("/api/v1/resources/customers", "客户管理"),
     ("/api/v1/resources/vendors", "供应商管理"),

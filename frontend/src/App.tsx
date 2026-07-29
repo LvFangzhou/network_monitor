@@ -33,6 +33,7 @@ const loadDeviceList = () => import('./pages/devices/DeviceList')
 const loadDeviceDictionaryManager = () => import('./pages/devices/DeviceDictionaryManager')
 const loadDeviceForm = () => import('./pages/devices/DeviceForm')
 const loadDeviceDetail = () => import('./pages/devices/DeviceDetail')
+const loadDeviceCompliance = () => import('./pages/devices/DeviceCompliance')
 const loadDatacenterList = () => import('./pages/datacenters/DatacenterList')
 const loadCustomerList = () => import('./pages/resources/CustomerList')
 const loadVendorList = () => import('./pages/resources/VendorList')
@@ -62,6 +63,7 @@ const DeviceList = lazyWithReload(loadDeviceList)
 const DeviceDictionaryManager = lazyWithReload(loadDeviceDictionaryManager)
 const DeviceForm = lazyWithReload(loadDeviceForm)
 const DeviceDetail = lazyWithReload(loadDeviceDetail)
+const DeviceCompliance = lazyWithReload(loadDeviceCompliance)
 const DatacenterList = lazyWithReload(loadDatacenterList)
 const CustomerList = lazyWithReload(loadCustomerList)
 const VendorList = lazyWithReload(loadVendorList)
@@ -101,12 +103,13 @@ const preloadHighFrequencyRoutes = () => {
   window.setTimeout(preload, 1200)
 }
 
-const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/customers', '/device-overview', '/collection-health', '/telemetry-status', '/grafana', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
+const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/device-compliance', '/customers', '/device-overview', '/collection-health', '/telemetry-status', '/grafana', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/grafana']
 const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
 const ROUTE_ALIASES: Record<string, string[]> = {
   '/collection-health': ['/device-overview'],
   '/telemetry-status': ['/lossless-info-query'],
+  '/device-compliance': ['/devices'],
 }
 
 const getInitialRoute = (allowedMenus: string[] = []) => {
@@ -261,6 +264,7 @@ function App() {
             <Route index element={<HomeRedirect />} />
             <Route path="dashboard" element={<MenuRoute menuPath="/dashboard"><Dashboard /></MenuRoute>} />
             <Route path="devices" element={<MenuRoute menuPath="/devices"><DeviceList /></MenuRoute>} />
+            <Route path="device-compliance" element={<MenuRoute menuPath="/device-compliance"><DeviceCompliance /></MenuRoute>} />
             <Route path="device-dictionaries" element={<MenuRoute menuPath="/device-dictionaries"><DeviceDictionaryManager /></MenuRoute>} />
             <Route path="customers" element={<MenuRoute menuPath="/customers"><CustomerList /></MenuRoute>} />
             <Route path="datacenters" element={<MenuRoute menuPath="/datacenters"><DatacenterList /></MenuRoute>} />

@@ -46,6 +46,7 @@ const Layout = () => {
   const canAccessMenu = (path: string) =>
     allowedMenus.includes('*') ||
     allowedMenus.includes(path) ||
+    (path === '/device-compliance' && allowedMenus.includes('/devices')) ||
     (path.startsWith('/tacacs/') && allowedMenus.includes('/tacacs'))
 
   const selectedMenuKey = location.pathname
@@ -92,6 +93,7 @@ const Layout = () => {
       children: [
         { key: '/device-dictionaries', label: '字典管理' },
         { key: '/devices', label: '网络设备' },
+        { key: '/device-compliance', label: '上线合规' },
         { key: '/customers', label: '客户管理' },
         { key: '/public-circuits', label: '公网管理' },
         { key: '/private-circuits', label: '专线管理' },

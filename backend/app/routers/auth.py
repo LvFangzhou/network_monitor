@@ -49,6 +49,7 @@ MENU_OPTIONS = [
     {"label": "仪表盘", "value": "/dashboard"},
     {"label": "字典管理", "value": "/device-dictionaries"},
     {"label": "网络设备", "value": "/devices"},
+    {"label": "上线合规", "value": "/device-compliance"},
     {"label": "公网管理", "value": "/public-circuits"},
     {"label": "专线管理", "value": "/private-circuits"},
     {"label": "IPDB", "value": "/ipdb"},
@@ -98,6 +99,8 @@ def normalize_allowed_menus(allowed_menus: Optional[list[str]], is_superuser: bo
         normalized.append("/quality-query")
     if has_monitor_center_access and "/traffic-query" not in normalized:
         normalized.append("/traffic-query")
+    if "/devices" in normalized and "/device-compliance" not in normalized:
+        normalized.append("/device-compliance")
     return normalized
 
 

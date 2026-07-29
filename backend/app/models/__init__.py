@@ -4,6 +4,7 @@ from app.models.alert import AlertRule, AlertHistory, AlertSilence, SyslogEvent
 from app.models.user import User, Role, Permission, DEFAULT_PERMISSIONS, DEFAULT_MENU_PERMISSIONS, AuditLog
 from app.models.config_backup import ConfigBackupJob, ConfigBackupResult
 from app.models.bmp import BmpSession, BmpMessage
+from app.models.compliance import DeviceModelProfile, VersionBaseline, DeviceComplianceSnapshot
 
 __all__ = [
     "Device", "DeviceGroup", "Tag", "Datacenter", "DeviceType", "DeviceRole", "DeviceVendor",
@@ -12,4 +13,5 @@ __all__ = [
     "User", "Role", "Permission", "DEFAULT_PERMISSIONS", "DEFAULT_MENU_PERMISSIONS", "AuditLog",
     "ConfigBackupJob", "ConfigBackupResult",
     "BmpSession", "BmpMessage",
+    "DeviceModelProfile", "VersionBaseline", "DeviceComplianceSnapshot",
 ]
