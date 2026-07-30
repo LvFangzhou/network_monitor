@@ -34,7 +34,7 @@ const CHECK_META: Record<CheckStatus, { label: string; color: string }> = {
 }
 
 const CAPABILITIES = [
-  ['snmp', 'SNMP'], ['syslog', 'Syslog'], ['tacacs', 'TACACS'],
+  ['snmp', 'SNMP'], ['exporter', 'Exporter'], ['syslog', 'Syslog'], ['tacacs', 'TACACS'],
   ['telemetry', 'Telemetry'], ['bmp', 'BMP'], ['nqa', 'NQA'],
   ['evpn_vxlan', 'EVPN/VXLAN'], ['roce', 'RoCE'], ['pfc', 'PFC'],
   ['ecn', 'ECN'], ['buffer', 'Buffer'], ['config_backup', '配置备份'],
@@ -42,7 +42,7 @@ const CAPABILITIES = [
 
 const CHECKS = [
   ['model_profile', '型号模板'], ['version', '版本'], ['patch', '补丁'],
-  ['snmp', 'SNMP'], ['syslog', 'Syslog'], ['tacacs', 'TACACS'],
+  ['snmp', 'SNMP'], ['exporter', 'Exporter'], ['syslog', 'Syslog'], ['tacacs', 'TACACS'],
 ].map(([value, label]) => ({ value, label }))
 
 const NETWORK_TYPES = [

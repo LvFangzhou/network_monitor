@@ -83,6 +83,7 @@ def _inferred_profile(device: Device):
     is_s9867 = "s9867" in normalized_model
     capabilities = {
         "snmp": not asternos,
+        "exporter": asternos,
         "syslog": True,
         "tacacs": not asternos,
         "telemetry": "h3c" in normalized_vendor,
@@ -103,7 +104,9 @@ def _inferred_profile(device: Device):
         "device_type": device.device_type,
         "default_role": device.device_role,
         "capabilities": capabilities,
-        "required_checks": ["model_profile", "version", "snmp", "syslog", "tacacs"],
+        "required_checks": [
+            "model_profile", "version", "exporter" if asternos else "snmp", "syslog", "tacacs",
+        ],
         "description": "根据现有CMDB设备自动生成，请核对网络类型、能力和必检项。",
         "priority": 100,
         "is_active": True,

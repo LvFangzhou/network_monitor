@@ -5,10 +5,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 CAPABILITY_KEYS = (
-    "snmp", "syslog", "tacacs", "telemetry", "bmp", "nqa",
+    "snmp", "exporter", "syslog", "tacacs", "telemetry", "bmp", "nqa",
     "evpn_vxlan", "roce", "pfc", "ecn", "buffer", "config_backup",
 )
-CHECK_KEYS = ("model_profile", "version", "patch", "snmp", "syslog", "tacacs")
+CHECK_KEYS = ("model_profile", "version", "patch", "snmp", "exporter", "syslog", "tacacs")
 
 
 class ModelProfilePayload(BaseModel):

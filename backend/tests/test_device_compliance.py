@@ -120,13 +120,14 @@ def test_asternos_can_skip_unsupported_snmp_and_tacacs(monkeypatch):
         vendor="Asteros",
         model_pattern="CX532P",
         network_type="management",
-        capabilities={"snmp": False, "syslog": True, "tacacs": False},
-        required_checks=["model_profile", "snmp", "syslog", "tacacs"],
+        capabilities={"snmp": False, "exporter": True, "syslog": True, "tacacs": False},
+        required_checks=["model_profile", "exporter", "syslog", "tacacs"],
         priority=10,
         is_active=True,
     )
     monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
-        "system_info": {"software_version": "1.0", "snmp_model": "CX532P"},
+        "collected_at": "2026-07-30T06:10:59+00:00",
+        "system_info": {"sys_name": "aster-leaf", "software_version": "1.0", "snmp_model": "CX532P"},
     })
 
     result = device_compliance.evaluate_device(
@@ -134,7 +135,8 @@ def test_asternos_can_skip_unsupported_snmp_and_tacacs(monkeypatch):
     )
     checks = _check_map(result)
 
-    assert checks["snmp"]["status"] == "skipped"
+    assert "snmp" not in checks
+    assert checks["exporter"]["status"] == "passed"
     assert checks["tacacs"]["status"] == "skipped"
     assert result["overall_status"] == "compliant"
 

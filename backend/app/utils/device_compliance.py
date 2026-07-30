@@ -22,6 +22,7 @@ CHECK_LABELS = {
     "version": "版本基线",
     "patch": "补丁基线",
     "snmp": "SNMP",
+    "exporter": "Exporter",
     "syslog": "Syslog",
     "tacacs": "TACACS",
 }
@@ -206,6 +207,7 @@ def evaluate_device(
     asternos = any(marker in _normalize(device.vendor) for marker in ("asternos", "asterfusion", "asteros", "星融元"))
     inferred_capabilities = {
         "snmp": not asternos,
+        "exporter": asternos,
         "syslog": True,
         "tacacs": not asternos,
     }
@@ -278,7 +280,25 @@ def evaluate_device(
             True,
         ))
 
-    if not effective_capabilities.get("snmp", True):
+    if asternos:
+        exporter_ok = (
+            device.monitor_source == "asternos_exporter"
+            and bool(overview.get("collected_at"))
+            and bool(system_info.get("sys_name") or system_info.get("sys_descr"))
+        )
+        checks.append(_check(
+            "exporter",
+            "passed" if exporter_ok else "pending",
+            "已通过Exporter获取设备系统信息" if exporter_ok else "尚未获得有效Exporter系统信息",
+            {
+                "collected_at": overview.get("collected_at"),
+                "sys_name": system_info.get("sys_name"),
+                "model": system_info.get("snmp_model"),
+                "software_version": system_info.get("software_version"),
+            } if overview else None,
+            "exporter" in required_checks or "snmp" in required_checks,
+        ))
+    elif not effective_capabilities.get("snmp", True):
         checks.append(_check("snmp", "skipped", "型号能力模板声明不使用SNMP", required=False))
     else:
         sources = overview.get("data_sources") if isinstance(overview.get("data_sources"), dict) else {}
