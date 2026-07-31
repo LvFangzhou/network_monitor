@@ -177,3 +177,111 @@ def test_vendor_prefixed_duplicate_model_can_use_explicit_baseline_scope(monkeyp
     assert result["model_profile_id"] == 4
     assert result["version_baseline_id"] == 1
     assert _check_map(result)["version"]["status"] == "passed"
+
+
+def test_h3c_version_compares_comware_platform_and_release_separately(monkeypatch):
+    device = Device(
+        id=5, name="s6805", ip_address="192.0.2.14", vendor="H3C",
+        model="S6805-54HF", is_monitored=True, monitor_source="snmp", custom_fields={},
+    )
+    profile = DeviceModelProfile(
+        id=5, name="S6805-54HF", vendor="H3C", model_pattern="S6805-54HF",
+        network_type="general", capabilities={"snmp": False, "syslog": False, "tacacs": False},
+        required_checks=["model_profile", "version"], priority=100, is_active=True,
+    )
+    baseline = VersionBaseline(
+        id=2, name="S6805生产版本", model_profile_id=5, vendor="H3C",
+        platform_version="7.1.070", allowed_releases=["6715P01"],
+        allowed_versions=[], required_patches=[], forbidden_versions=[],
+        priority=100, is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "system_info": {"software_version": "Software Version 7.1.070, Release 6715P01"},
+    })
+
+    result = device_compliance.evaluate_device(device, [profile], [baseline], None, set())
+    version_check = _check_map(result)["version"]
+
+    assert version_check["status"] == "passed"
+    assert version_check["evidence"]["current_comware_platform"] == "7.1.070"
+    assert version_check["evidence"]["current_software_release"] == "6715P01"
+
+
+def test_h3c_release_mismatch_fails_even_when_comware_platform_matches(monkeypatch):
+    device = Device(
+        id=6, name="s6805", ip_address="192.0.2.15", vendor="H3C",
+        model="S6805-54HF", is_monitored=True, monitor_source="snmp", custom_fields={},
+    )
+    profile = DeviceModelProfile(
+        id=6, name="S6805-54HF", vendor="H3C", model_pattern="S6805-54HF",
+        network_type="general", capabilities={"snmp": False, "syslog": False, "tacacs": False},
+        required_checks=["model_profile", "version"], priority=100, is_active=True,
+    )
+    baseline = VersionBaseline(
+        id=3, name="S6805生产版本", model_profile_id=6, vendor="H3C",
+        platform_version="7.1.070", allowed_releases=["6715P01"],
+        allowed_versions=[], required_patches=[], forbidden_versions=[],
+        priority=100, is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "system_info": {"software_version": "Software Version 7.1.070, Release 6715"},
+    })
+
+    result = device_compliance.evaluate_device(device, [profile], [baseline], None, set())
+
+    assert _check_map(result)["version"]["status"] == "failed"
+
+
+def test_h3c_comware_platform_supports_wildcard(monkeypatch):
+    device = Device(
+        id=7, name="s9867", ip_address="192.0.2.16", vendor="H3C",
+        model="S9867-128DH", is_monitored=True, monitor_source="snmp", custom_fields={},
+    )
+    profile = DeviceModelProfile(
+        id=7, name="S9867-128DH", vendor="H3C", model_pattern="S9867*",
+        network_type="roce", capabilities={"snmp": False, "syslog": False, "tacacs": False},
+        required_checks=["model_profile", "version"], priority=100, is_active=True,
+    )
+    baseline = VersionBaseline(
+        id=4, name="S9867生产版本", model_profile_id=7, vendor="H3C",
+        platform_version="7.1.*", allowed_releases=["6635P01"],
+        allowed_versions=[], required_patches=[], forbidden_versions=[],
+        priority=100, is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "system_info": {"software_version": "Software Version 7.1.076, Release 6635P01"},
+    })
+
+    result = device_compliance.evaluate_device(device, [profile], [baseline], None, set())
+
+    assert _check_map(result)["version"]["status"] == "passed"
+
+
+def test_compliance_uses_snmp_patch_evidence_from_system_info(monkeypatch):
+    device = Device(
+        id=8, name="s6850", ip_address="192.0.2.17", vendor="H3C",
+        model="S6850-56HF", is_monitored=True, monitor_source="snmp", custom_fields={},
+    )
+    profile = DeviceModelProfile(
+        id=8, name="S6850-56HF", vendor="H3C", model_pattern="S6850*",
+        network_type="general", capabilities={"snmp": False, "syslog": False, "tacacs": False},
+        required_checks=["model_profile", "version", "patch"], priority=100, is_active=True,
+    )
+    baseline = VersionBaseline(
+        id=5, name="S6850生产版本", model_profile_id=8, vendor="H3C",
+        platform_version="7.1.*", allowed_releases=["6715"],
+        allowed_versions=[], required_patches=["R6715HS09"], forbidden_versions=[],
+        priority=100, is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "system_info": {
+            "software_version": "Software Version 7.1.070, Release 6715",
+            "software_patches": ["R6715HS09"],
+            "software_patch_packages": [{"name": "s9850_6850-cmw710-r6715hs09.bin", "version": "R6715HS09"}],
+        },
+    })
+
+    result = device_compliance.evaluate_device(device, [profile], [baseline], None, set())
+
+    assert _check_map(result)["patch"]["status"] == "passed"
+    assert result["observed_patches"] == ["R6715HS09"]

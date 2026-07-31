@@ -58,6 +58,8 @@ class VersionBaseline(Base):
     vendor = Column(String(50), index=True)
     model_pattern = Column(String(120), index=True)
     device_role = Column(String(50), index=True)
+    platform_version = Column(String(100))
+    allowed_releases = Column(JSON, nullable=False, default=list)
     allowed_versions = Column(JSON, nullable=False, default=list)
     minimum_version = Column(String(100))
     required_patches = Column(JSON, nullable=False, default=list)
@@ -76,6 +78,8 @@ class VersionBaseline(Base):
             "vendor": self.vendor,
             "model_pattern": self.model_pattern,
             "device_role": self.device_role,
+            "platform_version": self.platform_version,
+            "allowed_releases": self.allowed_releases or [],
             "allowed_versions": self.allowed_versions or [],
             "minimum_version": self.minimum_version,
             "required_patches": self.required_patches or [],

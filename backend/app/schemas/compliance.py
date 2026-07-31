@@ -65,6 +65,8 @@ class VersionBaselinePayload(BaseModel):
     vendor: Optional[str] = Field(default=None, max_length=50)
     model_pattern: Optional[str] = Field(default=None, max_length=120)
     device_role: Optional[str] = Field(default=None, max_length=50)
+    platform_version: Optional[str] = Field(default=None, max_length=100)
+    allowed_releases: List[str] = Field(default_factory=list)
     allowed_versions: List[str] = Field(default_factory=list)
     minimum_version: Optional[str] = Field(default=None, max_length=100)
     required_patches: List[str] = Field(default_factory=list)
@@ -73,7 +75,7 @@ class VersionBaselinePayload(BaseModel):
     priority: int = Field(default=100, ge=0, le=10000)
     is_active: bool = True
 
-    @field_validator("allowed_versions", "required_patches", "forbidden_versions")
+    @field_validator("allowed_releases", "allowed_versions", "required_patches", "forbidden_versions")
     @classmethod
     def normalize_list(cls, value: List[str]):
         return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
@@ -86,6 +88,8 @@ class VersionBaselineUpdate(BaseModel):
     vendor: Optional[str] = Field(default=None, max_length=50)
     model_pattern: Optional[str] = Field(default=None, max_length=120)
     device_role: Optional[str] = Field(default=None, max_length=50)
+    platform_version: Optional[str] = Field(default=None, max_length=100)
+    allowed_releases: Optional[List[str]] = None
     allowed_versions: Optional[List[str]] = None
     minimum_version: Optional[str] = Field(default=None, max_length=100)
     required_patches: Optional[List[str]] = None

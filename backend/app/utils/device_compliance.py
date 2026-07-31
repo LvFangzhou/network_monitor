@@ -168,6 +168,27 @@ def _version_matches(version: str, patterns: Iterable[str]) -> bool:
     return False
 
 
+def _extract_h3c_version(value: Any) -> Dict[str, Optional[str]]:
+    """将H3C回显拆为Comware平台版本和Release设备软件版本。"""
+    text = str(value or "").strip()
+    platform_match = re.search(
+        r"(?:Software\s+)?Version\s+([0-9]+(?:\.[0-9A-Za-z]+)+)",
+        text,
+        re.IGNORECASE,
+    )
+    if not platform_match:
+        platform_match = re.search(r"^\s*([0-9]+(?:\.[0-9A-Za-z]+)+)\b", text)
+    release_match = re.search(r"\bRelease\s+([0-9A-Za-z._-]+)", text, re.IGNORECASE)
+    return {
+        "platform_version": platform_match.group(1).strip() if platform_match else None,
+        "software_release": release_match.group(1).strip() if release_match else None,
+    }
+
+
+def _is_h3c(device: Device, baseline: Optional[VersionBaseline]) -> bool:
+    return "h3c" in _normalize(device.vendor) or (baseline is not None and "h3c" in _normalize(baseline.vendor))
+
+
 def _check(key: str, status: str, message: str, evidence: Any = None, required: bool = True) -> Dict[str, Any]:
     return {
         "key": key,
@@ -194,8 +215,14 @@ def evaluate_device(
     observed_vendor = str(device.vendor or "").strip() or None
     observed_version = _extract_version(system_info)
     custom_fields = device.custom_fields if isinstance(device.custom_fields, dict) else {}
-    patch_evidence_available = "software_patches" in custom_fields or "patches" in custom_fields
-    observed_patches = custom_fields.get("software_patches")
+    patch_evidence_available = (
+        "software_patches" in system_info
+        or "software_patches" in custom_fields
+        or "patches" in custom_fields
+    )
+    observed_patches = system_info.get("software_patches")
+    if observed_patches is None:
+        observed_patches = custom_fields.get("software_patches")
     if observed_patches is None:
         observed_patches = custom_fields.get("patches")
     if observed_patches is None:
@@ -232,25 +259,55 @@ def evaluate_device(
     elif not observed_version:
         checks.append(_check("version", "pending", "尚未采集到软件版本", None, True))
     else:
-        forbidden = _version_matches(observed_version, baseline.forbidden_versions or [])
-        allowed = not baseline.allowed_versions or _version_matches(observed_version, baseline.allowed_versions or [])
-        minimum_ok = True
-        if baseline.minimum_version:
-            current_numbers = _version_numbers(observed_version)
-            minimum_numbers = _version_numbers(baseline.minimum_version)
-            minimum_ok = bool(current_numbers and minimum_numbers and current_numbers >= minimum_numbers)
-        version_ok = allowed and minimum_ok and not forbidden
-        checks.append(_check(
-            "version",
-            "passed" if version_ok else "failed",
-            "软件版本符合基线" if version_ok else "软件版本不符合基线",
-            {
+        use_h3c_fields = _is_h3c(device, baseline) and bool(
+            baseline.platform_version or baseline.allowed_releases
+        )
+        if use_h3c_fields:
+            h3c_version = _extract_h3c_version(observed_version)
+            observed_platform = h3c_version["platform_version"]
+            observed_release = h3c_version["software_release"]
+            platform_ok = (
+                not baseline.platform_version
+                or _version_matches(observed_platform or "", [baseline.platform_version])
+            )
+            release_ok = (
+                not baseline.allowed_releases
+                or _version_matches(observed_release or "", baseline.allowed_releases or [])
+            )
+            forbidden = _version_matches(observed_release or observed_version, baseline.forbidden_versions or [])
+            version_ok = bool(observed_platform and observed_release and platform_ok and release_ok and not forbidden)
+            evidence = {
+                "current": observed_version,
+                "current_comware_platform": observed_platform,
+                "current_software_release": observed_release,
+                "baseline": baseline.name,
+                "required_comware_platform": baseline.platform_version,
+                "allowed_software_releases": baseline.allowed_releases or [],
+                "forbidden_software_releases": baseline.forbidden_versions or [],
+            }
+            message = "Comware平台和Release软件版本符合基线" if version_ok else "Comware平台或Release软件版本不符合基线"
+        else:
+            forbidden = _version_matches(observed_version, baseline.forbidden_versions or [])
+            allowed = not baseline.allowed_versions or _version_matches(observed_version, baseline.allowed_versions or [])
+            minimum_ok = True
+            if baseline.minimum_version:
+                current_numbers = _version_numbers(observed_version)
+                minimum_numbers = _version_numbers(baseline.minimum_version)
+                minimum_ok = bool(current_numbers and minimum_numbers and current_numbers >= minimum_numbers)
+            version_ok = allowed and minimum_ok and not forbidden
+            evidence = {
                 "current": observed_version,
                 "baseline": baseline.name,
                 "allowed_versions": baseline.allowed_versions or [],
                 "minimum_version": baseline.minimum_version,
                 "forbidden_versions": baseline.forbidden_versions or [],
-            },
+            }
+            message = "软件版本符合基线" if version_ok else "软件版本不符合基线"
+        checks.append(_check(
+            "version",
+            "passed" if version_ok else "failed",
+            message,
+            evidence,
             True,
         ))
 
@@ -276,7 +333,12 @@ def evaluate_device(
             "patch",
             "failed" if missing else "passed",
             f"缺少补丁：{', '.join(missing)}" if missing else "必需补丁完整",
-            {"required": required_patches, "observed": observed_patches, "missing": missing},
+            {
+                "required": required_patches,
+                "observed": observed_patches,
+                "packages": system_info.get("software_patch_packages") or [],
+                "missing": missing,
+            },
             True,
         ))
 

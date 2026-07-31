@@ -4,7 +4,7 @@ Tacacs+ 管理与日志查询。
 import re
 import json
 import socket
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +14,7 @@ from app.config import settings
 from app.models import User
 from app.routers.auth import check_permission, get_current_active_user
 from app.utils import notification_manager
+from app.utils.tacacs_time import SHANGHAI_TZ, parse_tacacs_log_time
 
 router = APIRouter()
 
@@ -25,12 +26,6 @@ TACACS_CONTAINER_NAME = "nm-tacacs"
 DOCKER_SOCKET = "/var/run/docker.sock"
 
 LOG_PATTERN = re.compile(r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
-MONTH_MAP = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-}
-
-
 def _ensure_data_dir() -> None:
     (TACACS_DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
 
@@ -55,13 +50,7 @@ def _detect_notification_type(webhook_url: str) -> str:
 
 
 def _parse_log_time(raw_time: str) -> Optional[str]:
-    try:
-        month_text, day, time_text = raw_time.split()
-        hour, minute, second = [int(item) for item in time_text.split(":")]
-        parsed = datetime(datetime.now().year, MONTH_MAP[month_text], int(day), hour, minute, second)
-        return (parsed + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
+    return parse_tacacs_log_time(raw_time)
 
 
 def _extract_command(raw_command: str) -> str:
@@ -346,7 +335,7 @@ async def test_tacacs_notification(
 
     channel_type = _detect_notification_type(webhook_url)
     config = {"url": webhook_url} if channel_type == "webhook" else {"webhook": webhook_url}
-    now_text = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    now_text = datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
     success = await notification_manager.send_notification(
         channel_type,
         config,

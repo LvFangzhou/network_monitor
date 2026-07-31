@@ -54,6 +54,17 @@ const NETWORK_TYPES = [
   { value: 'firewall', label: '防火墙网络' },
 ]
 
+const normalizeVendor = (value?: string) => (value || '').trim().toLowerCase()
+
+const vendorVersionLabel = (vendor?: string) => {
+  const normalized = normalizeVendor(vendor)
+  if (normalized.includes('ruijie') || normalized.includes('锐捷')) return '锐捷RGOS软件版本'
+  if (normalized.includes('cisco') || normalized.includes('思科')) return 'Cisco NX-OS软件版本'
+  if (normalized.includes('aster')) return 'AsterNOS软件版本'
+  if (normalized.includes('hillstone') || normalized.includes('山石')) return '山石StoneOS软件版本'
+  return '允许的软件版本'
+}
+
 const DeviceCompliancePage = () => {
   const canModify = !useAuthStore((state) => state.user?.read_only)
   const [activeTab, setActiveTab] = useState('devices')
@@ -76,6 +87,8 @@ const DeviceCompliancePage = () => {
   const [editingBaseline, setEditingBaseline] = useState<VersionBaseline>()
   const [profileForm] = Form.useForm()
   const [baselineForm] = Form.useForm()
+  const baselineVendor = Form.useWatch('vendor', baselineForm)
+  const isH3CBaseline = normalizeVendor(baselineVendor).includes('h3c')
 
   const loadCatalogs = async () => {
     const [profileResult, baselineResult] = await Promise.all([getModelProfiles(), getVersionBaselines()])
@@ -173,6 +186,14 @@ const DeviceCompliancePage = () => {
   const saveBaseline = async () => {
     try {
       const values = await baselineForm.validateFields()
+      if (normalizeVendor(values.vendor).includes('h3c')) {
+        values.allowed_versions = []
+        values.minimum_version = null
+      } else {
+        values.platform_version = null
+        values.allowed_releases = []
+        values.minimum_version = null
+      }
       if (editingBaseline) await updateVersionBaseline(editingBaseline.id, values)
       else await createVersionBaseline(values)
       message.success('版本补丁基线已保存')
@@ -264,10 +285,27 @@ const DeviceCompliancePage = () => {
     },
     { title: '厂商', dataIndex: 'vendor', key: 'vendor', width: 85, ellipsis: true, render: (value: string) => value || '-' },
     { title: '型号匹配', dataIndex: 'model_pattern', key: 'model', width: 135, ellipsis: true, render: (value: string) => value || '-' },
-    { title: '允许版本', dataIndex: 'allowed_versions', key: 'allowed', width: 245, render: (value: string[]) => value?.length ? value.map((item) => <Tag color="green" key={item}>{item}</Tag>) : '不限' },
-    { title: '最低版本', dataIndex: 'minimum_version', key: 'minimum', width: 190, ellipsis: true, render: (value: string) => value || '-' },
-    { title: '必需补丁', dataIndex: 'required_patches', key: 'patches', width: 180, render: (value: string[]) => value?.length ? value.map((item) => <Tag color="blue" key={item}>{item}</Tag>) : '无' },
+    {
+      title: '版本要求', key: 'version_requirement', width: 320,
+      render: (_: unknown, record: VersionBaseline) => normalizeVendor(record.vendor).includes('h3c') && (record.platform_version || record.allowed_releases?.length)
+        ? (
+          <Space size={[4, 4]} wrap>
+            <Tag color="geekblue">Comware {record.platform_version || '不限'}</Tag>
+            {(record.allowed_releases || []).map((item) => <Tag color="green" key={item}>Release {item}</Tag>)}
+          </Space>
+        )
+        : record.allowed_versions?.length
+          ? record.allowed_versions.map((item) => <Tag color="green" key={item}>{item}</Tag>)
+          : '不限',
+    },
+    {
+      title: '必需补丁', dataIndex: 'required_patches', key: 'patches', width: 190,
+      render: (value: string[]) => value?.length
+        ? value.map((item) => <Tag color="blue" key={item}>{item}</Tag>)
+        : '无',
+    },
     { title: '禁用版本', dataIndex: 'forbidden_versions', key: 'forbidden', width: 190, render: (value: string[]) => value?.length ? value.map((item) => <Tag color="red" key={item}>{item}</Tag>) : '无' },
+    { title: '备注', dataIndex: 'recommendation', key: 'recommendation', width: 210, ellipsis: true, render: (value: string) => value || '-' },
     {
       title: '操作', key: 'action', width: 105,
       render: (_: unknown, record: VersionBaseline) => canModify && (
@@ -365,14 +403,14 @@ const DeviceCompliancePage = () => {
             children: (
               <>
                 {canModify && <Button type="primary" icon={<PlusOutlined />} onClick={() => openBaseline()} style={{ marginBottom: 12 }}>新增版本基线</Button>}
-                <Table rowKey="id" size="small" tableLayout="fixed" dataSource={baselines} columns={baselineColumns} scroll={{ x: 1445 }} pagination={false} />
+                <Table rowKey="id" size="small" tableLayout="fixed" dataSource={baselines} columns={baselineColumns} scroll={{ x: 1550 }} pagination={false} />
               </>
             ),
           },
         ]}
       />
 
-      <Drawer title="设备上线检查清单" width={720} open={Boolean(selected)} onClose={() => setSelected(undefined)}
+      <Drawer title="设备上线检查清单" width={920} open={Boolean(selected)} onClose={() => setSelected(undefined)}
         extra={selected && canModify ? <Button loading={evaluating} onClick={() => void runEvaluation(selected.device_id)}>立即核验</Button> : null}>
         {selected && (
           <>
@@ -388,16 +426,24 @@ const DeviceCompliancePage = () => {
             </Descriptions>
             <Table
               rowKey="key" pagination={false} dataSource={selected.checks}
+              tableLayout="fixed"
+              scroll={{ x: 880 }}
               columns={[
-                { title: '检查项', dataIndex: 'label', key: 'label', width: 130 },
+                { title: '检查项', dataIndex: 'label', key: 'label', width: 150, ellipsis: true },
                 {
-                  title: '结果', dataIndex: 'status', key: 'status', width: 100,
+                  title: '结果', dataIndex: 'status', key: 'status', width: 110,
                   render: (value: CheckStatus) => <Tag color={CHECK_META[value].color} icon={value === 'passed' ? <CheckCircleOutlined /> : value === 'failed' ? <CloseCircleOutlined /> : undefined}>{CHECK_META[value].label}</Tag>,
                 },
-                { title: '判断说明', dataIndex: 'message', key: 'message' },
+                { title: '判断说明', dataIndex: 'message', key: 'message', width: 280, ellipsis: true },
                 {
-                  title: '证据', dataIndex: 'evidence', key: 'evidence', width: 220,
-                  render: (value: any) => value ? <Tooltip title={<pre style={{ whiteSpace: 'pre-wrap' }}>{JSON.stringify(value, null, 2)}</pre>}><span>{typeof value === 'string' ? value : JSON.stringify(value)}</span></Tooltip> : '-',
+                  title: '原因', dataIndex: 'evidence', key: 'evidence', width: 340,
+                  render: (value: any) => value ? (
+                    <Tooltip title={<pre style={{ whiteSpace: 'pre-wrap' }}>{JSON.stringify(value, null, 2)}</pre>}>
+                      <span style={{ display: 'block', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {typeof value === 'string' ? value : JSON.stringify(value)}
+                      </span>
+                    </Tooltip>
+                  ) : '-',
                 },
               ]}
             />
@@ -431,30 +477,84 @@ const DeviceCompliancePage = () => {
         <Form form={baselineForm} layout="vertical">
           <Form.Item name="name" label="基线名称" rules={[{ required: true }]}><Input placeholder="例如 H3C S9867 生产基线" /></Form.Item>
           <Row gutter={12}>
-            <Col span={12}><Form.Item name="model_profile_id" label="关联型号模板"><Select allowClear options={profiles.map((item) => ({ value: item.id, label: item.name }))} /></Form.Item></Col>
-            <Col span={6}><Form.Item name="vendor" label="厂商"><Input /></Form.Item></Col>
+            <Col span={12}>
+              <Form.Item name="model_profile_id" label="关联型号模板">
+                <Select
+                  allowClear
+                  showSearch
+                  optionFilterProp="label"
+                  options={profiles.map((item) => ({ value: item.id, label: item.name }))}
+                  onChange={(profileId) => {
+                    const profile = profiles.find((item) => item.id === profileId)
+                    if (profile) baselineForm.setFieldsValue({ vendor: profile.vendor, model_pattern: profile.model_pattern })
+                  }}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={6}>
+              <Form.Item name="vendor" label="厂商" rules={[{ required: true, message: '请选择厂商' }]}>
+                <Select allowClear showSearch optionFilterProp="label" options={vendorOptions} placeholder="选择厂商后显示版本字段" />
+              </Form.Item>
+            </Col>
             <Col span={6}><Form.Item name="model_pattern" label="型号匹配"><Input placeholder="支持 * 通配符" /></Form.Item></Col>
           </Row>
           <Form.Item name="device_role" label="设备角色"><Input placeholder="可选，Spine / Leaf等" /></Form.Item>
-          <Form.Item
-            name="allowed_versions"
-            label="允许版本"
-            extra="每个完整版本输入后按回车；版本中的逗号属于版本内容，不会再被拆分。"
-          >
-            <Select mode="tags" placeholder="例如：Software Version 7.1.070, Release 6715P01" />
-          </Form.Item>
-          <Row gutter={12}>
-            <Col span={12}><Form.Item name="minimum_version" label="最低版本"><Input /></Form.Item></Col>
-            <Col span={12}><Form.Item name="priority" label="匹配优先级"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item></Col>
-          </Row>
-          <Form.Item name="required_patches" label="必需补丁" extra="只填写独立补丁名称；版本号中的P01等后缀不需要重复填在这里。">
-            <Select mode="tags" placeholder="输入独立补丁名称后按回车；没有则留空" />
-          </Form.Item>
+          {baselineVendor && isH3CBaseline && (
+            <Row gutter={12}>
+              <Col span={10}>
+                <Form.Item
+                  name="platform_version"
+                  label="H3C Comware平台版本"
+                  rules={[{ required: true, message: '请输入Comware平台版本' }]}
+                  extra="支持 * 和 ? 通配符；例如7.1.*可匹配7.1.070、7.1.076等Comware 7.1平台。"
+                >
+                  <Input placeholder="精确值7.1.070，或通配值7.1.*" />
+                </Form.Item>
+              </Col>
+              <Col span={14}>
+                <Form.Item
+                  name="allowed_releases"
+                  label="H3C允许的Release软件版本"
+                  rules={[{ required: true, message: '请至少输入一个Release软件版本' }]}
+                  extra="保留完整补丁后缀，例如6715P01；多个允许版本分别输入后按回车。"
+                >
+                  <Select mode="tags" placeholder="例如 6715P01" />
+                </Form.Item>
+              </Col>
+            </Row>
+          )}
+          {baselineVendor && isH3CBaseline && (
+            <Form.Item
+              name="required_patches"
+              label="H3C必需补丁"
+              extra="从设备hh3cSysPackageTable自动读取并比较；多个必需补丁分别输入后按回车。未要求补丁时留空。"
+            >
+              <Select mode="tags" placeholder="例如 R6715HS09" />
+            </Form.Item>
+          )}
+          {baselineVendor && !isH3CBaseline && (
+            <>
+              <Form.Item
+                name="allowed_versions"
+                label={vendorVersionLabel(baselineVendor)}
+                rules={[{ required: true, message: '请至少输入一个允许的软件版本' }]}
+                extra="每个完整软件版本输入后按回车，支持输入多个允许版本。"
+              >
+                <Select mode="tags" placeholder={`输入${vendorVersionLabel(baselineVendor)}后按回车`} />
+              </Form.Item>
+              <Form.Item name="required_patches" label="必需独立补丁" extra="仅在厂商能够单独采集补丁列表时填写；没有则留空。">
+                <Select mode="tags" placeholder="输入独立补丁名称后按回车" />
+              </Form.Item>
+            </>
+          )}
           <Form.Item name="forbidden_versions" label="禁止版本">
-            <Select mode="tags" placeholder="输入完整的已知故障版本后按回车" />
+            <Select mode="tags" placeholder={isH3CBaseline ? '输入禁止的Release版本后按回车' : '输入完整的已知故障版本后按回车'} />
           </Form.Item>
-          <Form.Item name="recommendation" label="整改建议"><Input.TextArea rows={3} /></Form.Item>
-          <Form.Item name="is_active" label="启用" valuePropName="checked"><Switch /></Form.Item>
+          <Form.Item name="recommendation" label="备注"><Input.TextArea rows={3} /></Form.Item>
+          <Row gutter={12}>
+            <Col span={12}><Form.Item name="priority" label="匹配优先级"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col span={12}><Form.Item name="is_active" label="启用" valuePropName="checked"><Switch /></Form.Item></Col>
+          </Row>
         </Form>
       </Modal>
     </Card>

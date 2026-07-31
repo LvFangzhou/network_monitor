@@ -5,7 +5,6 @@ import asyncio
 import json
 import re
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -14,6 +13,7 @@ from celery import shared_task
 from app.config import settings
 from app.core import get_logger
 from app.utils import notification_manager, redis_client
+from app.utils.tacacs_time import parse_tacacs_log_time
 
 logger = get_logger(__name__)
 
@@ -26,20 +26,8 @@ BUFFER_KEY = "tacacs:log:buffer"
 BUFFER_FIRST_SEEN_KEY = "tacacs:log:buffer:first_seen"
 BATCH_DELAY_SECONDS = 20
 LOG_PATTERN = re.compile(r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
-MONTH_MAP = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-}
-
-
 def _parse_log_time(raw_time: str) -> str:
-    try:
-        month_text, day, time_text = raw_time.split()
-        hour, minute, second = [int(item) for item in time_text.split(":")]
-        parsed = datetime(datetime.now().year, MONTH_MAP[month_text], int(day), hour, minute, second)
-        return (parsed + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return raw_time
+    return parse_tacacs_log_time(raw_time) or raw_time
 
 
 def _extract_command(raw_command: str) -> str:

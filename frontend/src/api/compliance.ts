@@ -25,6 +25,8 @@ export interface VersionBaseline {
   vendor?: string
   model_pattern?: string
   device_role?: string
+  platform_version?: string
+  allowed_releases: string[]
   allowed_versions: string[]
   minimum_version?: string
   required_patches: string[]

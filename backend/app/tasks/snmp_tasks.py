@@ -324,7 +324,10 @@ def _merge_snmp_gap_fill_into_overview_cache(device: Device, gap_fill: Dict[str,
     system_info = gap_fill.get("system_info")
     if isinstance(system_info, dict):
         target_system_info = overview.setdefault("system_info", {})
-        for key in ["sys_name", "sys_descr", "software_version", "snmp_model", "serial_number", "uptime_seconds"]:
+        for key in [
+            "sys_name", "sys_descr", "software_version", "snmp_model", "serial_number",
+            "uptime_seconds", "software_patches", "software_patch_packages",
+        ]:
             value = system_info.get(key)
             if value is not None and value != "":
                 target_system_info[key] = value
