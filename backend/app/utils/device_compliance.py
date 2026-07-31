@@ -189,6 +189,30 @@ def _is_h3c(device: Device, baseline: Optional[VersionBaseline]) -> bool:
     return "h3c" in _normalize(device.vendor) or (baseline is not None and "h3c" in _normalize(baseline.vendor))
 
 
+def _extract_ruijie_version(value: Any) -> Dict[str, Optional[str]]:
+    """将锐捷回显拆为RGOS平台版本和设备软件版本。
+
+    Typical values:
+    - Software Version S6980_RGOS 12.5(2)B0605
+    - Software Version S6500-X86_RGOS 11.0(5)B9P62
+    """
+    text = str(value or "").strip()
+    version_match = re.search(r"RGOS\s+([0-9]+(?:\.[0-9]+)*(?:\([^)]*\))?[A-Za-z0-9._-]*)", text, re.IGNORECASE)
+    if not version_match:
+        version_match = re.search(r"\b([0-9]+(?:\.[0-9]+)*(?:\([^)]*\))?[A-Za-z0-9._-]*)\b", text)
+    software_version = version_match.group(1).strip() if version_match else None
+    platform_match = re.match(r"([0-9]+(?:\.[0-9]+)*)", software_version or "")
+    return {
+        "platform_version": platform_match.group(1).strip() if platform_match else None,
+        "software_release": software_version,
+    }
+
+
+def _is_ruijie(device: Device, baseline: Optional[VersionBaseline]) -> bool:
+    vendor = f"{_normalize(device.vendor)} {_normalize(baseline.vendor if baseline else '')}"
+    return any(marker in vendor for marker in ("ruijie", "锐捷", "rgos"))
+
+
 def _check(key: str, status: str, message: str, evidence: Any = None, required: bool = True) -> Dict[str, Any]:
     return {
         "key": key,
@@ -259,13 +283,14 @@ def evaluate_device(
     elif not observed_version:
         checks.append(_check("version", "pending", "尚未采集到软件版本", None, True))
     else:
-        use_h3c_fields = _is_h3c(device, baseline) and bool(
+        use_structured_fields = (_is_h3c(device, baseline) or _is_ruijie(device, baseline)) and bool(
             baseline.platform_version or baseline.allowed_releases
         )
-        if use_h3c_fields:
-            h3c_version = _extract_h3c_version(observed_version)
-            observed_platform = h3c_version["platform_version"]
-            observed_release = h3c_version["software_release"]
+        if use_structured_fields:
+            is_ruijie = _is_ruijie(device, baseline)
+            parsed_version = _extract_ruijie_version(observed_version) if is_ruijie else _extract_h3c_version(observed_version)
+            observed_platform = parsed_version["platform_version"]
+            observed_release = parsed_version["software_release"]
             platform_ok = (
                 not baseline.platform_version
                 or _version_matches(observed_platform or "", [baseline.platform_version])
@@ -278,14 +303,24 @@ def evaluate_device(
             version_ok = bool(observed_platform and observed_release and platform_ok and release_ok and not forbidden)
             evidence = {
                 "current": observed_version,
-                "current_comware_platform": observed_platform,
-                "current_software_release": observed_release,
+                "current_platform_version": observed_platform,
+                "current_device_version": observed_release,
                 "baseline": baseline.name,
-                "required_comware_platform": baseline.platform_version,
-                "allowed_software_releases": baseline.allowed_releases or [],
-                "forbidden_software_releases": baseline.forbidden_versions or [],
+                "required_platform_version": baseline.platform_version,
+                "allowed_device_versions": baseline.allowed_releases or [],
+                "forbidden_device_versions": baseline.forbidden_versions or [],
             }
-            message = "Comware平台和Release软件版本符合基线" if version_ok else "Comware平台或Release软件版本不符合基线"
+            if is_ruijie:
+                message = "RGOS平台和设备版本符合基线" if version_ok else "RGOS平台或设备版本不符合基线"
+            else:
+                evidence.update({
+                    "current_comware_platform": observed_platform,
+                    "current_software_release": observed_release,
+                    "required_comware_platform": baseline.platform_version,
+                    "allowed_software_releases": baseline.allowed_releases or [],
+                    "forbidden_software_releases": baseline.forbidden_versions or [],
+                })
+                message = "Comware平台和Release软件版本符合基线" if version_ok else "Comware平台或Release软件版本不符合基线"
         else:
             forbidden = _version_matches(observed_version, baseline.forbidden_versions or [])
             allowed = not baseline.allowed_versions or _version_matches(observed_version, baseline.allowed_versions or [])

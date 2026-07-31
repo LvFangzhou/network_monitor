@@ -56,6 +56,13 @@ const NETWORK_TYPES = [
 
 const normalizeVendor = (value?: string) => (value || '').trim().toLowerCase()
 
+const isH3CVendor = (vendor?: string) => normalizeVendor(vendor).includes('h3c')
+const isRuijieVendor = (vendor?: string) => {
+  const normalized = normalizeVendor(vendor)
+  return normalized.includes('ruijie') || normalized.includes('锐捷') || normalized.includes('rgos')
+}
+const useStructuredVersionFields = (vendor?: string) => isH3CVendor(vendor) || isRuijieVendor(vendor)
+
 const vendorVersionLabel = (vendor?: string) => {
   const normalized = normalizeVendor(vendor)
   if (normalized.includes('ruijie') || normalized.includes('锐捷')) return '锐捷RGOS软件版本'
@@ -88,7 +95,8 @@ const DeviceCompliancePage = () => {
   const [profileForm] = Form.useForm()
   const [baselineForm] = Form.useForm()
   const baselineVendor = Form.useWatch('vendor', baselineForm)
-  const isH3CBaseline = normalizeVendor(baselineVendor).includes('h3c')
+  const isRuijieBaseline = isRuijieVendor(baselineVendor)
+  const isStructuredBaseline = useStructuredVersionFields(baselineVendor)
 
   const loadCatalogs = async () => {
     const [profileResult, baselineResult] = await Promise.all([getModelProfiles(), getVersionBaselines()])
@@ -186,7 +194,7 @@ const DeviceCompliancePage = () => {
   const saveBaseline = async () => {
     try {
       const values = await baselineForm.validateFields()
-      if (normalizeVendor(values.vendor).includes('h3c')) {
+      if (useStructuredVersionFields(values.vendor)) {
         values.allowed_versions = []
         values.minimum_version = null
       } else {
@@ -287,11 +295,11 @@ const DeviceCompliancePage = () => {
     { title: '型号匹配', dataIndex: 'model_pattern', key: 'model', width: 135, ellipsis: true, render: (value: string) => value || '-' },
     {
       title: '版本要求', key: 'version_requirement', width: 320,
-      render: (_: unknown, record: VersionBaseline) => normalizeVendor(record.vendor).includes('h3c') && (record.platform_version || record.allowed_releases?.length)
+      render: (_: unknown, record: VersionBaseline) => useStructuredVersionFields(record.vendor) && (record.platform_version || record.allowed_releases?.length)
         ? (
           <Space size={[4, 4]} wrap>
-            <Tag color="geekblue">Comware {record.platform_version || '不限'}</Tag>
-            {(record.allowed_releases || []).map((item) => <Tag color="green" key={item}>Release {item}</Tag>)}
+            <Tag color="geekblue">{isRuijieVendor(record.vendor) ? '平台' : 'Comware'} {record.platform_version || '不限'}</Tag>
+            {(record.allowed_releases || []).map((item) => <Tag color="green" key={item}>{isRuijieVendor(record.vendor) ? '设备版本' : 'Release'} {item}</Tag>)}
           </Space>
         )
         : record.allowed_versions?.length
@@ -499,40 +507,40 @@ const DeviceCompliancePage = () => {
             <Col span={6}><Form.Item name="model_pattern" label="型号匹配"><Input placeholder="支持 * 通配符" /></Form.Item></Col>
           </Row>
           <Form.Item name="device_role" label="设备角色"><Input placeholder="可选，Spine / Leaf等" /></Form.Item>
-          {baselineVendor && isH3CBaseline && (
+          {baselineVendor && isStructuredBaseline && (
             <Row gutter={12}>
               <Col span={10}>
                 <Form.Item
                   name="platform_version"
-                  label="H3C Comware平台版本"
-                  rules={[{ required: true, message: '请输入Comware平台版本' }]}
-                  extra="支持 * 和 ? 通配符；例如7.1.*可匹配7.1.070、7.1.076等Comware 7.1平台。"
+                  label={isRuijieBaseline ? '锐捷平台版本' : 'H3C Comware平台版本'}
+                  rules={[{ required: true, message: `请输入${isRuijieBaseline ? '锐捷平台版本' : 'Comware平台版本'}` }]}
+                  extra={isRuijieBaseline ? '支持 * 和 ? 通配符；例如12.*可匹配12.5，11.*可匹配11.0。' : '支持 * 和 ? 通配符；例如7.1.*可匹配7.1.070、7.1.076等Comware 7.1平台。'}
                 >
-                  <Input placeholder="精确值7.1.070，或通配值7.1.*" />
+                  <Input placeholder={isRuijieBaseline ? '例如 11.0* 或 12.5*' : '精确值7.1.070，或通配值7.1.*'} />
                 </Form.Item>
               </Col>
               <Col span={14}>
                 <Form.Item
                   name="allowed_releases"
-                  label="H3C允许的Release软件版本"
-                  rules={[{ required: true, message: '请至少输入一个Release软件版本' }]}
-                  extra="保留完整补丁后缀，例如6715P01；多个允许版本分别输入后按回车。"
+                  label={isRuijieBaseline ? '锐捷允许的设备版本' : 'H3C允许的Release软件版本'}
+                  rules={[{ required: true, message: `请至少输入一个${isRuijieBaseline ? '设备版本' : 'Release软件版本'}` }]}
+                  extra={isRuijieBaseline ? '填写设备实际软件版本；多个允许版本分别输入后按回车。' : '保留完整补丁后缀，例如6715P01；多个允许版本分别输入后按回车。'}
                 >
-                  <Select mode="tags" placeholder="例如 6715P01" />
+                  <Select mode="tags" placeholder={isRuijieBaseline ? '例如 12.5(2)B0605 或 11.0(5)B9P62' : '例如 6715P01'} />
                 </Form.Item>
               </Col>
             </Row>
           )}
-          {baselineVendor && isH3CBaseline && (
+          {baselineVendor && isStructuredBaseline && (
             <Form.Item
               name="required_patches"
-              label="H3C必需补丁"
-              extra="从设备hh3cSysPackageTable自动读取并比较；多个必需补丁分别输入后按回车。未要求补丁时留空。"
+              label={isRuijieBaseline ? '锐捷必需补丁' : 'H3C必需补丁'}
+              extra={isRuijieBaseline ? '仅在锐捷设备能够采集到独立补丁信息时填写；多个补丁分别输入后按回车。未要求补丁时留空。' : '从设备hh3cSysPackageTable自动读取并比较；多个必需补丁分别输入后按回车。未要求补丁时留空。'}
             >
-              <Select mode="tags" placeholder="例如 R6715HS09" />
+              <Select mode="tags" placeholder={isRuijieBaseline ? '输入补丁名称后按回车' : '例如 R6715HS09'} />
             </Form.Item>
           )}
-          {baselineVendor && !isH3CBaseline && (
+          {baselineVendor && !isStructuredBaseline && (
             <>
               <Form.Item
                 name="allowed_versions"
@@ -548,7 +556,7 @@ const DeviceCompliancePage = () => {
             </>
           )}
           <Form.Item name="forbidden_versions" label="禁止版本">
-            <Select mode="tags" placeholder={isH3CBaseline ? '输入禁止的Release版本后按回车' : '输入完整的已知故障版本后按回车'} />
+            <Select mode="tags" placeholder={isStructuredBaseline ? `输入禁止的${isRuijieBaseline ? '设备版本' : 'Release版本'}后按回车` : '输入完整的已知故障版本后按回车'} />
           </Form.Item>
           <Form.Item name="recommendation" label="备注"><Input.TextArea rows={3} /></Form.Item>
           <Row gutter={12}>

@@ -285,3 +285,56 @@ def test_compliance_uses_snmp_patch_evidence_from_system_info(monkeypatch):
 
     assert _check_map(result)["patch"]["status"] == "passed"
     assert result["observed_patches"] == ["R6715HS09"]
+
+
+def test_ruijie_version_compares_rgos_platform_and_device_version(monkeypatch):
+    device = Device(
+        id=9, name="s6980", ip_address="192.0.2.18", vendor="锐捷",
+        model="S6980", is_monitored=True, monitor_source="snmp", custom_fields={},
+    )
+    profile = DeviceModelProfile(
+        id=9, name="S6980", vendor="锐捷", model_pattern="S6980*",
+        network_type="general", capabilities={"snmp": False, "syslog": False, "tacacs": False},
+        required_checks=["model_profile", "version"], priority=100, is_active=True,
+    )
+    baseline = VersionBaseline(
+        id=6, name="S6980生产版本", model_profile_id=9, vendor="锐捷",
+        platform_version="12.*", allowed_releases=["12.5(2)B0605"],
+        allowed_versions=[], required_patches=[], forbidden_versions=[],
+        priority=100, is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "system_info": {"software_version": "Software Version S6980_RGOS 12.5(2)B0605"},
+    })
+
+    result = device_compliance.evaluate_device(device, [profile], [baseline], None, set())
+    version_check = _check_map(result)["version"]
+
+    assert version_check["status"] == "passed"
+    assert version_check["evidence"]["current_platform_version"] == "12.5"
+    assert version_check["evidence"]["current_device_version"] == "12.5(2)B0605"
+
+
+def test_ruijie_device_version_mismatch_fails_even_when_platform_matches(monkeypatch):
+    device = Device(
+        id=10, name="s6500", ip_address="192.0.2.19", vendor="Ruijie",
+        model="S6500", is_monitored=True, monitor_source="snmp", custom_fields={},
+    )
+    profile = DeviceModelProfile(
+        id=10, name="S6500", vendor="Ruijie", model_pattern="S6500*",
+        network_type="general", capabilities={"snmp": False, "syslog": False, "tacacs": False},
+        required_checks=["model_profile", "version"], priority=100, is_active=True,
+    )
+    baseline = VersionBaseline(
+        id=7, name="S6500生产版本", model_profile_id=10, vendor="Ruijie",
+        platform_version="11.*", allowed_releases=["11.0(5)B9P61"],
+        allowed_versions=[], required_patches=[], forbidden_versions=[],
+        priority=100, is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "system_info": {"software_version": "Software Version S6500-X86_RGOS 11.0(5)B9P62"},
+    })
+
+    result = device_compliance.evaluate_device(device, [profile], [baseline], None, set())
+
+    assert _check_map(result)["version"]["status"] == "failed"
