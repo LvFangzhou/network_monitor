@@ -130,6 +130,11 @@ def _normalize_interface_key(value: Any) -> str:
         "fourhundredge": "400g",
         "fhgigabitethernet": "400g",
         "400ge": "400g",
+        "twohundred-gigabitethernet": "200g",
+        "twohundredgigabitethernet": "200g",
+        "twohundredgige": "200g",
+        "twohundredge": "200g",
+        "200ge": "200g",
         "hundred-gigabitethernet": "hge",
         "hundredgigabitethernet": "hge",
         "hundredgige": "hge",
@@ -144,11 +149,16 @@ def _normalize_interface_key(value: Any) -> str:
         "xge": "tengige",
         "fh": "400g",
         "te": "tengige",
+        "inloopback": "inloop",
+        "loopback": "loop",
+        "register-tunnel": "reg",
+        "registertunnel": "reg",
     }
-    # 必须先替换长前缀，再替换短前缀。否则 FourHundredGigE 会先命中
-    # HundredGigE，导致 FourHundredGigE1/0/1 和 400GE1/0/1 不能被识别为同一接口。
+    # 只替换接口名前缀，避免 TwoHundredGigE 中间的 HundredGigE 被误替换。
     for src, dst in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
-        normalized = normalized.replace(src, dst)
+        if normalized.startswith(src):
+            normalized = f"{dst}{normalized[len(src):]}"
+            break
     return re.sub(r"[^a-z0-9/._:-]", "", normalized)
 
 
