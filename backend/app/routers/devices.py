@@ -24,6 +24,7 @@ from app.utils import influx_client
 from app.utils.asternos_exporter_client import asternos_exporter_client
 from app.utils.monitor_profile import normalize_monitoring_profile
 from app.utils.tacacs_time import parse_tacacs_log_time
+from app.utils.tacacs_commands import extract_tacacs_command, is_tacacs_user_command
 from app.schemas import (
     DeviceCreate, DeviceUpdate, DeviceResponse,
     DeviceGroupCreate, DeviceGroupUpdate, DeviceGroupResponse,
@@ -104,18 +105,6 @@ def _parse_time_filter(value: Optional[str]) -> Optional[datetime]:
 
 def _format_tacacs_time(raw_time: str) -> Optional[str]:
     return parse_tacacs_log_time(raw_time)
-
-
-def _extract_tacacs_command(raw_command: str) -> str:
-    text = (raw_command or "").strip()
-    if not text:
-        return ""
-    marker_match = re.search(r"\s+(cmd-arg|err_msg|start_time)=", text)
-    command = text[:marker_match.start()].strip() if marker_match else text
-    rest = text[marker_match.start():] if marker_match else ""
-    arg_match = re.search(r"\bcmd-arg=(.*?)(?=\s+(?:err_msg|start_time)=|$)", rest)
-    cmd_arg = arg_match.group(1).strip() if arg_match else ""
-    return f"{command} {cmd_arg}".strip() if cmd_arg else command
 
 
 def _normalize_interface_key(value: Any) -> str:
@@ -2231,7 +2220,9 @@ async def get_device_detail_tacacs(
             continue
         if match.group(2) != device.ip_address:
             continue
-        command_text = _extract_tacacs_command(match.group(6))
+        command_text = extract_tacacs_command(match.group(6))
+        if not is_tacacs_user_command(command_text):
+            continue
         parsed_time = _format_tacacs_time(match.group(1)) or match.group(1)
         item = {
             "time": parsed_time,

@@ -346,6 +346,10 @@ class QualityProbeTarget(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False)
     target = Column(String(255), nullable=False)
+    # A card may contain several independently collected server ICMP targets.
+    # ``target`` remains the primary address for backward compatibility.
+    target_addresses = Column(JSON, default=list)
+    target_statuses = Column(JSON, default=dict)
     datacenter_id = Column(Integer, ForeignKey("datacenters.id"), nullable=True)
     circuit_id = Column(Integer, ForeignKey("circuits.id", ondelete="SET NULL"), nullable=True, index=True)
     device_id = Column(Integer, ForeignKey("devices.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -361,7 +365,7 @@ class QualityProbeTarget(Base):
     loss_threshold_percent = Column(Integer, default=1)
     jitter_threshold_ms = Column(Integer, default=30)
     mtr_enabled = Column(Boolean, default=False)
-    mtr_interval_seconds = Column(Integer, default=300)
+    mtr_interval_seconds = Column(Integer, default=3600)
     last_mtr_at = Column(DateTime(timezone=True))
     last_mtr_path_hash = Column(String(64))
     last_mtr_final_latency_ms = Column(Float)
@@ -417,6 +421,8 @@ class QualityProbeTarget(Base):
             "id": self.id,
             "name": self.name,
             "target": self.target,
+            "target_addresses": self.target_addresses or [self.target],
+            "target_statuses": self.target_statuses or {},
             "datacenter_id": self.datacenter_id,
             "datacenter_name": self.datacenter_ref.name if self.datacenter_ref else None,
             "circuit_id": self.circuit_id,

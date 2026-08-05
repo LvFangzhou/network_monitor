@@ -2,6 +2,7 @@ import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } fro
 import { Button, Card, DatePicker, Empty, Input, Select, Space, Spin, message } from 'antd'
 import { CloseOutlined, HolderOutlined, LockOutlined, ReloadOutlined, SearchOutlined, UnlockOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
+import { useSearchParams } from 'react-router-dom'
 import {
   Area,
   AreaChart,
@@ -21,6 +22,7 @@ import {
 } from '../../api/metrics'
 import { getCircuits, getCustomers, type Circuit, type Customer } from '../../api/resources'
 import { useAuthStore } from '../../store/auth'
+import AutoRefreshControl from '../../components/AutoRefreshControl'
 
 const { RangePicker } = DatePicker
 
@@ -437,21 +439,24 @@ const TrafficChart = ({
 
 const TrafficQuery = () => {
   const currentUser = useAuthStore((state) => state.user)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const urlCircuitIds = searchParams.getAll('circuit').map(Number).filter((value) => Number.isInteger(value) && value > 0)
+  const urlPresetKeys = searchParams.getAll('summary').filter(Boolean)
   const [optionsLoading, setOptionsLoading] = useState(false)
   const [dashboardLoading, setDashboardLoading] = useState(false)
-  const [keyword, setKeyword] = useState('')
+  const [keyword, setKeyword] = useState(searchParams.get('q') || '')
   const [selectedLineId, setSelectedLineId] = useState<number | undefined>()
-  const [lineType, setLineType] = useState<'internet' | 'private_line'>('internet')
-  const [datacenterId, setDatacenterId] = useState<number | undefined>()
-  const [providerKey, setProviderKey] = useState<string | undefined>()
-  const [customerId, setCustomerId] = useState<number | undefined>()
+  const [lineType, setLineType] = useState<'internet' | 'private_line'>(searchParams.get('type') === 'private_line' ? 'private_line' : 'internet')
+  const [datacenterId, setDatacenterId] = useState<number | undefined>(Number(searchParams.get('datacenter')) || undefined)
+  const [providerKey, setProviderKey] = useState<string | undefined>(searchParams.get('provider') || undefined)
+  const [customerId, setCustomerId] = useState<number | undefined>(Number(searchParams.get('customer')) || undefined)
   const [datacenters, setDatacenters] = useState<Datacenter[]>([])
   const [customers, setCustomers] = useState<Customer[]>([])
   const [filterOptionItems, setFilterOptionItems] = useState<Circuit[]>([])
   const [dashboardCards, setDashboardCards] = useState<Record<number, CircuitTrafficCard>>({})
   const [cardQueryStates, setCardQueryStates] = useState<Record<number, CardQueryState>>({})
-  const [visibleCircuitIds, setVisibleCircuitIds] = useState<number[]>([])
-  const [selectedPresetKeys, setSelectedPresetKeys] = useState<string[]>(DEFAULT_SUMMARY_PRESETS.map((item) => item.key))
+  const [visibleCircuitIds, setVisibleCircuitIds] = useState<number[]>(urlCircuitIds)
+  const [selectedPresetKeys, setSelectedPresetKeys] = useState<string[]>(urlPresetKeys.length ? urlPresetKeys : DEFAULT_SUMMARY_PRESETS.map((item) => item.key))
   const [layoutLocked, setLayoutLocked] = useState(false)
   const [draggingId, setDraggingId] = useState<number | null>(null)
   const trafficRequestSeqRef = useRef<Record<number, number>>({})
@@ -511,7 +516,7 @@ const TrafficQuery = () => {
     })
   }, [])
 
-  const loadSummaryTrafficCard = useCallback(async (preset: SummaryPreset, force = false, queryOverride?: CardQueryState) => {
+  const loadSummaryTrafficCard = useCallback(async (preset: SummaryPreset, force = false, queryOverride?: CardQueryState, background = false) => {
     const summaryCircuit = buildSummaryCircuit(preset)
     const query = queryOverride || getCardQueryState(summaryCircuit.id)
     const requestSeq = (trafficRequestSeqRef.current[summaryCircuit.id] || 0) + 1
@@ -524,7 +529,7 @@ const TrafficQuery = () => {
         aggregateData: prev[summaryCircuit.id]?.aggregateData || [],
         targetCount: prev[summaryCircuit.id]?.targetCount,
         skippedTargetCount: prev[summaryCircuit.id]?.skippedTargetCount,
-        loading: true,
+        loading: background ? prev[summaryCircuit.id]?.loading : true,
       },
     }))
     try {
@@ -563,7 +568,7 @@ const TrafficQuery = () => {
     }
   }, [getCardQueryState])
 
-  const loadTrafficCard = useCallback(async (record: Circuit, silent = false, force = false, queryOverride?: CardQueryState) => {
+  const loadTrafficCard = useCallback(async (record: Circuit, silent = false, force = false, queryOverride?: CardQueryState, background = false) => {
     const query = queryOverride || getCardQueryState(record.id)
     const requestSeq = (trafficRequestSeqRef.current[record.id] || 0) + 1
     trafficRequestSeqRef.current[record.id] = requestSeq
@@ -573,7 +578,7 @@ const TrafficQuery = () => {
         circuit: record,
         targets: prev[record.id]?.targets || [],
         aggregateData: prev[record.id]?.aggregateData || [],
-        loading: true,
+        loading: background ? prev[record.id]?.loading : true,
       },
     }))
     try {
@@ -635,14 +640,16 @@ const TrafficQuery = () => {
   const loadDefaultDashboard = useCallback(async () => {
     const prefs = readTrafficPrefs(prefsKey)
     const defaults = (prefs.defaultCircuitIds || []).filter(Boolean)
-    const visible = (prefs.visibleCircuitIds || defaults).filter(Boolean)
+    const urlVisible = searchParams.getAll('circuit').map(Number).filter((value) => Number.isInteger(value) && value > 0)
+    const visible = (urlVisible.length ? urlVisible : (prefs.visibleCircuitIds || defaults)).filter(Boolean)
     setVisibleCircuitIds(visible)
     setLayoutLocked(Boolean(prefs.locked))
 
     setDashboardLoading(true)
     try {
       const requiredDefaultKeys = DEFAULT_SUMMARY_PRESETS.map((item) => item.key)
-      const savedDefaultOrder = (prefs.summaryPresetKeys || []).filter((key) => requiredDefaultKeys.includes(key))
+      const urlSummaryKeys = searchParams.getAll('summary').filter(Boolean)
+      const savedDefaultOrder = (urlSummaryKeys.length ? urlSummaryKeys : (prefs.summaryPresetKeys || [])).filter((key) => requiredDefaultKeys.includes(key))
       const defaultPresetKeys = [...savedDefaultOrder, ...requiredDefaultKeys.filter((key) => !savedDefaultOrder.includes(key))]
       setSelectedPresetKeys(defaultPresetKeys)
       await Promise.all(defaultPresetKeys.map((key) => DEFAULT_SUMMARY_PRESETS.find((preset) => preset.key === key)).filter(Boolean).map((preset) => loadSummaryTrafficCard(preset as SummaryPreset)))
@@ -655,7 +662,7 @@ const TrafficQuery = () => {
     } finally {
       setDashboardLoading(false)
     }
-  }, [ensureTrafficCard, loadSummaryTrafficCard, prefsKey])
+  }, [ensureTrafficCard, loadSummaryTrafficCard, prefsKey, searchParams])
 
   useEffect(() => {
     void loadOptions()
@@ -670,6 +677,18 @@ const TrafficQuery = () => {
   useEffect(() => {
     void loadFilterOptionItems()
   }, [loadFilterOptionItems])
+
+  useEffect(() => {
+    const next = new URLSearchParams()
+    if (lineType !== 'internet') next.set('type', lineType)
+    if (datacenterId) next.set('datacenter', String(datacenterId))
+    if (providerKey) next.set('provider', providerKey)
+    if (customerId) next.set('customer', String(customerId))
+    if (keyword.trim()) next.set('q', keyword.trim())
+    visibleCircuitIds.forEach((id) => next.append('circuit', String(id)))
+    selectedPresetKeys.forEach((key) => next.append('summary', key))
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [customerId, datacenterId, keyword, lineType, providerKey, searchParams, selectedPresetKeys, setSearchParams, visibleCircuitIds])
 
   useEffect(() => {
     setProviderKey(undefined)
@@ -834,12 +853,17 @@ const TrafficQuery = () => {
     setCustomerId(undefined)
   }
 
-  const refreshVisibleCards = async () => {
-    const cards = visibleCircuitIds.map((id) => dashboardCards[id]).filter(Boolean)
-    const activePresets = summaryPresets.filter((preset) => selectedPresetKeys.includes(preset.key))
+  const refreshVisibleCards = async (background = false) => {
+    const cards = visibleCircuitIds
+      .map((id) => dashboardCards[id])
+      .filter(Boolean)
+      .filter((card) => !background || getCardQueryState(card.circuit.id).rangeValue !== 'custom')
+    const activePresets = summaryPresets
+      .filter((preset) => selectedPresetKeys.includes(preset.key))
+      .filter((preset) => !background || getCardQueryState(getSummaryPresetId(preset)).rangeValue !== 'custom')
     await Promise.all([
-      ...activePresets.map((preset) => loadSummaryTrafficCard(preset, true)),
-      ...cards.map((card) => loadTrafficCard(card.circuit, true, true)),
+      ...activePresets.map((preset) => loadSummaryTrafficCard(preset, true, undefined, background)),
+      ...cards.map((card) => loadTrafficCard(card.circuit, true, true, undefined, background)),
     ])
   }
 
@@ -955,7 +979,12 @@ const TrafficQuery = () => {
           <RangePicker size="small" showTime value={query.customRange as any} onChange={(value) => handleCardCustomRangeChange(card.circuit.id, value as any)} />
         ) : null}
         <Select value={query.intervalValue} size="small" style={{ width: 94 }} options={INTERVAL_OPTIONS} onChange={(value) => handleCardIntervalChange(card.circuit.id, value)} />
-        <Button size="small" icon={<ReloadOutlined />} loading={card.loading} onClick={() => { void reloadCardById(card.circuit.id, true) }} />
+        <AutoRefreshControl
+          disabled={query.rangeValue === 'custom'}
+          disabledTip="自定义固定时间段不自动刷新；切换到实时范围后可开启。"
+          onRefresh={() => reloadCardById(card.circuit.id, true)}
+          tip="只刷新当前线路或汇总图卡，不改变时间范围，也不影响其他图卡。"
+        />
         {!isSummaryCard ? <Button size="small" type="text" danger icon={<CloseOutlined />} onClick={() => removeCard(card.circuit.id)} /> : null}
       </Space>
     )
@@ -1095,7 +1124,7 @@ const TrafficQuery = () => {
         title="流量图表"
         extra={(
           <Space wrap>
-            <Button icon={<ReloadOutlined />} loading={dashboardLoading} disabled={!visibleCards.length && !summaryCards.length} onClick={refreshVisibleCards}>
+            <Button icon={<ReloadOutlined />} loading={dashboardLoading} disabled={!visibleCards.length && !summaryCards.length} onClick={() => { void refreshVisibleCards(false) }}>
               刷新全部
             </Button>
             <Button icon={layoutLocked ? <LockOutlined /> : <UnlockOutlined />} onClick={toggleLayoutLocked}>

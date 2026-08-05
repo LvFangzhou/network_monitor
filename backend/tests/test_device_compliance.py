@@ -103,7 +103,7 @@ def test_missing_required_patch_is_non_compliant(monkeypatch):
     assert "PATCH-002" in _check_map(result)["patch"]["message"]
 
 
-def test_asternos_can_skip_unsupported_snmp_and_tacacs(monkeypatch):
+def test_asternos_requires_exporter_syslog_and_tacacs_even_for_legacy_profile(monkeypatch):
     device = Device(
         id=3,
         name="aster-leaf",
@@ -137,8 +137,133 @@ def test_asternos_can_skip_unsupported_snmp_and_tacacs(monkeypatch):
 
     assert "snmp" not in checks
     assert checks["exporter"]["status"] == "passed"
-    assert checks["tacacs"]["status"] == "skipped"
+    assert checks["tacacs"]["status"] == "pending"
+    assert checks["tacacs"]["required"] is True
+    assert result["overall_status"] == "pending"
+
+
+def test_asternos_hardware_can_pass_with_known_fans_and_unreported_power(monkeypatch):
+    device = Device(
+        id=31,
+        name="aster-hardware",
+        ip_address="192.0.2.31",
+        vendor="Asteros",
+        model="CX308P-48Y-NF-AC",
+        is_monitored=True,
+        monitor_source="asternos_exporter",
+        custom_fields={},
+    )
+    profile = DeviceModelProfile(
+        id=31,
+        name="CX308P-48Y-NF-AC",
+        vendor="Asteros",
+        model_pattern="CX308P-48Y-NF-AC",
+        network_type="management",
+        capabilities={"snmp": False, "exporter": True, "syslog": False, "tacacs": False},
+        required_checks=["model_profile", "exporter", "hardware"],
+        priority=10,
+        is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "collected_at": "2026-08-03T06:10:59+00:00",
+        "system_info": {"sys_name": "aster-hardware", "software_version": "3.1", "snmp_model": "CX308P-48Y-NF-AC"},
+        "hardware": {
+            "fan_total": 4,
+            "fan_down": 0,
+            "fan_status_known": True,
+            "power_total": 0,
+            "power_down": 0,
+            "power_status_known": False,
+        },
+    })
+
+    result = device_compliance.evaluate_device(device, [profile], [], None, set())
+    hardware = _check_map(result)["hardware"]
+
+    assert hardware["status"] == "passed"
+    assert hardware["message"] == "风扇 4 个运行正常；电源指标未上报"
+
+
+def test_asternos_identity_matches_recorded_asset_and_requires_all_services(monkeypatch):
+    device = Device(
+        id=32,
+        name="QDD10N24J07U41-CX308P48Y-LEAF3-2",
+        ip_address="192.0.2.32",
+        vendor="Asteros",
+        model="CX308P-48Y-NF-AC",
+        serial_number="F02225AB813",
+        is_monitored=True,
+        monitor_source="asternos_exporter",
+        custom_fields={},
+    )
+    profile = DeviceModelProfile(
+        id=32, name="CX308P-48Y-NF-AC", vendor="Asteros", model_pattern="CX308P-48Y-NF-AC",
+        network_type="management", capabilities={"exporter": True, "syslog": True, "tacacs": True},
+        # Legacy profiles may still contain the retired Part Number check.
+        required_checks=["model_profile", "part_number", "version", "patch", "hardware", "exporter", "syslog", "tacacs"],
+        priority=10, is_active=True,
+    )
+    baseline = VersionBaseline(
+        id=32, name="CX308P生产基线", model_profile_id=32, vendor="Asteros",
+        allowed_versions=["V3.1R0407P04"], required_patches=["V3.1R0407P04-00008"],
+        forbidden_versions=[], priority=10, is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "collected_at": "2026-08-03T06:10:59+00:00",
+        "system_info": {
+            "sys_name": device.name,
+            "software_version": "Software V3.1R0407P04",
+            "software_patches": ["V3.1R0407P04-00008"],
+            "snmp_model": device.model,
+            "serial_number": device.serial_number,
+        },
+        "hardware": {"fan_total": 4, "fan_down": 0, "fan_absent": 0, "fan_status_known": True},
+    })
+
+    result = device_compliance.evaluate_device(
+        device, [profile], [baseline], datetime.now(timezone.utc), {device.ip_address},
+    )
+    checks = _check_map(result)
+
+    assert "part_number" not in checks
+    for key in ("device_name", "device_model", "serial_number", "version", "patch", "hardware", "exporter", "syslog", "tacacs"):
+        assert checks[key]["status"] == "passed"
+        assert checks[key]["required"] is True
     assert result["overall_status"] == "compliant"
+
+
+def test_asternos_identity_mismatch_and_absent_fan_block_onboarding(monkeypatch):
+    device = Device(
+        id=33, name="recorded-name", ip_address="192.0.2.33", vendor="Asteros",
+        model="CX308P-48Y-NF-AC", serial_number="RECORDED-SN", is_monitored=True,
+        monitor_source="asternos_exporter", custom_fields={},
+    )
+    profile = DeviceModelProfile(
+        id=33, name="CX308P-48Y-NF-AC", vendor="Asteros", model_pattern="CX308P-48Y-NF-AC",
+        network_type="management", capabilities={}, required_checks=["model_profile"],
+        priority=10, is_active=True,
+    )
+    monkeypatch.setattr(device_compliance, "load_overview", lambda _device_id: {
+        "collected_at": "2026-08-03T06:10:59+00:00",
+        "system_info": {
+            "sys_name": "actual-name", "snmp_model": device.model,
+            "serial_number": "ACTUAL-SN",
+        },
+        "hardware": {
+            "fan_total": 3, "fan_expected_total": 4, "fan_absent": 1,
+            "fan_down": 0, "fan_status_known": True,
+        },
+    })
+
+    result = device_compliance.evaluate_device(device, [profile], [], None, set())
+    checks = _check_map(result)
+
+    assert checks["device_name"]["status"] == "failed"
+    assert checks["serial_number"]["status"] == "failed"
+    assert "part_number" not in checks
+    assert checks["hardware"]["status"] == "failed"
+    assert "风扇缺位 1 个" in checks["hardware"]["message"]
+    assert result["overall_status"] == "non_compliant"
 
 
 def test_vendor_prefixed_duplicate_model_can_use_explicit_baseline_scope(monkeypatch):

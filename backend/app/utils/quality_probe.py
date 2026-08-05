@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.core import get_logger
 from app.utils import influx_client, redis_client
@@ -37,6 +37,41 @@ def _safe_mtr_target(target: str) -> str:
     if not target_text or not re.fullmatch(r"[A-Za-z0-9_.:-]+", target_text):
         raise ValueError("目标地址不合法")
     return target_text
+
+
+def normalize_quality_target_addresses(
+    primary_target: Any,
+    addresses: Optional[List[Any]] = None,
+    *,
+    max_addresses: int = 20,
+) -> List[str]:
+    """Normalize all addresses in a quality card and preserve their order."""
+    raw_values: List[Any] = list(addresses or [])
+    if primary_target:
+        raw_values.insert(0, primary_target)
+    normalized: List[str] = []
+    seen = set()
+    for raw in raw_values:
+        for candidate in re.split(r"[,，;；\s]+", str(raw or "")):
+            text = candidate.strip()
+            if not text:
+                continue
+            safe = _safe_mtr_target(text)
+            key = safe.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(safe)
+            if len(normalized) > max_addresses:
+                raise ValueError(f"一个卡片最多配置 {max_addresses} 个目标地址")
+    if not normalized:
+        raise ValueError("请至少填写一个目标地址")
+    return normalized
+
+
+def quality_probe_member_key(target_id: Any, member_target: Any) -> str:
+    digest = hashlib.sha1(str(member_target or "").strip().lower().encode("utf-8")).hexdigest()[:12]
+    return f"{target_id}:{digest}"
 
 
 def _normalize_mtr_asn(as_info: str | None) -> str | None:
@@ -432,8 +467,9 @@ def run_quality_nqa_snmp(target: Any, device: Any) -> Dict[str, Any]:
 SERVER_ICMP_MIN_INTERVAL_SECONDS = 30
 SERVER_ICMP_MIN_PACKET_COUNT = 10
 SERVER_ICMP_MIN_TIMEOUT_MS = 1500
-SERVER_ICMP_MIN_MTR_INTERVAL_SECONDS = 300
+SERVER_ICMP_MIN_MTR_INTERVAL_SECONDS = 3600
 SERVER_ICMP_PING_BATCH_WORKERS = 3
+SERVER_ICMP_FAST_PING_WORKERS = 20
 
 
 def normalize_server_icmp_probe_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -696,6 +732,59 @@ def run_quality_ping_batch(targets: List[Dict[str, Any]]) -> Dict[Any, Dict[str,
     return results
 
 
+def run_quality_fast_ping_batch(targets: List[Dict[str, Any]]) -> Dict[Any, Dict[str, Any]]:
+    """Fast high-loss detector using two short, independently confirmed rounds.
+
+    This is deliberately separate from the 10-packet quality sampler: the fast
+    path detects severe loss/outage, while the normal sampler remains the source
+    of accurate latency, jitter and rolling-loss trends.
+    """
+    results: Dict[Any, Dict[str, Any]] = {}
+
+    def _probe_one(item: Dict[str, Any]) -> tuple[Any, Dict[str, Any]]:
+        target_id = item.get("id")
+        host = _safe_mtr_target(str(item.get("target") or ""))
+        timeout_ms = max(500, min(int(item.get("timeout_ms") or 1000), 1000))
+        rounds = []
+        for _ in range(2):
+            result = normalize_quality_ping_result(_run_system_ping(host, 2, timeout_ms) or {})
+            rounds.append(result)
+            try:
+                sent = int(result.get("sent") or 0)
+                received = int(result.get("received") or 0)
+            except (TypeError, ValueError):
+                sent, received = 0, 0
+            if sent > 0 and received == sent:
+                break
+        sent_total = sum(int(item.get("sent") or 0) for item in rounds)
+        received_total = sum(int(item.get("received") or 0) for item in rounds)
+        result = normalize_quality_ping_result({
+            "success": received_total > 0,
+            "sent": sent_total,
+            "received": received_total,
+            "avg_latency_ms": next((item.get("avg_latency_ms") for item in reversed(rounds) if item.get("avg_latency_ms") is not None), None),
+            "min_latency_ms": None,
+            "max_latency_ms": None,
+            "jitter_ms": None,
+            "error": None if received_total > 0 else "快速探测两轮均未收到响应",
+            "probe_source": "server_icmp",
+            "probe_engine": "system_ping_fast_confirmed",
+        })
+        result["confirmed_rounds"] = len(rounds)
+        return target_id, result
+
+    max_workers = max(1, min(SERVER_ICMP_FAST_PING_WORKERS, len(targets) or 1))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_probe_one, item) for item in targets if item.get("id") is not None]
+        for future in as_completed(futures):
+            try:
+                target_id, result = future.result()
+                results[target_id] = result
+            except Exception as exc:
+                logger.warning("快速ICMP探测失败", error=str(exc))
+    return results
+
+
 def _run_system_ping(target_host: str, packet_count: int, timeout_ms: int) -> Dict[str, Any] | None:
     """Run iputils ping as the primary server-side ICMP engine."""
     ping_bin = shutil.which("ping")
@@ -931,14 +1020,16 @@ def apply_quality_loss_window(
     return smoothed
 
 
-def write_quality_probe_result(target: Any, result: Dict[str, Any]) -> None:
+def write_quality_probe_result(target: Any, result: Dict[str, Any], member_target: Optional[str] = None) -> None:
     """Write quality probe result to InfluxDB."""
     try:
         influx_client.write_point(
             "quality_probe",
             tags={
                 "target_id": str(target.id),
-                "target": target.target,
+                "target": member_target or target.target,
+                "member_target": member_target or target.target,
+                "member_key": quality_probe_member_key(target.id, member_target or target.target),
                 "name": target.name,
                 "datacenter": target.datacenter_ref.name if getattr(target, "datacenter_ref", None) else "",
                 "operator": target.operator_name or "",

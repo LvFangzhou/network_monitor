@@ -733,6 +733,10 @@ export interface QualityProbeTarget {
   id: number
   name: string
   target: string
+  target_addresses?: string[]
+  target_statuses?: Record<string, QualityProbeMemberStatus>
+  member_count?: number
+  abnormal_member_count?: number
   datacenter_id?: number | null
   datacenter_name?: string | null
   circuit_id?: number | null
@@ -788,6 +792,18 @@ export interface QualityProbeTarget {
   sla_previous_avg_latency_ms?: number | null
   sla_latency_change_ms?: number | null
   sla_target_percent?: number
+  sla_worst_member_target?: string | null
+  member_sla?: Array<{
+    target: string
+    availability_percent?: number | null
+    packet_loss_percent?: number | null
+    sent?: number
+    received?: number
+    lost?: number
+    sample_count?: number
+    avg_latency_ms?: number | null
+    avg_jitter_ms?: number | null
+  }>
   sla_month_availability_percent?: number | null
   sla_error_budget_allowed_minutes?: number | null
   sla_error_budget_used_minutes?: number | null
@@ -812,6 +828,19 @@ export interface QualityProbeTarget {
   latest_mtr_event?: QualityMtrEvent | null
   created_at?: string | null
   updated_at?: string | null
+}
+
+export interface QualityProbeMemberStatus {
+  success: boolean
+  avg_latency_ms?: number | null
+  packet_loss_percent?: number | null
+  rolling_packet_loss_percent?: number | null
+  jitter_ms?: number | null
+  received?: number | null
+  sent?: number | null
+  error?: string | null
+  last_probe_at?: string | null
+  last_mtr_at?: string | null
 }
 
 export interface QualityMtrHop {
@@ -1008,17 +1037,20 @@ export const deleteQualityProbeTarget = async (id: number): Promise<void> => {
 
 export const testQualityProbeTarget = async (
   id: number
-): Promise<{ target: QualityProbeTarget; result: QualityProbeResult }> => {
+): Promise<{ target: QualityProbeTarget; result: QualityProbeResult; results?: Record<string, QualityProbeResult>; summary?: { total: number; healthy: number; abnormal: number } }> => {
   return await request.post(`/metrics/quality/probe-targets/${id}/test`) as {
     target: QualityProbeTarget
     result: QualityProbeResult
+    results?: Record<string, QualityProbeResult>
+    summary?: { total: number; healthy: number; abnormal: number }
   }
 }
 
 export const runQualityProbeMtr = async (
-  id: number
+  id: number,
+  memberTarget?: string,
 ): Promise<{ target: QualityProbeTarget; generated_at: string; command: string; output: string; tool: string }> => {
-  return await request.post(`/metrics/quality/probe-targets/${id}/mtr`) as {
+  return await request.post(`/metrics/quality/probe-targets/${id}/mtr`, undefined, { params: { member_target: memberTarget } }) as {
     target: QualityProbeTarget
     generated_at: string
     command: string
@@ -1028,7 +1060,8 @@ export const runQualityProbeMtr = async (
 }
 
 export const getQualityMtrObservation = async (
-  id: number
+  id: number,
+  params?: { member_target?: string; days?: number; page?: number; page_size?: number },
 ): Promise<{
   target: QualityProbeTarget
   enabled: boolean
@@ -1037,8 +1070,13 @@ export const getQualityMtrObservation = async (
   previous_different_snapshot?: QualityMtrSnapshot | null
   snapshots: QualityMtrSnapshot[]
   events: QualityMtrEvent[]
+  member_target?: string
+  days: number
+  page: number
+  page_size: number
+  snapshot_total: number
 }> => {
-  return await request.get(`/metrics/quality/probe-targets/${id}/mtr-observation`) as {
+  return await request.get(`/metrics/quality/probe-targets/${id}/mtr-observation`, { params }) as {
     target: QualityProbeTarget
     enabled: boolean
     interval_seconds: number
@@ -1046,12 +1084,17 @@ export const getQualityMtrObservation = async (
     previous_different_snapshot?: QualityMtrSnapshot | null
     snapshots: QualityMtrSnapshot[]
     events: QualityMtrEvent[]
+    member_target?: string
+    days: number
+    page: number
+    page_size: number
+    snapshot_total: number
   }
 }
 
 export const getQualityProbeHistory = async (
   id: number,
-  params: { range: string; interval: string; start?: string; end?: string; start_ts?: number; end_ts?: number }
+  params: { range: string; interval: string; start?: string; end?: string; start_ts?: number; end_ts?: number; member_target?: string }
 ): Promise<{
   target: QualityProbeTarget
   range: string

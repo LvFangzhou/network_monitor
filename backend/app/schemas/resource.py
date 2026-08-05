@@ -248,6 +248,7 @@ class IPAddressRecordResponse(IPAddressRecordBase):
 class QualityProbeTargetBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     target: str = Field(..., min_length=1, max_length=255)
+    target_addresses: Optional[List[str]] = None
     datacenter_id: Optional[int] = None
     circuit_id: Optional[int] = None
     device_id: Optional[int] = None
@@ -263,7 +264,7 @@ class QualityProbeTargetBase(BaseModel):
     loss_threshold_percent: int = Field(default=1, ge=0, le=100)
     jitter_threshold_ms: int = Field(default=30, ge=0, le=10000)
     mtr_enabled: bool = False
-    mtr_interval_seconds: int = Field(default=300, ge=60, le=86400)
+    mtr_interval_seconds: int = Field(default=3600, ge=3600, le=86400)
     description: Optional[str] = None
     is_active: bool = True
 
@@ -275,6 +276,7 @@ class QualityProbeTargetCreate(QualityProbeTargetBase):
 class QualityProbeTargetUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     target: Optional[str] = Field(None, min_length=1, max_length=255)
+    target_addresses: Optional[List[str]] = None
     datacenter_id: Optional[int] = None
     circuit_id: Optional[int] = None
     device_id: Optional[int] = None
@@ -290,7 +292,7 @@ class QualityProbeTargetUpdate(BaseModel):
     loss_threshold_percent: Optional[int] = Field(None, ge=0, le=100)
     jitter_threshold_ms: Optional[int] = Field(None, ge=0, le=10000)
     mtr_enabled: Optional[bool] = None
-    mtr_interval_seconds: Optional[int] = Field(None, ge=60, le=86400)
+    mtr_interval_seconds: Optional[int] = Field(None, ge=3600, le=86400)
     description: Optional[str] = None
     is_active: Optional[bool] = None
 

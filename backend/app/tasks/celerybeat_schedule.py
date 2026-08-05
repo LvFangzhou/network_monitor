@@ -46,6 +46,14 @@ beat_schedule = {
             'expires': SNMP_TASK_EXPIRES_SECONDS,
         }
     },
+    # 按需登记的H3C三层VLAN接口流量；单设备复用一次SSH会话批量读取。
+    'collect-h3c-vlan-statistics-every-30s': {
+        'task': 'app.tasks.snmp_tasks.collect_h3c_vlan_statistics',
+        'schedule': 30.0,
+        'options': {
+            'expires': 25.0,
+        },
+    },
     'collect-h3c-s9867-roce-interface-health-every-30s': {
         'task': 'app.tasks.snmp_tasks.collect_h3c_s9867_roce_interface_health',
         'schedule': SNMP_SCHEDULER_INTERVAL_SECONDS,
@@ -202,6 +210,15 @@ beat_schedule = {
         }
     },
 
+    # 光功率突变 Syslog 轻量兜底恢复：只读现有缓存，不额外轮询设备
+    'reconcile-syslog-optical-power-alerts-every-60s': {
+        'task': 'app.tasks.alert_tasks.reconcile_syslog_optical_power_alerts',
+        'schedule': 60.0,
+        'options': {
+            'expires': 50.0,
+        },
+    },
+
     # 常规告警检查 - 每60秒执行一次，避免较慢规则拖住关键接口告警
     'check-alerts-every-60s': {
         'task': 'app.tasks.alert_tasks.check_alerts',
@@ -334,12 +351,20 @@ beat_schedule = {
             'expires': 5.0,
         },
     },
-    # 公网路径观察 - 只处理开启了MTR观察的公网质量目标，目标自身控制执行间隔
-    'collect-quality-mtr-paths-every-30s': {
-        'task': 'app.tasks.quality_tasks.collect_quality_mtr_paths',
-        'schedule': 30.0,
+    # 公网严重丢包/不可达快速探测：两轮短探针复核，目标在约5秒内发现。
+    'collect-quality-fast-outages-every-5s': {
+        'task': 'app.tasks.quality_tasks.collect_quality_fast_outages',
+        'schedule': 5.0,
         'options': {
-            'expires': 25.0,
+            'expires': 5.0,
+        },
+    },
+    # 公网路径观察 - 只处理开启了MTR观察的公网质量目标，目标自身控制执行间隔
+    'collect-quality-mtr-paths-every-5m': {
+        'task': 'app.tasks.quality_tasks.collect_quality_mtr_paths',
+        'schedule': 300.0,
+        'options': {
+            'expires': 240.0,
         },
     },
 }

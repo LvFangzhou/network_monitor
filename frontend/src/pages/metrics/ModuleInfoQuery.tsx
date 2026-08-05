@@ -3,6 +3,8 @@ import type { DragEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { Button, Card, Checkbox, Dropdown, Input, Select, Space, Table, Tag, Tooltip, Typography, message } from 'antd'
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import { getLocalOpticalModules } from '../../api/metrics'
+import { useSearchParams } from 'react-router-dom'
+import { readUrlNumber, replaceUrlValues } from '../../utils/urlState'
 
 const { Text } = Typography
 
@@ -321,16 +323,17 @@ const hasChannelPowerAbnormal = (record: any, field: 'rx_power_dbm' | 'tx_power_
   })
 
 const ModuleInfoQuery = () => {
+  const [searchParams, setSearchParams] = useSearchParams()
   const [loading, setLoading] = useState(false)
   const [items, setItems] = useState<any[]>([])
   const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(100)
-  const [search, setSearch] = useState('')
-  const [deviceIp, setDeviceIp] = useState('')
-  const [interfaceName, setInterfaceName] = useState('')
-  const [vendorName, setVendorName] = useState('')
-  const [datacenterName, setDatacenterName] = useState('')
+  const [page, setPage] = useState(readUrlNumber(searchParams, 'page', 1)!)
+  const [pageSize, setPageSize] = useState(readUrlNumber(searchParams, 'page_size', 100)!)
+  const [search, setSearch] = useState(searchParams.get('q') || '')
+  const [deviceIp, setDeviceIp] = useState(searchParams.get('device_ip') || '')
+  const [interfaceName, setInterfaceName] = useState(searchParams.get('interface') || '')
+  const [vendorName, setVendorName] = useState(searchParams.get('vendor') || '')
+  const [datacenterName, setDatacenterName] = useState(searchParams.get('datacenter') || '')
   const [availableVendors, setAvailableVendors] = useState<string[]>([])
   const [availableDatacenters, setAvailableDatacenters] = useState<string[]>([])
   const [draggingColumnKey, setDraggingColumnKey] = useState<string | null>(null)
@@ -409,6 +412,19 @@ const ModuleInfoQuery = () => {
     }, MODULE_REFRESH_INTERVAL_MS)
     return () => window.clearInterval(timer)
   }, [page, pageSize, search, deviceIp, interfaceName, vendorName, datacenterName])
+
+  useEffect(() => {
+    const next = replaceUrlValues(searchParams, {
+      page,
+      page_size: pageSize,
+      q: search,
+      device_ip: deviceIp,
+      interface: interfaceName,
+      vendor: vendorName,
+      datacenter: datacenterName,
+    }, { page: 1, page_size: 100 })
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [datacenterName, deviceIp, interfaceName, page, pageSize, search, searchParams, setSearchParams, vendorName])
 
   const updateVisibleColumnKeys = (updater: string[] | ((current: string[]) => string[])) => {
     setVisibleColumnKeys((current) => {

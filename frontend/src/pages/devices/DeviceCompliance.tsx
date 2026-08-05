@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Button, Card, Checkbox, Col, Descriptions, Drawer, Form, Input, InputNumber,
   Modal, Popconfirm, Progress, Row, Select, Space, Statistic, Switch, Table,
@@ -17,6 +17,9 @@ import {
 import type {
   CheckStatus, ComplianceStatus, DeviceCompliance, DeviceModelProfile, VersionBaseline,
 } from '../../api/compliance'
+import { getDatacenters, type Datacenter } from '../../api/devices'
+import { useSearchParams } from 'react-router-dom'
+import { readUrlNumber, replaceUrlValues } from '../../utils/urlState'
 
 
 const STATUS_META: Record<ComplianceStatus, { label: string; color: string }> = {
@@ -41,7 +44,9 @@ const CAPABILITIES = [
 ].map(([value, label]) => ({ value, label }))
 
 const CHECKS = [
-  ['model_profile', '型号模板'], ['version', '版本'], ['patch', '补丁'],
+  ['model_profile', '型号模板'], ['device_name', '设备名称'], ['device_model', '设备型号'],
+  ['serial_number', '序列号'], ['version', '版本'], ['patch', '补丁'],
+  ['hardware', '硬件运行状态'],
   ['snmp', 'SNMP'], ['exporter', 'Exporter'], ['syslog', 'Syslog'], ['tacacs', 'TACACS'],
 ].map(([value, label]) => ({ value, label }))
 
@@ -74,20 +79,25 @@ const vendorVersionLabel = (vendor?: string) => {
 
 const DeviceCompliancePage = () => {
   const canModify = !useAuthStore((state) => state.user?.read_only)
-  const [activeTab, setActiveTab] = useState('devices')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedTab = searchParams.get('tab') || 'devices'
+  const [activeTab, setActiveTab] = useState(['devices', 'profiles', 'baselines'].includes(requestedTab) ? requestedTab : 'devices')
   const [loading, setLoading] = useState(false)
   const [evaluating, setEvaluating] = useState(false)
   const [profiles, setProfiles] = useState<DeviceModelProfile[]>([])
   const [baselines, setBaselines] = useState<VersionBaseline[]>([])
+  const [datacenters, setDatacenters] = useState<Datacenter[]>([])
   const [devices, setDevices] = useState<DeviceCompliance[]>([])
   const [summary, setSummary] = useState({ total: 0, evaluated: 0, unevaluated: 0, counts: {} as Record<string, number>, compliance_rate: 0 })
   const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(50)
-  const [statusFilter, setStatusFilter] = useState<string>()
-  const [vendorFilter, setVendorFilter] = useState<string>()
-  const [search, setSearch] = useState('')
+  const [page, setPage] = useState(readUrlNumber(searchParams, 'page', 1)!)
+  const [pageSize, setPageSize] = useState(readUrlNumber(searchParams, 'page_size', 50)!)
+  const [statusFilter, setStatusFilter] = useState<string | undefined>(searchParams.get('status') || undefined)
+  const [vendorFilter, setVendorFilter] = useState<string | undefined>(searchParams.get('vendor') || undefined)
+  const [datacenterFilter, setDatacenterFilter] = useState<number | undefined>(readUrlNumber(searchParams, 'datacenter'))
+  const [search, setSearch] = useState(searchParams.get('q') || '')
   const [selected, setSelected] = useState<DeviceCompliance>()
+  const suppressedDeviceIdRef = useRef<number | null>(null)
   const [profileModal, setProfileModal] = useState(false)
   const [baselineModal, setBaselineModal] = useState(false)
   const [editingProfile, setEditingProfile] = useState<DeviceModelProfile>()
@@ -99,9 +109,10 @@ const DeviceCompliancePage = () => {
   const isStructuredBaseline = useStructuredVersionFields(baselineVendor)
 
   const loadCatalogs = async () => {
-    const [profileResult, baselineResult] = await Promise.all([getModelProfiles(), getVersionBaselines()])
+    const [profileResult, baselineResult, datacenterResult] = await Promise.all([getModelProfiles(), getVersionBaselines(), getDatacenters()])
     setProfiles(profileResult.items)
     setBaselines(baselineResult.items)
+    setDatacenters(datacenterResult)
   }
 
   const loadDevices = async (refresh = false, nextPage = page, nextPageSize = pageSize) => {
@@ -110,6 +121,7 @@ const DeviceCompliancePage = () => {
       limit: nextPageSize,
       overall_status: statusFilter,
       vendor: vendorFilter,
+      datacenter_id: datacenterFilter,
       search: search.trim() || undefined,
       refresh,
     })
@@ -132,6 +144,48 @@ const DeviceCompliancePage = () => {
   useEffect(() => {
     void loadAll()
   }, [])
+
+  useEffect(() => {
+    const next = replaceUrlValues(searchParams, {
+      tab: activeTab,
+      q: search,
+      status: statusFilter,
+      vendor: vendorFilter,
+      datacenter: datacenterFilter,
+      page,
+      page_size: pageSize,
+      device: selected?.device_id,
+    }, { tab: 'devices', page: 1, page_size: 50 })
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [activeTab, datacenterFilter, page, pageSize, search, searchParams, selected?.device_id, setSearchParams, statusFilter, vendorFilter])
+
+  useEffect(() => {
+    const selectedId = readUrlNumber(searchParams, 'device')
+    if (!selectedId) {
+      suppressedDeviceIdRef.current = null
+      return
+    }
+    if (suppressedDeviceIdRef.current === selectedId || selected?.device_id === selectedId) return
+    void getDeviceCompliance(selectedId).then(setSelected).catch(() => undefined)
+  }, [searchParams, selected?.device_id])
+
+  const closeSelectedDevice = () => {
+    const selectedId = selected?.device_id || readUrlNumber(searchParams, 'device') || null
+    suppressedDeviceIdRef.current = selectedId
+    const next = new URLSearchParams(searchParams)
+    next.delete('device')
+    setSearchParams(next, { replace: true })
+    setSelected(undefined)
+  }
+
+  useEffect(() => {
+    if (activeTab !== 'devices') return
+    const timer = window.setTimeout(() => {
+      setPage(1)
+      void loadDevices(false, 1, pageSize)
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [activeTab, search, statusFilter, vendorFilter, datacenterFilter])
 
   const runEvaluation = async (deviceId?: number) => {
     setEvaluating(true)
@@ -160,7 +214,7 @@ const DeviceCompliancePage = () => {
       priority: 100,
       is_active: true,
       capability_keys: ['snmp', 'syslog', 'tacacs', 'config_backup'],
-      required_checks: ['model_profile', 'version', 'snmp', 'syslog', 'tacacs'],
+      required_checks: ['model_profile', 'version', 'hardware', 'snmp', 'syslog', 'tacacs'],
     })
     setProfileModal(true)
   }
@@ -217,16 +271,21 @@ const DeviceCompliancePage = () => {
     ...devices.map((item) => item.device.vendor || ''),
   ].filter(Boolean))).sort().map((value) => ({ value, label: value })), [profiles, devices])
 
+  const datacenterOptions = useMemo(() => datacenters.map((item) => ({
+    value: item.id,
+    label: item.code ? `${item.name}（${item.code}）` : item.name,
+  })), [datacenters])
+
   const deviceColumns = [
     {
-      title: '设备', key: 'device', width: 250,
+      title: '设备名称', key: 'device', width: 240,
       render: (_: unknown, record: DeviceCompliance) => (
         <Button type="link" style={{ padding: 0, height: 'auto', textAlign: 'left' }} onClick={() => setSelected(record)}>
-          <div><strong>{record.device.name}</strong></div>
-          <div style={{ color: '#7b8794', fontSize: 12 }}>{record.device.ip_address}</div>
+          <strong>{record.device.name}</strong>
         </Button>
       ),
     },
+    { title: 'IP地址', key: 'ip_address', width: 130, ellipsis: true, render: (_: unknown, record: DeviceCompliance) => record.device.ip_address || '-' },
     { title: '机房', key: 'datacenter', width: 145, ellipsis: true, render: (_: unknown, record: DeviceCompliance) => record.device.datacenter?.name || '-' },
     { title: '厂商', key: 'vendor', width: 85, ellipsis: true, render: (_: unknown, record: DeviceCompliance) => record.device.vendor || '-' },
     { title: '型号', key: 'model', width: 145, ellipsis: true, render: (_: unknown, record: DeviceCompliance) => record.observed_model || record.device.model || '-' },
@@ -357,24 +416,21 @@ const DeviceCompliancePage = () => {
                 <Space wrap style={{ marginBottom: 12 }}>
                   <Input
                     allowClear value={search} onChange={(event) => setSearch(event.target.value)}
-                    onPressEnter={() => { setPage(1); void loadDevices(false, 1) }}
                     prefix={<SearchOutlined />} placeholder="设备名称、IP或型号" style={{ width: 260 }}
                   />
                   <Select allowClear placeholder="上线状态" value={statusFilter} onChange={setStatusFilter} style={{ width: 140 }}
                     options={Object.entries(STATUS_META).map(([value, meta]) => ({ value, label: meta.label }))} />
                   <Select allowClear showSearch placeholder="厂商" value={vendorFilter} onChange={setVendorFilter} style={{ width: 140 }} options={vendorOptions} />
-                  <Button onClick={() => { setPage(1); void loadDevices(false, 1) }}>查询</Button>
-                  <Button onClick={async () => {
-                    setSearch(''); setStatusFilter(undefined); setVendorFilter(undefined); setPage(1)
-                    const result = await getComplianceDevices({ skip: 0, limit: pageSize })
-                    setDevices(result.items); setTotal(result.total)
+                  <Select allowClear showSearch optionFilterProp="label" placeholder="机房" value={datacenterFilter} onChange={setDatacenterFilter} style={{ width: 220 }} options={datacenterOptions} />
+                  <Button onClick={() => {
+                    setSearch(''); setStatusFilter(undefined); setVendorFilter(undefined); setDatacenterFilter(undefined); setPage(1)
                   }}>重置</Button>
                 </Space>
                 <Table
                   rowKey="device_id" loading={loading} dataSource={devices} columns={deviceColumns}
                   size="small"
                   tableLayout="fixed"
-                  scroll={{ x: 1370 }}
+                  scroll={{ x: 1490 }}
                   pagination={{
                     current: page, pageSize, total, showSizeChanger: true, showTotal: (value) => `共 ${value} 台`,
                     onChange: (nextPage, nextPageSize) => {
@@ -418,7 +474,7 @@ const DeviceCompliancePage = () => {
         ]}
       />
 
-      <Drawer title="设备上线检查清单" width={920} open={Boolean(selected)} onClose={() => setSelected(undefined)}
+      <Drawer title="设备上线检查清单" width={920} open={Boolean(selected)} onClose={closeSelectedDevice}
         extra={selected && canModify ? <Button loading={evaluating} onClick={() => void runEvaluation(selected.device_id)}>立即核验</Button> : null}>
         {selected && (
           <>
@@ -429,6 +485,13 @@ const DeviceCompliancePage = () => {
               <Descriptions.Item label="软件版本">{selected.observed_version || '待采集'}</Descriptions.Item>
               <Descriptions.Item label="匹配模板">{selected.profile?.name || '未匹配'}</Descriptions.Item>
               <Descriptions.Item label="版本基线">{selected.baseline?.name || '未配置'}</Descriptions.Item>
+              <Descriptions.Item label="已采集补丁" span={2}>
+                {selected.observed_patches?.length ? (
+                  <Space size={[4, 4]} wrap>
+                    {selected.observed_patches.map((patch) => <Tag color="geekblue" key={patch}>{patch}</Tag>)}
+                  </Space>
+                ) : '未采集或无独立补丁'}
+              </Descriptions.Item>
               <Descriptions.Item label="上线状态"><Tag color={STATUS_META[selected.overall_status]?.color}>{STATUS_META[selected.overall_status]?.label}</Tag></Descriptions.Item>
               <Descriptions.Item label="合规度"><Progress percent={selected.score} size="small" /></Descriptions.Item>
             </Descriptions>

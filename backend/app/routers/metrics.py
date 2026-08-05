@@ -54,14 +54,18 @@ from app.utils.quality_probe import (
     discover_quality_nqa_snmp_instances,
     normalize_server_icmp_probe_config,
     normalize_quality_ping_result,
+    normalize_quality_target_addresses,
+    quality_probe_member_key,
     SERVER_ICMP_MIN_PACKET_COUNT,
     run_quality_nqa_snmp,
     run_quality_ping,
+    run_quality_ping_batch,
     run_mtr_or_trace,
     write_quality_probe_result,
 )
 from app.utils.telemetry_lossless import LOSSLESS_SENSOR_PATHS, sensor_cache_suffix
 from app.utils.telemetry_forwarding import forwarding_cache_key
+from app.utils.h3c_vlan_statistics import vlan_id_from_interface_name
 from app.utils.server_resources import (
     HISTORY_KEY as SERVER_RESOURCE_HISTORY_KEY,
     collect_host_resource_sample,
@@ -309,10 +313,31 @@ def _quality_target_payload(target: QualityProbeTarget) -> Dict[str, Any]:
     # “卡片最近一轮 100%，曲线近 5 分钟仍有丢包”的互相矛盾展示。
     # 专线 NQA 保持设备最近一次回显口径，不套用公网 ICMP 的滚动窗口。
     if (getattr(target, "probe_source", None) or "server_icmp") == "server_icmp":
-        latest_loss = _latest_quality_loss_from_window(target.id)
-        if latest_loss is not None:
+        addresses = normalize_quality_target_addresses(target.target, target.target_addresses)
+        statuses = target.target_statuses or {}
+        rolling_losses = []
+        for address in addresses:
+            status = statuses.get(address) or {}
+            cached_loss = status.get("rolling_packet_loss_percent")
+            try:
+                rolling_losses.append(float(cached_loss))
+            except (TypeError, ValueError):
+                # 兼容尚未完成一次新版采集的旧目标；后续采集会直接使用
+                # target_statuses 中已计算好的滚动值，不再扫描整段 Redis 历史。
+                fallback_loss = _latest_quality_loss_from_window(
+                    quality_probe_member_key(target.id, address)
+                )
+                if fallback_loss is not None:
+                    rolling_losses.append(fallback_loss)
+        rolling_losses = [value for value in rolling_losses if value is not None]
+        if rolling_losses:
+            latest_loss = max(rolling_losses)
             payload["last_packet_loss_percent"] = latest_loss
             payload["last_availability_percent"] = round(max(0.0, 100.0 - latest_loss), 2)
+        payload["member_count"] = len(addresses)
+        payload["abnormal_member_count"] = sum(
+            1 for address in addresses if statuses.get(address) and not bool(statuses[address].get("success"))
+        )
     return payload
 
 
@@ -1788,7 +1813,7 @@ def _traffic_summary_rows(
       |> sort(columns: ["_time"])
     '''
     rows = influx_client.query(flux)
-    _apply_windowed_octet_rates(rows, rate_window_seconds)
+    _apply_windowed_octet_rates(rows, rate_window_seconds, preserve_existing_rates=True)
     _apply_windowed_bps_average(rows, rate_window_seconds, interval_seconds, range_seconds)
 
     filtered_rows: List[Dict[str, Any]] = []
@@ -1849,7 +1874,12 @@ def _group_traffic_rows_by_target(rows: List[Dict[str, Any]]) -> Dict[str, List[
     return {key: [items[item_key] for item_key in sorted(items.keys())] for key, items in grouped.items()}
 
 
-def _apply_windowed_octet_rates(rows: List[Dict[str, Any]], window_seconds: int) -> None:
+def _apply_windowed_octet_rates(
+    rows: List[Dict[str, Any]],
+    window_seconds: int,
+    *,
+    preserve_existing_rates: bool = False,
+) -> None:
     if window_seconds <= 0:
         return
 
@@ -1874,10 +1904,18 @@ def _apply_windowed_octet_rates(rows: List[Dict[str, Any]], window_seconds: int)
                 if current_value is None:
                     continue
 
+                # Circuit/line charts are also used to verify traffic tests and
+                # troubleshoot microbursts. Their *_bps fields are calculated
+                # from adjacent counter samples and selected with max(), so a
+                # five-minute counter delta must not replace an existing rate
+                # and hide the real peak. The wider counter window remains a
+                # fallback for samples whose rate field is missing.
+                existing_rate = _safe_float(row.get(bps_key))
+
                 cutoff = row_time.timestamp() - window_seconds
                 candidates = [(time_value, value) for time_value, value in candidates if time_value.timestamp() >= cutoff]
                 previous = candidates[0] if candidates else last_seen
-                if previous:
+                if previous and not (preserve_existing_rates and existing_rate is not None):
                     previous_time, previous_value = previous
                     elapsed = (row_time - previous_time).total_seconds()
                     delta = current_value - previous_value
@@ -1925,10 +1963,23 @@ def _apply_windowed_bps_average(rows: List[Dict[str, Any]], window_seconds: int,
                 row[bps_key] = round(sum(value for _, value in candidates) / len(candidates), 2)
 
 
-def _recalculate_utilization_from_display_rates(rows: List[Dict[str, Any]]) -> None:
+def _recalculate_utilization_from_display_rates(
+    rows: List[Dict[str, Any]],
+    *,
+    allow_configured_bandwidth_overrun: bool = False,
+) -> None:
     """Keep utilization charts aligned with the displayed traffic rate window."""
     for row in rows:
-        _sanitize_impossible_interface_rates(row)
+        if allow_configured_bandwidth_overrun:
+            # H3C Vlan-interface bandwidth is route/interface metadata, not a
+            # physical line-rate cap.  Real VLAN forwarding can legitimately
+            # exceed it and must remain visible (utilization may exceed 100%).
+            for bps_key in ["in_bps", "out_bps"]:
+                value = _safe_float(row.get(bps_key))
+                if value is not None and value < 0:
+                    row[bps_key] = None
+        else:
+            _sanitize_impossible_interface_rates(row)
         speed_bps = _safe_float(row.get("speed_bps"))
         if not speed_bps or speed_bps <= 0:
             continue
@@ -2886,14 +2937,7 @@ async def _build_asternos_overview(device: Device) -> Dict[str, Any]:
             "storage_percent": None,
         },
         "sessions": {"current": None, "total": None, "usage_percent": None},
-        "hardware": {
-            "fan_total": 0,
-            "fan_down": 0,
-            "fan_status_known": True,
-            "power_total": 0,
-            "power_down": 0,
-            "power_status_known": True,
-        },
+        "hardware": asternos_exporter_client.hardware_summary(metrics),
         "protocols": {
             "bgp": _summarize_exporter_protocol(
                 asternos_exporter_client._rows(metrics, "bgp_status"),
@@ -3170,7 +3214,7 @@ async def get_traffic_summary(
         cutoff_ts = datetime.now(timezone.utc).timestamp() - range_seconds
         stop_ts = None
 
-    cache_key = f"traffic:summary:v1:{line_type}:{datacenter_id or 'all'}:{cache_range_key}:{safe_interval}:{octet_interval}:{rate_window_seconds}"
+    cache_key = f"traffic:summary:v2:{line_type}:{datacenter_id or 'all'}:{cache_range_key}:{safe_interval}:{octet_interval}:{rate_window_seconds}"
     if not fresh:
         cached = redis_client.get(cache_key)
         if cached:
@@ -3282,7 +3326,7 @@ async def get_circuit_traffic_history(
         cutoff_ts = datetime.now(timezone.utc).timestamp() - range_seconds
         stop_ts = None
 
-    cache_key = f"traffic:circuit_history:v1:{circuit_id}:{cache_range_key}:{safe_interval}:{octet_interval}:{rate_window_seconds}"
+    cache_key = f"traffic:circuit_history:v2:{circuit_id}:{cache_range_key}:{safe_interval}:{octet_interval}:{rate_window_seconds}"
     if not fresh:
         cached = redis_client.get(cache_key)
         if cached:
@@ -3375,6 +3419,39 @@ async def get_monitor_device_interface_history(
     if device.status not in {"active", "online"} or not device.is_monitored:
         raise HTTPException(status_code=400, detail="该设备未加入监控，或当前不是上线状态")
 
+    cached_interfaces = _load_monitor_cache("interfaces", device.id)
+    cached_interface = next(
+        (
+            item for item in (cached_interfaces.get("interfaces") or [])
+            if str(item.get("index")) == str(interface_index)
+        ),
+        None,
+    ) if isinstance(cached_interfaces, dict) else None
+    vlan_id = vlan_id_from_interface_name((cached_interface or {}).get("name"))
+    is_h3c_vlan_statistics = bool(
+        vlan_id is not None
+        and ("h3c" in _device_identity_text(device) or "华三" in _device_identity_text(device))
+    )
+    if is_h3c_vlan_statistics:
+        # Registration is cheap and persistent. The page never waits for SSH:
+        # the first selection queues a collection and the 30-second scheduler
+        # continues updating the same target afterward.
+        from app.tasks.snmp_tasks import (
+            collect_h3c_vlan_statistics,
+            is_h3c_vlan_statistics_excluded,
+            register_h3c_vlan_statistics_target,
+            remove_h3c_vlan_statistics_targets,
+        )
+
+        if is_h3c_vlan_statistics_excluded(device):
+            remove_h3c_vlan_statistics_targets(device.id)
+        else:
+            newly_registered = register_h3c_vlan_statistics_target(device.id, interface_index, int(vlan_id))
+            trigger_key = f"monitor:h3c_vlan_statistics:trigger:{device.id}"
+            trigger_allowed = bool(redis_client.set(trigger_key, "1", ex=20, nx=True))
+            if newly_registered or trigger_allowed:
+                collect_h3c_vlan_statistics.delay(device.id)
+
     start_time = datetime.fromtimestamp(start_ts / 1000, timezone.utc) if start_ts else _parse_query_datetime(start)
     end_time = datetime.fromtimestamp(end_ts / 1000, timezone.utc) if end_ts else (_parse_query_datetime(end) or datetime.now(timezone.utc))
     use_absolute_range = bool(start_time and start_time < end_time)
@@ -3419,7 +3496,7 @@ async def get_monitor_device_interface_history(
         range_clause = f'start: {_flux_time(start_time)}, stop: {_flux_time(end_time)}'
         traffic_start_time = start_time.timestamp() - rate_window_seconds
         traffic_range_clause = f'start: {_flux_time(datetime.fromtimestamp(traffic_start_time, timezone.utc))}, stop: {_flux_time(end_time)}'
-        cache_suffix = f":v12:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}:{octet_interval}:{rate_window_seconds}"
+        cache_suffix = f":v14:{interface_index}:{normalized_group}:abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}:{interval}:{octet_interval}:{rate_window_seconds}"
         logger.info(
             "端口历史绝对时间查询",
             device_id=device_id,
@@ -3433,7 +3510,7 @@ async def get_monitor_device_interface_history(
     else:
         range_clause = f"start: {range}"
         traffic_range_clause = f"start: -{traffic_start}"
-        cache_suffix = f":v12:{interface_index}:{normalized_group}:{range}:{interval}:{octet_interval}:{rate_window_seconds}"
+        cache_suffix = f":v14:{interface_index}:{normalized_group}:{range}:{interval}:{octet_interval}:{rate_window_seconds}"
     fresh_sample_written = False
     if not is_traffic_only:
         fresh_sample_written = await _persist_fresh_interface_sample(device, interface_index, range_seconds)
@@ -3441,7 +3518,7 @@ async def get_monitor_device_interface_history(
     if isinstance(cached_response, dict):
         return cached_response
 
-    interface_names: List[str] = []
+    interface_names: List[str] = [str(cached_interface.get("name"))] if cached_interface and cached_interface.get("name") else []
     if get_effective_monitor_source(device) == "asternos_exporter":
         lookup = await _resolve_asternos_interface_lookup(device, interface_index)
         interface_names = lookup["interface_names"]
@@ -3453,7 +3530,10 @@ async def get_monitor_device_interface_history(
                     interface_names = [str(v) for v in [item.get("name"), item.get("alias")] if v]
                     break
     interface_filter = _interface_history_filter(interface_index, interface_names)
-    source_filter = '|> filter(fn: (r) => r.source == "telemetry" or r.source == "telemetry_fallback_snmp")' if telemetry_interface else ""
+    if is_h3c_vlan_statistics:
+        source_filter = '|> filter(fn: (r) => r.source == "h3c_vlan_statistics")'
+    else:
+        source_filter = '|> filter(fn: (r) => r.source == "telemetry" or r.source == "telemetry_fallback_snmp")' if telemetry_interface else ""
 
     other_field_filter = '''
         r._field == "speed_bps" or
@@ -3531,11 +3611,14 @@ async def get_monitor_device_interface_history(
             rows=len(history),
             interval=interval,
         )
-    _apply_windowed_octet_rates(history, rate_window_seconds)
+    _apply_windowed_octet_rates(history, rate_window_seconds, preserve_existing_rates=True)
     _apply_windowed_bps_average(history, rate_window_seconds, interval_seconds, range_seconds)
     if get_effective_monitor_source(device) == "asternos_exporter":
         _fill_short_rate_gaps(history)
-    _recalculate_utilization_from_display_rates(history)
+    _recalculate_utilization_from_display_rates(
+        history,
+        allow_configured_bandwidth_overrun=is_h3c_vlan_statistics,
+    )
     _mark_stale_rate_samples(
         history,
         interval_seconds,
@@ -3611,7 +3694,7 @@ async def get_monitor_device_interface_history(
     }
     redis_client.setex(
         _monitor_cache_key("interface_history", device_id, suffix=cache_suffix),
-        HISTORY_REQUEST_CACHE_SECONDS,
+        5 if is_h3c_vlan_statistics and not history else HISTORY_REQUEST_CACHE_SECONDS,
         json.dumps(response_data, default=str),
     )
     return response_data
@@ -4788,7 +4871,7 @@ async def get_quality_probe_targets_sla(
 ):
     """批量计算质量目标SLA，供质量看板统一使用，避免逐卡查询InfluxDB。"""
     safe_range = _safe_flux_duration(range, "-1h")
-    cache_key = f"quality_probe:sla_summary:v4:{safe_range}"
+    cache_key = f"quality_probe:sla_summary:v5:{safe_range}"
     cached = redis_client.get(cache_key)
     if cached:
         try:
@@ -4800,42 +4883,43 @@ async def get_quality_probe_targets_sla(
     target_map = {str(target.id): target for target in targets}
     duration_seconds = _parse_flux_duration_seconds(safe_range, 3600)
 
-    def collect_values(range_clause: str) -> Dict[str, Dict[str, float]]:
+    def collect_values(range_clause: str) -> Dict[str, Dict[str, Dict[str, float]]]:
         flux = f'''
     base = from(bucket: "{influx_client.bucket}")
       |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "quality_probe")
     sent = base
       |> filter(fn: (r) => r._field == "sent")
-      |> group(columns: ["target_id", "_field"])
+      |> group(columns: ["target_id", "target", "_field"])
       |> sum()
     received = base
       |> filter(fn: (r) => r._field == "received")
-      |> group(columns: ["target_id", "_field"])
+      |> group(columns: ["target_id", "target", "_field"])
       |> sum()
     samples = base
       |> filter(fn: (r) => r._field == "sent")
-      |> group(columns: ["target_id"])
+      |> group(columns: ["target_id", "target"])
       |> count()
       |> set(key: "_field", value: "sample_count")
     latency = base
       |> filter(fn: (r) => r._field == "avg_latency_ms")
-      |> group(columns: ["target_id", "_field"])
+      |> group(columns: ["target_id", "target", "_field"])
       |> mean()
     jitter = base
       |> filter(fn: (r) => r._field == "jitter_ms")
-      |> group(columns: ["target_id", "_field"])
+      |> group(columns: ["target_id", "target", "_field"])
       |> mean()
     union(tables: [sent, received, samples, latency, jitter])
     '''
-        collected: Dict[str, Dict[str, float]] = {}
+        collected: Dict[str, Dict[str, Dict[str, float]]] = {}
         try:
             for row in influx_client.query(flux):
                 target_id = str(row.get("target_id") or "")
+                member_target = str(row.get("target") or target_map.get(target_id).target or "") if target_id in target_map else ""
                 field = str(row.get("_field") or "")
                 value = _safe_float(row.get("_value"))
-                if target_id in target_map and field and value is not None:
-                    collected.setdefault(target_id, {})[field] = value
+                if target_id in target_map and member_target and field and value is not None:
+                    collected.setdefault(target_id, {}).setdefault(member_target, {})[field] = value
         except Exception as exc:
             logger.warning("批量计算质量SLA失败", range=range_clause, error=str(exc))
         return collected
@@ -4891,8 +4975,31 @@ async def get_quality_probe_targets_sla(
     items: List[Dict[str, Any]] = []
     for target in targets:
         base_payload = _quality_target_payload(target)
-        metrics = values.get(str(target.id), {})
-        previous_metrics = previous_values.get(str(target.id), {})
+        member_values = values.get(str(target.id), {})
+        previous_member_values = previous_values.get(str(target.id), {})
+        configured_addresses = normalize_quality_target_addresses(target.target, target.target_addresses)
+        member_sla: List[Dict[str, Any]] = []
+        for address in configured_addresses:
+            member_metrics = member_values.get(address, {})
+            member_sent = max(0.0, member_metrics.get("sent", 0.0))
+            member_received = max(0.0, min(member_metrics.get("received", 0.0), member_sent)) if member_sent > 0 else 0.0
+            member_availability = round(member_received * 100.0 / member_sent, 3) if member_sent > 0 else None
+            member_sla.append({
+                "target": address,
+                "availability_percent": member_availability,
+                "packet_loss_percent": round(100.0 - member_availability, 3) if member_availability is not None else None,
+                "sent": int(round(member_sent)),
+                "received": int(round(member_received)),
+                "lost": int(round(max(0.0, member_sent - member_received))),
+                "sample_count": max(0, int(member_metrics.get("sample_count", 0))),
+                "avg_latency_ms": round(member_metrics["avg_latency_ms"], 2) if "avg_latency_ms" in member_metrics else None,
+                "avg_jitter_ms": round(member_metrics["jitter_ms"], 2) if "jitter_ms" in member_metrics else None,
+            })
+        available_members = [item for item in member_sla if item["availability_percent"] is not None]
+        worst_member = min(available_members, key=lambda item: item["availability_percent"]) if available_members else None
+        selected_address = str((worst_member or {"target": configured_addresses[0]}).get("target"))
+        metrics = member_values.get(selected_address, {})
+        previous_metrics = previous_member_values.get(selected_address, {})
         sent = max(0.0, metrics.get("sent", 0.0))
         received = max(0.0, min(metrics.get("received", 0.0), sent)) if sent > 0 else 0.0
         previous_sent = max(0.0, previous_metrics.get("sent", 0.0))
@@ -4905,7 +5012,7 @@ async def get_quality_probe_targets_sla(
         # SNMP/NQA读取还存在任务与网络开销，因此预期读取周期不低于5秒。
         effective_collection_interval = max(5, int(target.interval_seconds or 1))
         expected_samples = max(1, int(duration_seconds / effective_collection_interval))
-        availability = round(received * 100.0 / sent, 3) if sent > 0 else None
+        availability = worst_member.get("availability_percent") if worst_member else None
         previous_availability = (
             round(previous_received * 100.0 / previous_sent, 3)
             if previous_sent > 0 else None
@@ -4976,6 +5083,13 @@ async def get_quality_probe_targets_sla(
             "sla_data_completeness_percent": round(min(100.0, sample_count * 100.0 / expected_samples), 2),
             "sla_avg_latency_ms": round(metrics["avg_latency_ms"], 2) if "avg_latency_ms" in metrics else None,
             "sla_avg_jitter_ms": round(metrics["jitter_ms"], 2) if "jitter_ms" in metrics else None,
+            "member_sla": member_sla,
+            "member_count": len(configured_addresses),
+            "abnormal_member_count": sum(
+                1 for item in member_sla
+                if item["availability_percent"] is not None and item["availability_percent"] < 100.0
+            ),
+            "sla_worst_member_target": worst_member.get("target") if worst_member else None,
             "sla_previous_availability_percent": previous_availability,
             "sla_availability_change_percent": (
                 round(availability - previous_availability, 3)
@@ -5199,7 +5313,10 @@ async def save_quality_target_alert_settings(target_id: int, payload: dict, db: 
         active_alerts = db.query(AlertHistory).filter(
             AlertHistory.rule_id == rule.id,
             AlertHistory.alert_target_type == "quality_probe",
-            AlertHistory.alert_target_key == str(target_id),
+            or_(
+                AlertHistory.alert_target_key == str(target_id),
+                AlertHistory.alert_target_key.like(f"{target_id}:%"),
+            ),
             AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
         ).all()
         for alert in active_alerts:
@@ -5208,6 +5325,11 @@ async def save_quality_target_alert_settings(target_id: int, payload: dict, db: 
             alert.resolved_by = "target_alert_disabled"
             alert.resolution_note = "该质量探测目标的告警通知已停用"
         redis_client.delete(f"quality_probe:consecutive_loss:{target_id}")
+        for address in normalize_quality_target_addresses(target.target, target.target_addresses):
+            member_key = quality_probe_member_key(target_id, address)
+            redis_client.delete(f"quality_probe:consecutive_loss:{member_key}")
+            redis_client.delete(f"quality_probe:consecutive_latency:{member_key}")
+            redis_client.delete(f"quality_probe:consecutive_jitter:{member_key}")
     db.commit()
     db.refresh(rule)
     return _quality_target_alert_settings_payload(rule, target_id)
@@ -5220,10 +5342,16 @@ async def create_quality_probe_target(
 ):
     """新增公网质量探测目标"""
     data = payload.model_dump()
-    data["target"] = data["target"].strip()
+    try:
+        addresses = normalize_quality_target_addresses(data.get("target"), data.get("target_addresses"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    data["target"] = addresses[0]
+    data["target_addresses"] = addresses
     data["name"] = data["name"].strip()
     data = normalize_server_icmp_probe_config(data)
     if data.get("probe_source") == "device_nqa_snmp":
+        data["target_addresses"] = [data["target"]]
         device = db.query(Device).filter(Device.id == data.get("device_id")).first()
         if not device:
             raise HTTPException(status_code=400, detail="请选择有效的NQA采集设备")
@@ -5308,6 +5436,15 @@ async def update_quality_probe_target(
     update_data = payload.model_dump(exclude_unset=True)
     effective_source = update_data.get("probe_source", db_target.probe_source or "server_icmp")
     if effective_source == "server_icmp":
+        try:
+            addresses = normalize_quality_target_addresses(
+                update_data.get("target", db_target.target),
+                update_data.get("target_addresses", db_target.target_addresses),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        update_data["target"] = addresses[0]
+        update_data["target_addresses"] = addresses
         if "interval_seconds" in update_data:
             update_data["interval_seconds"] = max(int(update_data.get("interval_seconds") or 60), 30)
         if "packet_count" in update_data:
@@ -5316,10 +5453,11 @@ async def update_quality_probe_target(
             update_data["timeout_ms"] = max(int(update_data.get("timeout_ms") or 1500), 1500)
         if bool(update_data.get("mtr_enabled", db_target.mtr_enabled)):
             update_data["mtr_interval_seconds"] = max(
-                int(update_data.get("mtr_interval_seconds", db_target.mtr_interval_seconds) or 300),
-                300,
+                int(update_data.get("mtr_interval_seconds", db_target.mtr_interval_seconds) or 3600),
+                3600,
             )
     if effective_source == "device_nqa_snmp":
+        update_data["target_addresses"] = [str(update_data.get("target", db_target.target)).strip()]
         device_id = update_data.get("device_id", db_target.device_id)
         admin_name = update_data.get("nqa_admin_name", db_target.nqa_admin_name)
         operation_tag = update_data.get("nqa_operation_tag", db_target.nqa_operation_tag)
@@ -5376,12 +5514,56 @@ async def test_quality_probe_target(target_id: int, db: Session = Depends(get_db
             raise HTTPException(status_code=400, detail="NQA采集设备不存在")
         result = await asyncio.to_thread(run_quality_nqa_snmp, db_target, device)
     else:
-        result = await asyncio.to_thread(
-            run_quality_ping,
-            db_target.target,
-            db_target.packet_count or SERVER_ICMP_MIN_PACKET_COUNT,
-            db_target.timeout_ms or 1000,
-        )
+        addresses = normalize_quality_target_addresses(db_target.target, db_target.target_addresses)
+        batch_items = [{
+            "id": quality_probe_member_key(db_target.id, address),
+            "target": address,
+            "packet_count": db_target.packet_count or SERVER_ICMP_MIN_PACKET_COUNT,
+            "timeout_ms": db_target.timeout_ms or 1000,
+        } for address in addresses]
+        batch_results = await asyncio.to_thread(run_quality_ping_batch, batch_items)
+        results: Dict[str, Dict[str, Any]] = {}
+        statuses = dict(db_target.target_statuses or {})
+        now = datetime.now(timezone.utc)
+        for address in addresses:
+            key = quality_probe_member_key(db_target.id, address)
+            raw_member = normalize_quality_ping_result(batch_results.get(key) or {})
+            member_result = apply_quality_loss_window(key, raw_member)
+            results[address] = member_result
+            statuses[address] = {
+                "success": bool(member_result.get("success")),
+                "avg_latency_ms": member_result.get("avg_latency_ms"),
+                "packet_loss_percent": member_result.get("current_packet_loss_percent", raw_member.get("packet_loss_percent")),
+                "rolling_packet_loss_percent": member_result.get("packet_loss_percent"),
+                "jitter_ms": member_result.get("jitter_ms"),
+                "received": member_result.get("received"),
+                "sent": member_result.get("sent"),
+                "error": member_result.get("error"),
+                "last_probe_at": now.isoformat(),
+            }
+            write_quality_probe_result(db_target, member_result, address)
+        worst_address, result = max(results.items(), key=lambda item: (
+            0 if item[1].get("success") else 1,
+            float(item[1].get("packet_loss_percent") or 0),
+            float(item[1].get("avg_latency_ms") or 0),
+        ))
+        raw_result = result
+        db_target.target_statuses = statuses
+        db_target.last_probe_at = now
+        db_target.last_success = all(bool(item.get("success")) for item in results.values())
+        db_target.last_avg_latency_ms = result.get("avg_latency_ms")
+        db_target.last_packet_loss_percent = result.get("current_packet_loss_percent", result.get("packet_loss_percent"))
+        db_target.last_jitter_ms = max((float(item.get("jitter_ms")) for item in results.values() if item.get("jitter_ms") is not None), default=None)
+        failed_addresses = [address for address, item in results.items() if not item.get("success")]
+        db_target.last_error = f"异常目标：{', '.join(failed_addresses)}" if failed_addresses else None
+        db.commit()
+        db.refresh(db_target)
+        return {
+            "target": _quality_target_payload(db_target),
+            "result": result,
+            "results": results,
+            "summary": {"total": len(results), "healthy": len(results) - len(failed_addresses), "abnormal": len(failed_addresses)},
+        }
     raw_result = normalize_quality_ping_result(result or {})
     result = apply_quality_loss_window(db_target.id, raw_result)
     db_target.last_probe_at = datetime.now(timezone.utc)
@@ -5398,15 +5580,24 @@ async def test_quality_probe_target(target_id: int, db: Session = Depends(get_db
 
 
 @router.post("/quality/probe-targets/{target_id}/mtr")
-async def run_quality_probe_mtr(target_id: int, db: Session = Depends(get_db)):
+async def run_quality_probe_mtr(
+    target_id: int,
+    member_target: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
     """对质量探测目标执行一次 MTR/Traceroute。"""
     db_target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
     if not db_target:
         raise HTTPException(status_code=404, detail="质量探测目标不存在")
-    result = await asyncio.to_thread(run_mtr_or_trace, db_target.target, 5, 30, False)
+    addresses = normalize_quality_target_addresses(db_target.target, db_target.target_addresses)
+    selected = member_target or addresses[0]
+    if selected not in addresses:
+        raise HTTPException(status_code=400, detail="所选地址不属于该探测卡片")
+    result = await asyncio.to_thread(run_mtr_or_trace, selected, 5, 30, False)
     return {
         "target": _quality_target_payload(db_target),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "member_target": selected,
         **result,
     }
 
@@ -5414,34 +5605,57 @@ async def run_quality_probe_mtr(target_id: int, db: Session = Depends(get_db)):
 @router.get("/quality/probe-targets/{target_id}/mtr-observation")
 async def get_quality_probe_mtr_observation(
     target_id: int,
-    snapshot_limit: int = Query(10, ge=1, le=50),
-    event_limit: int = Query(20, ge=1, le=100),
+    member_target: Optional[str] = Query(None),
+    days: int = Query(7, ge=1, le=30),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    event_limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
     """查看质量目标的周期MTR路径观察结果。"""
     target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="质量探测目标不存在")
+    addresses = normalize_quality_target_addresses(target.target, target.target_addresses)
+    selected = member_target or addresses[0]
+    if selected not in addresses:
+        raise HTTPException(status_code=400, detail="所选地址不属于该探测卡片")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    snapshot_query = db.query(QualityMtrSnapshot).filter(
+        QualityMtrSnapshot.target_id == target_id,
+        QualityMtrSnapshot.target == selected,
+        QualityMtrSnapshot.created_at >= cutoff,
+    )
+    snapshot_total = snapshot_query.count()
     snapshots = (
-        db.query(QualityMtrSnapshot)
-        .filter(QualityMtrSnapshot.target_id == target_id)
+        snapshot_query
         .order_by(QualityMtrSnapshot.created_at.desc(), QualityMtrSnapshot.id.desc())
-        .limit(snapshot_limit)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
         .all()
     )
-    events = (
+    event_rows = (
         db.query(QualityMtrEvent)
         .filter(QualityMtrEvent.target_id == target_id)
+        .filter(QualityMtrEvent.created_at >= cutoff)
         .order_by(QualityMtrEvent.created_at.desc(), QualityMtrEvent.id.desc())
-        .limit(event_limit)
         .all()
     )
+    events = [
+        item for item in event_rows
+        if str((item.detail or {}).get("target") or target.target) == selected
+    ][:event_limit]
     latest = snapshots[0] if snapshots else None
     previous = next((item for item in snapshots[1:] if item.path_hash != (latest.path_hash if latest else None)), None) if latest else None
     return {
         "target": _quality_target_payload(target),
         "enabled": bool(target.mtr_enabled),
-        "interval_seconds": int(target.mtr_interval_seconds or 300),
+        "interval_seconds": int(target.mtr_interval_seconds or 3600),
+        "member_target": selected,
+        "days": days,
+        "page": page,
+        "page_size": page_size,
+        "snapshot_total": snapshot_total,
         "latest_snapshot": latest.to_dict() if latest else None,
         "previous_different_snapshot": previous.to_dict() if previous else None,
         "snapshots": [item.to_dict() for item in snapshots],
@@ -5452,6 +5666,7 @@ async def get_quality_probe_mtr_observation(
 @router.get("/quality/probe-targets/{target_id}/history")
 async def get_quality_probe_history(
     target_id: int,
+    member_target: Optional[str] = Query(None, description="多地址卡片中要查看的具体目标"),
     range: str = Query("-24h", description="查询范围，例如 -1h/-6h/-24h/-7d/-30d/-365d"),
     interval: str = Query("1m", description="聚合间隔，例如 30s/1m/5m/1h"),
     start: Optional[str] = Query(None, description="绝对开始时间"),
@@ -5464,11 +5679,16 @@ async def get_quality_probe_history(
     db_target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first()
     if not db_target:
         raise HTTPException(status_code=404, detail="质量探测目标不存在")
+    addresses = normalize_quality_target_addresses(db_target.target, db_target.target_addresses)
+    selected_target = member_target or addresses[0]
+    if selected_target not in addresses:
+        raise HTTPException(status_code=400, detail="所选地址不属于该探测卡片")
     safe_range = _safe_flux_duration(range, "-24h")
     safe_interval = _safe_flux_interval(interval, "1m")
     range_clause, use_absolute_range, start_time, end_time = _build_query_range_clause(safe_range, start, end, start_ts, end_ts)
     cache_range_key = f"abs:{int(start_time.timestamp())}:{int(end_time.timestamp())}" if use_absolute_range and start_time and end_time else safe_range
-    cache_key = f"quality_probe:history:v8:{target_id}:{cache_range_key}:{safe_interval}"
+    member_cache_key = quality_probe_member_key(target_id, selected_target)
+    cache_key = f"quality_probe:history:v9:{member_cache_key}:{cache_range_key}:{safe_interval}"
     cached = redis_client.get(cache_key)
     if cached:
         try:
@@ -5476,11 +5696,13 @@ async def get_quality_probe_history(
         except Exception:
             redis_client.delete(cache_key)
     escaped_id = _flux_string(target_id)
+    escaped_target = _flux_string(selected_target)
     metrics_flux = f'''
     from(bucket: "{influx_client.bucket}")
       |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "quality_probe")
       |> filter(fn: (r) => r.target_id == {escaped_id})
+      |> filter(fn: (r) => r.target == {escaped_target})
       |> filter(fn: (r) => r._field == "avg_latency_ms" or r._field == "min_latency_ms" or r._field == "max_latency_ms" or r._field == "jitter_ms" or r._field == "jitter_sd_ms" or r._field == "jitter_ds_ms")
       |> aggregateWindow(every: {safe_interval}, fn: mean, createEmpty: false)
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
@@ -5491,6 +5713,7 @@ async def get_quality_probe_history(
       |> range({range_clause})
       |> filter(fn: (r) => r._measurement == "quality_probe")
       |> filter(fn: (r) => r.target_id == {escaped_id})
+      |> filter(fn: (r) => r.target == {escaped_target})
       |> filter(fn: (r) => r._field == "sent" or r._field == "received" or r._field == "packet_loss_percent" or r._field == "availability_percent" or r._field == "rolling_packet_loss_percent" or r._field == "rolling_availability_percent")
       |> aggregateWindow(every: {safe_interval}, fn: mean, createEmpty: false)
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
@@ -5568,6 +5791,7 @@ async def get_quality_probe_history(
             item["availability_percent"] = round(bounded_received * 100.0 / rolling_sent, 2)
     payload = {
         "target": _quality_target_payload(db_target),
+        "member_target": selected_target,
         "range": safe_range,
         "start": start_time.isoformat() if use_absolute_range and start_time else None,
         "end": end_time.isoformat() if use_absolute_range and end_time else None,

@@ -140,6 +140,75 @@ class AsterNOSExporterClient:
             "uptime_seconds": uptime_seconds,
         }
 
+    @classmethod
+    def hardware_summary(cls, metrics: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        """汇总 AsterNOS Exporter 风扇/电源状态，未上报的类别保持 unknown。"""
+        available_rows = cls._rows(metrics, "device_fan_available_status")
+        operational_rows = cls._rows(metrics, "device_fan_operational_status")
+        rpm_rows = cls._rows(metrics, "device_fan_rpm")
+
+        def component_key(row: Dict[str, Any], position: int) -> str:
+            labels = row.get("metric") or {}
+            return str(labels.get("name") or labels.get("fan") or labels.get("slot") or f"fan{position}")
+
+        available = {
+            component_key(row, position): row.get("value")
+            for position, row in enumerate(available_rows, start=1)
+        }
+        operational = {
+            component_key(row, position): row.get("value")
+            for position, row in enumerate(operational_rows, start=1)
+        }
+        rpm = {
+            component_key(row, position): row.get("value")
+            for position, row in enumerate(rpm_rows, start=1)
+        }
+        fan_names = sorted(set(available) | set(operational) | set(rpm))
+        fans: List[Dict[str, Any]] = []
+        absent_fans: List[Dict[str, Any]] = []
+        for name in fan_names:
+            available_value = available.get(name)
+            operational_value = operational.get(name)
+            # 有在位指标时只统计明确在位的实体；旧版 Exporter 没有在位指标时，
+            # 兼容使用运行状态或转速指标发现风扇。
+            present = available_value is None or available_value >= 1
+            if not present:
+                absent_fans.append({"name": name, "available": False, "operational": None, "rpm": rpm.get(name)})
+                continue
+            fans.append({
+                "name": name,
+                "available": available_value >= 1 if available_value is not None else None,
+                "operational": operational_value >= 1 if operational_value is not None else None,
+                "rpm": rpm.get(name),
+            })
+
+        # 现网 AsterNOS Exporter 仅在部分型号提供 PSU 输入功率。没有 PSU 指标时
+        # 必须标记为未知，不能把“未上报”误认为“电源正常”。
+        power_rows = cls._rows(metrics, "psu_power_input")
+        powers: List[Dict[str, Any]] = []
+        for position, row in enumerate(power_rows, start=1):
+            labels = row.get("metric") or {}
+            value = row.get("value")
+            powers.append({
+                "name": str(labels.get("name") or labels.get("psu") or labels.get("slot") or f"power{position}"),
+                "operational": value is not None and value > 0,
+                "power_input": value,
+            })
+
+        return {
+            "fan_total": len(fans),
+            "fan_expected_total": len(fans) + len(absent_fans),
+            "fan_absent": len(absent_fans),
+            "fan_down": sum(1 for item in fans if item.get("operational") is False),
+            "fan_status_known": bool(fans) and all(item.get("operational") is not None for item in fans),
+            "fans": fans,
+            "absent_fans": absent_fans,
+            "power_total": len(powers),
+            "power_down": sum(1 for item in powers if item.get("operational") is False),
+            "power_status_known": bool(powers),
+            "powers": powers,
+        }
+
     async def list_interfaces(self, device: Any) -> List[Dict[str, Any]]:
         metrics = await self.scrape(device)
         rows = self._rows(metrics, "interface_info")

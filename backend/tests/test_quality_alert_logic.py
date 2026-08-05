@@ -67,6 +67,32 @@ def test_quality_notification_uses_target_specific_robot_and_mentions():
     assert alert_tasks._notification_mentions_for_alert(rule, alert) == ["13800138000"]
 
 
+def test_multi_target_quality_notification_uses_parent_card_robot():
+    rule = SimpleNamespace(
+        metric_type="quality_packet_loss",
+        notification_channels=[],
+        extra_config={
+            "target_notifications": {
+                "9": {
+                    "enabled": True,
+                    "channel_type": "wechat",
+                    "webhook_url": "https://example.invalid/robot/target-9",
+                    "mention_users": ["13800138000"],
+                },
+            }
+        },
+    )
+    alert = SimpleNamespace(
+        alert_target_type="quality_probe",
+        alert_target_key="9:0123456789ab",
+    )
+
+    channels = alert_tasks._notification_channels_for_alert(rule, alert)
+
+    assert channels[0]["config"]["webhook"].endswith("target-9")
+    assert alert_tasks._notification_mentions_for_alert(rule, alert) == ["13800138000"]
+
+
 def test_quality_notification_impact_text_is_actionable():
     assert "完全不可达" in alert_tasks._quality_impact_text(100)
     assert "严重丢包" in alert_tasks._quality_impact_text(10)
@@ -81,8 +107,68 @@ def test_quality_notification_title_distinguishes_fault_and_recovery():
         extra_config={},
     )
 
-    assert "公网链路质量下降" in alert_tasks._build_notification_title(rule, "firing", None)
-    assert "公网链路质量恢复" in alert_tasks._build_notification_title(rule, "auto_resolved", None)
+    assert "公网链路严重丢包" in alert_tasks._build_notification_title(rule, "firing", None)
+    assert "公网链路丢包恢复" in alert_tasks._build_notification_title(rule, "auto_resolved", None)
+
+
+def test_quality_latency_title_is_distinct_from_packet_loss():
+    rule = SimpleNamespace(metric_type="quality_latency", severity="P1", extra_config={})
+
+    assert alert_tasks._build_notification_title(rule, "firing", None) == "P1-公网链路延迟升高"
+    assert alert_tasks._build_notification_title(rule, "auto_resolved", None) == "P1-公网链路延迟恢复"
+
+
+def test_critical_packet_loss_title_is_p0_and_distinct_from_latency():
+    rule = SimpleNamespace(metric_type="quality_packet_loss_critical", severity="P0", extra_config={})
+
+    assert alert_tasks._build_notification_title(rule, "firing", None) == "P0-公网链路严重丢包"
+    assert alert_tasks._build_notification_title(rule, "auto_resolved", None) == "P0-公网链路丢包恢复"
+
+
+def test_firing_quality_alert_repeats_after_rule_interval(monkeypatch):
+    alert = SimpleNamespace(
+        status="firing",
+        started_at=None,
+        notifications_sent=[
+            {
+                "event_type": "firing",
+                "success": True,
+                "sent_at": "2026-08-04T10:40:00+00:00",
+            }
+        ],
+    )
+    rule = SimpleNamespace(suppress_duration=300)
+
+    monkeypatch.setattr(
+        alert_tasks,
+        "_utc_now",
+        lambda: alert_tasks.datetime.fromisoformat("2026-08-04T10:45:01+00:00"),
+    )
+
+    assert alert_tasks._should_repeat_notify(alert, rule) is True
+
+
+def test_firing_quality_alert_does_not_repeat_before_rule_interval(monkeypatch):
+    alert = SimpleNamespace(
+        status="firing",
+        started_at=None,
+        notifications_sent=[
+            {
+                "event_type": "firing",
+                "success": True,
+                "sent_at": "2026-08-04T10:40:00+00:00",
+            }
+        ],
+    )
+    rule = SimpleNamespace(suppress_duration=300)
+
+    monkeypatch.setattr(
+        alert_tasks,
+        "_utc_now",
+        lambda: alert_tasks.datetime.fromisoformat("2026-08-04T10:44:59+00:00"),
+    )
+
+    assert alert_tasks._should_repeat_notify(alert, rule) is False
 
 
 def test_reachability_recovery_title_keeps_original_probe_type():

@@ -16,11 +16,15 @@ TACACS_LOG_FILE = Path("/app/data/tacacs/logs/tacacs.log")
 TACACS_LOG_PATTERN = re.compile(
     r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+\w+\s+\S+\s+\S+.*?cmd="
 )
-DEFAULT_REQUIRED_CHECKS = ["model_profile", "version", "snmp", "syslog", "tacacs"]
+DEFAULT_REQUIRED_CHECKS = ["model_profile", "version", "hardware", "snmp", "syslog", "tacacs"]
 CHECK_LABELS = {
     "model_profile": "型号能力模板",
+    "device_name": "设备名称一致性",
+    "device_model": "设备型号一致性",
+    "serial_number": "序列号一致性",
     "version": "版本基线",
     "patch": "补丁基线",
+    "hardware": "硬件运行状态",
     "snmp": "SNMP",
     "exporter": "Exporter",
     "syslog": "Syslog",
@@ -224,6 +228,37 @@ def _check(key: str, status: str, message: str, evidence: Any = None, required: 
     }
 
 
+def _identity_check(
+    key: str,
+    expected: Any,
+    observed: Any,
+    *,
+    model: bool = False,
+    vendor: Any = None,
+) -> Dict[str, Any]:
+    """比较CMDB录入值与设备实际上报值；缺任一侧时不猜测为正常。"""
+    expected_text = str(expected or "").strip()
+    observed_text = str(observed or "").strip()
+    evidence = {"recorded": expected_text or None, "observed": observed_text or None}
+    if not expected_text:
+        return _check(key, "pending", f"尚未录入{CHECK_LABELS[key].removesuffix('一致性')}", evidence, True)
+    if not observed_text:
+        return _check(key, "pending", f"Exporter尚未上报{CHECK_LABELS[key].removesuffix('一致性')}", evidence, True)
+    if model:
+        matched = _normalize(canonical_model_name(expected_text, vendor)) == _normalize(
+            canonical_model_name(observed_text, vendor)
+        )
+    else:
+        matched = _normalize(expected_text) == _normalize(observed_text)
+    return _check(
+        key,
+        "passed" if matched else "failed",
+        f"{CHECK_LABELS[key].removesuffix('一致性')}与录入信息一致" if matched else f"{CHECK_LABELS[key].removesuffix('一致性')}与录入信息不一致",
+        evidence,
+        True,
+    )
+
+
 def evaluate_device(
     device: Device,
     profiles: Iterable[DeviceModelProfile],
@@ -260,10 +295,20 @@ def evaluate_device(
         "snmp": not asternos,
         "exporter": asternos,
         "syslog": True,
-        "tacacs": not asternos,
+        "tacacs": True,
     }
     effective_capabilities = {**inferred_capabilities, **capabilities}
     required_checks = list(profile.required_checks or DEFAULT_REQUIRED_CHECKS) if profile else DEFAULT_REQUIRED_CHECKS.copy()
+    # Part Number has been retired from asset entry and onboarding. Ignore it
+    # on profiles created before the field was removed.
+    required_checks = [key for key in required_checks if key != "part_number"]
+    if asternos:
+        # Asteros准入固定要求Exporter、Syslog和TACACS，不能被旧型号模板中的
+        # tacacs=false静默降级为“不适用”。
+        effective_capabilities.update({"exporter": True, "syslog": True, "tacacs": True})
+        for key in ("device_name", "device_model", "serial_number", "version", "patch", "hardware", "exporter", "syslog", "tacacs"):
+            if key not in required_checks:
+                required_checks.append(key)
     if baseline and baseline.required_patches and "patch" not in required_checks:
         required_checks.append("patch")
 
@@ -275,6 +320,13 @@ def evaluate_device(
         {"profile_id": profile.id, "network_type": profile.network_type} if profile else None,
         "model_profile" in required_checks,
     ))
+
+    if asternos:
+        checks.extend([
+            _identity_check("device_name", device.name, system_info.get("sys_name")),
+            _identity_check("device_model", device.model, system_info.get("snmp_model"), model=True, vendor=device.vendor),
+            _identity_check("serial_number", device.serial_number, system_info.get("serial_number")),
+        ])
 
     if "version" not in required_checks:
         checks.append(_check("version", "skipped", "该型号未要求版本检查", required=False))
@@ -376,6 +428,50 @@ def evaluate_device(
             },
             True,
         ))
+
+    hardware = overview.get("hardware") if isinstance(overview.get("hardware"), dict) else {}
+    fan_total = int(hardware.get("fan_total") or 0)
+    fan_expected_total = int(hardware.get("fan_expected_total") or fan_total)
+    fan_absent = int(hardware.get("fan_absent") or 0)
+    fan_down = int(hardware.get("fan_down") or 0)
+    power_total = int(hardware.get("power_total") or 0)
+    power_down = int(hardware.get("power_down") or 0)
+    fan_known = bool(hardware.get("fan_status_known", fan_total > 0))
+    power_known = bool(hardware.get("power_status_known", power_total > 0))
+    hardware_evidence = {
+        "fan_total": fan_total,
+        "fan_expected_total": fan_expected_total,
+        "fan_absent": fan_absent,
+        "fan_abnormal": fan_down,
+        "power_total": power_total,
+        "power_abnormal": power_down,
+        "collected_at": overview.get("collected_at"),
+    }
+    hardware_required = "hardware" in required_checks
+    if fan_absent or fan_down or power_down:
+        abnormal_parts = []
+        if fan_absent:
+            abnormal_parts.append(f"风扇缺位 {fan_absent} 个")
+        if fan_down:
+            abnormal_parts.append(f"风扇异常 {fan_down} 个")
+        if power_down:
+            abnormal_parts.append(f"电源异常 {power_down} 个")
+        checks.append(_check("hardware", "failed", "，".join(abnormal_parts), hardware_evidence, hardware_required))
+    elif fan_total <= 0 and power_total <= 0:
+        checks.append(_check("hardware", "pending", "尚未采集到风扇或电源运行状态", hardware_evidence, hardware_required))
+    elif (fan_total > 0 and not fan_known) or (power_total > 0 and not power_known):
+        checks.append(_check("hardware", "pending", "已发现硬件组件，但运行状态无法确认", hardware_evidence, hardware_required))
+    else:
+        normal_parts = []
+        if fan_total > 0:
+            normal_parts.append(f"风扇 {fan_total} 个运行正常")
+        else:
+            normal_parts.append("风扇指标未上报")
+        if power_total > 0:
+            normal_parts.append(f"电源 {power_total} 个运行正常")
+        else:
+            normal_parts.append("电源指标未上报")
+        checks.append(_check("hardware", "passed", "；".join(normal_parts), hardware_evidence, hardware_required))
 
     if asternos:
         exporter_ok = (

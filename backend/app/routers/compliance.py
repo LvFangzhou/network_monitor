@@ -85,7 +85,7 @@ def _inferred_profile(device: Device):
         "snmp": not asternos,
         "exporter": asternos,
         "syslog": True,
-        "tacacs": not asternos,
+        "tacacs": True,
         "telemetry": "h3c" in normalized_vendor,
         "bmp": False,
         "nqa": "h3c" in normalized_vendor,
@@ -105,7 +105,8 @@ def _inferred_profile(device: Device):
         "default_role": device.device_role,
         "capabilities": capabilities,
         "required_checks": [
-            "model_profile", "version", "exporter" if asternos else "snmp", "syslog", "tacacs",
+            *(["model_profile", "device_name", "device_model", "serial_number"] if asternos else ["model_profile"]),
+            "version", "patch", "hardware", "exporter" if asternos else "snmp", "syslog", "tacacs",
         ],
         "description": "根据现有CMDB设备自动生成，请核对网络类型、能力和必检项。",
         "priority": 100,
@@ -307,23 +308,16 @@ async def list_device_compliance(
     limit: int = Query(50, ge=1, le=500),
     overall_status: Optional[str] = None,
     vendor: Optional[str] = None,
+    datacenter_id: Optional[int] = None,
     search: Optional[str] = None,
     refresh: bool = False,
     db: Session = Depends(get_db),
     _: User = Depends(get_current_active_user),
 ):
-    if refresh or db.query(DeviceComplianceSnapshot).count() == 0:
-        _evaluate_and_save(db, db.query(Device).options(joinedload(Device.datacenter_ref)).all())
-    else:
-        evaluated_ids = {
-            device_id for (device_id,) in db.query(DeviceComplianceSnapshot.device_id).all()
-        }
-        missing_query = db.query(Device).options(joinedload(Device.datacenter_ref))
-        if evaluated_ids:
-            missing_query = missing_query.filter(Device.id.notin_(evaluated_ids))
-        missing_devices = missing_query.all()
-        if missing_devices:
-            _evaluate_and_save(db, missing_devices)
+    # 上线合规是准入/复核动作，不是后台巡检。
+    # 列表接口只展示上一次核验快照；真正执行版本、补丁、Syslog、SNMP/Exporter、TACACS
+    # 对比的入口统一收口到 POST /compliance/evaluate，避免用户打开页面或刷新列表时
+    # 隐式触发全设备核验。
 
     query = db.query(DeviceComplianceSnapshot, Device).join(
         Device, Device.id == DeviceComplianceSnapshot.device_id
@@ -332,6 +326,8 @@ async def list_device_compliance(
         query = query.filter(DeviceComplianceSnapshot.overall_status == overall_status)
     if vendor:
         query = query.filter(Device.vendor.ilike(f"%{vendor.strip()}%"))
+    if datacenter_id:
+        query = query.filter(Device.datacenter_id == datacenter_id)
     if search:
         keyword = f"%{search.strip()}%"
         query = query.filter(or_(
@@ -371,9 +367,29 @@ async def get_device_compliance(
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
     snapshot = db.query(DeviceComplianceSnapshot).filter(DeviceComplianceSnapshot.device_id == device_id).first()
-    if refresh or not snapshot:
-        result = _evaluate_and_save(db, [device])[0]
-        return _result_payload(result, device)
+    if not snapshot:
+        return {
+            "device_id": device.id,
+            "model_profile_id": None,
+            "version_baseline_id": None,
+            "overall_status": "pending",
+            "score": 0,
+            "observed_vendor": device.vendor,
+            "observed_model": device.model,
+            "observed_version": None,
+            "observed_patches": [],
+            "checks": [],
+            "blockers": [{"key": "unevaluated", "label": "待核验", "status": "pending", "message": "尚未执行上线核验"}],
+            "evaluated_at": None,
+            "device": {
+                "id": device.id, "name": device.name, "ip_address": device.ip_address,
+                "vendor": device.vendor, "model": device.model, "device_role": device.device_role,
+                "is_monitored": bool(device.is_monitored),
+                "datacenter": device.datacenter_ref.to_dict() if device.datacenter_ref else None,
+            },
+            "profile": None,
+            "baseline": None,
+        }
     payload = snapshot.to_dict()
     payload["device"] = {
         "id": device.id, "name": device.name, "ip_address": device.ip_address,

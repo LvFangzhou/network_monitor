@@ -25,6 +25,7 @@ from app.utils.asternos_exporter_client import asternos_exporter_client
 from app.utils.monitor_profile import device_feature_enabled
 from app.utils.forwarding_collectors import collect_device_forwarding
 from app.utils.telemetry_forwarding import forwarding_cache_key
+from app.utils.h3c_vlan_statistics import parse_h3c_vlan_statistics, vlan_id_from_interface_name
 
 logger = get_logger(__name__)
 
@@ -69,6 +70,9 @@ ICMP_PING_INTERVAL_MS = 200
 MONITOR_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 ASTERNOS_TASK_LOCK_TTL_SECONDS = max(45, min(180, ASTERNOS_FULL_COLLECTION_INTERVAL_SECONDS * 2))
 INTERFACE_REALTIME_LOCK_TTL_SECONDS = 120
+H3C_VLAN_STATISTICS_TARGETS_KEY = "monitor:h3c_vlan_statistics:targets"
+H3C_VLAN_STATISTICS_EXCLUDED_DEVICES_KEY = "monitor:h3c_vlan_statistics:excluded_devices"
+H3C_VLAN_STATISTICS_LOCK_TTL_SECONDS = 120
 INTERFACE_REALTIME_MAX_WORKERS = max(1, int(settings.SNMP_INTERFACE_REALTIME_MAX_WORKERS))
 ROCE_INTERFACE_HEALTH_INTERVAL_SECONDS = 60
 ROCE_INTERFACE_HEALTH_BATCH_COUNT = max(1, math.ceil(ROCE_INTERFACE_HEALTH_INTERVAL_SECONDS / SNMP_SCHEDULER_INTERVAL_SECONDS))
@@ -84,6 +88,8 @@ DEVICE_DETAIL_PREWARM_LOCK_TTL_SECONDS = 6 * 60 * 60
 DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS = 24 * 60 * 60
 FORWARDING_PREWARM_MAX_WORKERS = 2
 FORWARDING_PREWARM_LOCK_TTL_SECONDS = 3 * 60 * 60
+ASTERNOS_PATCH_MAX_WORKERS = 3
+ASTERNOS_PATCH_LOCK_TTL_SECONDS = 3 * 60 * 60
 INTERFACE_QUALITY_DELTA_BANDS = [
     ("P2", 10.0, 100.0, "10~99"),
     ("P1", 100.0, 1000.0, "100~999"),
@@ -348,6 +354,57 @@ def _load_monitor_cache(kind: str, device_id: int, suffix: str = "") -> Optional
         return json.loads(raw)
     except Exception:
         return None
+
+
+def _is_h3c_device(device: Device) -> bool:
+    identity = f"{device.vendor or ''} {device.model or ''}".lower()
+    return "h3c" in identity or "华三" in identity
+
+
+def _h3c_vlan_statistics_target(device_id: int, interface_index: int, vlan_id: int) -> str:
+    return f"{int(device_id)}:{int(interface_index)}:{int(vlan_id)}"
+
+
+def is_h3c_vlan_statistics_excluded(device: Device) -> bool:
+    """Return whether CLI-based VLAN statistics collection is disabled."""
+    members = _redis_set_members(H3C_VLAN_STATISTICS_EXCLUDED_DEVICES_KEY)
+    members.update(_split_csv_values(os.getenv("H3C_VLAN_STATISTICS_EXCLUDED_DEVICE_IDS")))
+    members.update(_split_csv_values(os.getenv("H3C_VLAN_STATISTICS_EXCLUDED_DEVICE_IPS")))
+    return str(device.id) in members or str(device.ip_address or "").strip() in members
+
+
+def remove_h3c_vlan_statistics_targets(device_id: int) -> int:
+    """Remove all persisted VLAN-statistics targets for one device."""
+    prefix = f"{int(device_id)}:"
+    members = redis_client.smembers(H3C_VLAN_STATISTICS_TARGETS_KEY) or []
+    matched = []
+    for raw in members:
+        text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
+        if text.startswith(prefix):
+            matched.append(raw)
+    return int(redis_client.srem(H3C_VLAN_STATISTICS_TARGETS_KEY, *matched)) if matched else 0
+
+
+def register_h3c_vlan_statistics_target(device_id: int, interface_index: int, vlan_id: int) -> bool:
+    return bool(redis_client.sadd(
+        H3C_VLAN_STATISTICS_TARGETS_KEY,
+        _h3c_vlan_statistics_target(device_id, interface_index, vlan_id),
+    ))
+
+
+def _registered_h3c_vlan_statistics_targets() -> Dict[int, List[Dict[str, int]]]:
+    targets: Dict[int, List[Dict[str, int]]] = {}
+    for raw in redis_client.smembers(H3C_VLAN_STATISTICS_TARGETS_KEY) or []:
+        text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
+        try:
+            device_id, interface_index, vlan_id = [int(value) for value in text.split(":", 2)]
+        except (TypeError, ValueError):
+            continue
+        targets.setdefault(device_id, []).append({
+            "interface_index": interface_index,
+            "vlan_id": vlan_id,
+        })
+    return targets
 
 
 def _asternos_lock_key(device_id: int) -> str:
@@ -677,6 +734,184 @@ def _prewarm_lldp_neighbors(device: Device, db, force_refresh: bool = False) -> 
     return {"lldp_cached": False, "lldp_neighbors": len(rows)}
 
 
+def _is_asternos_device(device: Device) -> bool:
+    vendor = f"{device.vendor or ''} {device.model or ''} {device.monitor_source or ''}".lower()
+    return any(marker in vendor for marker in ["asternos", "asterfusion", "asteros", "aster", "星融元"])
+
+
+def _read_ssh_shell(shell: Any, idle_seconds: float = 1.0, timeout_seconds: float = 20.0) -> str:
+    end_at = time.time() + timeout_seconds
+    last_data_at = time.time()
+    chunks: List[str] = []
+    while time.time() < end_at:
+        if shell.recv_ready():
+            data = shell.recv(65535)
+            if not data:
+                break
+            chunks.append(data.decode("utf-8", errors="ignore"))
+            last_data_at = time.time()
+            continue
+        if chunks and time.time() - last_data_at >= idle_seconds:
+            break
+        time.sleep(0.1)
+    return "".join(chunks)
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    decoder = json.JSONDecoder()
+    last_error: Optional[Exception] = None
+    for match in re.finditer(r"\{", text or ""):
+        candidate = text[match.start():]
+        try:
+            payload, _ = decoder.raw_decode(candidate)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if isinstance(payload, dict):
+            return payload
+    if last_error:
+        raise RuntimeError(f"未读取到有效 applied_patches JSON 内容：{last_error}") from last_error
+    raise RuntimeError("未读取到 applied_patches JSON 内容")
+
+
+def _parse_asternos_applied_patches(raw_text: str) -> Dict[str, Any]:
+    payload = _extract_json_object(raw_text)
+    patch_ids: List[str] = []
+    packages: List[Dict[str, Any]] = []
+    for key, value in payload.items():
+        if not isinstance(value, dict):
+            patch_id = str(key).strip()
+            if patch_id:
+                patch_ids.append(patch_id)
+            continue
+        header = value.get("header") if isinstance(value.get("header"), dict) else {}
+        patch_id = str(header.get("patch_id") or key or "").strip()
+        if not patch_id:
+            continue
+        requirements = header.get("requirements") if isinstance(header.get("requirements"), dict) else {}
+        software_requirements = requirements.get("software") if isinstance(requirements.get("software"), list) else []
+        firmware_ids = [
+            str(item.get("firmware_id") or "").strip()
+            for item in software_requirements
+            if isinstance(item, dict) and str(item.get("firmware_id") or "").strip()
+        ]
+        impact = header.get("impact") if isinstance(header.get("impact"), dict) else {}
+        packages.append({
+            "patch_id": patch_id,
+            "name": header.get("name"),
+            "description": header.get("description"),
+            "priority": header.get("priority"),
+            "firmware_ids": firmware_ids,
+            "reboot_required": impact.get("reboot"),
+            "operator": value.get("operator"),
+            "timestamp": value.get("timestamp") or value.get("timstamp"),
+        })
+        patch_ids.append(patch_id)
+    return {"software_patches": sorted(set(patch_ids)), "software_patch_packages": packages}
+
+
+def _collect_asternos_patches_via_ssh(device: Device) -> Dict[str, Any]:
+    try:
+        import paramiko
+    except ImportError as exc:
+        raise RuntimeError("缺少 paramiko 依赖，无法采集 Asteros 补丁") from exc
+
+    username = (device.ssh_username or "").strip()
+    password = device.ssh_password or None
+    key_text = (device.ssh_key or "").strip()
+    if not username:
+        raise RuntimeError("设备未配置 SSH 用户名")
+    if not password and not key_text:
+        raise RuntimeError("设备未配置 SSH 密码或密钥")
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    connect_kwargs: Dict[str, Any] = {
+        "hostname": device.ip_address,
+        "port": int(device.ssh_port or 22),
+        "username": username,
+        "timeout": 12,
+        "banner_timeout": 12,
+        "auth_timeout": 12,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    if key_text:
+        import io
+        key_file = io.StringIO(key_text)
+        key = None
+        key_errors: List[str] = []
+        for key_cls in (paramiko.RSAKey, paramiko.ECDSAKey, paramiko.Ed25519Key):
+            key_file.seek(0)
+            try:
+                key = key_cls.from_private_key(key_file, password=password)
+                break
+            except Exception as exc:
+                key_errors.append(str(exc))
+        if not key:
+            raise RuntimeError(f"SSH 密钥解析失败：{'; '.join(key_errors[:2])}")
+        connect_kwargs["pkey"] = key
+    else:
+        connect_kwargs["password"] = password
+
+    try:
+        client.connect(**connect_kwargs)
+        shell = client.invoke_shell(width=240, height=2000)
+        _read_ssh_shell(shell, idle_seconds=0.8, timeout_seconds=8)
+        # Asteros 登录后通常先进入 NOS CLI，需要 `system bash` 才能读取
+        # /etc/applied_patches.json。进入 bash 后提示符初始化较慢，等待稍长一点，
+        # 避免只读到命令回显。
+        shell.send("system bash\n")
+        _read_ssh_shell(shell, idle_seconds=2.0, timeout_seconds=10)
+        time.sleep(0.5)
+        raw_text = ""
+        last_error: Optional[Exception] = None
+        for _ in range(2):
+            shell.send("cat /etc/applied_patches.json\n")
+            raw_text = _read_ssh_shell(shell, idle_seconds=2.0, timeout_seconds=30)
+            try:
+                result = _parse_asternos_applied_patches(raw_text)
+                shell.send("exit\n")
+                return result
+            except Exception as exc:
+                last_error = exc
+                time.sleep(1.5)
+        shell.send("exit\n")
+        raise last_error or RuntimeError("未读取到 applied_patches JSON 内容")
+    finally:
+        client.close()
+
+
+def _collect_and_store_asternos_patches(device: Device) -> Dict[str, Any]:
+    patch_info = _collect_asternos_patches_via_ssh(device)
+    collected_at = datetime.now(timezone.utc).isoformat()
+    custom_fields = dict(device.custom_fields or {}) if isinstance(device.custom_fields, dict) else {}
+    custom_fields["software_patches"] = patch_info["software_patches"]
+    custom_fields["software_patch_packages"] = patch_info["software_patch_packages"]
+    custom_fields["software_patch_collected_at"] = collected_at
+    custom_fields["software_patch_source"] = "asternos_ssh_applied_patches_json"
+    device.custom_fields = custom_fields
+
+    overview = _load_monitor_cache("overview", device.id)
+    if isinstance(overview, dict):
+        system_info = dict(overview.get("system_info") or {})
+        system_info["software_patches"] = patch_info["software_patches"]
+        system_info["software_patch_packages"] = patch_info["software_patch_packages"]
+        system_info["software_patch_collected_at"] = collected_at
+        system_info["software_patch_source"] = "asternos_ssh_applied_patches_json"
+        overview["system_info"] = system_info
+        _set_monitor_cache("overview", device.id, overview)
+
+    return {
+        "device_id": device.id,
+        "name": device.name,
+        "ip_address": device.ip_address,
+        "patch_count": len(patch_info["software_patches"]),
+        "patches": patch_info["software_patches"],
+        "collected_at": collected_at,
+    }
+
+
 def _prewarm_device_detail_snapshot(device: Device, force_lldp_refresh: bool = False) -> Dict[str, Any]:
     monitor_source = str(device.monitor_source or "snmp")
     collected_at = datetime.now(timezone.utc).isoformat()
@@ -697,7 +932,7 @@ def _prewarm_device_detail_snapshot(device: Device, force_lldp_refresh: bool = F
                 "storage_percent": None,
             },
             "sessions": {"current": None, "total": None, "usage_percent": None},
-            "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
+            "hardware": asternos_exporter_client.hardware_summary(metrics),
             "protocols": {
                 "bgp": _summarize_exporter_protocol(asternos_exporter_client._rows(metrics, "bgp_status"), ["established", "up"]),
                 "ospf": _summarize_exporter_protocol(asternos_exporter_client._rows(metrics, "ospf_status"), ["full", "established", "up"]),
@@ -1030,6 +1265,57 @@ def prewarm_device_detail_caches():
         return {"success": False, "error": str(exc)}
     finally:
         _release_device_detail_prewarm_lock(lock_token)
+        db.close()
+
+
+@shared_task(
+    name="app.tasks.snmp_tasks.collect_asternos_software_patches",
+    time_limit=60 * 60,
+    soft_time_limit=55 * 60,
+)
+def collect_asternos_software_patches(device_id: Optional[int] = None):
+    """低频采集 Asteros 已安装补丁列表，供上线合规/补丁基线使用。"""
+    lock_key = f"asternos_patch_collect:lock:{device_id or 'all'}"
+    if not redis_client.set(lock_key, str(uuid.uuid4()), ex=ASTERNOS_PATCH_LOCK_TTL_SECONDS, nx=True):
+        return {"skipped": True, "reason": "上一轮Asteros补丁采集未完成", "device_id": device_id}
+
+    db = SessionLocal()
+    try:
+        query = db.query(Device).filter(
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+        )
+        if device_id:
+            query = query.filter(Device.id == int(device_id))
+        devices = [device for device in query.order_by(Device.id.asc()).all() if _is_asternos_device(device)]
+        results: List[Dict[str, Any]] = []
+        for device in devices:
+            try:
+                results.append(_collect_and_store_asternos_patches(device))
+                db.flush()
+            except Exception as exc:
+                logger.warning("Asteros补丁采集失败", device_id=device.id, ip_address=device.ip_address, error=str(exc))
+                results.append({
+                    "device_id": device.id,
+                    "name": device.name,
+                    "ip_address": device.ip_address,
+                    "success": False,
+                    "error": str(exc),
+                })
+        db.commit()
+        return {
+            "success": True,
+            "total_devices": len(devices),
+            "success_count": sum(1 for item in results if item.get("error") is None),
+            "failed_count": sum(1 for item in results if item.get("error")),
+            "results": results,
+        }
+    except Exception as exc:
+        db.rollback()
+        logger.error("Asteros补丁批量采集失败", error=str(exc))
+        return {"success": False, "error": str(exc)}
+    finally:
+        redis_client.delete(lock_key)
         db.close()
 
 
@@ -2327,6 +2613,151 @@ def collect_all_snmp_interface_realtime():
         db.close()
 
 
+def _collect_h3c_vlan_statistics_for_device(
+    device: Device,
+    targets: List[Dict[str, int]],
+) -> Dict[str, Any]:
+    """Collect all requested VLAN statistics over one shared SSH session."""
+    try:
+        from netmiko import ConnectHandler
+    except ImportError as exc:
+        raise RuntimeError("缺少 netmiko 依赖，无法采集H3C VLAN统计") from exc
+
+    username = str(device.ssh_username or "").strip()
+    password = device.ssh_password or None
+    if not username or not password:
+        raise RuntimeError("设备未配置可用的SSH用户名和密码")
+
+    interfaces_cache = _load_monitor_cache("interfaces", device.id)
+    interfaces = interfaces_cache.get("interfaces", []) if isinstance(interfaces_cache, dict) else []
+    interface_map = {
+        int(item["index"]): item
+        for item in interfaces
+        if item.get("index") is not None and str(item.get("index")).isdigit()
+    }
+    connection = ConnectHandler(
+        device_type="hp_comware",
+        host=device.ip_address,
+        port=int(device.ssh_port or 22),
+        username=username,
+        password=password,
+        timeout=20,
+        conn_timeout=12,
+        banner_timeout=12,
+        auth_timeout=12,
+        fast_cli=False,
+    )
+    points: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    now = datetime.utcnow()
+    try:
+        for target in sorted(targets, key=lambda item: item["vlan_id"]):
+            interface_index = int(target["interface_index"])
+            vlan_id = int(target["vlan_id"])
+            interface = interface_map.get(interface_index) or {}
+            interface_name = str(interface.get("name") or f"Vlan-interface{vlan_id}")
+            if vlan_id_from_interface_name(interface_name) not in {None, vlan_id}:
+                failures.append({"vlan_id": vlan_id, "error": "接口索引与VLAN ID不匹配"})
+                continue
+            try:
+                output = connection.send_command(
+                    f"display vlan {vlan_id} statistics",
+                    read_timeout=20,
+                    strip_prompt=True,
+                    strip_command=True,
+                )
+                stats = parse_h3c_vlan_statistics(output)
+            except Exception as exc:
+                failures.append({"vlan_id": vlan_id, "error": str(exc)})
+                continue
+
+            speed_bps = _safe_float(interface.get("speed_bps"))
+            fields = {
+                **stats,
+                "speed_bps": speed_bps,
+                # Do not cap a VLAN's observed forwarding rate at configured
+                # bandwidth.  The configured value is metadata, not policing.
+                "in_utilization_percent": round(stats["in_bps"] * 100 / speed_bps, 3) if speed_bps else None,
+                "out_utilization_percent": round(stats["out_bps"] * 100 / speed_bps, 3) if speed_bps else None,
+                "admin_status": 1.0 if str(interface.get("admin_status")).lower() == "up" else 0.0,
+                "oper_status": 1.0 if str(interface.get("oper_status")).lower() == "up" else 0.0,
+                "sample_seconds": 30.0,
+            }
+            points.append({
+                "measurement": "interface_monitoring",
+                "tags": {
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                    "interface_index": str(interface_index),
+                    "interface_name": interface_name,
+                    "source": "h3c_vlan_statistics",
+                    "vlan_id": str(vlan_id),
+                },
+                "fields": fields,
+                "timestamp": now,
+            })
+    finally:
+        connection.disconnect()
+
+    if points:
+        influx_client.write_points(points, sync=True)
+    return {
+        "device_id": device.id,
+        "targets": len(targets),
+        "points_written": len(points),
+        "failures": failures,
+    }
+
+
+@shared_task(name="app.tasks.snmp_tasks.collect_h3c_vlan_statistics")
+def collect_h3c_vlan_statistics(device_id: Optional[int] = None):
+    """Collect registered H3C VLAN-interface forwarding statistics."""
+    lock_key = f"h3c_vlan_statistics:lock:{device_id or 'all'}"
+    if not redis_client.set(lock_key, uuid.uuid4().hex, ex=H3C_VLAN_STATISTICS_LOCK_TTL_SECONDS, nx=True):
+        return {"skipped": True, "reason": "上一轮H3C VLAN统计采集未完成"}
+    db = SessionLocal()
+    try:
+        target_map = _registered_h3c_vlan_statistics_targets()
+        if device_id is not None:
+            target_map = {int(device_id): target_map.get(int(device_id), [])}
+        devices = db.query(Device).filter(
+            Device.id.in_(list(target_map.keys()) or [-1]),
+            Device.status.in_(["active", "online"]),
+            Device.is_monitored == True,
+        ).all()
+        results: List[Dict[str, Any]] = []
+        for device in devices:
+            targets = target_map.get(device.id) or []
+            if not targets or not _is_h3c_device(device):
+                continue
+            if is_h3c_vlan_statistics_excluded(device):
+                removed = remove_h3c_vlan_statistics_targets(device.id)
+                results.append({
+                    "device_id": device.id,
+                    "skipped": "vlan_statistics_excluded",
+                    "targets_removed": removed,
+                })
+                continue
+            try:
+                results.append(_collect_h3c_vlan_statistics_for_device(device, targets))
+            except Exception as exc:
+                logger.warning(
+                    "H3C VLAN统计采集失败",
+                    device_id=device.id,
+                    ip_address=device.ip_address,
+                    error=str(exc),
+                )
+                results.append({"device_id": device.id, "error": str(exc)})
+        return {
+            "devices": len(results),
+            "points_written": sum(int(item.get("points_written") or 0) for item in results),
+            "results": results,
+        }
+    finally:
+        redis_client.delete(lock_key)
+        db.close()
+
+
 @shared_task(bind=True)
 def collect_asternos_for_device(self, device_id: int):
     """采集单台 AsterNOS Exporter 设备，并缓存总览/端口/邻居快照。"""
@@ -2409,7 +2840,7 @@ def collect_asternos_for_device(self, device_id: int):
                 "storage_percent": None,
             },
             "sessions": {"current": None, "total": None, "usage_percent": None},
-            "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
+            "hardware": asternos_exporter_client.hardware_summary(metrics),
             "protocols": {
                 "bgp": _summarize_exporter_protocol(
                     asternos_exporter_client._rows(metrics, "bgp_status"),
@@ -2470,7 +2901,14 @@ def collect_asternos_for_device(self, device_id: int):
                 "connectivity": {"type": "exporter", "status": "unreachable", "message": str(exc)},
                 "resources": {"cpu_percent": None, "memory_percent": None, "temperature": None, "storage_percent": None},
                 "sessions": {"current": None, "total": None, "usage_percent": None},
-                "hardware": {"fan_total": 0, "fan_down": 0, "power_total": 0, "power_down": 0},
+                "hardware": {
+                    "fan_total": 0,
+                    "fan_down": 0,
+                    "fan_status_known": False,
+                    "power_total": 0,
+                    "power_down": 0,
+                    "power_status_known": False,
+                },
                 "protocols": {"bgp": {"total": 0, "up": 0, "down": 0}, "ospf": {"total": 0, "up": 0, "down": 0}},
                 "system_info": {"sys_name": None, "sys_descr": None, "software_version": None, "snmp_model": None, "serial_number": None, "uptime_seconds": None},
                 "collected_at": datetime.now(timezone.utc).isoformat(),

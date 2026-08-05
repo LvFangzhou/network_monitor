@@ -106,6 +106,7 @@ export const getComplianceDevices = async (params?: {
   limit?: number
   overall_status?: string
   vendor?: string
+  datacenter_id?: number
   search?: string
   refresh?: boolean
 }) => await request.get('/compliance/devices', { params }) as { total: number; items: DeviceCompliance[] }

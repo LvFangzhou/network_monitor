@@ -33,6 +33,7 @@ import {
 import { getDevices, deleteDevice, batchDeleteDevices, batchUpdateDevices, exportDevices, exportDeviceTemplate, importDevices, getDeviceFilterOptions } from '../../api/devices'
 import type { Device } from '../../api/devices'
 import { useAuthStore } from '../../store/auth'
+import { readUrlNumber, replaceUrlValues } from '../../utils/urlState'
 
 const { Search } = Input
 const { Text } = Typography
@@ -203,24 +204,27 @@ const DeviceList = () => {
       return null
     }
   })()
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const hasSharedView = Array.from(searchParams.keys()).some((key) => key !== 'reset')
   const initialVisibleColumns = normalizeVisibleColumns(persistedState?.visibleColumns)
 
   const [devices, setDevices] = useState<Device[]>([])
   const [loading, setLoading] = useState(false)
   const [listProgress, setListProgress] = useState(0)
   const [total, setTotal] = useState(0)
-  const [currentPage, setCurrentPage] = useState(persistedState?.currentPage || 1)
-  const [pageSize, setPageSize] = useState(persistedState?.pageSize || 20)
-  const [searchKeyword, setSearchKeyword] = useState(persistedState?.searchKeyword || '')
-  const [statusFilter, setStatusFilter] = useState<string | undefined>(persistedState?.statusFilter)
-  const [roleFilter, setRoleFilter] = useState<string | undefined>(persistedState?.roleFilter)
-  const [vendorFilter, setVendorFilter] = useState<string | undefined>(persistedState?.vendorFilter)
-  const [monitoredFilter, setMonitoredFilter] = useState<string | undefined>(persistedState?.monitoredFilter)
-  const [datacenterFilter, setDatacenterFilter] = useState<number | undefined>(persistedState?.datacenterFilter)
-  const [deviceTypeFilter, setDeviceTypeFilter] = useState<number | undefined>(persistedState?.deviceTypeFilter)
+  const [currentPage, setCurrentPage] = useState(hasSharedView ? readUrlNumber(searchParams, 'page', 1)! : (persistedState?.currentPage || 1))
+  const [pageSize, setPageSize] = useState(hasSharedView ? readUrlNumber(searchParams, 'page_size', 20)! : (persistedState?.pageSize || 20))
+  const [searchKeyword, setSearchKeyword] = useState(hasSharedView ? (searchParams.get('q') || '') : (persistedState?.searchKeyword || ''))
+  const [statusFilter, setStatusFilter] = useState<string | undefined>(hasSharedView ? (searchParams.get('status') || undefined) : persistedState?.statusFilter)
+  const [roleFilter, setRoleFilter] = useState<string | undefined>(hasSharedView ? (searchParams.get('role') || undefined) : persistedState?.roleFilter)
+  const [vendorFilter, setVendorFilter] = useState<string | undefined>(hasSharedView ? (searchParams.get('vendor') || undefined) : persistedState?.vendorFilter)
+  const [monitoredFilter, setMonitoredFilter] = useState<string | undefined>(hasSharedView ? (searchParams.get('monitored') || undefined) : persistedState?.monitoredFilter)
+  const [datacenterFilter, setDatacenterFilter] = useState<number | undefined>(hasSharedView ? readUrlNumber(searchParams, 'dc') : persistedState?.datacenterFilter)
+  const [deviceTypeFilter, setDeviceTypeFilter] = useState<number | undefined>(hasSharedView ? readUrlNumber(searchParams, 'type') : persistedState?.deviceTypeFilter)
   const [columnFilters, setColumnFilters] = useState<Partial<Record<ColumnFilterKey, string>>>(persistedState?.columnFilters || {})
-  const [sortField, setSortField] = useState<SortField | undefined>(persistedState?.sortField)
-  const [sortOrder, setSortOrder] = useState<SortOrder>(persistedState?.sortOrder)
+  const [sortField, setSortField] = useState<SortField | undefined>(hasSharedView ? (searchParams.get('sort') as SortField || undefined) : persistedState?.sortField)
+  const [sortOrder, setSortOrder] = useState<SortOrder>(hasSharedView ? (searchParams.get('order') as SortOrder || undefined) : persistedState?.sortOrder)
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>({
     ...DEFAULT_COLUMN_WIDTHS,
     ...(persistedState?.columnWidths || {}),
@@ -243,8 +247,6 @@ const DeviceList = () => {
     statuses: ['active', 'inactive', 'in_stock', 'deployed'],
   })
 
-  const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
   const canModify = !useAuthStore((state) => state.user?.read_only)
   const {
     token: { colorBgContainer, colorBgElevated, colorBorder, colorText, colorTextSecondary },
@@ -411,6 +413,24 @@ const DeviceList = () => {
       })
     )
   }, [currentPage, pageSize, searchKeyword, statusFilter, roleFilter, vendorFilter, monitoredFilter, datacenterFilter, deviceTypeFilter, columnFilters, sortField, sortOrder, columnWidths, visibleColumns])
+
+  useEffect(() => {
+    const next = replaceUrlValues(searchParams, {
+      page: currentPage,
+      page_size: pageSize,
+      q: searchKeyword,
+      status: statusFilter,
+      role: roleFilter,
+      vendor: vendorFilter,
+      monitored: monitoredFilter,
+      dc: datacenterFilter,
+      type: deviceTypeFilter,
+      sort: sortField,
+      order: sortOrder,
+    }, { page: 1, page_size: 20 })
+    next.delete('reset')
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [currentPage, datacenterFilter, deviceTypeFilter, monitoredFilter, pageSize, roleFilter, searchKeyword, searchParams, setSearchParams, sortField, sortOrder, statusFilter, vendorFilter])
 
   useEffect(() => {
     return () => {

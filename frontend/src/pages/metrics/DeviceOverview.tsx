@@ -19,6 +19,8 @@ import {
 } from 'antd'
 import { EyeOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
+import { useSearchParams } from 'react-router-dom'
+import { readUrlNumber, replaceUrlValues } from '../../utils/urlState'
 import {
   getDeviceOverview,
   getDeviceProtocolNeighbors,
@@ -551,18 +553,19 @@ type DeviceOverviewCachePayload = {
 }
 
 const DeviceOverview = () => {
+  const [searchParams, setSearchParams] = useSearchParams()
   const [loading, setLoading] = useState(false)
   const [overviewProgress, setOverviewProgress] = useState(0)
   const [refreshingDeviceId, setRefreshingDeviceId] = useState<number | null>(null)
   const [items, setItems] = useState<DeviceOverviewItem[]>([])
-  const [search, setSearch] = useState('')
-  const [vendor, setVendor] = useState('')
-  const [datacenter, setDatacenter] = useState(DATACENTER_ALL_VALUE)
-  const [model, setModel] = useState('')
-  const [connectivity, setConnectivity] = useState('')
-  const [sortKey, setSortKey] = useState('ip_asc')
+  const [search, setSearch] = useState(searchParams.get('q') || '')
+  const [vendor, setVendor] = useState(searchParams.get('vendor') || '')
+  const [datacenter, setDatacenter] = useState(searchParams.get('datacenter') || DATACENTER_ALL_VALUE)
+  const [model, setModel] = useState(searchParams.get('model') || '')
+  const [connectivity, setConnectivity] = useState(searchParams.get('status') || '')
+  const [sortKey, setSortKey] = useState(searchParams.get('sort') || 'ip_asc')
   const [refreshIntervalSeconds, setRefreshIntervalSeconds] = useState(300)
-  const [tablePageSize, setTablePageSize] = useState(20)
+  const [tablePageSize, setTablePageSize] = useState(readUrlNumber(searchParams, 'page_size', 20)!)
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => {
     try {
       const raw = window.localStorage.getItem(COLUMN_WIDTH_STORAGE_KEY)
@@ -576,6 +579,7 @@ const DeviceOverview = () => {
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailProgress, setDetailProgress] = useState(0)
   const [detailDevice, setDetailDevice] = useState<DeviceOverviewItem | null>(null)
+  const suppressedDetailIdRef = useRef<number | null>(null)
   const [neighbors, setNeighbors] = useState<{ bgp: ProtocolNeighbor[]; ospf: ProtocolNeighbor[]; lldp: ProtocolNeighbor[] }>({ bgp: [], ospf: [], lldp: [] })
   const detailCacheRef = useRef<Record<number, { at: number; neighbors: { bgp: ProtocolNeighbor[]; ospf: ProtocolNeighbor[]; lldp: ProtocolNeighbor[] } }>>({})
   const [lldpPageSize, setLldpPageSize] = useState(20)
@@ -702,6 +706,41 @@ const DeviceOverview = () => {
       document.removeEventListener('mouseup', handleMouseUp)
     }
   }, [])
+
+  useEffect(() => {
+    const next = replaceUrlValues(searchParams, {
+      q: search,
+      vendor,
+      datacenter,
+      model,
+      status: connectivity,
+      sort: sortKey,
+      page_size: tablePageSize,
+      device: detailOpen ? detailDevice?.device.id : undefined,
+    }, { datacenter: DATACENTER_ALL_VALUE, sort: 'ip_asc', page_size: 20 })
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [connectivity, datacenter, detailDevice?.device.id, detailOpen, model, search, searchParams, setSearchParams, sortKey, tablePageSize, vendor])
+
+  useEffect(() => {
+    const detailId = readUrlNumber(searchParams, 'device')
+    if (!detailId) {
+      suppressedDetailIdRef.current = null
+      return
+    }
+    if (suppressedDetailIdRef.current === detailId || detailOpen || items.length === 0) return
+    const target = items.find((item) => item.device.id === detailId)
+    if (target) void openDetail(target)
+  }, [detailOpen, items, searchParams])
+
+  const closeDetail = () => {
+    const detailId = detailDevice?.device.id || readUrlNumber(searchParams, 'device') || null
+    suppressedDetailIdRef.current = detailId
+    const next = new URLSearchParams(searchParams)
+    next.delete('device')
+    setSearchParams(next, { replace: true })
+    setDetailOpen(false)
+    setDetailDevice(null)
+  }
 
   const moveVisibleColumn = (sourceKey: string, targetKey: string) => {
     if (sourceKey === targetKey) return
@@ -1602,7 +1641,7 @@ const DeviceOverview = () => {
       <Drawer
         title={detailDevice ? `${detailDevice.device.name || detailDevice.device.ip_address} 协议邻居` : '协议邻居'}
         open={detailOpen}
-        onClose={() => setDetailOpen(false)}
+        onClose={closeDetail}
         width={1450}
       >
         {detailLoading ? (

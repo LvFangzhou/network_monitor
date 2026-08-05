@@ -13,6 +13,7 @@ from celery import shared_task
 from app.config import settings
 from app.core import get_logger
 from app.utils import notification_manager, redis_client
+from app.utils.tacacs_commands import extract_tacacs_command, is_tacacs_user_command
 from app.utils.tacacs_time import parse_tacacs_log_time
 
 logger = get_logger(__name__)
@@ -30,35 +31,12 @@ def _parse_log_time(raw_time: str) -> str:
     return parse_tacacs_log_time(raw_time) or raw_time
 
 
-def _extract_command(raw_command: str) -> str:
-    """
-    Tacacs accounting 行里 cmd 后面可能带 cmd-arg/err_msg/start_time 等字段。
-    机器人和前端只展示真实命令，附加字段留在 raw 日志里。
-    """
-    text = (raw_command or "").strip()
-    if not text:
-        return ""
-
-    marker_match = re.search(r"\s+(cmd-arg|err_msg|start_time)=", text)
-    command = text[:marker_match.start()].strip() if marker_match else text
-    rest = text[marker_match.start():] if marker_match else ""
-
-    arg_match = re.search(
-        r"\bcmd-arg=(.*?)(?=\s+(?:err_msg|start_time)=|$)",
-        rest,
-    )
-    cmd_arg = arg_match.group(1).strip() if arg_match else ""
-    if cmd_arg:
-        return f"{command} {cmd_arg}".strip()
-    return command
-
-
 def _parse_line(line: str) -> Optional[Dict[str, str]]:
     match = LOG_PATTERN.search(line)
     if not match:
         return None
-    command = _extract_command(match.group(6))
-    if not command or command in {"startup"}:
+    command = extract_tacacs_command(match.group(6))
+    if not is_tacacs_user_command(command):
         return None
     return {
         "time": _parse_log_time(match.group(1)),
@@ -115,11 +93,12 @@ async def _send_robot_notification(title: str, content: str, card_data: Dict[str
     for channel in _load_notification_channels():
         channel_type = str(channel.get("type") or "").strip()
         webhook = str(channel.get("webhook") or channel.get("url") or "").strip()
-        if channel_type not in {"wechat", "dingtalk", "feishu"} or not webhook:
+        if channel_type not in {"wechat", "dingtalk", "feishu", "webhook"} or not webhook:
             continue
+        channel_config = {"url": webhook} if channel_type == "webhook" else {"webhook": webhook}
         if await notification_manager.send_notification(
             channel_type,
-            {"webhook": webhook, "url": webhook},
+            channel_config,
             title,
             content,
             card_data,

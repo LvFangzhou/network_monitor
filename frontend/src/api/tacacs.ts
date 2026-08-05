@@ -17,6 +17,13 @@ export interface TacacsConfigResponse {
   settings: TacacsSettings
 }
 
+export interface TacacsServiceStatus {
+  status: 'running' | 'stopped' | 'not_found'
+  running: boolean
+  label: string
+  message?: string
+}
+
 export interface TacacsCommandRule {
   name: string
   permit: string[]
@@ -76,10 +83,22 @@ export const getTacacsLogs = async (params?: {
   return await request.get('/tacacs/logs', { params }) as { total: number; items: TacacsCommandLog[]; path: string }
 }
 
-export const restartTacacs = async (): Promise<{ message: string; container: string }> => {
-  return await request.post('/tacacs/restart') as { message: string; container: string }
+export const getTacacsStatus = async (): Promise<TacacsServiceStatus> => {
+  return await request.get('/tacacs/status') as TacacsServiceStatus
 }
 
-export const testTacacsNotification = async (url: string): Promise<{ success: boolean; channel_type: string; message: string }> => {
-  return await request.post('/tacacs/test-notification', { url }) as { success: boolean; channel_type: string; message: string }
+export const startTacacs = async (): Promise<TacacsServiceStatus> => {
+  return await request.post('/tacacs/start') as TacacsServiceStatus
+}
+
+export const restartTacacs = async (): Promise<TacacsServiceStatus> => {
+  return await request.post('/tacacs/restart') as TacacsServiceStatus
+}
+
+export const stopTacacs = async (): Promise<TacacsServiceStatus> => {
+  return await request.post('/tacacs/stop') as TacacsServiceStatus
+}
+
+export const testTacacsNotification = async (url: string, channelIndex?: number): Promise<{ success: boolean; channel_type: string; message: string }> => {
+  return await request.post('/tacacs/test-notification', { url, channel_index: channelIndex }) as { success: boolean; channel_type: string; message: string }
 }

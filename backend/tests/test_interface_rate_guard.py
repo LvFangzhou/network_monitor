@@ -78,6 +78,63 @@ def test_history_rejects_legacy_exact_line_rate_point():
     assert row["out_bps"] == 80_000_000
 
 
+def test_windowed_octet_rate_preserves_collected_peak_when_requested():
+    rows = [
+        {
+            "_time": "2026-08-03T12:20:00+00:00",
+            "device_id": "182",
+            "interface_index": "19",
+            "interface_name": "Twenty-FiveGigE1/0/19",
+            "out_octets": 1_000_000,
+            "out_bps": 100_000_000.0,
+        },
+        {
+            "_time": "2026-08-03T12:21:00+00:00",
+            "device_id": "182",
+            "interface_index": "19",
+            "interface_name": "Twenty-FiveGigE1/0/19",
+            "out_octets": 10_000_000,
+            "out_bps": 4_321_560_557.25,
+        },
+    ]
+
+    metrics._apply_windowed_octet_rates(
+        rows,
+        300,
+        preserve_existing_rates=True,
+    )
+
+    assert rows[1]["out_bps"] == 4_321_560_557.25
+
+
+def test_windowed_octet_rate_falls_back_to_counter_when_rate_is_missing():
+    rows = [
+        {
+            "_time": "2026-08-03T12:20:00+00:00",
+            "device_id": "182",
+            "interface_index": "19",
+            "interface_name": "Twenty-FiveGigE1/0/19",
+            "out_octets": 1_000_000,
+        },
+        {
+            "_time": "2026-08-03T12:21:00+00:00",
+            "device_id": "182",
+            "interface_index": "19",
+            "interface_name": "Twenty-FiveGigE1/0/19",
+            "out_octets": 10_000_000,
+        },
+    ]
+
+    metrics._apply_windowed_octet_rates(
+        rows,
+        300,
+        preserve_existing_rates=True,
+    )
+
+    assert rows[1]["out_bps"] == 1_200_000.0
+    assert rows[1]["sample_seconds"] == 60.0
+
+
 def test_older_sample_does_not_replace_newer_counter_baseline(monkeypatch):
     fake_redis = FakeRedis()
     monkeypatch.setattr(snmp_tasks, "redis_client", fake_redis)

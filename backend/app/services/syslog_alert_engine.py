@@ -18,7 +18,12 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.core import get_logger
 from app.models import AlertHistory, AlertRule, Device, SyslogEvent
-from app.tasks.alert_tasks import _ensure_alarm_id, _is_silenced, enqueue_alert_notification
+from app.tasks.alert_tasks import (
+    _ensure_alarm_id,
+    _is_silenced,
+    enqueue_alert_notification,
+    reset_optical_interface_baselines,
+)
 from app.tasks.system_tasks import _detect_webhook_provider
 from app.utils import redis_client
 
@@ -53,6 +58,13 @@ SYSLOG_ALERT_RULE_DEFINITIONS: List[Dict[str, Any]] = [
         "severity": "P2",
         "description": "由 H3C 设备 Syslog 光模块拔插或异常事件自动生成。",
         "category": "optical_module",
+    },
+    {
+        "name": "【H3C】Syslog光模块收光功率突变",
+        "metric_type": "syslog_optical_rx_power_change",
+        "severity": "P2",
+        "description": "由 H3C 设备 Syslog 光模块收光功率突变事件自动生成；恢复 Syslog 优先，周期光功率采集连续正常时兜底恢复。",
+        "category": "optical_rx_power_change",
     },
     {
         "name": "【H3C】Syslog电源模块异常",
@@ -104,7 +116,15 @@ BGP_STATE_RE = re.compile(
 )
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 INTERFACE_NAME_RE = re.compile(
-    r"\b(?:FourHundredGigE|HundredGigE|Ten-GigabitEthernet|FortyGigE|GigabitEthernet|M-GigabitEthernet|Eth-Trunk|Bridge-Aggregation)\s*\d+(?:/\d+){1,3}\b",
+    r"\b(?:FourHundredGigE|HundredGigE|Ten-GigabitEthernet|FortyGigE|GigabitEthernet|M-GigabitEthernet|WGE|Eth-Trunk|Bridge-Aggregation)\s*\d+(?:/\d+){1,3}\b",
+    re.IGNORECASE,
+)
+INTERNAL_LINK_RE = re.compile(r"\bINTERNALLINK_(?P<event>[A-Z0-9_]+)\b", re.IGNORECASE)
+INTERNAL_LINK_REASON_RE = re.compile(r"\bReason\s*=\s*(?P<reason>[^)]+)", re.IGNORECASE)
+GENERIC_RECOVERY_RE = re.compile(
+    r"(?:_[A-Z0-9]*CLEAR\b|_[A-Z0-9]*RECOVER(?:ED)?\b|"
+    r"\balarm\s+(?:was\s+)?cleared\b|\brecovered\s+from\b|"
+    r"告警(?:已)?清除|(?:已经|已)?恢复正常)",
     re.IGNORECASE,
 )
 
@@ -335,6 +355,35 @@ def parse_syslog_alert(message: str, severity: Optional[int] = None) -> Optional
             context="LINK_UPDOWN",
         )
 
+    # H3C internal-link events describe a physical/remote-fault condition on
+    # an interface.  A *_CLEAR event is a recovery notification even though
+    # its Syslog severity can still be critical (2), so it must be parsed
+    # before the generic critical-event fallback below.
+    internal_link_match = INTERNAL_LINK_RE.search(text)
+    if internal_link_match:
+        interface_name = _extract_interface_name(text) or "内部链路"
+        event_name = (internal_link_match.group("event") or "").upper()
+        state = "resolved" if (
+            "CLEAR" in event_name
+            or "RECOVER" in event_name
+            or re.search(r"\balarm\s+(?:was\s+)?cleared\b|\brecovered\s+from\b", text, re.IGNORECASE)
+        ) else "firing"
+        reason_match = INTERNAL_LINK_REASON_RE.search(text)
+        reason = (reason_match.group("reason") or "").strip() if reason_match else text
+        return ParsedSyslogAlert(
+            category="interface_phy",
+            state=state,
+            target_type="interface",
+            target_key=f"syslog:h3c:interface:{_normalize_interface_key(interface_name)}",
+            target_name=interface_name,
+            rule_name="【H3C】Syslog接口物理Down/瞬断",
+            metric_type="syslog_interface_phy_down",
+            severity="P2",
+            description="由 H3C 设备内部链路异常/恢复 Syslog 自动生成，用于补齐周期采集无法捕获的接口远端故障。",
+            reason=reason or None,
+            context="INTERNALLINK_ALARM",
+        )
+
     match = BGP_STATE_RE.search(text)
     if match:
         peer = (match.group("peer") or "").strip()
@@ -393,6 +442,11 @@ def parse_syslog_alert(message: str, severity: Optional[int] = None) -> Optional
 
     optical_markers = ["TRANSCEIVER", "OPTICAL", "SFP", "QSFP", "光模块"]
     if any(marker.lower() in text.lower() for marker in optical_markers):
+        is_rx_power_change = bool(
+            re.search(r"(?:Rx|receive)\s+power\s+change", text, re.IGNORECASE)
+            or "收光功率变化" in text
+            or "收光功率突变" in text
+        )
         state = _keyword_state(
             text,
             firing_keywords=[
@@ -404,6 +458,20 @@ def parse_syslog_alert(message: str, severity: Optional[int] = None) -> Optional
         )
         if state:
             interface_name = _extract_interface_name(text) or "光模块"
+            if is_rx_power_change:
+                return ParsedSyslogAlert(
+                    category="optical_rx_power_change",
+                    state=state,
+                    target_type="optical_module",
+                    target_key=f"syslog:h3c:optical-rx-change:{_normalize_interface_key(interface_name)}",
+                    target_name=interface_name,
+                    rule_name="【H3C】Syslog光模块收光功率突变",
+                    metric_type="syslog_optical_rx_power_change",
+                    severity="P2",
+                    description="由 H3C 设备 Syslog 光模块收光功率突变事件自动生成；恢复 Syslog 优先，周期光功率采集连续正常时兜底恢复。",
+                    reason=text,
+                    context="OPTICAL_RX_POWER_CHANGE",
+                )
             return ParsedSyslogAlert(
                 category="optical_module",
                 state=state,
@@ -472,6 +540,12 @@ def parse_syslog_alert(message: str, severity: Optional[int] = None) -> Optional
             reason=text,
             context=category.upper(),
         )
+
+    # Recovery messages must never create a new generic critical alarm.  A
+    # specifically parsed recovery above can resolve an existing alert; an
+    # unknown recovery message remains available in raw Syslog for auditing.
+    if GENERIC_RECOVERY_RE.search(text):
+        return None
 
     if severity is not None and severity <= 2:
         return ParsedSyslogAlert(
@@ -574,6 +648,20 @@ def _build_resolution_note(event: SyslogEvent, parsed: ParsedSyslogAlert) -> str
     return " | ".join(parts)
 
 
+def _resets_optical_baseline(parsed: ParsedSyslogAlert, message: str) -> bool:
+    """Return true only for a real interface/module session boundary."""
+    if parsed.category == "interface_phy":
+        return True
+    if parsed.category != "optical_module":
+        return False
+    return bool(re.search(
+        r"(?:MODULE_(?:OUT|IN)|OPTICAL_(?:REMOVED|INSERTED)|"
+        r"transceiver\s+(?:was\s+)?(?:removed|inserted)|module\s+(?:removed|inserted))",
+        str(message or ""),
+        re.IGNORECASE,
+    ))
+
+
 def process_syslog_alert_event(db: Session, event: SyslogEvent, device: Optional[Device]) -> None:
     """将单条 Syslog 事件转换为告警/恢复。调用方应已完成 SyslogEvent 入库。"""
     if not device or not event:
@@ -581,6 +669,15 @@ def process_syslog_alert_event(db: Session, event: SyslogEvent, device: Optional
     parsed = parse_syslog_alert(event.message or event.raw_message or "", event.severity)
     if not parsed:
         return
+    source_message = event.message or event.raw_message or ""
+    if _resets_optical_baseline(parsed, source_message) and parsed.target_name:
+        deleted_keys = reset_optical_interface_baselines(device.id, parsed.target_name)
+        logger.info(
+            "接口/模块会话变化，已重置光功率与FEC基线",
+            device_id=device.id,
+            target=parsed.target_name,
+            deleted_keys=len(deleted_keys),
+        )
     # Some devices emit the same hardware event repeatedly in one burst. Keep
     # every raw Syslog row for audit, but only mutate the alert once per burst.
     fingerprint_source = "|".join([

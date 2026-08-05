@@ -275,10 +275,22 @@ def ensure_compatible_schema() -> None:
                 connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN nqa_operation_tag VARCHAR(32)"))
             if "probe_interface_name" not in quality_probe_columns:
                 connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN probe_interface_name VARCHAR(128)"))
+            if "target_addresses" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN target_addresses JSON DEFAULT '[]'::json"))
+            if "target_statuses" not in quality_probe_columns:
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN target_statuses JSON DEFAULT '{}'::json"))
             if "mtr_enabled" not in quality_probe_columns:
                 connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN mtr_enabled BOOLEAN DEFAULT FALSE"))
             if "mtr_interval_seconds" not in quality_probe_columns:
-                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN mtr_interval_seconds INTEGER DEFAULT 300"))
+                connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN mtr_interval_seconds INTEGER DEFAULT 3600"))
+            connection.execute(text(
+                "UPDATE quality_probe_targets SET target_addresses = json_build_array(target) "
+                "WHERE target_addresses IS NULL OR json_array_length(target_addresses) = 0"
+            ))
+            connection.execute(text(
+                "UPDATE quality_probe_targets SET mtr_interval_seconds = 3600 "
+                "WHERE mtr_interval_seconds IS NULL OR mtr_interval_seconds < 3600"
+            ))
             if "last_mtr_at" not in quality_probe_columns:
                 connection.execute(text("ALTER TABLE quality_probe_targets ADD COLUMN last_mtr_at TIMESTAMP WITH TIME ZONE"))
             if "last_mtr_path_hash" not in quality_probe_columns:

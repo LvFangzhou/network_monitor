@@ -1,6 +1,7 @@
 """
 通知管理器 - 支持企业微信、钉钉、飞书、邮件、Webhook
 """
+import asyncio
 import httpx
 import json
 import re
@@ -153,18 +154,21 @@ class NotificationManager:
         if card_data and card_data.get("notification_kind") == "config_backup":
             return self._build_config_backup_markdown(card_data)
         rows = (card_data or {}).get("rows") or []
+        event_type = str((card_data or {}).get("event_type") or "").strip()
+        emphasis_color = "#52C41A" if event_type == "auto_resolved" else "#F53F3F" if event_type == "firing" else ""
         lines = []
-        is_operation = card_data and card_data.get("notification_kind") == "operation"
         for row in rows:
             label = str(row.get("label") or "").strip()
             value = str(row.get("value") or "")
             if not label or not value.strip():
                 continue
-            if is_operation and label == "变更内容" and len(value) > 300:
-                value = value[:300] + "..."
-            lines.append(f"**{label}：**{value}")
+            if row.get("emphasis"):
+                emphasis_text = f"**◆ {label}：{value}**"
+                lines.append(f'<font color="{emphasis_color}">{emphasis_text}</font>' if emphasis_color else emphasis_text)
+            else:
+                lines.append(f"**{label}：**{value}")
         if card_data and card_data.get("detail_url"):
-            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "通知详情" if card_data.get("notification_kind") == "resource_notice" else "故障详情"
+            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "通知详情" if card_data.get("notification_kind") == "resource_notice" else "查看详情"
             lines.append(f"[{detail_label}]({card_data['detail_url']})")
         return "\n".join(lines)
 
@@ -172,15 +176,18 @@ class NotificationManager:
         if card_data and card_data.get("notification_kind") == "config_backup":
             return self._build_config_backup_markdown(card_data)
         rows = (card_data or {}).get("rows") or []
+        event_type = str((card_data or {}).get("event_type") or "").strip()
+        emphasis_color = "#52C41A" if event_type == "auto_resolved" else "#F53F3F" if event_type == "firing" else ""
         lines = []
-        is_operation = card_data and card_data.get("notification_kind") == "operation"
         for row in rows:
             label = str(row.get("label") or "").strip()
             value = str(row.get("value") or "")
             if label and value.strip():
-                if is_operation and label == "变更内容" and len(value) > 300:
-                    value = value[:300] + "..."
-                lines.append(f"**{label}：**{value}")
+                if row.get("emphasis"):
+                    emphasis_text = f"**◆ {label}：{value}**"
+                    lines.append(f'<font color="{emphasis_color}">{emphasis_text}</font>' if emphasis_color else emphasis_text)
+                else:
+                    lines.append(f"**{label}：**{value}")
         return "\n".join(lines)
 
     def _build_config_backup_markdown(self, card_data: Optional[Dict[str, Any]]) -> str:
@@ -245,6 +252,61 @@ class NotificationManager:
         else:
             color = "warning"
         return f"# <font color=\"{color}\">**{title}**</font>"
+
+    @staticmethod
+    def _split_text_by_utf8_bytes(text: str, max_bytes: int) -> List[str]:
+        """Split text without dropping a character, even when one row is oversized."""
+        if not text:
+            return [""]
+        chunks: List[str] = []
+        current: List[str] = []
+        current_bytes = 0
+        for character in text:
+            character_bytes = len(character.encode("utf-8"))
+            if current and current_bytes + character_bytes > max_bytes:
+                chunks.append("".join(current))
+                current = []
+                current_bytes = 0
+            current.append(character)
+            current_bytes += character_bytes
+        if current:
+            chunks.append("".join(current))
+        return chunks
+
+    @classmethod
+    def _split_markdown_by_lines(cls, markdown: str, max_bytes: int = 3000) -> List[str]:
+        """Build complete robot pages, preferring row boundaries over hard cuts."""
+        if len(markdown.encode("utf-8")) <= max_bytes:
+            return [markdown]
+
+        pages: List[str] = []
+        current_lines: List[str] = []
+        current_bytes = 0
+        for line in markdown.splitlines():
+            line_bytes = len(line.encode("utf-8"))
+            separator_bytes = 1 if current_lines else 0
+            if current_lines and current_bytes + separator_bytes + line_bytes > max_bytes:
+                pages.append("\n".join(current_lines))
+                current_lines = []
+                current_bytes = 0
+
+            if line_bytes <= max_bytes:
+                current_lines.append(line)
+                current_bytes += (1 if current_bytes else 0) + line_bytes
+                continue
+
+            if current_lines:
+                pages.append("\n".join(current_lines))
+                current_lines = []
+                current_bytes = 0
+            oversized_parts = cls._split_text_by_utf8_bytes(line, max_bytes)
+            pages.extend(oversized_parts[:-1])
+            current_lines = [oversized_parts[-1]]
+            current_bytes = len(oversized_parts[-1].encode("utf-8"))
+
+        if current_lines:
+            pages.append("\n".join(current_lines))
+        return pages or [""]
 
     def _normalize_mention_targets(self, value: Any) -> List[str]:
         if not value:
@@ -318,36 +380,46 @@ class NotificationManager:
 
         mentions_inlined = self._inline_wechat_mentions_into_handler(card_data, markdown_mentions)
 
-        markdown_content = f"{self._wechat_markdown_title(title, card_data)}\n\n"
         if card_data:
-            markdown_content += self._build_card_rows_markdown(card_data) or content
+            markdown_body = self._build_card_rows_markdown(card_data) or content
         else:
-            markdown_content += content
+            markdown_body = content
 
         if markdown_mentions and not mentions_inlined:
-            markdown_content = f"{markdown_content}\n\n{markdown_mentions}"
+            markdown_body = f"{markdown_body}\n\n{markdown_mentions}"
 
-        message = {
-            "msgtype": "markdown",
-            "markdown": {
-                "content": markdown_content
-            }
-        }
+        # Enterprise WeChat has a per-message size limit. Keep every config row
+        # and page long operation records instead of silently replacing them
+        # with an ellipsis.
+        markdown_pages = self._split_markdown_by_lines(markdown_body)
         
         try:
-            response = await self._post_json(webhook_url, message)
-            result = self._parse_robot_response(response, "企业微信")
-            if result is None:
-                return False
-            if result.get("errcode") == 0:
-                logger.info("企业微信消息发送成功", title=title)
-                return True
-            else:
-                self.last_error_message = f"企业微信机器人拒绝请求：{result.get('errmsg') or result}"
-                logger.error("企业微信消息发送失败", 
-                            status=response.status_code,
-                            error=result)
-                return False
+            page_count = len(markdown_pages)
+            for page_number, markdown_page in enumerate(markdown_pages, start=1):
+                page_title = title if page_count == 1 else f"{title}（{page_number}/{page_count}）"
+                markdown_content = f"{self._wechat_markdown_title(page_title, card_data)}\n\n{markdown_page}"
+                message = {
+                    "msgtype": "markdown",
+                    "markdown": {"content": markdown_content},
+                }
+                response = await self._post_json(webhook_url, message)
+                result = self._parse_robot_response(response, "企业微信")
+                if result is None:
+                    return False
+                if result.get("errcode") != 0:
+                    self.last_error_message = f"企业微信机器人拒绝请求：{result.get('errmsg') or result}"
+                    logger.error(
+                        "企业微信消息发送失败",
+                        status=response.status_code,
+                        error=result,
+                        page=page_number,
+                        page_count=page_count,
+                    )
+                    return False
+                if page_number < page_count:
+                    await asyncio.sleep(0.2)
+            logger.info("企业微信消息发送成功", title=title, page_count=page_count)
+            return True
         except Exception as e:
             self.last_error_message = f"企业微信消息发送异常：{str(e)}"
             logger.error("企业微信消息发送异常", error=str(e))
@@ -368,7 +440,7 @@ class NotificationManager:
 
         if card_data:
             severity_style = self._severity_style(card_data)
-            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "通知详情" if card_data.get("notification_kind") == "resource_notice" else "故障详情"
+            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "通知详情" if card_data.get("notification_kind") == "resource_notice" else "查看详情"
             markdown_lines = [
                 f"## <font color=\"{severity_style['hex']}\">{title}</font>",
             ]
@@ -379,9 +451,10 @@ class NotificationManager:
                     label = str(row.get("label") or "").strip()
                     value = str(row.get("value") or "").strip()
                     if label and value:
-                        if card_data.get("notification_kind") == "operation" and label == "变更内容" and len(value) > 300:
-                            value = value[:300] + "..."
-                        markdown_lines.append(f"**{label}：**{value}")
+                        if row.get("emphasis"):
+                            markdown_lines.append(f"**◆ {label}：{value}**")
+                        else:
+                            markdown_lines.append(f"**{label}：**{value}")
             if card_data.get("detail_url"):
                 markdown_lines.append(f"[{detail_label}]({card_data['detail_url']})")
                 message = {
@@ -451,7 +524,7 @@ class NotificationManager:
 
         if card_data:
             severity_style = self._severity_style(card_data)
-            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "通知详情" if card_data.get("notification_kind") == "resource_notice" else "故障详情"
+            detail_label = "记录详情" if card_data.get("notification_kind") == "operation" else "通知详情" if card_data.get("notification_kind") == "resource_notice" else "查看详情"
             elements = [{
                 "tag": "div",
                 "text": {

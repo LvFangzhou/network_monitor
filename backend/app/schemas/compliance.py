@@ -8,7 +8,10 @@ CAPABILITY_KEYS = (
     "snmp", "exporter", "syslog", "tacacs", "telemetry", "bmp", "nqa",
     "evpn_vxlan", "roce", "pfc", "ecn", "buffer", "config_backup",
 )
-CHECK_KEYS = ("model_profile", "version", "patch", "snmp", "exporter", "syslog", "tacacs")
+CHECK_KEYS = (
+    "model_profile", "device_name", "device_model", "serial_number",
+    "version", "patch", "hardware", "snmp", "exporter", "syslog", "tacacs",
+)
 
 
 class ModelProfilePayload(BaseModel):
@@ -20,7 +23,7 @@ class ModelProfilePayload(BaseModel):
     device_type: Optional[str] = Field(default=None, max_length=50)
     default_role: Optional[str] = Field(default=None, max_length=50)
     capabilities: Dict[str, bool] = Field(default_factory=dict)
-    required_checks: List[str] = Field(default_factory=lambda: ["model_profile", "version", "snmp", "syslog", "tacacs"])
+    required_checks: List[str] = Field(default_factory=lambda: ["model_profile", "version", "hardware", "snmp", "syslog", "tacacs"])
     description: Optional[str] = None
     priority: int = Field(default=100, ge=0, le=10000)
     is_active: bool = True
@@ -36,7 +39,12 @@ class ModelProfilePayload(BaseModel):
     @field_validator("required_checks")
     @classmethod
     def validate_checks(cls, value: List[str]):
-        normalized = list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+        # Part Number is no longer collected or checked. Ignore the retired
+        # value when an older model profile is edited through the API.
+        normalized = list(dict.fromkeys(
+            str(item).strip() for item in value
+            if str(item).strip() and str(item).strip() != "part_number"
+        ))
         unknown = set(normalized) - set(CHECK_KEYS)
         if unknown:
             raise ValueError(f"不支持的检查项: {', '.join(sorted(unknown))}")
