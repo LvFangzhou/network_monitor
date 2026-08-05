@@ -49,6 +49,7 @@ MENU_OPTIONS = [
     {"label": "仪表盘", "value": "/dashboard"},
     {"label": "字典管理", "value": "/device-dictionaries"},
     {"label": "网络设备", "value": "/devices"},
+    {"label": "服务器管理", "value": "/servers"},
     {"label": "上线合规", "value": "/device-compliance"},
     {"label": "公网管理", "value": "/public-circuits"},
     {"label": "专线管理", "value": "/private-circuits"},

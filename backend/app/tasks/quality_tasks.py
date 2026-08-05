@@ -17,17 +17,24 @@ from app.utils.quality_probe import (
     run_quality_nqa_snmp,
     run_quality_ping,
     run_quality_ping_batch,
+    run_quality_fast_ping_batch,
     run_mtr_or_trace,
     normalize_quality_ping_result,
+    normalize_quality_target_addresses,
+    quality_probe_member_key,
     write_quality_probe_result,
 )
 
 
 logger = get_logger(__name__)
 QUALITY_PROBE_LOCK_KEY = "quality_probe:collect:lock"
-QUALITY_PROBE_LOCK_TTL_SECONDS = 15
+# A full 10-packet sweep currently takes about 28 seconds in production.
+# Keep the lock beyond one sweep so the 1-second scheduler cannot start a
+# duplicate collection while the previous one is still running.
+QUALITY_PROBE_LOCK_TTL_SECONDS = 60
 QUALITY_PROBE_MAX_WORKERS = 20
 QUALITY_LOSS_ALERT_METRIC_TYPE = "quality_packet_loss"
+QUALITY_CRITICAL_LOSS_ALERT_METRIC_TYPE = "quality_packet_loss_critical"
 QUALITY_LATENCY_ALERT_METRIC_TYPE = "quality_latency"
 QUALITY_JITTER_ALERT_METRIC_TYPE = "quality_jitter"
 QUALITY_ALERT_ACTIVE_STATUSES = ("firing", "acknowledged", "ignored", "snoozed")
@@ -35,29 +42,32 @@ QUALITY_MTR_LOCK_KEY = "quality_probe:mtr:collect:lock"
 QUALITY_MTR_LOCK_TTL_SECONDS = 120
 QUALITY_MTR_MAX_WORKERS = 4
 QUALITY_MTR_LATENCY_EVENT_THRESHOLD_MS = 50.0
+QUALITY_FAST_PROBE_LOCK_KEY = "quality_probe:fast_collect:lock"
+QUALITY_FAST_PROBE_LOCK_TTL_SECONDS = 10
+QUALITY_FAST_CRITICAL_LOSS_PERCENT = 50.0
 
 
-def _quality_loss_counter_key(target_id: int) -> str:
+def _quality_loss_counter_key(target_id: Any) -> str:
     return f"quality_probe:consecutive_loss:{target_id}"
 
 
-def _quality_latency_counter_key(target_id: int) -> str:
+def _quality_latency_counter_key(target_id: Any) -> str:
     return f"quality_probe:consecutive_latency:{target_id}"
 
 
-def _quality_latency_recovery_counter_key(target_id: int) -> str:
+def _quality_latency_recovery_counter_key(target_id: Any) -> str:
     return f"quality_probe:latency_recovery:{target_id}"
 
 
-def _quality_jitter_counter_key(target_id: int) -> str:
+def _quality_jitter_counter_key(target_id: Any) -> str:
     return f"quality_probe:consecutive_jitter:{target_id}"
 
 
-def _quality_jitter_recovery_counter_key(target_id: int) -> str:
+def _quality_jitter_recovery_counter_key(target_id: Any) -> str:
     return f"quality_probe:jitter_recovery:{target_id}"
 
 
-def _update_consecutive_threshold_count(target_id: int, metric_name: str, is_abnormal: bool) -> int:
+def _update_consecutive_threshold_count(target_id: Any, metric_name: str, is_abnormal: bool) -> int:
     if metric_name == "latency":
         key = _quality_latency_counter_key(target_id)
     elif metric_name == "jitter":
@@ -79,7 +89,7 @@ def _update_consecutive_threshold_count(target_id: int, metric_name: str, is_abn
         return 1
 
 
-def _update_consecutive_loss_count(target_id: int, raw_result: Dict[str, Any]) -> int:
+def _update_consecutive_loss_count(target_id: Any, raw_result: Dict[str, Any]) -> int:
     """Count consecutive probe cycles with at least one lost packet."""
     try:
         sent = int(float(raw_result.get("sent") or 0))
@@ -198,7 +208,11 @@ def _quality_target_notification(rule: AlertRule | None, target: QualityProbeTar
     if target_notification:
         return target_notification
     # 延迟/抖动告警复用质量探测目标里已经配置的机器人，避免同一个探测目标重复配置机器人。
-    if rule.metric_type in {QUALITY_LATENCY_ALERT_METRIC_TYPE, QUALITY_JITTER_ALERT_METRIC_TYPE} and fallback_rule:
+    if rule.metric_type in {
+        QUALITY_CRITICAL_LOSS_ALERT_METRIC_TYPE,
+        QUALITY_LATENCY_ALERT_METRIC_TYPE,
+        QUALITY_JITTER_ALERT_METRIC_TYPE,
+    } and fallback_rule:
         fallback_extra = fallback_rule.extra_config or {}
         return (fallback_extra.get("target_notifications") or {}).get(str(target.id)) or {}
     return {}
@@ -213,6 +227,8 @@ def _quality_alert_message(
     required_count: int,
     raw_result: Dict[str, Any],
     smoothed_result: Dict[str, Any],
+    member_target: str | None = None,
+    fast_confirmed: bool = False,
 ) -> str:
     datacenter = target.datacenter_ref.name if target.datacenter_ref else "-"
     latency = smoothed_result.get("avg_latency_ms")
@@ -224,13 +240,60 @@ def _quality_alert_message(
     unit = "ms" if metric_label in {"延迟", "抖动"} else "%"
     value_text = f"{current_value:.2f}{unit}"
     threshold_text = f"{threshold:.2f}{unit}"
+    loss_window_label = "快速复核丢包率" if fast_confirmed else "最近5分钟丢包率"
+    probe_cycle_label = "次快速复核" if fast_confirmed else "个探测周期"
     return (
-        f"探测目标 {target.name} ({target.target}) {metric_label} {value_text}，"
-        f"已连续 {consecutive_count} 个探测周期{metric_label}异常，告警要求连续 {required_count} 个周期，"
+        f"探测目标 {target.name} ({member_target or target.target}) {metric_label} {value_text}，"
+        f"已连续 {consecutive_count} {probe_cycle_label}{metric_label}异常，告警要求连续 {required_count} 次，"
         f"{metric_label}阈值为 {threshold_text}；"
-        f"当前延迟：{latency_text}，最近5分钟丢包率：{loss_text}，本轮收发：{received}/{sent}；"
+        f"当前延迟：{latency_text}，{loss_window_label}：{loss_text}，本轮收发：{received}/{sent}；"
         f"机房：{datacenter}，运营商：{target.operator_name or '-'}"
     )
+
+
+def _get_or_create_critical_loss_rule(db, config_rule: AlertRule | None) -> AlertRule | None:
+    """Keep P0 severe loss separate from ordinary quality thresholds."""
+    rule = (
+        db.query(AlertRule)
+        .filter(AlertRule.metric_type == QUALITY_CRITICAL_LOSS_ALERT_METRIC_TYPE)
+        .order_by(AlertRule.id.asc())
+        .first()
+    )
+    if rule:
+        changed = False
+        if rule.severity != "P0":
+            rule.severity = "P0"
+            changed = True
+        if float(rule.threshold or 0) != QUALITY_FAST_CRITICAL_LOSS_PERCENT:
+            rule.threshold = QUALITY_FAST_CRITICAL_LOSS_PERCENT
+            changed = True
+        if config_rule is not None and int(rule.enabled or 0) != int(config_rule.enabled or 0):
+            rule.enabled = int(config_rule.enabled or 0)
+            changed = True
+        if changed:
+            db.commit()
+        return rule
+    if not config_rule:
+        return None
+    rule = AlertRule(
+        name="公网质量探测严重丢包",
+        description="快速探测连续两轮复核后丢包率仍达到50%，立即触发P0；正常质量采样负责确认恢复",
+        rule_type="threshold",
+        metric_type=QUALITY_CRITICAL_LOSS_ALERT_METRIC_TYPE,
+        condition=">=",
+        threshold=QUALITY_FAST_CRITICAL_LOSS_PERCENT,
+        duration=0,
+        suppress_duration=300,
+        severity="P0",
+        enabled=1 if config_rule.enabled else 0,
+        device_ids=[],
+        extra_config={"quality_probe_global": True, "consecutive_samples": 1},
+        notification_channels=[],
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
 
 
 def _evaluate_quality_loss_alert(
@@ -239,20 +302,28 @@ def _evaluate_quality_loss_alert(
     target: QualityProbeTarget,
     raw_result: Dict[str, Any],
     smoothed_result: Dict[str, Any],
+    member_target: str | None = None,
+    immediate_critical: bool = False,
+    fallback_channel_rule: AlertRule | None = None,
 ) -> None:
     if not rule:
         return
-    target_notification = _quality_target_notification(rule, target)
+    target_notification = _quality_target_notification(rule, target, fallback_channel_rule)
     if not target_notification.get("enabled") or not str(target_notification.get("webhook_url") or "").strip():
         return
     required_count, threshold = _quality_target_thresholds(rule, target_notification)
-    consecutive_count = _update_consecutive_loss_count(target.id, raw_result)
+    if immediate_critical or rule.metric_type == QUALITY_CRITICAL_LOSS_ALERT_METRIC_TYPE:
+        required_count = 1
+        threshold = max(float(threshold), QUALITY_FAST_CRITICAL_LOSS_PERCENT)
+    member_target = member_target or target.target
+    member_key = quality_probe_member_key(target.id, member_target)
+    consecutive_count = _update_consecutive_loss_count(member_key, raw_result)
     try:
         loss_percent = float(smoothed_result.get("packet_loss_percent") or 0.0)
     except (TypeError, ValueError):
         return
     should_alert = consecutive_count >= required_count and loss_percent >= threshold
-    target_key = str(target.id)
+    target_key = member_key
     active_alert = (
         db.query(AlertHistory)
         .filter(
@@ -264,20 +335,45 @@ def _evaluate_quality_loss_alert(
         .order_by(AlertHistory.id.desc())
         .first()
     )
-    message = _quality_alert_message(target, "丢包率", loss_percent, threshold, consecutive_count, required_count, raw_result, smoothed_result)
+    message = _quality_alert_message(
+        target,
+        "丢包率",
+        loss_percent,
+        threshold,
+        consecutive_count,
+        required_count,
+        raw_result,
+        smoothed_result,
+        member_target,
+        fast_confirmed=immediate_critical,
+    )
     now = datetime.now(timezone.utc)
     if should_alert:
         try:
-            redis_client.delete(_quality_latency_recovery_counter_key(target.id))
+            redis_client.delete(_quality_latency_recovery_counter_key(member_key))
         except Exception:
             pass
         if active_alert:
             active_alert.alert_value = loss_percent
             active_alert.threshold = threshold
             active_alert.message = message
-            active_alert.alert_target_name = f"{target.name} / {target.target}"
+            active_alert.alert_target_name = f"{target.name} / {member_target}"
             active_alert.updated_at = now
             db.commit()
+            # 质量探测使用独立评估流程，不会经过 alert_tasks 的通用规则扫描。
+            # 持续丢包时仍复用通用重复通知判断，按规则 suppress_duration
+            # （当前公网质量规则为 300 秒）再次播报，恢复后自然停止。
+            from app.tasks.alert_tasks import enqueue_alert_notification, _should_repeat_notify
+            if _should_repeat_notify(active_alert, rule):
+                enqueue_alert_notification(active_alert.id)
+                logger.info(
+                    "公网质量持续丢包重复通知",
+                    target_id=target.id,
+                    target=member_target,
+                    alert_id=active_alert.id,
+                    loss_percent=loss_percent,
+                    interval_seconds=rule.suppress_duration,
+                )
             return
         alert = AlertHistory(
             rule_id=rule.id,
@@ -287,7 +383,7 @@ def _evaluate_quality_loss_alert(
             message=message,
             alert_target_type="quality_probe",
             alert_target_key=target_key,
-            alert_target_name=f"{target.name} / {target.target}",
+            alert_target_name=f"{target.name} / {member_target}",
             status="firing",
             started_at=now,
         )
@@ -299,7 +395,7 @@ def _evaluate_quality_loss_alert(
         logger.warning(
             "公网质量连续丢包告警触发",
             target_id=target.id,
-            target=target.target,
+            target=member_target,
             consecutive_count=consecutive_count,
             loss_percent=loss_percent,
             threshold=threshold,
@@ -328,6 +424,86 @@ def _evaluate_quality_loss_alert(
         logger.info("公网质量连续丢包告警恢复", target_id=target.id, alert_id=active_alert.id)
 
 
+@shared_task(bind=True, name="app.tasks.quality_tasks.collect_quality_fast_outages")
+def collect_quality_fast_outages(self) -> Dict[str, Any]:
+    """Every five seconds, detect only confirmed severe loss/outage."""
+    try:
+        acquired = redis_client.set(
+            QUALITY_FAST_PROBE_LOCK_KEY,
+            self.request.id or "1",
+            ex=QUALITY_FAST_PROBE_LOCK_TTL_SECONDS,
+            nx=True,
+        )
+    except Exception:
+        acquired = True
+    if not acquired:
+        return {"status": "locked", "checked": 0}
+
+    db = SessionLocal()
+    try:
+        targets = (
+            db.query(QualityProbeTarget)
+            .filter(
+                QualityProbeTarget.is_active == True,  # noqa: E712
+                QualityProbeTarget.probe_source == "server_icmp",
+            )
+            .order_by(QualityProbeTarget.id.asc())
+            .all()
+        )
+        config_rule = (
+            db.query(AlertRule)
+            .filter(AlertRule.metric_type == QUALITY_LOSS_ALERT_METRIC_TYPE, AlertRule.enabled == 1)
+            .order_by(AlertRule.id.asc())
+            .first()
+        )
+        if not config_rule:
+            return {"status": "disabled", "checked": 0}
+        rule = _get_or_create_critical_loss_rule(db, config_rule)
+        if not rule or not rule.enabled:
+            return {"status": "disabled", "checked": 0}
+
+        probes: List[Dict[str, Any]] = []
+        targets_by_member: Dict[str, tuple[QualityProbeTarget, str]] = {}
+        for target in targets:
+            for address in normalize_quality_target_addresses(target.target, target.target_addresses):
+                member_key = quality_probe_member_key(target.id, address)
+                probes.append({"id": member_key, "target": address, "timeout_ms": min(int(target.timeout_ms or 1000), 1000)})
+                targets_by_member[member_key] = (target, address)
+
+        results = run_quality_fast_ping_batch(probes)
+        critical = 0
+        for member_key, result in results.items():
+            try:
+                loss_percent = float(result.get("packet_loss_percent") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if loss_percent < QUALITY_FAST_CRITICAL_LOSS_PERCENT or int(result.get("confirmed_rounds") or 0) < 2:
+                continue
+            target, address = targets_by_member[str(member_key)]
+            _evaluate_quality_loss_alert(
+                db,
+                rule,
+                target,
+                result,
+                result,
+                address,
+                immediate_critical=True,
+                fallback_channel_rule=config_rule,
+            )
+            critical += 1
+        return {"status": "ok", "checked": len(results), "critical": critical}
+    except Exception as exc:
+        db.rollback()
+        logger.error("快速公网质量探测失败", error=str(exc))
+        return {"status": "error", "error": str(exc), "checked": 0}
+    finally:
+        db.close()
+        try:
+            redis_client.delete(QUALITY_FAST_PROBE_LOCK_KEY)
+        except Exception:
+            pass
+
+
 def _evaluate_quality_latency_alert(
     db,
     rule: AlertRule | None,
@@ -335,6 +511,7 @@ def _evaluate_quality_latency_alert(
     target: QualityProbeTarget,
     raw_result: Dict[str, Any],
     smoothed_result: Dict[str, Any],
+    member_target: str | None = None,
 ) -> None:
     if not rule:
         return
@@ -350,9 +527,11 @@ def _evaluate_quality_latency_alert(
         is_abnormal = False
     else:
         is_abnormal = latency_ms >= threshold
-    consecutive_count = _update_consecutive_threshold_count(target.id, "latency", is_abnormal)
+    member_target = member_target or target.target
+    member_key = quality_probe_member_key(target.id, member_target)
+    consecutive_count = _update_consecutive_threshold_count(member_key, "latency", is_abnormal)
     should_alert = consecutive_count >= required_count and is_abnormal
-    target_key = str(target.id)
+    target_key = member_key
     active_alert = (
         db.query(AlertHistory)
         .filter(
@@ -364,16 +543,19 @@ def _evaluate_quality_latency_alert(
         .order_by(AlertHistory.id.desc())
         .first()
     )
-    message = _quality_alert_message(target, "延迟", latency_ms, threshold, consecutive_count, required_count, raw_result, smoothed_result)
+    message = _quality_alert_message(target, "延迟", latency_ms, threshold, consecutive_count, required_count, raw_result, smoothed_result, member_target)
     now = datetime.now(timezone.utc)
     if should_alert:
         if active_alert:
             active_alert.alert_value = latency_ms
             active_alert.threshold = threshold
             active_alert.message = message
-            active_alert.alert_target_name = f"{target.name} / {target.target}"
+            active_alert.alert_target_name = f"{target.name} / {member_target}"
             active_alert.updated_at = now
             db.commit()
+            from app.tasks.alert_tasks import enqueue_alert_notification, _should_repeat_notify
+            if _should_repeat_notify(active_alert, rule):
+                enqueue_alert_notification(active_alert.id)
             return
         alert = AlertHistory(
             rule_id=rule.id,
@@ -383,7 +565,7 @@ def _evaluate_quality_latency_alert(
             message=message,
             alert_target_type="quality_probe",
             alert_target_key=target_key,
-            alert_target_name=f"{target.name} / {target.target}",
+            alert_target_name=f"{target.name} / {member_target}",
             status="firing",
             started_at=now,
         )
@@ -395,7 +577,7 @@ def _evaluate_quality_latency_alert(
         logger.warning(
             "质量探测连续延迟超阈值告警触发",
             target_id=target.id,
-            target=target.target,
+            target=member_target,
             consecutive_count=consecutive_count,
             latency_ms=latency_ms,
             threshold=threshold,
@@ -403,7 +585,7 @@ def _evaluate_quality_latency_alert(
         )
         return
     if active_alert:
-        recovery_key = _quality_latency_recovery_counter_key(target.id)
+        recovery_key = _quality_latency_recovery_counter_key(member_key)
         recovery_required = _quality_latency_recovery_required(rule)
         if is_abnormal:
             try:
@@ -455,6 +637,7 @@ def _evaluate_quality_jitter_alert(
     target: QualityProbeTarget,
     raw_result: Dict[str, Any],
     smoothed_result: Dict[str, Any],
+    member_target: str | None = None,
 ) -> None:
     if not rule:
         return
@@ -470,9 +653,11 @@ def _evaluate_quality_jitter_alert(
         is_abnormal = False
     else:
         is_abnormal = jitter_ms >= threshold
-    consecutive_count = _update_consecutive_threshold_count(target.id, "jitter", is_abnormal)
+    member_target = member_target or target.target
+    member_key = quality_probe_member_key(target.id, member_target)
+    consecutive_count = _update_consecutive_threshold_count(member_key, "jitter", is_abnormal)
     should_alert = consecutive_count >= required_count and is_abnormal
-    target_key = str(target.id)
+    target_key = member_key
     active_alert = (
         db.query(AlertHistory)
         .filter(
@@ -484,16 +669,19 @@ def _evaluate_quality_jitter_alert(
         .order_by(AlertHistory.id.desc())
         .first()
     )
-    message = _quality_alert_message(target, "抖动", jitter_ms, threshold, consecutive_count, required_count, raw_result, smoothed_result)
+    message = _quality_alert_message(target, "抖动", jitter_ms, threshold, consecutive_count, required_count, raw_result, smoothed_result, member_target)
     now = datetime.now(timezone.utc)
     if should_alert:
         if active_alert:
             active_alert.alert_value = jitter_ms
             active_alert.threshold = threshold
             active_alert.message = message
-            active_alert.alert_target_name = f"{target.name} / {target.target}"
+            active_alert.alert_target_name = f"{target.name} / {member_target}"
             active_alert.updated_at = now
             db.commit()
+            from app.tasks.alert_tasks import enqueue_alert_notification, _should_repeat_notify
+            if _should_repeat_notify(active_alert, rule):
+                enqueue_alert_notification(active_alert.id)
             return
         alert = AlertHistory(
             rule_id=rule.id,
@@ -503,7 +691,7 @@ def _evaluate_quality_jitter_alert(
             message=message,
             alert_target_type="quality_probe",
             alert_target_key=target_key,
-            alert_target_name=f"{target.name} / {target.target}",
+            alert_target_name=f"{target.name} / {member_target}",
             status="firing",
             started_at=now,
         )
@@ -515,7 +703,7 @@ def _evaluate_quality_jitter_alert(
         logger.warning(
             "质量探测连续抖动超阈值告警触发",
             target_id=target.id,
-            target=target.target,
+            target=member_target,
             consecutive_count=consecutive_count,
             jitter_ms=jitter_ms,
             threshold=threshold,
@@ -523,7 +711,7 @@ def _evaluate_quality_jitter_alert(
         )
         return
     if active_alert:
-        recovery_key = _quality_jitter_recovery_counter_key(target.id)
+        recovery_key = _quality_jitter_recovery_counter_key(member_key)
         recovery_required = _quality_jitter_recovery_required(rule)
         if is_abnormal:
             try:
@@ -607,7 +795,7 @@ def collect_quality_probes(self) -> Dict[str, Any]:
         if not due_targets:
             return {"status": "ok", "collected": 0, "failed": 0, "items": []}
 
-        probe_results: Dict[int, Dict[str, Any]] = {}
+        probe_results: Dict[str, Dict[str, Any]] = {}
         device_ids = {
             int(target.device_id)
             for target in due_targets
@@ -626,12 +814,17 @@ def collect_quality_probes(self) -> Dict[str, Any]:
                 "packet_count": target.packet_count,
                 "timeout_ms": target.timeout_ms,
             })
-            server_ping_targets.append({
-                "id": target.id,
-                "target": target.target,
-                "packet_count": safe_config["packet_count"],
-                "timeout_ms": safe_config["timeout_ms"],
-            })
+            try:
+                addresses = normalize_quality_target_addresses(target.target, target.target_addresses)
+            except ValueError:
+                addresses = [target.target]
+            for address in addresses:
+                server_ping_targets.append({
+                    "id": quality_probe_member_key(target.id, address),
+                    "target": address,
+                    "packet_count": safe_config["packet_count"],
+                    "timeout_ms": safe_config["timeout_ms"],
+                })
         if server_ping_targets:
             probe_results.update(run_quality_ping_batch(server_ping_targets))
 
@@ -645,7 +838,7 @@ def collect_quality_probes(self) -> Dict[str, Any]:
             for target in nqa_targets:
                 device = devices_by_id.get(target.device_id)
                 if not device:
-                    probe_results[target.id] = {
+                    probe_results[str(target.id)] = {
                         "success": False,
                         "avg_latency_ms": None,
                         "min_latency_ms": None,
@@ -659,7 +852,7 @@ def collect_quality_probes(self) -> Dict[str, Any]:
                     }
                     continue
                 future = executor.submit(run_quality_nqa_snmp, target, device)
-                futures[future] = target.id
+                futures[future] = str(target.id)
             for future in as_completed(futures):
                 target_id = futures[future]
                 try:
@@ -685,6 +878,9 @@ def collect_quality_probes(self) -> Dict[str, Any]:
             .order_by(AlertRule.id.asc())
             .first()
         )
+        quality_critical_loss_alert_rule = _get_or_create_critical_loss_rule(db, quality_loss_alert_rule)
+        if not quality_loss_alert_rule or not quality_loss_alert_rule.enabled:
+            quality_critical_loss_alert_rule = None
         quality_latency_alert_rule = (
             db.query(AlertRule)
             .filter(AlertRule.metric_type == QUALITY_LATENCY_ALERT_METRIC_TYPE, AlertRule.enabled == 1)
@@ -698,33 +894,76 @@ def collect_quality_probes(self) -> Dict[str, Any]:
             .first()
         )
         for target in due_targets:
-            raw_result = normalize_quality_ping_result(probe_results.get(target.id) or {})
-            result = apply_quality_loss_window(target.id, raw_result)
-            target.last_probe_at = datetime.now(timezone.utc)
-            target.last_success = bool(result.get("success"))
-            target.last_avg_latency_ms = result.get("avg_latency_ms")
-            # 卡片上的“当前丢包率”应表示最近一次探测，不使用滚动窗口值；
-            # 滚动窗口丢包率仍写入 Influx，用于历史趋势图和避免单包毛刺。
-            target.last_packet_loss_percent = result.get("current_packet_loss_percent", raw_result.get("packet_loss_percent"))
-            target.last_jitter_ms = result.get("jitter_ms")
-            target.last_error = result.get("error")
+            is_server_icmp = (target.probe_source or "server_icmp") == "server_icmp"
+            addresses = normalize_quality_target_addresses(target.target, target.target_addresses) if is_server_icmp else [target.target]
+            member_statuses: Dict[str, Dict[str, Any]] = dict(target.target_statuses or {})
+            member_results: List[tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+            now = datetime.now(timezone.utc)
+            for address in addresses:
+                member_key = quality_probe_member_key(target.id, address) if is_server_icmp else str(target.id)
+                raw_result = normalize_quality_ping_result(probe_results.get(member_key) or {})
+                result = apply_quality_loss_window(member_key, raw_result)
+                member_statuses[address] = {
+                    "success": bool(result.get("success")),
+                    "avg_latency_ms": result.get("avg_latency_ms"),
+                    "packet_loss_percent": result.get("current_packet_loss_percent", raw_result.get("packet_loss_percent")),
+                    "rolling_packet_loss_percent": result.get("packet_loss_percent"),
+                    "jitter_ms": result.get("jitter_ms"),
+                    "received": result.get("received"),
+                    "sent": result.get("sent"),
+                    "error": result.get("error"),
+                    "last_probe_at": now.isoformat(),
+                    **({"last_mtr_at": member_statuses.get(address, {}).get("last_mtr_at")} if member_statuses.get(address, {}).get("last_mtr_at") else {}),
+                }
+                write_quality_probe_result(target, result, address)
+                if is_server_icmp:
+                    # 快速层负责触发；正常采样使用同一P0规则确认持续状态及恢复，
+                    # 不再另外生成一条普通丢包告警。
+                    _evaluate_quality_loss_alert(
+                        db,
+                        quality_critical_loss_alert_rule,
+                        target,
+                        raw_result,
+                        result,
+                        address,
+                        fallback_channel_rule=quality_loss_alert_rule,
+                    )
+                _evaluate_quality_latency_alert(db, quality_latency_alert_rule, quality_loss_alert_rule, target, raw_result, result, address)
+                _evaluate_quality_jitter_alert(db, quality_jitter_alert_rule, quality_loss_alert_rule, target, raw_result, result, address)
+                member_results.append((address, raw_result, result))
+                collected += 1
+                if not result.get("success"):
+                    failed += 1
+                rows.append({
+                    "id": target.id,
+                    "name": target.name,
+                    "target": address,
+                    "success": bool(result.get("success")),
+                    "avg_latency_ms": result.get("avg_latency_ms"),
+                    "packet_loss_percent": result.get("packet_loss_percent"),
+                })
+
+            worst_address, worst_raw, worst_result = max(
+                member_results,
+                key=lambda item: (
+                    0 if item[2].get("success") else 1,
+                    float(item[2].get("packet_loss_percent") or 0),
+                    float(item[2].get("avg_latency_ms") or 0),
+                ),
+            )
+            target.target_addresses = addresses
+            target.target_statuses = member_statuses
+            target.last_probe_at = now
+            target.last_success = all(bool(item[2].get("success")) for item in member_results)
+            target.last_avg_latency_ms = worst_result.get("avg_latency_ms")
+            target.last_packet_loss_percent = worst_result.get("current_packet_loss_percent", worst_raw.get("packet_loss_percent"))
+            target.last_jitter_ms = max(
+                (float(item[2].get("jitter_ms")) for item in member_results if item[2].get("jitter_ms") is not None),
+                default=None,
+            )
+            failed_addresses = [address for address, _, result in member_results if not result.get("success")]
+            target.last_error = f"异常目标：{', '.join(failed_addresses)}" if failed_addresses else worst_result.get("error")
             db.commit()
-            db.refresh(target)
-            write_quality_probe_result(target, result)
-            # 当前质量告警仅启用延迟/抖动阈值；丢包率只作为图表和机器人参考字段保留。
-            _evaluate_quality_latency_alert(db, quality_latency_alert_rule, quality_loss_alert_rule, target, raw_result, result)
-            _evaluate_quality_jitter_alert(db, quality_jitter_alert_rule, quality_loss_alert_rule, target, raw_result, result)
-            collected += 1
-            if not result.get("success"):
-                failed += 1
-            rows.append({
-                "id": target.id,
-                "name": target.name,
-                "target": target.target,
-                "success": bool(result.get("success")),
-                "avg_latency_ms": result.get("avg_latency_ms"),
-                "packet_loss_percent": result.get("packet_loss_percent"),
-            })
         return {"status": "ok", "collected": collected, "failed": failed, "items": rows[:20]}
     except Exception as e:
         db.rollback()
@@ -767,7 +1006,7 @@ def _create_mtr_event_if_needed(db, target: QualityProbeTarget, previous: Qualit
         latency_delta_ms=latency_delta,
         detail={
             "target_name": target.name,
-            "target": target.target,
+            "target": current.target,
             "previous_path": [hop.get("ip") for hop in (previous.hops or []) if hop.get("ip")],
             "current_path": [hop.get("ip") for hop in (current.hops or []) if hop.get("ip")],
             "path_changed": path_changed,
@@ -802,19 +1041,29 @@ def collect_quality_mtr_paths(self) -> Dict[str, Any]:
             .order_by(QualityProbeTarget.id.asc())
             .all()
         )
-        due_targets = []
+        due_members: List[tuple[QualityProbeTarget, str]] = []
+        now = datetime.now(timezone.utc)
         for target in targets:
-            interval = max(int(target.mtr_interval_seconds or 300), 60)
-            if _seconds_since(target.last_mtr_at) < interval:
-                continue
-            due_targets.append(target)
-        if not due_targets:
+            interval = max(int(target.mtr_interval_seconds or 3600), 3600)
+            statuses = target.target_statuses or {}
+            for address in normalize_quality_target_addresses(target.target, target.target_addresses):
+                last_mtr_raw = (statuses.get(address) or {}).get("last_mtr_at")
+                try:
+                    last_mtr_at = datetime.fromisoformat(str(last_mtr_raw).replace("Z", "+00:00")) if last_mtr_raw else None
+                except (TypeError, ValueError):
+                    last_mtr_at = None
+                if _seconds_since(last_mtr_at) >= interval:
+                    due_members.append((target, address))
+        if not due_members:
             return {"status": "ok", "collected": 0, "failed": 0, "events": 0, "items": []}
 
-        results: Dict[int, Dict[str, Any]] = {}
-        max_workers = max(1, min(QUALITY_MTR_MAX_WORKERS, len(due_targets)))
+        results: Dict[str, Dict[str, Any]] = {}
+        max_workers = max(1, min(QUALITY_MTR_MAX_WORKERS, len(due_members)))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(run_mtr_or_trace, target.target, 5, 35, False): target.id for target in due_targets}
+            futures = {
+                executor.submit(run_mtr_or_trace, address, 5, 35, False): quality_probe_member_key(target.id, address)
+                for target, address in due_members
+            }
             for future in as_completed(futures):
                 target_id = futures[future]
                 try:
@@ -822,18 +1071,18 @@ def collect_quality_mtr_paths(self) -> Dict[str, Any]:
                 except Exception as exc:
                     results[target_id] = {"success": False, "error": str(exc), "hops": [], "output": str(exc), "tool": "none"}
 
-        now = datetime.now(timezone.utc)
-        for target in due_targets:
-            result = results.get(target.id) or {}
+        for target, address in due_members:
+            result = results.get(quality_probe_member_key(target.id, address)) or {}
             previous = (
                 db.query(QualityMtrSnapshot)
                 .filter(QualityMtrSnapshot.target_id == target.id)
+                .filter(QualityMtrSnapshot.target == address)
                 .order_by(QualityMtrSnapshot.created_at.desc(), QualityMtrSnapshot.id.desc())
                 .first()
             )
             snapshot = QualityMtrSnapshot(
                 target_id=target.id,
-                target=target.target,
+                target=address,
                 path_hash=result.get("path_hash") or "",
                 hop_count=int(result.get("hop_count") or 0),
                 final_hop_ip=result.get("final_hop_ip"),
@@ -853,16 +1102,26 @@ def collect_quality_mtr_paths(self) -> Dict[str, Any]:
             event = _create_mtr_event_if_needed(db, target, previous, snapshot)
             if event:
                 events += 1
-            target.last_mtr_at = now
-            target.last_mtr_path_hash = snapshot.path_hash
-            target.last_mtr_final_latency_ms = snapshot.final_avg_latency_ms
+            statuses = dict(target.target_statuses or {})
+            member_status = dict(statuses.get(address) or {})
+            member_status.update({
+                "last_mtr_at": now.isoformat(),
+                "last_mtr_path_hash": snapshot.path_hash,
+                "last_mtr_final_latency_ms": snapshot.final_avg_latency_ms,
+            })
+            statuses[address] = member_status
+            target.target_statuses = statuses
+            if address == target.target or not target.last_mtr_at:
+                target.last_mtr_at = now
+                target.last_mtr_path_hash = snapshot.path_hash
+                target.last_mtr_final_latency_ms = snapshot.final_avg_latency_ms
             if not snapshot.success:
                 failed += 1
             collected += 1
             rows.append({
                 "id": target.id,
                 "name": target.name,
-                "target": target.target,
+                "target": address,
                 "success": snapshot.success,
                 "hop_count": snapshot.hop_count,
                 "final_avg_latency_ms": snapshot.final_avg_latency_ms,

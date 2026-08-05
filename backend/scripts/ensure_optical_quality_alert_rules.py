@@ -104,11 +104,11 @@ def main() -> None:
         h3c_channels = _vendor_channels(db, "H3C")
         _, was_created = _upsert(db, {
             "name": "【H3C S9867】光功率下降并伴随FEC增长",
-            "description": "仅用于RoCE Fabric：接口UP、近1小时收光下降且同周期FEC增长时触发。不可纠错FEC增长直接按严重关联值处理。",
+            "description": "仅用于RoCE Fabric：同一模块在线会话内，接口UP、近1小时收光下降且同周期FEC不可纠错计数增长时触发；可纠错计数仅作诊断信息。",
             "rule_type": "threshold",
             "metric_type": "optical_rx_fec_correlation",
             "condition": ">",
-            "threshold": 1000.0,
+            "threshold": 0.0,
             "duration": 600,
             "severity": "P1",
             "notification_channels": h3c_channels,

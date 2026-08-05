@@ -14,6 +14,30 @@ depends_on = None
 
 
 def upgrade():
+    expected_tables = {
+        "device_model_profiles",
+        "version_baselines",
+        "device_compliance_snapshots",
+    }
+    existing_tables = expected_tables.intersection(sa.inspect(op.get_bind()).get_table_names())
+    if existing_tables == expected_tables:
+        op.execute("CREATE INDEX IF NOT EXISTS ix_device_model_profiles_vendor ON device_model_profiles (vendor)")
+        op.execute("CREATE INDEX IF NOT EXISTS ix_device_model_profiles_model_pattern ON device_model_profiles (model_pattern)")
+        op.execute("CREATE INDEX IF NOT EXISTS ix_device_model_profiles_network_type ON device_model_profiles (network_type)")
+        op.execute("CREATE INDEX IF NOT EXISTS ix_version_baselines_model_profile_id ON version_baselines (model_profile_id)")
+        op.execute("CREATE INDEX IF NOT EXISTS ix_version_baselines_vendor ON version_baselines (vendor)")
+        op.execute("CREATE INDEX IF NOT EXISTS ix_version_baselines_model_pattern ON version_baselines (model_pattern)")
+        op.execute("CREATE INDEX IF NOT EXISTS ix_version_baselines_device_role ON version_baselines (device_role)")
+        op.execute("CREATE INDEX IF NOT EXISTS ix_device_compliance_snapshots_device_id ON device_compliance_snapshots (device_id)")
+        op.execute("CREATE INDEX IF NOT EXISTS ix_device_compliance_snapshots_overall_status ON device_compliance_snapshots (overall_status)")
+        op.execute("CREATE INDEX IF NOT EXISTS ix_device_compliance_snapshots_evaluated_at ON device_compliance_snapshots (evaluated_at)")
+        return
+    if existing_tables:
+        raise RuntimeError(
+            "Partial device compliance schema found; refusing to mark migration 009 complete: "
+            + ", ".join(sorted(existing_tables))
+        )
+
     op.create_table(
         "device_model_profiles",
         sa.Column("id", sa.Integer(), primary_key=True),

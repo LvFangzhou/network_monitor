@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Row, Col, Card, Statistic, Spin, Progress, Select, Space, Typography, theme, Segmented, Tooltip as AntTooltip } from 'antd'
+import { Row, Col, Card, Statistic, Spin, Progress, Select, Space, Typography, theme, Segmented, Tooltip as AntTooltip, Alert, Table, Tag } from 'antd'
 import {
   DesktopOutlined,
   CheckCircleOutlined,
@@ -9,9 +9,10 @@ import {
   GlobalOutlined,
   ApartmentOutlined,
   QuestionCircleOutlined,
+  DeploymentUnitOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
-import { getDashboardStats, getServerResourceHistory, getServerResources, ServerResourceStats } from '../api/metrics'
+import { getDashboardStats, getServerQueueHealth, getServerResourceHistory, getServerResources, QueueHealth, QueueHealthItem, ServerResourceStats } from '../api/metrics'
 import { getDatacenters } from '../api/devices'
 import {
   CartesianGrid,
@@ -120,6 +121,7 @@ const Dashboard = () => {
   const [serverResources, setServerResources] = useState<ServerResourceStats | null>(null)
   const [resourceSamples, setResourceSamples] = useState<ResourceSample[]>([])
   const [resourceRange, setResourceRange] = useState<ResourceRange>('1h')
+  const [queueHealth, setQueueHealth] = useState<QueueHealth | null>(null)
   const [stats, setStats] = useState({
     total: 0,
     datacenters: 0,
@@ -151,8 +153,13 @@ const Dashboard = () => {
   useEffect(() => {
     fetchStats()
     fetchServerResources()
+    fetchQueueHealth()
     const timer = window.setInterval(fetchServerResources, 10000)
-    return () => window.clearInterval(timer)
+    const queueTimer = window.setInterval(fetchQueueHealth, 10000)
+    return () => {
+      window.clearInterval(timer)
+      window.clearInterval(queueTimer)
+    }
   }, [])
 
   useEffect(() => {
@@ -195,6 +202,21 @@ const Dashboard = () => {
       setServerResources(result)
     } catch (error) {
       console.error('获取服务器资源失败:', error)
+    }
+  }
+
+  const fetchQueueHealth = async () => {
+    try {
+      setQueueHealth(await getServerQueueHealth())
+    } catch (error) {
+      console.error('获取消息队列健康状态失败:', error)
+      setQueueHealth({
+        status: 'unavailable',
+        checked_at: Date.now() / 1000,
+        message: '队列监控接口暂不可用',
+        broker: { reachable: false, total_messages: 0, total_ready: 0, total_unacked: 0, consumers: 0 },
+        queues: [],
+      })
     }
   }
 
@@ -648,6 +670,53 @@ const Dashboard = () => {
               <div style={{ textAlign: 'center', padding: 48 }}>
                 <Spin />
               </div>
+            )}
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]}>
+        <Col span={24}>
+          <Card
+            title={<Space><DeploymentUnitOutlined /><span>任务队列健康</span></Space>}
+            extra={queueHealth ? (
+              <Tag color={queueHealth.status === 'healthy' ? 'success' : queueHealth.status === 'warning' ? 'warning' : 'error'}>
+                {queueHealth.status === 'healthy' ? '运行正常' : queueHealth.status === 'warning' ? '存在积压' : queueHealth.status === 'critical' ? '需要处理' : '监控不可用'}
+              </Tag>
+            ) : null}
+          >
+            {!queueHealth ? (
+              <div style={{ textAlign: 'center', padding: 32 }}><Spin /></div>
+            ) : !queueHealth.broker.reachable ? (
+              <Alert type="warning" showIcon message="RabbitMQ 队列监控暂不可用" description={queueHealth.message || '不会影响仪表盘其他功能，请检查 RabbitMQ Management API。'} />
+            ) : (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                <Row gutter={[16, 16]}>
+                  <Col xs={12} md={6}><Statistic title="总待处理" value={queueHealth.broker.total_ready} suffix="条" /></Col>
+                  <Col xs={12} md={6}><Statistic title="处理中" value={queueHealth.broker.total_unacked} suffix="条" /></Col>
+                  <Col xs={12} md={6}><Statistic title="消费者" value={queueHealth.broker.consumers} suffix="个" /></Col>
+                  <Col xs={12} md={6}><Statistic title="监控队列" value={queueHealth.queues.length} suffix="个" /></Col>
+                </Row>
+                <Table<QueueHealthItem>
+                  size="small"
+                  rowKey="name"
+                  pagination={false}
+                  scroll={{ x: 920 }}
+                  dataSource={queueHealth.queues}
+                  columns={[
+                    { title: '队列', dataIndex: 'display_name', width: 190, render: (value, row) => <Space direction="vertical" size={0}><Text>{value}</Text><Text type="secondary" style={{ fontSize: 12 }}>{row.name}</Text></Space> },
+                    { title: '待处理', dataIndex: 'ready', width: 90, sorter: (a, b) => a.ready - b.ready },
+                    { title: '处理中', dataIndex: 'unacked', width: 90 },
+                    { title: '消费者', dataIndex: 'consumers', width: 90 },
+                    { title: '发布/秒', dataIndex: 'publish_rate', width: 100, render: (value) => Number(value || 0).toFixed(2) },
+                    { title: '消费/秒', dataIndex: 'deliver_rate', width: 100, render: (value) => Number(value || 0).toFixed(2) },
+                    { title: '处理延迟', dataIndex: 'processing_lag_seconds', width: 105, render: (value) => value == null ? '-' : `${value}s` },
+                    { title: '最近耗时', dataIndex: 'last_latency_ms', width: 105, render: (value) => value == null ? '-' : `${value}ms` },
+                    { title: '失败数', dataIndex: 'failed', width: 85, render: (value) => Number(value || 0) },
+                    { title: '状态', dataIndex: 'status', width: 90, render: (value) => <Tag color={value === 'healthy' ? 'success' : value === 'warning' ? 'warning' : 'error'}>{value === 'healthy' ? '正常' : value === 'warning' ? '积压' : '异常'}</Tag> },
+                  ]}
+                />
+              </Space>
             )}
           </Card>
         </Col>

@@ -15,9 +15,15 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("datacenters", sa.Column("network_owner", sa.String(length=100), nullable=True))
-    op.add_column("datacenters", sa.Column("network_owner_email", sa.String(length=255), nullable=True))
-    op.add_column("datacenters", sa.Column("robot_mention", sa.String(length=255), nullable=True))
+    columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("datacenters")}
+    additions = (
+        ("network_owner", sa.Column("network_owner", sa.String(length=100), nullable=True)),
+        ("network_owner_email", sa.Column("network_owner_email", sa.String(length=255), nullable=True)),
+        ("robot_mention", sa.Column("robot_mention", sa.String(length=255), nullable=True)),
+    )
+    for name, column in additions:
+        if name not in columns:
+            op.add_column("datacenters", column)
 
 
 def downgrade() -> None:

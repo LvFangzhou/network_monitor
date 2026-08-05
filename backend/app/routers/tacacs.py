@@ -4,7 +4,7 @@ Tacacs+ 管理与日志查询。
 import re
 import json
 import socket
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +14,8 @@ from app.config import settings
 from app.models import User
 from app.routers.auth import check_permission, get_current_active_user
 from app.utils import notification_manager
+from app.utils.tacacs_commands import extract_tacacs_command, is_tacacs_user_command
+from app.utils.tacacs_time import SHANGHAI_TZ, parse_tacacs_log_time
 
 router = APIRouter()
 
@@ -23,14 +25,9 @@ TACACS_LOG_FILE = TACACS_DATA_DIR / "logs" / "tacacs.log"
 TACACS_SETTINGS_FILE = TACACS_DATA_DIR / "settings.json"
 TACACS_CONTAINER_NAME = "nm-tacacs"
 DOCKER_SOCKET = "/var/run/docker.sock"
+MASKED_SECRET = "******"
 
 LOG_PATTERN = re.compile(r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
-MONTH_MAP = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-}
-
-
 def _ensure_data_dir() -> None:
     (TACACS_DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
 
@@ -54,31 +51,18 @@ def _detect_notification_type(webhook_url: str) -> str:
     return "webhook"
 
 
+def _validate_webhook_url(webhook_url: str, *, allow_masked: bool = False) -> None:
+    value = (webhook_url or "").strip()
+    if allow_masked and value == MASKED_SECRET:
+        return
+    if value == MASKED_SECRET:
+        raise HTTPException(status_code=400, detail="Webhook 地址已脱敏，测试或新增保存前请重新粘贴完整地址")
+    if not re.match(r"^https?://", value, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Webhook 地址必须以 http:// 或 https:// 开头")
+
+
 def _parse_log_time(raw_time: str) -> Optional[str]:
-    try:
-        month_text, day, time_text = raw_time.split()
-        hour, minute, second = [int(item) for item in time_text.split(":")]
-        parsed = datetime(datetime.now().year, MONTH_MAP[month_text], int(day), hour, minute, second)
-        return (parsed + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
-
-
-def _extract_command(raw_command: str) -> str:
-    text = (raw_command or "").strip()
-    if not text:
-        return ""
-    marker_match = re.search(r"\s+(cmd-arg|err_msg|start_time)=", text)
-    command = text[:marker_match.start()].strip() if marker_match else text
-    rest = text[marker_match.start():] if marker_match else ""
-    arg_match = re.search(
-        r"\bcmd-arg=(.*?)(?=\s+(?:err_msg|start_time)=|$)",
-        rest,
-    )
-    cmd_arg = arg_match.group(1).strip() if arg_match else ""
-    if cmd_arg:
-        return f"{command} {cmd_arg}".strip()
-    return command
+    return parse_tacacs_log_time(raw_time)
 
 
 def _render_command_block(command: Dict[str, Any]) -> str:
@@ -202,7 +186,7 @@ def _require_tacacs_admin(current_user: User) -> None:
 
 
 def _mask_secret(value: Any) -> Any:
-    return "******" if str(value or "").strip() else value
+    return MASKED_SECRET if str(value or "").strip() else value
 
 
 def _masked_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -217,12 +201,34 @@ def _masked_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
-def _restart_docker_container(container_name: str) -> None:
+def _decode_chunked_body(body: bytes) -> bytes:
+    decoded = bytearray()
+    remaining = body
+    while remaining:
+        size_line, separator, remaining = remaining.partition(b"\r\n")
+        if not separator:
+            raise ValueError("分块响应缺少长度分隔符")
+        try:
+            chunk_size = int(size_line.split(b";", 1)[0], 16)
+        except ValueError as exc:
+            raise ValueError("分块响应长度无效") from exc
+        if chunk_size == 0:
+            return bytes(decoded)
+        if len(remaining) < chunk_size + 2:
+            raise ValueError("分块响应内容不完整")
+        decoded.extend(remaining[:chunk_size])
+        if remaining[chunk_size:chunk_size + 2] != b"\r\n":
+            raise ValueError("分块响应结尾无效")
+        remaining = remaining[chunk_size + 2:]
+    raise ValueError("分块响应缺少结束标记")
+
+
+def _docker_request(method: str, path: str) -> tuple[str, str]:
     if not Path(DOCKER_SOCKET).exists():
-        raise HTTPException(status_code=500, detail="API容器未挂载Docker Socket，无法重启Tacacs容器")
+        raise HTTPException(status_code=500, detail="服务管理接口不可用，无法操作 Tacacs 服务")
 
     request = (
-        f"POST /containers/{container_name}/restart?t=10 HTTP/1.1\r\n"
+        f"{method} {path} HTTP/1.1\r\n"
         "Host: docker\r\n"
         "Content-Length: 0\r\n"
         "Connection: close\r\n\r\n"
@@ -232,16 +238,71 @@ def _restart_docker_container(container_name: str) -> None:
             client.settimeout(15)
             client.connect(DOCKER_SOCKET)
             client.sendall(request.encode("utf-8"))
-            response = client.recv(4096).decode("utf-8", errors="ignore")
+            chunks = []
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            response = b"".join(chunks)
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"重启Tacacs容器失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail=f"操作 Tacacs 服务失败：{exc}") from exc
 
-    status_line = response.splitlines()[0] if response else ""
-    if " 204 " in status_line or " 200 " in status_line:
+    header_bytes, separator, body_bytes = response.partition(b"\r\n\r\n")
+    if not separator:
+        raise HTTPException(status_code=500, detail="操作 Tacacs 服务失败：响应格式异常")
+    header = header_bytes.decode("utf-8", errors="ignore")
+    if "transfer-encoding: chunked" in header.lower():
+        try:
+            body_bytes = _decode_chunked_body(body_bytes)
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=f"操作 Tacacs 服务失败：{exc}") from exc
+    status_line = header.splitlines()[0] if header else ""
+    return status_line, body_bytes.decode("utf-8", errors="ignore")
+
+
+def _docker_container_request(container_name: str, action: str, timeout_seconds: int = 10) -> None:
+    status_line, _ = _docker_request(
+        "POST",
+        f"/containers/{container_name}/{action}?t={timeout_seconds}",
+    )
+
+    if " 204 " in status_line or " 200 " in status_line or " 304 " in status_line:
         return
     if " 404 " in status_line:
-        raise HTTPException(status_code=404, detail=f"未找到Tacacs容器：{container_name}")
-    raise HTTPException(status_code=500, detail=f"Docker重启Tacacs容器失败：{status_line or '无响应'}")
+        raise HTTPException(status_code=404, detail="未找到 Tacacs 服务")
+    raise HTTPException(status_code=500, detail=f"操作 Tacacs 服务失败：{status_line or '无响应'}")
+
+
+def _docker_container_status(container_name: str) -> Dict[str, Any]:
+    status_line, body = _docker_request("GET", f"/containers/{container_name}/json")
+    if " 404 " in status_line:
+        return {"status": "not_found", "running": False, "label": "服务不存在"}
+    if " 200 " not in status_line:
+        raise HTTPException(status_code=500, detail=f"读取 Tacacs 服务状态失败：{status_line or '无响应'}")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="读取 Tacacs 服务状态失败：响应格式异常") from exc
+    state = payload.get("State") if isinstance(payload.get("State"), dict) else {}
+    running = bool(state.get("Running"))
+    return {
+        "status": "running" if running else "stopped",
+        "running": running,
+        "label": "运行中" if running else "已停止",
+    }
+
+
+def _restart_docker_container(container_name: str) -> None:
+    _docker_container_request(container_name, "restart")
+
+
+def _stop_docker_container(container_name: str) -> None:
+    _docker_container_request(container_name, "stop")
+
+
+def _start_docker_container(container_name: str) -> None:
+    _docker_container_request(container_name, "start")
 
 
 @router.get("/config", response_model=dict)
@@ -288,8 +349,11 @@ async def save_tacacs_config(
     for index, channel in enumerate(settings.get("notification_channels") or []):
         if not isinstance(channel, dict):
             continue
-        if channel.get("webhook") in {None, "", "******"} and index < len(existing_channels):
+        if channel.get("webhook") in {None, "", MASKED_SECRET} and index < len(existing_channels):
             channel["webhook"] = existing_channels[index].get("webhook")
+        webhook = str(channel.get("webhook") or "").strip()
+        if webhook:
+            _validate_webhook_url(webhook)
     content = _render_config(settings)
     _save_settings(settings)
     if TACACS_CONFIG_FILE.exists() and TACACS_CONFIG_FILE.is_dir():
@@ -309,10 +373,21 @@ async def save_tacacs_notifications(
         raise HTTPException(status_code=400, detail="机器人通知配置格式不正确")
 
     channels = []
-    for channel in raw_channels:
+    existing_channels = [
+        channel
+        for channel in _load_settings().get("notification_channels") or []
+        if isinstance(channel, dict)
+    ]
+    has_masked_channel = False
+    for index, channel in enumerate(raw_channels):
         webhook = str((channel or {}).get("webhook") or (channel or {}).get("url") or "").strip()
         if not webhook:
             continue
+        if webhook == MASKED_SECRET:
+            has_masked_channel = True
+            if index < len(existing_channels):
+                webhook = str(existing_channels[index].get("webhook") or existing_channels[index].get("url") or "").strip()
+        _validate_webhook_url(webhook)
         channels.append({
             "type": _detect_notification_type(webhook),
             "webhook": webhook,
@@ -322,16 +397,36 @@ async def save_tacacs_notifications(
     settings["notification_channels"] = channels
     _save_settings(settings)
     return {
-        "message": "机器人通知已保存",
+        "message": "机器人通知已保存" if not has_masked_channel else "机器人通知已保存，脱敏地址已沿用原配置",
         "settings": _masked_settings(settings),
     }
 
 
+@router.get("/status", response_model=dict)
+async def get_tacacs_status(current_user: User = Depends(get_current_active_user)):
+    _require_tacacs_admin(current_user)
+    return _docker_container_status(TACACS_CONTAINER_NAME)
+
+
+@router.post("/start", response_model=dict)
+async def start_tacacs_service(current_user: User = Depends(get_current_active_user)):
+    _require_tacacs_admin(current_user)
+    _start_docker_container(TACACS_CONTAINER_NAME)
+    return {"message": "Tacacs 服务已启动", **_docker_container_status(TACACS_CONTAINER_NAME)}
+
+
 @router.post("/restart", response_model=dict)
-async def restart_tacacs_container(current_user: User = Depends(get_current_active_user)):
+async def restart_tacacs_service(current_user: User = Depends(get_current_active_user)):
     _require_tacacs_admin(current_user)
     _restart_docker_container(TACACS_CONTAINER_NAME)
-    return {"message": "Tacacs容器重启已触发", "container": TACACS_CONTAINER_NAME}
+    return {"message": "Tacacs 服务已重启", **_docker_container_status(TACACS_CONTAINER_NAME)}
+
+
+@router.post("/stop", response_model=dict)
+async def stop_tacacs_service(current_user: User = Depends(get_current_active_user)):
+    _require_tacacs_admin(current_user)
+    _stop_docker_container(TACACS_CONTAINER_NAME)
+    return {"message": "Tacacs 服务已停止", **_docker_container_status(TACACS_CONTAINER_NAME)}
 
 
 @router.post("/test-notification", response_model=dict)
@@ -341,12 +436,24 @@ async def test_tacacs_notification(
 ):
     _require_tacacs_admin(current_user)
     webhook_url = str(payload.get("url") or payload.get("webhook") or "").strip()
+    channel_index = payload.get("channel_index")
+    if webhook_url == MASKED_SECRET or (not webhook_url and channel_index is not None):
+        channels = [
+            channel for channel in _load_settings().get("notification_channels") or []
+            if isinstance(channel, dict)
+        ]
+        try:
+            saved_channel = channels[int(channel_index)]
+        except (IndexError, TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="未找到已保存的机器人地址")
+        webhook_url = str(saved_channel.get("webhook") or saved_channel.get("url") or "").strip()
     if not webhook_url:
         raise HTTPException(status_code=400, detail="Webhook 地址不能为空")
+    _validate_webhook_url(webhook_url)
 
     channel_type = _detect_notification_type(webhook_url)
     config = {"url": webhook_url} if channel_type == "webhook" else {"webhook": webhook_url}
-    now_text = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    now_text = datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
     success = await notification_manager.send_notification(
         channel_type,
         config,
@@ -415,8 +522,8 @@ async def list_tacacs_logs(
         match = LOG_PATTERN.search(line)
         if not match:
             continue
-        command_text = _extract_command(match.group(6))
-        if not command_text or command_text in {"startup"}:
+        command_text = extract_tacacs_command(match.group(6))
+        if not is_tacacs_user_command(command_text):
             continue
         item = {
             "time": _parse_log_time(match.group(1)) or match.group(1),

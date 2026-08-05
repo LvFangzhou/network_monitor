@@ -5,6 +5,7 @@ from app.models.user import User, Role, Permission, DEFAULT_PERMISSIONS, DEFAULT
 from app.models.config_backup import ConfigBackupJob, ConfigBackupResult
 from app.models.bmp import BmpSession, BmpMessage
 from app.models.compliance import DeviceModelProfile, VersionBaseline, DeviceComplianceSnapshot
+from app.models.server import ServerAsset, ServerComponent, ServerNIC, ServerIPAddress, ServerNetworkConnection, ServerPortChange
 
 __all__ = [
     "Device", "DeviceGroup", "Tag", "Datacenter", "DeviceType", "DeviceRole", "DeviceVendor",
@@ -14,4 +15,5 @@ __all__ = [
     "ConfigBackupJob", "ConfigBackupResult",
     "BmpSession", "BmpMessage",
     "DeviceModelProfile", "VersionBaseline", "DeviceComplianceSnapshot",
+    "ServerAsset", "ServerComponent", "ServerNIC", "ServerIPAddress", "ServerNetworkConnection", "ServerPortChange",
 ]

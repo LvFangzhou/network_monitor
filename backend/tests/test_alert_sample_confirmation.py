@@ -24,7 +24,7 @@ class FakeRedis:
 
 
 def _rule(metric_type="exporter_reachability", duration=60):
-    return SimpleNamespace(id=133, metric_type=metric_type, duration=duration)
+    return SimpleNamespace(id=133, metric_type=metric_type, duration=duration, extra_config={})
 
 
 def _device():
@@ -174,3 +174,48 @@ def test_fec_telemetry_payload_is_normalized():
 def test_optical_sample_age_allows_five_minute_telemetry_interval():
     rule = SimpleNamespace(metric_type="optical_rx_power", extra_config={})
     assert alert_tasks._sample_max_age_seconds(rule, {}) == 420
+
+
+def test_legacy_syslog_rx_power_change_alert_is_reconciled():
+    rule = SimpleNamespace(metric_type="syslog_optical_module_event")
+    alert = SimpleNamespace(message="Reason=The transceiver Rx power change exceeded the threshold")
+    assert alert_tasks._syslog_optical_power_change_alert(rule, alert)
+
+
+def test_unrelated_legacy_optical_event_is_not_reconciled():
+    rule = SimpleNamespace(metric_type="syslog_optical_module_event")
+    alert = SimpleNamespace(message="Reason=Transceiver Tx LOS error")
+    assert not alert_tasks._syslog_optical_power_change_alert(rule, alert)
+
+
+def test_module_session_reset_removes_name_and_index_baselines(monkeypatch):
+    fake_redis = FakeRedis()
+    fake_redis.set("monitor:cache:optical_modules:310", json.dumps({
+        "items": [{
+            "interface_name": "FourHundredGigE1/0/21",
+            "interface_index": 22,
+        }],
+    }))
+    for key in (
+        "alerts:optical_rx_history:310:22",
+        "alerts:fec_counter:310:22",
+        "alerts:optical_rx_history:310:fourhundredgige1021",
+        "alerts:fec_counter:310:fourhundredgige1021",
+    ):
+        fake_redis.set(key, "old")
+    monkeypatch.setattr(alert_tasks, "redis_client", fake_redis)
+
+    alert_tasks.reset_optical_interface_baselines(310, "FourHundredGigE1/0/21")
+
+    assert "alerts:optical_rx_history:310:22" not in fake_redis.values
+    assert "alerts:fec_counter:310:22" not in fake_redis.values
+    assert "alerts:optical_rx_history:310:fourhundredgige1021" not in fake_redis.values
+    assert "alerts:fec_counter:310:fourhundredgige1021" not in fake_redis.values
+
+
+def test_correctable_fec_growth_alone_is_not_a_p1_correlation():
+    # The correctable delta (315526) remains diagnostic context; only the
+    # uncorrectable delta is passed as the actionable value.
+    assert alert_tasks._optical_fec_correlation_value(5.29, 1.0, 0) == 0
+    assert alert_tasks._optical_fec_correlation_value(5.29, 1.0, 2) == 2
+    assert alert_tasks._optical_fec_correlation_value(0.5, 1.0, 2) == 0

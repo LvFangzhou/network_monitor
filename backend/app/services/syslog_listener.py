@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
+import uuid
 from typing import Optional, Tuple
 
 from app.config import settings
@@ -22,6 +24,15 @@ RFC5424_RE = re.compile(
     r"^(?:<(?P<pri>\d+)>)?\d+\s+(?P<timestamp>\S+)\s+(?P<host>\S+)\s+(?P<app>\S+)\s+\S+\s+\S+\s+\S+\s*(?P<body>.*)$"
 )
 
+ASTERNOS_VENDOR_MARKERS = ("asternos", "asterfusion", "asteros", "aster", "星融元")
+ASTERNOS_SYSLOG_DROP_PATTERNS = (
+    # Asteros 底层 Linux 审计流水：sudo 会话打开/关闭。数量大、无运维告警价值。
+    re.compile(r"\bpam_unix\(sudo:session\):\s*session\s+(?:opened|closed)\b", re.IGNORECASE),
+    # Asteros sudo 命令审计：例如 PWD=/; USER=root; COMMAND=/usr/bin/xxx。
+    # 这些会在系统后台采集/登录时大量产生，不作为网络设备关键事件保存。
+    re.compile(r"\bsudo:\s+.*\bCOMMAND=", re.IGNORECASE),
+)
+
 
 def _sanitize_text_for_postgres(value: Optional[str]) -> Optional[str]:
     if value is None:
@@ -36,9 +47,32 @@ class _SyslogProtocol(asyncio.DatagramProtocol):
             raw = _sanitize_text_for_postgres(data.decode("utf-8", errors="replace")).strip()
             if not raw:
                 return
-            _persist_syslog_event(source_ip, raw)
+            _enqueue_syslog_event(source_ip, raw)
         except Exception as exc:
             logger.error("处理Syslog消息失败", source_ip=source_ip, error=str(exc))
+
+
+def _enqueue_syslog_event(source_ip: str, raw_message: str) -> None:
+    from app.tasks.event_tasks import process_syslog_event, record_event_queue_metric
+
+    event_id = uuid.uuid4().hex
+    received_at = time.time()
+    try:
+        process_syslog_event.apply_async(
+            args=[source_ip, raw_message, event_id, received_at],
+            queue="events_syslog",
+            expires=600,
+            retry=False,
+        )
+        record_event_queue_metric("events_syslog", "submitted")
+        record_event_queue_metric("events_syslog", "last_submitted_at", int(received_at))
+    except Exception as exc:
+        record_event_queue_metric("events_syslog", "enqueue_failed")
+        record_event_queue_metric("events_syslog", "last_error", str(exc)[:500])
+        logger.error("Syslog事件入队失败", source_ip=source_ip, error=str(exc))
+        if settings.EVENT_QUEUE_SYNC_FALLBACK:
+            record_event_queue_metric("events_syslog", "sync_fallback")
+            _persist_syslog_event(source_ip, raw_message)
 
 
 def _parse_syslog_message(raw: str) -> tuple[Optional[int], Optional[int], Optional[str], Optional[str], str]:
@@ -61,6 +95,21 @@ def _parse_syslog_message(raw: str) -> tuple[Optional[int], Optional[int], Optio
     return facility, severity, source_host, app_name, message
 
 
+def _is_asternos_device(device: Optional[Device]) -> bool:
+    if not device:
+        return False
+    value = f"{device.vendor or ''} {device.model or ''} {device.monitor_source or ''}".lower()
+    return any(marker in value for marker in ASTERNOS_VENDOR_MARKERS)
+
+
+def _should_drop_before_persist(device: Optional[Device], raw_message: str, message: str) -> bool:
+    """丢弃保存前即可判断为无效的设备日志。"""
+    if not _is_asternos_device(device):
+        return False
+    text = f"{raw_message}\n{message}"
+    return any(pattern.search(text) for pattern in ASTERNOS_SYSLOG_DROP_PATTERNS)
+
+
 def _persist_syslog_event(source_ip: str, raw_message: str) -> None:
     facility, severity, source_host, app_name, message = _parse_syslog_message(raw_message)
     source_host = _sanitize_text_for_postgres(source_host)
@@ -76,6 +125,14 @@ def _persist_syslog_event(source_ip: str, raw_message: str) -> None:
                 (Device.hostname == source_host) |
                 (Device.name == source_host)
             ).first()
+        if _should_drop_before_persist(device, raw_message, message):
+            logger.debug(
+                "丢弃Asteros无效Syslog流水",
+                source_ip=source_ip,
+                source_host=source_host,
+                device_id=device.id if device else None,
+            )
+            return
         event = SyslogEvent(
             device_id=device.id if device else None,
             source_ip=source_ip,

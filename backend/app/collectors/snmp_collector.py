@@ -157,6 +157,9 @@ class SNMPCollector(LoggerMixin):
         "entity_name_oid": "1.3.6.1.2.1.47.1.1.1.1.7",
         "entity_oper_status_oid": "1.3.6.1.4.1.25506.2.6.1.1.1.1.3",
         "entity_error_status_oid": "1.3.6.1.4.1.25506.2.6.1.1.1.1.19",
+        # HH3C-SYS-MAN-MIB hh3cSysPackageTable. A single small subtree walk
+        # exposes active boot/system/feature/patch packages and their versions.
+        "software_package_table_oid": "1.3.6.1.4.1.25506.2.3.1.7.2.1",
         "hardware_ok_values": [2, 3],
         "bgp_state_oids": [
             "1.3.6.1.2.1.15.3.1.2",
@@ -2687,7 +2690,52 @@ class SNMPCollector(LoggerMixin):
                 pass
         return None
 
-    def collect_system_info(self, device: Any) -> Dict[str, Optional[str]]:
+    def _collect_software_patches(self, device: Any, private_oids: Dict[str, Any]) -> Dict[str, Any]:
+        base_oid = str(private_oids.get("software_package_table_oid") or "").strip().strip(".")
+        if not base_oid:
+            return {"software_patches": [], "software_patch_packages": []}
+        packages: Dict[str, Dict[str, Any]] = {}
+        for item_oid, value in self.snmp_walk(device, base_oid):
+            normalized_oid = str(item_oid).strip().strip(".")
+            if not normalized_oid.startswith(f"{base_oid}."):
+                continue
+            suffix = normalized_oid[len(base_oid) + 1:]
+            parts = suffix.split(".", 1)
+            if len(parts) != 2:
+                continue
+            column, index = parts
+            if column not in {"2", "5", "8", "10"}:
+                continue
+            package = packages.setdefault(index, {"index": index})
+            if column == "2":
+                package["name"] = str(value or "").strip()
+            elif column == "5":
+                try:
+                    package["type"] = int(value)
+                except (TypeError, ValueError):
+                    package["type"] = value
+            elif column == "8":
+                package["description"] = str(value or "").strip()
+            elif column == "10":
+                package["version"] = str(value or "").strip()
+
+        patch_packages = []
+        for package in packages.values():
+            if package.get("type") != 4:
+                continue
+            version = str(package.get("version") or "").strip()
+            name = str(package.get("name") or "").strip()
+            if not version:
+                match = re.search(r"(R\d+(?:P\d+|HS\d+)?)", name, re.IGNORECASE)
+                version = match.group(1).upper() if match else name
+            if version:
+                package["version"] = version
+                patch_packages.append(package)
+        patch_packages.sort(key=lambda item: str(item.get("version") or item.get("name") or ""))
+        patches = list(dict.fromkeys(str(item["version"]) for item in patch_packages if item.get("version")))
+        return {"software_patches": patches, "software_patch_packages": patch_packages}
+
+    def collect_system_info(self, device: Any) -> Dict[str, Any]:
         """采集标准 SNMP system 信息"""
         sys_descr_text = self._snmp_get_text_value(device, "1.3.6.1.2.1.1.1.0")
         sys_name_text = self._snmp_get_text_value(device, "1.3.6.1.2.1.1.5.0")
@@ -2759,12 +2807,14 @@ class SNMPCollector(LoggerMixin):
             if not software_version and private_oids.get("entity_software_oid"):
                 software_map = self._walk_indexed_map(device, str(private_oids["entity_software_oid"]), str)
                 software_version = self._first_entity_inventory_value(class_map, software_map, {3}, name_map)
+        patch_info = self._collect_software_patches(device, private_oids)
         return {
             "sys_descr": sys_descr_text,
             "sys_name": sys_name_text,
             "software_version": software_version,
             "snmp_model": snmp_model,
             "serial_number": serial_number,
+            **patch_info,
         }
 
     def collect_overview_gap_fill(self, device: Any) -> Dict[str, Any]:

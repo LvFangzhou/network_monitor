@@ -15,8 +15,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    bind = op.get_bind()
+    metadata = sa.MetaData()
+    targets = sa.Table(
         "quality_probe_targets",
+        metadata,
         sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("name", sa.String(length=100), nullable=False),
         sa.Column("target", sa.String(length=255), nullable=False),
@@ -41,9 +44,10 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["datacenter_id"], ["datacenters.id"]),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index("ix_quality_probe_targets_id", "quality_probe_targets", ["id"])
-    op.create_index("idx_quality_probe_targets_active", "quality_probe_targets", ["is_active", "id"])
-    op.create_index("idx_quality_probe_targets_datacenter", "quality_probe_targets", ["datacenter_id"])
+    targets.create(bind, checkfirst=True)
+    op.execute("CREATE INDEX IF NOT EXISTS ix_quality_probe_targets_id ON quality_probe_targets (id)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_active ON quality_probe_targets (is_active, id)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_datacenter ON quality_probe_targets (datacenter_id)")
 
 
 def downgrade() -> None:

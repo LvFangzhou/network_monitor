@@ -30,6 +30,7 @@ const lazyWithReload = <T extends React.ComponentType<any>>(loader: () => Promis
 const loadLogin = () => import('./pages/Login')
 const loadDashboard = () => import('./pages/Dashboard')
 const loadDeviceList = () => import('./pages/devices/DeviceList')
+const loadServerList = () => import('./pages/resources/ServerList')
 const loadDeviceDictionaryManager = () => import('./pages/devices/DeviceDictionaryManager')
 const loadDeviceForm = () => import('./pages/devices/DeviceForm')
 const loadDeviceDetail = () => import('./pages/devices/DeviceDetail')
@@ -60,6 +61,7 @@ const loadConfigBackups = () => import('./pages/ConfigBackups')
 const Login = lazyWithReload(loadLogin)
 const Dashboard = lazyWithReload(loadDashboard)
 const DeviceList = lazyWithReload(loadDeviceList)
+const ServerList = lazyWithReload(loadServerList)
 const DeviceDictionaryManager = lazyWithReload(loadDeviceDictionaryManager)
 const DeviceForm = lazyWithReload(loadDeviceForm)
 const DeviceDetail = lazyWithReload(loadDeviceDetail)
@@ -103,7 +105,7 @@ const preloadHighFrequencyRoutes = () => {
   window.setTimeout(preload, 1200)
 }
 
-const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/device-compliance', '/customers', '/device-overview', '/collection-health', '/telemetry-status', '/grafana', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
+const FALLBACK_MENU_PATHS = ['/dashboard', '/devices', '/servers', '/device-compliance', '/customers', '/device-overview', '/collection-health', '/telemetry-status', '/grafana', '/ip-flow-query', '/quality-query', '/traffic-query', '/module-info-query', '/lossless-info-query', '/config-backups']
 const PUBLIC_MENU_PATHS = ['/alerts/history', '/alerts/audit', '/grafana']
 const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect'
 const ROUTE_ALIASES: Record<string, string[]> = {
@@ -264,6 +266,7 @@ function App() {
             <Route index element={<HomeRedirect />} />
             <Route path="dashboard" element={<MenuRoute menuPath="/dashboard"><Dashboard /></MenuRoute>} />
             <Route path="devices" element={<MenuRoute menuPath="/devices"><DeviceList /></MenuRoute>} />
+            <Route path="servers" element={<MenuRoute menuPath="/servers"><ServerList /></MenuRoute>} />
             <Route path="device-compliance" element={<MenuRoute menuPath="/device-compliance"><DeviceCompliance /></MenuRoute>} />
             <Route path="device-dictionaries" element={<MenuRoute menuPath="/device-dictionaries"><DeviceDictionaryManager /></MenuRoute>} />
             <Route path="customers" element={<MenuRoute menuPath="/customers"><CustomerList /></MenuRoute>} />

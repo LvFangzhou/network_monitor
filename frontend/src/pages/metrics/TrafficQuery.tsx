@@ -21,6 +21,7 @@ import {
 } from '../../api/metrics'
 import { getCircuits, getCustomers, type Circuit, type Customer } from '../../api/resources'
 import { useAuthStore } from '../../store/auth'
+import AutoRefreshControl from '../../components/AutoRefreshControl'
 
 const { RangePicker } = DatePicker
 
@@ -511,7 +512,7 @@ const TrafficQuery = () => {
     })
   }, [])
 
-  const loadSummaryTrafficCard = useCallback(async (preset: SummaryPreset, force = false, queryOverride?: CardQueryState) => {
+  const loadSummaryTrafficCard = useCallback(async (preset: SummaryPreset, force = false, queryOverride?: CardQueryState, background = false) => {
     const summaryCircuit = buildSummaryCircuit(preset)
     const query = queryOverride || getCardQueryState(summaryCircuit.id)
     const requestSeq = (trafficRequestSeqRef.current[summaryCircuit.id] || 0) + 1
@@ -524,7 +525,7 @@ const TrafficQuery = () => {
         aggregateData: prev[summaryCircuit.id]?.aggregateData || [],
         targetCount: prev[summaryCircuit.id]?.targetCount,
         skippedTargetCount: prev[summaryCircuit.id]?.skippedTargetCount,
-        loading: true,
+        loading: background ? prev[summaryCircuit.id]?.loading : true,
       },
     }))
     try {
@@ -563,7 +564,7 @@ const TrafficQuery = () => {
     }
   }, [getCardQueryState])
 
-  const loadTrafficCard = useCallback(async (record: Circuit, silent = false, force = false, queryOverride?: CardQueryState) => {
+  const loadTrafficCard = useCallback(async (record: Circuit, silent = false, force = false, queryOverride?: CardQueryState, background = false) => {
     const query = queryOverride || getCardQueryState(record.id)
     const requestSeq = (trafficRequestSeqRef.current[record.id] || 0) + 1
     trafficRequestSeqRef.current[record.id] = requestSeq
@@ -573,7 +574,7 @@ const TrafficQuery = () => {
         circuit: record,
         targets: prev[record.id]?.targets || [],
         aggregateData: prev[record.id]?.aggregateData || [],
-        loading: true,
+        loading: background ? prev[record.id]?.loading : true,
       },
     }))
     try {
@@ -834,12 +835,17 @@ const TrafficQuery = () => {
     setCustomerId(undefined)
   }
 
-  const refreshVisibleCards = async () => {
-    const cards = visibleCircuitIds.map((id) => dashboardCards[id]).filter(Boolean)
-    const activePresets = summaryPresets.filter((preset) => selectedPresetKeys.includes(preset.key))
+  const refreshVisibleCards = async (background = false) => {
+    const cards = visibleCircuitIds
+      .map((id) => dashboardCards[id])
+      .filter(Boolean)
+      .filter((card) => !background || getCardQueryState(card.circuit.id).rangeValue !== 'custom')
+    const activePresets = summaryPresets
+      .filter((preset) => selectedPresetKeys.includes(preset.key))
+      .filter((preset) => !background || getCardQueryState(getSummaryPresetId(preset)).rangeValue !== 'custom')
     await Promise.all([
-      ...activePresets.map((preset) => loadSummaryTrafficCard(preset, true)),
-      ...cards.map((card) => loadTrafficCard(card.circuit, true, true)),
+      ...activePresets.map((preset) => loadSummaryTrafficCard(preset, true, undefined, background)),
+      ...cards.map((card) => loadTrafficCard(card.circuit, true, true, undefined, background)),
     ])
   }
 
@@ -955,7 +961,12 @@ const TrafficQuery = () => {
           <RangePicker size="small" showTime value={query.customRange as any} onChange={(value) => handleCardCustomRangeChange(card.circuit.id, value as any)} />
         ) : null}
         <Select value={query.intervalValue} size="small" style={{ width: 94 }} options={INTERVAL_OPTIONS} onChange={(value) => handleCardIntervalChange(card.circuit.id, value)} />
-        <Button size="small" icon={<ReloadOutlined />} loading={card.loading} onClick={() => { void reloadCardById(card.circuit.id, true) }} />
+        <AutoRefreshControl
+          disabled={query.rangeValue === 'custom'}
+          disabledTip="自定义固定时间段不自动刷新；切换到实时范围后可开启。"
+          onRefresh={() => reloadCardById(card.circuit.id, true)}
+          tip="只刷新当前线路或汇总图卡，不改变时间范围，也不影响其他图卡。"
+        />
         {!isSummaryCard ? <Button size="small" type="text" danger icon={<CloseOutlined />} onClick={() => removeCard(card.circuit.id)} /> : null}
       </Space>
     )
@@ -1095,7 +1106,7 @@ const TrafficQuery = () => {
         title="流量图表"
         extra={(
           <Space wrap>
-            <Button icon={<ReloadOutlined />} loading={dashboardLoading} disabled={!visibleCards.length && !summaryCards.length} onClick={refreshVisibleCards}>
+            <Button icon={<ReloadOutlined />} loading={dashboardLoading} disabled={!visibleCards.length && !summaryCards.length} onClick={() => { void refreshVisibleCards(false) }}>
               刷新全部
             </Button>
             <Button icon={layoutLocked ? <LockOutlined /> : <UnlockOutlined />} onClick={toggleLayoutLocked}>

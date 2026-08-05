@@ -428,6 +428,11 @@ def _normalize_config_for_compare(config: str, device: Optional[Device] = None) 
         r"^!?\s*generated\s+at\s+.*",
         r"^!?\s*time\s*[:=].*",
         r"^!?\s*timestamp\s*[:=].*",
+        # Cisco NX-OS 会分别在 running/startup 配置头部写入生成时间。
+        # 两行每次保存后天然不同，只是动态元数据，不代表配置命令不一致。
+        r"^!?\s*running\s+configuration\s+last\s+done\s+at\s*:?.*$",
+        r"^!?\s*startup\s+config(?:uration)?\s+saved\s+at\s*:?.*$",
+        r"^!?\s*command\s*:\s*show\s+(?:running|startup)-config\s*$",
         r"^#\s*configuration\s+(last\s+)?(modified|saved|generated).*",
         r"^\s*building\s+configuration.*",
         r"^\s*current\s+configuration.*",

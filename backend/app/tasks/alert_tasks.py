@@ -39,6 +39,8 @@ REACHABILITY_CHECK_ALERTS_LOCK_KEY = "alerts:check_reachability_alerts:lock"
 PROTOCOL_CHECK_ALERTS_LOCK_KEY = "alerts:check_protocol_alerts:lock"
 DEVICE_HEALTH_CHECK_ALERTS_LOCK_KEY = "alerts:check_device_health_alerts:lock"
 OPTICAL_CHECK_ALERTS_LOCK_KEY = "alerts:check_optical_alerts:lock"
+SYSLOG_OPTICAL_RECOVERY_LOCK_KEY = "alerts:reconcile_syslog_optical_power:lock"
+SYSLOG_OPTICAL_DUPLICATE_SAMPLE = "__duplicate_healthy_sample__"
 INTERFACE_ALERT_RECOVERY_LOCK_KEY = "alerts:resolve_interface_alerts_quick:lock"
 HILLSTONE_BFD_RECOVERY_LOCK_KEY = "alerts:reconcile_hillstone_bfd_traps:lock"
 HILLSTONE_BGP_RECOVERY_LOCK_KEY = "alerts:reconcile_hillstone_bgp_traps:lock"
@@ -48,6 +50,7 @@ REACHABILITY_CHECK_ALERTS_LOCK_TTL_SECONDS = 180
 PROTOCOL_CHECK_ALERTS_LOCK_TTL_SECONDS = 180
 DEVICE_HEALTH_CHECK_ALERTS_LOCK_TTL_SECONDS = 120
 OPTICAL_CHECK_ALERTS_LOCK_TTL_SECONDS = 240
+SYSLOG_OPTICAL_RECOVERY_LOCK_TTL_SECONDS = 55
 INTERFACE_ALERT_RECOVERY_LOCK_TTL_SECONDS = 45
 EXPORTER_SCRAPE_CACHE_TTL_SECONDS = 60
 ROBOT_NOTIFICATION_INTERVAL_SECONDS = 2
@@ -66,6 +69,7 @@ EVENT_DRIVEN_METRIC_TYPES = {
     "syslog_bgp_state_change",
     "syslog_bfd_state_change",
     "syslog_optical_module_event",
+    "syslog_optical_rx_power_change",
     "syslog_power_event",
     "syslog_fan_event",
     "syslog_temperature_event",
@@ -104,6 +108,7 @@ def enqueue_alert_notification(
     alert_id: int,
     event_type: str = "firing",
     actor: Optional[str] = None,
+    countdown_seconds: int = 0,
 ) -> bool:
     """幂等提交告警通知；相同告警事件在窗口内只允许存在一个任务。"""
     event_type = str(event_type or "firing")
@@ -118,6 +123,7 @@ def enqueue_alert_notification(
         _send_alert_event_notification.apply_async(
             args=[int(alert_id), event_type, actor],
             queue=NOTIFICATION_QUEUE,
+            countdown=max(int(countdown_seconds or 0), 0),
             expires=expires_seconds,
         )
         return True
@@ -600,6 +606,7 @@ EXPORTER_METRIC_TYPES = {
 
 QUALITY_PROBE_METRIC_TYPES = {
     "quality_packet_loss",
+    "quality_packet_loss_critical",
     "quality_latency",
     "quality_jitter",
 }
@@ -612,6 +619,7 @@ PERCENT_METRIC_TYPES = {
     "snmp_pak_buffer_usage",
     "snmp_snat_resource_usage",
     "quality_packet_loss",
+    "quality_packet_loss_critical",
     "internet_circuit_utilization",
     "private_line_circuit_utilization",
 }
@@ -639,6 +647,7 @@ NUMERIC_DETAIL_METRIC_TYPES = {
     "optical_rx_fec_correlation",
     "exporter_metric",
     "quality_packet_loss",
+    "quality_packet_loss_critical",
     "quality_latency",
     "quality_jitter",
 }
@@ -665,6 +674,7 @@ METRIC_VALUE_LABELS = {
     "optical_rx_power_drop_24h": "24小时收光衰减",
     "optical_rx_fec_correlation": "当前FEC纠错包增长",
     "quality_packet_loss": "最近5分钟丢包率",
+    "quality_packet_loss_critical": "严重丢包率",
     "quality_latency": "当前平均延迟",
     "quality_jitter": "当前抖动",
     "internet_circuit_utilization": "当前公网线路使用率",
@@ -833,10 +843,18 @@ def _quality_target_notification(rule: AlertRule, alert: AlertHistory) -> Dict[s
     if rule.metric_type not in QUALITY_PROBE_METRIC_TYPES or alert.alert_target_type != "quality_probe":
         return {}
     target_notifications = (rule.extra_config or {}).get("target_notifications") or {}
-    target_notification = target_notifications.get(str(alert.alert_target_key or "")) or {}
+    # 单地址历史告警使用卡片 ID（如 "7"）；多地址告警为了独立计数，
+    # 使用 "卡片ID:成员地址摘要"（如 "7:abc123"）。机器人配置仍按卡片 ID 保存。
+    alert_target_key = str(alert.alert_target_key or "")
+    target_id_key = alert_target_key.split(":", 1)[0]
+    target_notification = (
+        target_notifications.get(alert_target_key)
+        or target_notifications.get(target_id_key)
+        or {}
+    )
     if target_notification:
         return target_notification
-    if rule.metric_type in {"quality_latency", "quality_jitter"}:
+    if rule.metric_type in {"quality_packet_loss_critical", "quality_latency", "quality_jitter"}:
         try:
             db = Session.object_session(alert)
             fallback_rule = (
@@ -847,7 +865,11 @@ def _quality_target_notification(rule: AlertRule, alert: AlertHistory) -> Dict[s
                 if db else None
             )
             fallback_notifications = (fallback_rule.extra_config or {}).get("target_notifications") or {} if fallback_rule else {}
-            return fallback_notifications.get(str(alert.alert_target_key or "")) or {}
+            return (
+                fallback_notifications.get(alert_target_key)
+                or fallback_notifications.get(target_id_key)
+                or {}
+            )
         except Exception:
             return {}
     return {}
@@ -1046,9 +1068,21 @@ def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[
         if alert is not None:
             context = _quality_probe_context_from_alert(alert)
             quality_label = context.get("line_label") or quality_label
+        metric_title = {
+            "quality_packet_loss": "严重丢包",
+            "quality_packet_loss_critical": "严重丢包",
+            "quality_latency": "延迟升高",
+            "quality_jitter": "抖动升高",
+        }.get(rule.metric_type, "质量下降")
+        recovery_title = {
+            "quality_packet_loss": "丢包恢复",
+            "quality_packet_loss_critical": "丢包恢复",
+            "quality_latency": "延迟恢复",
+            "quality_jitter": "抖动恢复",
+        }.get(rule.metric_type, "质量恢复")
         if event_type == "auto_resolved":
-            return f"{severity}-{quality_label}质量恢复{mention_suffix}"
-        return f"{severity}-{quality_label}质量下降{mention_suffix}"
+            return f"{severity}-{quality_label}{recovery_title}{mention_suffix}"
+        return f"{severity}-{quality_label}{metric_title}{mention_suffix}"
     if event_type == "auto_resolved":
         if rule.metric_type in DEVICE_REACHABILITY_METRIC_TYPES:
             return f"{severity}-{_reachability_recovery_fault_title(rule)}{mention_suffix}"
@@ -1059,7 +1093,7 @@ def _build_notification_title(rule: AlertRule, event_type: str, actor: Optional[
 def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
     """Build a stable, readable context for quality-probe robot messages."""
     try:
-        target_id = int(str(alert.alert_target_key or "").strip())
+        target_id = int(str(alert.alert_target_key or "").strip().split(":", 1)[0])
     except (TypeError, ValueError):
         target_id = 0
     target = db.query(QualityProbeTarget).filter(QualityProbeTarget.id == target_id).first() if target_id else None
@@ -1068,13 +1102,13 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
     extra_config = (rule.extra_config or {}) if rule else {}
     message = str(alert.message or "")
     resolution_note = str(alert.resolution_note or "")
-    match = re.search(r"连续\s*(\d+)\s*个探测周期", message)
+    match = re.search(r"连续\s*(\d+)\s*(?:个探测周期|次快速复核)", message)
     consecutive = int(match.group(1)) if match else 0
     target_notification = (extra_config.get("target_notifications") or {}).get(str(target_id)) or {}
-    if not target_notification and metric_type in {"quality_latency", "quality_jitter"}:
+    if not target_notification and metric_type in {"quality_packet_loss_critical", "quality_latency", "quality_jitter"}:
         fallback_rule = db.query(AlertRule).filter(AlertRule.metric_type == "quality_packet_loss").order_by(AlertRule.id.asc()).first()
         target_notification = ((fallback_rule.extra_config or {}).get("target_notifications") or {}).get(str(target_id)) or {} if fallback_rule else {}
-    required_match = re.search(r"告警要求连续\s*(\d+)\s*个周期", message)
+    required_match = re.search(r"告警要求连续\s*(\d+)\s*(?:个周期|次)", message)
     consecutive_key = "consecutive_samples"
     if metric_type == "quality_latency":
         consecutive_key = "latency_consecutive_samples"
@@ -1091,10 +1125,10 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
     sent = int(io_match.group(2)) if io_match else None
     latency_match = re.search(r"当前延迟[：:]\s*([\d.]+)\s*ms", message, re.IGNORECASE)
     jitter_match = re.search(r"当前抖动[：:]\s*([\d.]+)\s*ms", message, re.IGNORECASE)
-    loss_match = re.search(r"最近5分钟丢包率[：:]\s*([\d.]+)\s*%", message, re.IGNORECASE)
+    loss_match = re.search(r"(?:最近5分钟|快速复核)丢包率[：:]\s*([\d.]+)\s*%", message, re.IGNORECASE)
     latency_alert_value = float(alert.alert_value or 0) if metric_type == "quality_latency" else None
     jitter_alert_value = float(alert.alert_value or 0) if metric_type == "quality_jitter" else None
-    loss_alert_value = float(alert.alert_value or 0) if metric_type == "quality_packet_loss" else None
+    loss_alert_value = float(alert.alert_value or 0) if metric_type in {"quality_packet_loss", "quality_packet_loss_critical"} else None
     loss = loss_alert_value if loss_alert_value is not None else (
         float(loss_match.group(1)) if loss_match else getattr(target, "last_packet_loss_percent", None)
     )
@@ -1115,9 +1149,12 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
     timeout_ms = int(getattr(target, "timeout_ms", None) or 1000)
     name = getattr(target, "name", None) or alert.alert_target_name or "-"
     address = getattr(target, "target", None) or "-"
-    if not target and " / " in str(alert.alert_target_name or ""):
-        name, address = str(alert.alert_target_name).split(" / ", 1)
+    if " / " in str(alert.alert_target_name or ""):
+        alert_name, alert_address = str(alert.alert_target_name).split(" / ", 1)
+        name = alert_name or name
+        address = alert_address or address
     probe_source = getattr(target, "probe_source", None) or "server_icmp"
+    fast_confirmed = "快速复核" in message
     line_type = getattr(getattr(target, "circuit_ref", None), "line_type", None)
     is_private_line = probe_source == "device_nqa_snmp" or line_type == "private_line"
     line_label = "专线" if is_private_line else "公网链路"
@@ -1162,14 +1199,19 @@ def _quality_probe_context(db: Session, alert: AlertHistory) -> Dict[str, Any]:
             if sent is not None and received is not None else "-"
         ),
         "recovery_reason": resolution_note.split("：", 1)[-1] if resolution_note else "触发条件已不再满足",
-        "sampling": f"每 {interval_seconds} 秒 / 每次 {packet_count} 包 / 超时 {timeout_ms} ms",
+        "sampling": (
+            f"每 5 秒快速检查 / 异常后两轮复核 / 每轮 2 包 / 超时不超过 1000 ms"
+            if fast_confirmed
+            else f"每 {interval_seconds} 秒 / 每次 {packet_count} 包 / 超时 {timeout_ms} ms"
+        ),
+        "fast_confirmed": fast_confirmed,
     }
 
 
 def _quality_probe_context_from_alert(alert: AlertHistory) -> Dict[str, Any]:
     target = None
     try:
-        target_id = int(str(alert.alert_target_key or "").strip())
+        target_id = int(str(alert.alert_target_key or "").strip().split(":", 1)[0])
     except (TypeError, ValueError):
         target_id = 0
     if target_id:
@@ -1227,12 +1269,35 @@ def _extract_trap_content_from_message(message: Optional[str]) -> str:
 def _clean_operation_detail(alert: AlertHistory) -> str:
     detail = _extract_trap_content_from_message(alert.message)
     device_name = (alert.device.name if alert.device else "") or ""
-    if device_name and detail.startswith(device_name):
-        detail = detail[len(device_name):].lstrip(" /")
-    if " / " in detail:
-        parts = [part.strip() for part in detail.split(" / ") if part.strip()]
-        detail = next((part for part in parts if part != device_name), parts[-1] if parts else detail)
-    if device_name and detail == device_name:
+    device_ip = (alert.device.ip_address if alert.device else "") or ""
+    identifiers = {
+        value.strip().casefold()
+        for value in (device_name, device_ip)
+        if value and value.strip()
+    }
+
+    # Aggregated configuration Traps are stored as one bullet per real change.
+    # Clean each item independently and preserve every item for both the history
+    # page and robot card instead of applying the legacy single-line truncation.
+    raw_lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    is_batch = len(raw_lines) > 1 or any(line.startswith("- ") for line in raw_lines)
+    cleaned_items: List[str] = []
+    for raw_line in raw_lines or [detail]:
+        item = raw_line.removeprefix("- ").strip()
+        if item.startswith("其余 "):
+            cleaned_items.append(item)
+            continue
+        parts = [part.strip() for part in re.split(r"\s+/\s+", item) if part.strip()]
+        while len(parts) > 1 and parts[0].casefold() in identifiers:
+            parts.pop(0)
+        parts = [part for part in parts if part.casefold() not in identifiers]
+        item = " / ".join(parts).strip(" /")
+        if item and item not in cleaned_items:
+            cleaned_items.append(item)
+
+    if cleaned_items:
+        detail = "\n".join(f"• {item}" for item in cleaned_items) if is_batch else cleaned_items[0]
+    else:
         detail = ""
     if not detail and alert.alert_target_name and alert.alert_target_name != device_name:
         detail = alert.alert_target_name
@@ -1297,9 +1362,15 @@ def _build_notification_content(
                     f"处理建议：{_quality_action_text(context)}",
                 ])
             else:
+                loss_window_label = "快速复核丢包率" if context.get("fast_confirmed") else "5分钟丢包率"
+                trigger_reason = (
+                    "5秒快速检查发现异常，并经两轮独立探测确认严重丢包"
+                    if context.get("fast_confirmed")
+                    else "5分钟丢包率超阈值，并且连续异常周期达到要求（两个条件同时满足）"
+                )
                 lines.extend([
-                    "触发原因：5分钟丢包率超阈值，并且连续异常周期达到要求（两个条件同时满足）",
-                    f"5分钟丢包率：{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%",
+                    f"触发原因：{trigger_reason}",
+                    f"{loss_window_label}：{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%",
                     f"当前延迟：{context['latency']}",
                     f"连续异常周期：{context['consecutive']} / {context['required_count']}",
                     f"本轮探测：{context['probe_result']}",
@@ -1315,7 +1386,7 @@ def _build_notification_content(
             ])
         else:
             lines.extend([f"发生时间：{started_at_text}", f"当前处理人：{_current_handler_text(alert)}"])
-        lines.extend(["", f"故障详情：{_build_detail_url(alert)}"])
+        lines.extend(["", f"查看详情：{_build_detail_url(alert)}"])
         return "\n".join(lines)
     if not rule or not device:
         return alert.message or "告警详情不可用"
@@ -1370,7 +1441,7 @@ def _build_notification_content(
         if not is_operation and not is_resource_notice:
             lines.append(f"当前处理人：{_current_handler_text(alert)}")
         lines.append("")
-        lines.append(f"{'记录详情' if is_operation else '通知详情' if is_resource_notice else '故障详情'}：{detail_url}")
+        lines.append(f"{'记录详情' if is_operation else '通知详情' if is_resource_notice else '查看详情'}：{detail_url}")
     elif event_type == "ignored":
         if actor:
             lines.insert(0, f"{actor}忽略了1条{'操作记录' if is_operation else '故障'}：")
@@ -1386,7 +1457,7 @@ def _build_notification_content(
         if not is_resource_notice:
             lines.append(f"当前处理人：{_current_handler_text(alert)}")
         lines.append("")
-        lines.append(f"{'操作详情' if is_operation else '通知详情' if is_resource_notice else '故障详情'}：{detail_url}")
+        lines.append(f"{'操作详情' if is_operation else '通知详情' if is_resource_notice else '查看详情'}：{detail_url}")
 
     return "\n".join(lines)
 
@@ -1407,11 +1478,11 @@ def _build_notification_card_data(
         line_label = context.get("line_label") or "公网链路"
         rows = [
             {"label": "告警事件", "value": f"{line_label}质量恢复" if is_recovery else f"{line_label}质量下降"},
-            {"label": "探测名称", "value": context["name"]},
-            {"label": "目标地址", "value": context["address"]},
+            {"label": "探测名称", "value": context["name"], "emphasis": True},
+            {"label": "目标地址", "value": context["address"], "emphasis": True},
             {"label": "所属机房", "value": context["datacenter"]},
             {"label": "运营商", "value": context["operator"]},
-            {"label": f"{'恢复时' if is_recovery else '当前'}{context['metric_label']}", "value": context["current_value_text"]},
+            {"label": f"{'恢复时' if is_recovery else '当前'}{context['metric_label']}", "value": context["current_value_text"], "emphasis": True},
         ]
         if is_recovery:
             recovery_metric_label = (
@@ -1430,7 +1501,7 @@ def _build_notification_card_data(
             if context["metric_type"] == "quality_latency":
                 rows.extend([
                     {"label": "触发原因", "value": "平均延迟超阈值 + 连续异常周期达标（同时满足）"},
-                    {"label": "平均延迟", "value": f"{context['current_value_text']} / 阈值 {context['threshold_text']}"},
+                    {"label": "平均延迟", "value": f"{context['current_value_text']} / 阈值 {context['threshold_text']}", "emphasis": True},
                     {"label": "参考丢包率", "value": f"{context['loss']:.2f}%"},
                     {"label": "连续异常周期", "value": f"{context['consecutive']} / {context['required_count']}"},
                     {"label": "本轮探测", "value": context["probe_result"]},
@@ -1440,8 +1511,8 @@ def _build_notification_card_data(
             elif context["metric_type"] == "quality_jitter":
                 rows.extend([
                     {"label": "触发原因", "value": "抖动超阈值 + 连续异常周期达标（同时满足）"},
-                    {"label": "当前抖动", "value": f"{context['current_value_text']} / 阈值 {context['threshold_text']}"},
-                    {"label": "当前延迟", "value": context["latency"]},
+                    {"label": "当前抖动", "value": f"{context['current_value_text']} / 阈值 {context['threshold_text']}", "emphasis": True},
+                    {"label": "当前延迟", "value": context["latency"], "emphasis": True},
                     {"label": "参考丢包率", "value": f"{context['loss']:.2f}%"},
                     {"label": "连续异常周期", "value": f"{context['consecutive']} / {context['required_count']}"},
                     {"label": "本轮探测", "value": context["probe_result"]},
@@ -1449,9 +1520,16 @@ def _build_notification_card_data(
                     {"label": "处理建议", "value": _quality_action_text(context)},
                 ])
             else:
+                loss_window_label = "快速复核丢包率" if context.get("fast_confirmed") else "5分钟丢包率"
+                trigger_reason = (
+                    "5秒快速检查异常 + 两轮独立探测确认严重丢包"
+                    if context.get("fast_confirmed")
+                    else "5分钟丢包率超阈值 + 连续异常周期达标（同时满足）"
+                )
                 rows.extend([
-                    {"label": "触发原因", "value": "5分钟丢包率超阈值 + 连续异常周期达标（同时满足）"},
-                    {"label": "5分钟丢包率", "value": f"{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%"},
+                    {"label": "触发原因", "value": trigger_reason},
+                    {"label": loss_window_label, "value": f"{context['loss']:.2f}% / 阈值 {context['threshold']:.2f}%", "emphasis": True},
+                    {"label": "当前延迟", "value": context["latency"], "emphasis": True},
                     {"label": "连续异常周期", "value": f"{context['consecutive']} / {context['required_count']}"},
                     {"label": "本轮探测", "value": context["probe_result"]},
                     {"label": "影响判断", "value": _quality_impact_text(context["loss"])},
@@ -2529,6 +2607,195 @@ def check_optical_alerts():
         metric_types=OPTICAL_METRIC_TYPES,
         task_label="光模块质量告警检查",
     )
+
+
+def _syslog_optical_power_change_alert(rule: AlertRule, alert: AlertHistory) -> bool:
+    """Include the new dedicated rule and legacy alerts created before it existed."""
+    if rule.metric_type == "syslog_optical_rx_power_change":
+        return True
+    if rule.metric_type != "syslog_optical_module_event":
+        return False
+    message = str(alert.message or "")
+    return bool(
+        re.search(r"(?:Rx|receive)\s+power\s+change", message, re.IGNORECASE)
+        or "收光功率变化" in message
+        or "收光功率突变" in message
+    )
+
+
+def _syslog_optical_recovery_sample(
+    alert: AlertHistory,
+    device: Device,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return a distinct healthy sample marker and audit text, without polling a device."""
+    payload = _load_json_cache(f"monitor:cache:optical_modules:{device.id}")
+    states = _optical_interface_states(device.id)
+    interface_key = _normalize_interface_identity(alert.alert_target_name)
+    if not payload or not states or not interface_key:
+        return None, None
+
+    item = next(
+        (
+            row for row in payload.get("items") or []
+            if isinstance(row, dict)
+            and interface_key in {
+                _normalize_interface_identity(row.get("interface_name")),
+                _normalize_interface_identity(row.get("interface_index")),
+            }
+        ),
+        None,
+    )
+    if not item:
+        return None, None
+    state = _optical_interface_state(item, states)
+    if not _interface_state_is_up(state):
+        return None, None
+
+    sample_time = str(item.get("collected_at") or payload.get("collected_at") or "")
+    sample_age = _row_age_seconds({"_time": sample_time}) if sample_time else None
+    if not sample_time or sample_age is None or sample_age > OPTICAL_MAX_SAMPLE_AGE_SECONDS:
+        return None, None
+
+    lane_values = [
+        _optical_number(channel.get("rx_power_dbm"))
+        for channel in item.get("channels") or []
+        if isinstance(channel, dict)
+    ]
+    lane_values = [value for value in lane_values if value is not None]
+    if not lane_values:
+        module_rx = _optical_number(item.get("rx_power_dbm"))
+        if module_rx is None:
+            return None, None
+        lane_values = [module_rx]
+
+    low = _optical_number(item.get("rx_low_warning_dbm"))
+    high = _optical_number(item.get("rx_high_warning_dbm"))
+    if low is None or high is None:
+        bounds = _module_profile_bounds(item, state)
+        if bounds and bounds.get("rx"):
+            low, high = bounds["rx"]
+    if low is None or high is None or any(value < low or value > high for value in lane_values):
+        return None, None
+
+    # A non-zero historical FEC counter is allowed. Only a newly increasing
+    # uncorrectable counter blocks confirmation when FEC data exists.
+    fec_payload = _load_json_cache(f"monitor:cache:telemetry_lossless:{device.id}:ifmgr_iffecdata")
+    fec_row = next(
+        (
+            row for row in fec_payload.get("rows") or []
+            if isinstance(row, dict)
+            and _normalize_interface_identity(row.get("interface_name")) == interface_key
+        ),
+        None,
+    )
+    state_key = f"alerts:syslog_optical_recovery_state:{alert.id}"
+    previous = _load_json_cache(state_key)
+    current_fec = None
+    if fec_row and fec_row.get("fec_uncorrectable_packets") is not None:
+        try:
+            current_fec = float(fec_row.get("fec_uncorrectable_packets"))
+        except (TypeError, ValueError):
+            current_fec = None
+    previous_fec = previous.get("fec_uncorrectable_packets")
+    if current_fec is not None and previous_fec is not None and current_fec > float(previous_fec):
+        redis_client.set(
+            state_key,
+            json.dumps({"sample_time": sample_time, "rx_values": lane_values, "fec_uncorrectable_packets": current_fec}),
+            ex=PENDING_ALERT_TTL_SECONDS,
+        )
+        return None, None
+
+    previous_rx = previous.get("rx_values") if isinstance(previous.get("rx_values"), list) else []
+    stable = not previous_rx
+    if previous_rx:
+        stable = (
+            len(previous_rx) == len(lane_values)
+            and max(abs(float(current) - float(old)) for current, old in zip(lane_values, previous_rx)) <= 1.0
+        )
+    redis_client.set(
+        state_key,
+        json.dumps({"sample_time": sample_time, "rx_values": lane_values, "fec_uncorrectable_packets": current_fec}),
+        ex=PENDING_ALERT_TTL_SECONDS,
+    )
+    if not stable:
+        return None, None
+    if str(previous.get("sample_time") or "") == sample_time:
+        return SYSLOG_OPTICAL_DUPLICATE_SAMPLE, None
+
+    details = f"接口Admin/Oper均为Up；RX {min(lane_values):.2f}~{max(lane_values):.2f}dBm，设备合理范围 {low:.2f}~{high:.2f}dBm"
+    if current_fec is not None:
+        details += "；FEC不可纠错计数未新增"
+    return sample_time, details
+
+
+@shared_task
+def reconcile_syslog_optical_power_alerts() -> Dict[str, Any]:
+    """Use existing SNMP/Telemetry caches to recover transient optical Syslog alerts."""
+    lock_value = f"{time.time()}:{uuid.uuid4()}"
+    if not redis_client.set(
+        SYSLOG_OPTICAL_RECOVERY_LOCK_KEY,
+        lock_value,
+        ex=SYSLOG_OPTICAL_RECOVERY_LOCK_TTL_SECONDS,
+        nx=True,
+    ):
+        return {"skipped": True, "reason": "syslog optical recovery already running"}
+
+    db = SessionLocal()
+    checked = 0
+    resolved = 0
+    try:
+        rows = (
+            db.query(AlertHistory, AlertRule, Device)
+            .join(AlertRule, AlertRule.id == AlertHistory.rule_id)
+            .join(Device, Device.id == AlertHistory.device_id)
+            .filter(
+                AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
+                AlertRule.metric_type.in_(["syslog_optical_rx_power_change", "syslog_optical_module_event"]),
+            )
+            .all()
+        )
+        for alert, rule, device in rows:
+            if not _syslog_optical_power_change_alert(rule, alert):
+                continue
+            checked += 1
+            sample_marker, details = _syslog_optical_recovery_sample(alert, device)
+            pending_key = f"alerts:syslog_optical_recovery_pending:{alert.id}"
+            if sample_marker == SYSLOG_OPTICAL_DUPLICATE_SAMPLE:
+                continue
+            if not sample_marker:
+                redis_client.delete(pending_key)
+                continue
+            pending = _load_json_cache(pending_key)
+            markers = [str(value) for value in pending.get("markers") or [] if value]
+            if sample_marker not in markers:
+                markers.append(sample_marker)
+            redis_client.set(
+                pending_key,
+                json.dumps({"markers": markers[-3:], "details": details}, ensure_ascii=False),
+                ex=PENDING_ALERT_TTL_SECONDS,
+            )
+            if len(markers) < 3:
+                continue
+
+            now = _utc_now()
+            was_silenced_ignored = alert.status == "ignored" and alert.ignored_by == "alert_silence"
+            alert.status = "resolved"
+            alert.resolved_at = now
+            alert.resolved_by = "system-optical-sampling"
+            alert.resolution_note = f"连续3个不同采样周期确认光模块状态正常，周期采集兜底恢复：{details}"
+            alert.updated_at = now
+            db.commit()
+            redis_client.delete(pending_key)
+            redis_client.delete(f"alerts:syslog_optical_recovery_state:{alert.id}")
+            if not was_silenced_ignored:
+                enqueue_alert_notification(alert.id, "auto_resolved", "system-optical-sampling")
+            resolved += 1
+            logger.info("Syslog光功率突变告警已由周期采集确认恢复", alert_id=alert.id, device_id=device.id)
+        return {"checked": checked, "resolved": resolved}
+    finally:
+        db.close()
+        if redis_client.get(SYSLOG_OPTICAL_RECOVERY_LOCK_KEY) == lock_value:
+            redis_client.delete(SYSLOG_OPTICAL_RECOVERY_LOCK_KEY)
 
 
 def _default_rule_notification_channels(db: Session) -> List[Dict[str, Any]]:
@@ -4102,6 +4369,51 @@ def _optical_history_key(device_id: int, interface_key: str) -> str:
     return f"alerts:optical_rx_history:{device_id}:{interface_key}"
 
 
+def reset_optical_interface_baselines(device_id: int, interface_name: str) -> List[str]:
+    """Cut optical/FEC counter history at an interface or module session boundary.
+
+    Syslog reports module insert/remove and physical link transitions much sooner
+    than the periodic optical collector.  Reusing samples from before that boundary
+    makes a newly inserted module look like a sudden 1h/24h power degradation and
+    also produces a meaningless FEC delta.  Remove both the interface-name and
+    interface-index variants so the next periodic sample starts a fresh baseline.
+    """
+    normalized_name = _normalize_interface_identity(interface_name)
+    if not normalized_name:
+        return []
+
+    interface_keys = {normalized_name, str(interface_name or "").strip()}
+    for cache_key in (
+        f"monitor:cache:optical_modules:{device_id}",
+        f"monitor:cache:interfaces:{device_id}",
+    ):
+        payload = _load_json_cache(cache_key)
+        rows = payload.get("interfaces") or payload.get("items") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            identities = {
+                _normalize_interface_identity(row.get("name")),
+                _normalize_interface_identity(row.get("interface_name")),
+            }
+            if normalized_name not in identities:
+                continue
+            for value in (row.get("index"), row.get("interface_index"), row.get("name"), row.get("interface_name")):
+                if value is not None and str(value).strip():
+                    interface_keys.add(str(value).strip())
+                    interface_keys.add(_normalize_interface_identity(value))
+
+    deleted: List[str] = []
+    for interface_key in sorted(key for key in interface_keys if key):
+        for key in (
+            _optical_history_key(device_id, interface_key),
+            f"alerts:fec_counter:{device_id}:{interface_key}",
+        ):
+            redis_client.delete(key)
+            deleted.append(key)
+    return deleted
+
+
 def _update_optical_rx_history(
     device_id: int,
     interface_key: str,
@@ -4191,6 +4503,13 @@ def _fec_counter_delta(device_id: int, interface_key: str, row: Dict[str, Any], 
         ex=3 * 3600,
     )
     return result
+
+
+def _optical_fec_correlation_value(drop_1h: float, minimum_drop: float, uncorrectable_delta: float) -> float:
+    """Only newly uncorrectable FEC errors are actionable at P1 severity."""
+    if float(drop_1h) < float(minimum_drop):
+        return 0.0
+    return max(float(uncorrectable_delta), 0.0)
 
 
 def _get_optical_targets(
@@ -4294,7 +4613,11 @@ def _get_optical_targets(
             corrected = float(fec_delta.get("correctable_delta") or 0.0)
             uncorrected = float(fec_delta.get("uncorrectable_delta") or 0.0)
             minimum_drop = float(extra_config.get("rx_drop_db") or 1.0)
-            value = max(corrected, 1_000_000_000.0 if uncorrected > 0 else 0.0) if drop_1h >= minimum_drop else 0.0
+            # RS-FEC correctable counters can grow quickly on a healthy 400G link;
+            # they are diagnostic context, not a P1 fault by themselves.  Raise
+            # this correlated alarm only when optical power has declined in the
+            # same module session and *uncorrectable* FEC errors are newly added.
+            value = _optical_fec_correlation_value(drop_1h, minimum_drop, uncorrected)
             target["sample_time"] = fec_sample_time
             target["sample_age_seconds"] = _row_age_seconds({"_time": fec_sample_time})
             details.extend([
@@ -5801,11 +6124,17 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
 
     event_type = str(event_type or "firing")
     dedup_seconds = NOTIFICATION_DEDUP_SECONDS.get(event_type, 300)
+    queued_key = _notification_key("queued", alert_id, event_type)
     processing_key = _notification_key("processed", alert_id, event_type)
+    # 任务已经被 worker 接收，入队锁的使命即告结束。是否需要继续抑制通知，
+    # 由成功通知历史和下面的执行锁共同判断，避免一次“近期已发送”跳过
+    # 又额外占用整个重复通知周期。
+    redis_client.delete(queued_key)
     if not redis_client.set(processing_key, uuid.uuid4().hex, ex=dedup_seconds, nx=True):
         logger.info("跳过重复通知执行", alert_id=alert_id, event_type=event_type)
         return {"skipped": "duplicate"}
 
+    keep_processing_lock = False
     db = SessionLocal()
     try:
         alert = db.query(AlertHistory).filter(AlertHistory.id == alert_id).first()
@@ -5905,6 +6234,9 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
             alert.notifications_sent = history
             alert.updated_at = _utc_now()
             db.commit()
+            # 只有实际成功发送后才保留完整去重周期。发送端主动跳过、无渠道
+            # 或发送失败时会在 finally 中释放，允许下一轮重新判断/重试。
+            keep_processing_lock = any(bool(result) for result in results)
             
         finally:
             loop.close()
@@ -5913,6 +6245,8 @@ def _send_alert_event_notification(alert_id: int, event_type: str = "firing", ac
         logger.error("发送告警通知失败", alert_id=alert_id, error=str(e))
     finally:
         db.close()
+        if not keep_processing_lock:
+            redis_client.delete(processing_key)
 
 
 @shared_task

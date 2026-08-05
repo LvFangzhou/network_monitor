@@ -433,7 +433,7 @@ def _build_alert_history_query(
 ):
     query = (
         db.query(AlertHistory)
-        .join(Device)
+        .outerjoin(Device, Device.id == AlertHistory.device_id)
         .outerjoin(AlertRule, AlertHistory.rule_id == AlertRule.id)
         .outerjoin(Datacenter, Device.datacenter_id == Datacenter.id)
     )

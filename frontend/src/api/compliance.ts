@@ -25,6 +25,8 @@ export interface VersionBaseline {
   vendor?: string
   model_pattern?: string
   device_role?: string
+  platform_version?: string
+  allowed_releases: string[]
   allowed_versions: string[]
   minimum_version?: string
   required_patches: string[]
@@ -104,6 +106,7 @@ export const getComplianceDevices = async (params?: {
   limit?: number
   overall_status?: string
   vendor?: string
+  datacenter_id?: number
   search?: string
   refresh?: boolean
 }) => await request.get('/compliance/devices', { params }) as { total: number; items: DeviceCompliance[] }

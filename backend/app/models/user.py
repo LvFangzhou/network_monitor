@@ -183,6 +183,7 @@ class AuditLog(Base):
 DEFAULT_MENU_PERMISSIONS = [
     "/dashboard",
     "/devices",
+    "/servers",
     "/device-compliance",
     "/device-dictionaries",
     "/customers",

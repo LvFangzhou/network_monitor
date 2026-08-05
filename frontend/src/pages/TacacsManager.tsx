@@ -1,14 +1,18 @@
 import { useEffect, useState } from 'react'
-import { Button, Card, DatePicker, Divider, Form, Input, InputNumber, Select, Space, Switch, Table, Tabs, Tooltip, Typography, message, theme } from 'antd'
-import { DeleteOutlined, PlusOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
+import { Button, Card, DatePicker, Divider, Form, Input, InputNumber, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, Tooltip, Typography, message, theme } from 'antd'
+import { DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
 import {
   getTacacsConfig,
   getTacacsLogs,
+  getTacacsStatus,
   restartTacacs,
   saveTacacsConfig,
   saveTacacsNotifications,
+  startTacacs,
+  stopTacacs,
   testTacacsNotification,
   type TacacsCommandLog,
+  type TacacsServiceStatus,
   type TacacsSettings,
 } from '../api/tacacs'
 import { useAuthStore } from '../store/auth'
@@ -58,6 +62,16 @@ const detectWebhookChannel = (url?: string) => {
 
 const toText = (items?: string[]) => (items || []).join('\n')
 const toList = (text?: string) => (text || '').split('\n').map((item) => item.trim()).filter(Boolean)
+const isMaskedSecret = (value?: string) => (value || '').trim() === '******'
+const hasUrlProtocol = (value?: string) => /^https?:\/\//i.test((value || '').trim())
+
+const validateWebhookUrl = (_: any, value?: string) => {
+  const text = (value || '').trim()
+  if (!text) return Promise.reject(new Error('请输入 webhook 链接'))
+  if (isMaskedSecret(text)) return Promise.resolve()
+  if (!hasUrlProtocol(text)) return Promise.reject(new Error('Webhook 地址必须以 http:// 或 https:// 开头'))
+  return Promise.resolve()
+}
 
 const toFormValues = (settings?: TacacsSettings) => {
   const source = settings || defaultSettings
@@ -123,9 +137,14 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
   const [saving, setSaving] = useState(false)
   const [logs, setLogs] = useState<TacacsCommandLog[]>([])
   const [logLoading, setLogLoading] = useState(false)
+  const [serviceStatus, setServiceStatus] = useState<TacacsServiceStatus>()
+  const [statusLoading, setStatusLoading] = useState(false)
+  const [starting, setStarting] = useState(false)
   const [restarting, setRestarting] = useState(false)
+  const [stopping, setStopping] = useState(false)
   const [testingWebhook, setTestingWebhook] = useState<Record<number, boolean>>({})
   const [savingWebhook, setSavingWebhook] = useState<Record<number, boolean>>({})
+  const [activeRoleKey, setActiveRoleKey] = useState('0')
   const [search, setSearch] = useState('')
   const [logDevice, setLogDevice] = useState('')
   const [logUser, setLogUser] = useState('')
@@ -163,6 +182,17 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
     }
   }
 
+  const fetchServiceStatus = async () => {
+    setStatusLoading(true)
+    try {
+      setServiceStatus(await getTacacsStatus())
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '读取 Tacacs 服务状态失败')
+    } finally {
+      setStatusLoading(false)
+    }
+  }
+
   const fetchLogs = async (page = logPage, pageSize = logPageSize) => {
     setLogLoading(true)
     try {
@@ -190,6 +220,7 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
 
   useEffect(() => {
     fetchConfig()
+    fetchServiceStatus()
     fetchLogs()
   }, [])
 
@@ -207,7 +238,7 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
     setSaving(true)
     try {
       await saveTacacsConfig(toSettings(values))
-      message.success('Tacacs 配置已保存，重启 Tacacs 容器后生效')
+      message.success('Tacacs 配置已保存，重启 Tacacs 服务后生效')
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '保存 Tacacs 配置失败')
     } finally {
@@ -219,23 +250,54 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
     setRestarting(true)
     try {
       const result = await restartTacacs()
-      message.success(result.message || 'Tacacs 容器已重启')
+      setServiceStatus(result)
+      message.success(result.message || 'Tacacs 服务已重启')
     } catch (error: any) {
-      message.error(error?.response?.data?.detail || '重启 Tacacs 容器失败')
+      message.error(error?.response?.data?.detail || '重启 Tacacs 服务失败')
     } finally {
       setRestarting(false)
     }
   }
 
+  const handleStart = async () => {
+    setStarting(true)
+    try {
+      const result = await startTacacs()
+      setServiceStatus(result)
+      message.success(result.message || 'Tacacs 服务已启动')
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '启动 Tacacs 服务失败')
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  const handleStop = async () => {
+    setStopping(true)
+    try {
+      const result = await stopTacacs()
+      setServiceStatus(result)
+      message.success(result.message || 'Tacacs 服务已停止')
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || '停止 Tacacs 服务失败')
+    } finally {
+      setStopping(false)
+    }
+  }
+
   const handleTestWebhook = async (index: number) => {
-    const webhook = configForm.getFieldValue(['notification_channels', index, 'webhook'])
+    const webhook = (configForm.getFieldValue(['notification_channels', index, 'webhook']) || '').trim()
     if (!webhook) {
       message.warning('请先填写机器人地址')
       return
     }
+    if (!isMaskedSecret(webhook) && !hasUrlProtocol(webhook)) {
+      message.warning('Webhook 地址必须以 http:// 或 https:// 开头')
+      return
+    }
     setTestingWebhook((prev) => ({ ...prev, [index]: true }))
     try {
-      const result = await testTacacsNotification(webhook)
+      const result = await testTacacsNotification(webhook, index)
       message.success(result.message)
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '测试发送失败')
@@ -284,14 +346,32 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
                 title="Tacacs 配置管理"
                 extra={
                   <Space>
-                    <Tooltip title="刷新配置">
-                      <Button icon={<ReloadOutlined />} loading={loadingConfig} onClick={fetchConfig}>刷新</Button>
+                    <Tag color={serviceStatus?.running ? 'success' : serviceStatus?.status === 'stopped' ? 'default' : 'warning'}>
+                      当前状态：{statusLoading ? '读取中' : serviceStatus?.label || '未知'}
+                    </Tag>
+                    <Tooltip title="刷新配置和服务状态">
+                      <Button icon={<ReloadOutlined />} loading={loadingConfig || statusLoading} onClick={() => { void fetchConfig(); void fetchServiceStatus() }}>刷新</Button>
                     </Tooltip>
                     {canModify ? (
                       <>
-                        <Tooltip title="重启Tacacs容器">
-                          <Button icon={<ReloadOutlined />} loading={restarting} onClick={handleRestart}>重启Tacacs容器</Button>
-                        </Tooltip>
+                        {!serviceStatus?.running ? (
+                          <Button type="primary" icon={<PlayCircleOutlined />} loading={starting} onClick={handleStart}>启动 Tacacs 服务</Button>
+                        ) : (
+                          <>
+                            <Tooltip title="重启 Tacacs 服务">
+                              <Button icon={<ReloadOutlined />} loading={restarting} onClick={handleRestart}>重启 Tacacs 服务</Button>
+                            </Tooltip>
+                            <Popconfirm
+                              title="确认停止 Tacacs 服务？"
+                              description="停止后，网络设备通过 Tacacs 登录和命令授权可能不可用。"
+                              okText="确认停止"
+                              cancelText="取消"
+                              onConfirm={handleStop}
+                            >
+                              <Button danger icon={<PauseCircleOutlined />} loading={stopping}>停止 Tacacs 服务</Button>
+                            </Popconfirm>
+                          </>
+                        )}
                         <Tooltip title="保存配置">
                           <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={handleSave}>保存配置</Button>
                         </Tooltip>
@@ -343,58 +423,73 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
                       <Form.List name="roles">
                         {(roleFields, { add: addRole, remove: removeRole }) => (
                           <Space direction="vertical" style={{ width: '100%' }} size={8}>
-                            {roleFields.map((roleField) => (
-                              <div key={roleField.key} style={{ border: `1px solid ${colorBorder}`, borderRadius: 6, padding: 8, background: colorFillAlter }}>
-                                <div style={rowGrid('1fr 96px 100px 32px')}>
-                                  <Form.Item {...roleField} name={[roleField.name, 'name']} label="组名称" rules={[{ required: true, message: '请输入组名称' }]}>
-                                    <Input placeholder="network_admin" />
-                                  </Form.Item>
-                                  <Form.Item {...roleField} name={[roleField.name, 'priv_lvl']} label="级别" rules={[{ required: true, message: '请输入权限级别' }]}>
-                                    <InputNumber min={0} max={15} style={{ width: '100%' }} />
-                                  </Form.Item>
-                                  <Form.Item {...roleField} name={[roleField.name, 'default_permit']} label="默认放行" valuePropName="checked">
-                                    <Switch checkedChildren="是" unCheckedChildren="否" />
-                                  </Form.Item>
-                                  {canModify ? (
-                                    <Tooltip title="删除组">
-                                      <Button danger icon={<DeleteOutlined />} onClick={() => removeRole(roleField.name)} style={{ marginTop: 24 }} />
-                                    </Tooltip>
-                                  ) : null}
-                                </div>
-                                <Form.List name={[roleField.name, 'commands']}>
-                                  {(commandFields, { add: addCommand, remove: removeCommand }) => (
-                                    <Space direction="vertical" style={{ width: '100%' }} size={6}>
-                                      {commandFields.map((commandField) => (
-                                        <div key={commandField.key} style={rowGrid('120px 1fr 1fr 32px')}>
-                                          <Form.Item {...commandField} name={[commandField.name, 'name']} label="命令" rules={[{ required: true, message: '请输入命令' }]}>
-                                            <Input placeholder="display" />
-                                          </Form.Item>
-                                          <Form.Item {...commandField} name={[commandField.name, 'permitText']} label="允许规则">
-                                            <Input.TextArea rows={2} placeholder={'.*'} />
-                                          </Form.Item>
-                                          <Form.Item {...commandField} name={[commandField.name, 'denyText']} label="拒绝规则">
-                                            <Input.TextArea rows={2} placeholder="shutdown.*" />
-                                          </Form.Item>
-                                          {canModify ? (
-                                            <Tooltip title="删除命令权限">
-                                              <Button danger icon={<DeleteOutlined />} onClick={() => removeCommand(commandField.name)} style={{ marginTop: 24 }} />
-                                            </Tooltip>
-                                          ) : null}
-                                        </div>
-                                      ))}
-                                      {canModify ? (
-                                        <Tooltip title="添加命令权限">
-                                          <Button size="small" icon={<PlusOutlined />} onClick={() => addCommand({ name: '', permitText: '.*', denyText: '' })}>添加命令权限</Button>
-                                        </Tooltip>
-                                      ) : null}
-                                    </Space>
-                                  )}
-                                </Form.List>
-                              </div>
-                            ))}
+                            <Tabs
+                              type="card"
+                              size="small"
+                              activeKey={roleFields.some((field) => String(field.key) === activeRoleKey) ? activeRoleKey : String(roleFields[0]?.key ?? '0')}
+                              onChange={setActiveRoleKey}
+                              items={roleFields.map((roleField) => {
+                                const roleName = configForm.getFieldValue(['roles', roleField.name, 'name']) || `组 ${roleField.name + 1}`
+                                return {
+                                  key: String(roleField.key),
+                                  label: roleName,
+                                  children: (
+                                    <div style={{ border: `1px solid ${colorBorder}`, borderRadius: 6, padding: 8, background: colorFillAlter }}>
+                                      <div style={rowGrid('1fr 96px 120px 32px')}>
+                                        <Form.Item {...roleField} name={[roleField.name, 'name']} label="组名称" rules={[{ required: true, message: '请输入组名称' }]}>
+                                          <Input placeholder="network_admin" />
+                                        </Form.Item>
+                                        <Form.Item {...roleField} name={[roleField.name, 'priv_lvl']} label="级别" rules={[{ required: true, message: '请输入权限级别' }]}>
+                                          <InputNumber min={0} max={15} style={{ width: '100%' }} />
+                                        </Form.Item>
+                                        <Form.Item {...roleField} name={[roleField.name, 'default_permit']} label="默认放行" valuePropName="checked" extra="开启后未命中命令规则的命令也会放行">
+                                          <Switch checkedChildren="是" unCheckedChildren="否" />
+                                        </Form.Item>
+                                        {canModify ? (
+                                          <Tooltip title="删除组">
+                                            <Button danger icon={<DeleteOutlined />} onClick={() => removeRole(roleField.name)} style={{ marginTop: 24 }} />
+                                          </Tooltip>
+                                        ) : null}
+                                      </div>
+                                      <Form.List name={[roleField.name, 'commands']}>
+                                        {(commandFields, { add: addCommand, remove: removeCommand }) => (
+                                          <Space direction="vertical" style={{ width: '100%' }} size={6}>
+                                            {commandFields.map((commandField) => (
+                                              <div key={commandField.key} style={rowGrid('120px 1fr 1fr 32px')}>
+                                                <Form.Item {...commandField} name={[commandField.name, 'name']} label="命令" rules={[{ required: true, message: '请输入命令' }]}>
+                                                  <Input placeholder="display" />
+                                                </Form.Item>
+                                                <Form.Item {...commandField} name={[commandField.name, 'permitText']} label="允许规则">
+                                                  <Input.TextArea rows={2} placeholder={'.*'} />
+                                                </Form.Item>
+                                                <Form.Item {...commandField} name={[commandField.name, 'denyText']} label="拒绝规则">
+                                                  <Input.TextArea rows={2} placeholder="shutdown.*" />
+                                                </Form.Item>
+                                                {canModify ? (
+                                                  <Tooltip title="删除命令权限">
+                                                    <Button danger icon={<DeleteOutlined />} onClick={() => removeCommand(commandField.name)} style={{ marginTop: 24 }} />
+                                                  </Tooltip>
+                                                ) : null}
+                                              </div>
+                                            ))}
+                                            {canModify ? (
+                                              <Tooltip title="添加命令权限">
+                                                <Button size="small" icon={<PlusOutlined />} onClick={() => addCommand({ name: '', permitText: '.*', denyText: '' })}>添加命令权限</Button>
+                                              </Tooltip>
+                                            ) : null}
+                                          </Space>
+                                        )}
+                                      </Form.List>
+                                    </div>
+                                  ),
+                                }
+                              })}
+                            />
                             {canModify ? (
                               <Tooltip title="添加组">
-                                <Button size="small" icon={<PlusOutlined />} onClick={() => addRole({ name: '', priv_lvl: 1, default_permit: true, commands: [] })}>添加组</Button>
+                                <Button size="small" icon={<PlusOutlined />} onClick={() => {
+                                  addRole({ name: '', priv_lvl: 1, default_permit: false, commands: [] })
+                                }}>添加组</Button>
                               </Tooltip>
                             ) : null}
                           </Space>
@@ -419,7 +514,7 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
                                   name={[field.name, 'webhook']}
                                   label="Webhook 地址"
                                   extra={`当前识别：${detected.label}`}
-                                  rules={[{ required: true, message: '请输入 webhook 链接' }]}
+                                  rules={[{ validator: validateWebhookUrl }]}
                                 >
                                   <Input.Password
                                     visibilityToggle={false}

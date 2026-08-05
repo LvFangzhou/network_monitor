@@ -522,6 +522,61 @@ services:
           cpus: '2'
           memory: 1G
 
+  # Syslog 接收与入库/告警解耦，突发日志不会阻塞 API UDP 事件循环
+  celery-worker-events-syslog:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-events-syslog
+    command: celery -A app.tasks worker -l info -Q events_syslog -n worker-events-syslog@%h --pool=threads -c 4 --prefetch-multiplier=1 -Ofair
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+
+  # SNMP Trap 独立实时处理，保留山石告警合并/恢复逻辑
+  celery-worker-events-trap:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-events-trap
+    command: celery -A app.tasks worker -l info -Q events_trap -n worker-events-trap@%h --pool=threads -c 2 --prefetch-multiplier=1 -Ofair
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  # 5 秒级丢包/不可达探针享有独立高优先队列
+  celery-worker-quality-fast:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-quality-fast
+    command: celery -A app.tasks worker -l info -Q quality_fast -n worker-quality-fast@%h --pool=threads -c 4 --prefetch-multiplier=1 -Ofair
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+
+  # 常规延迟/丢包/抖动采集，不与快速故障探针互相排队
+  celery-worker-quality-regular:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-quality-regular
+    command: celery -A app.tasks worker -l info -Q quality_regular -n worker-quality-regular@%h --pool=threads -c 8 --prefetch-multiplier=1 -Ofair
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 2G
+
+  # MTR 属于长耗时低频任务，单独限并发以保护实时探测
+  celery-worker-quality-mtr:
+    <<: *celery-worker-base
+    container_name: nm-celery-worker-quality-mtr
+    command: celery -A app.tasks worker -l info -Q quality_mtr -n worker-quality-mtr@%h --pool=threads -c 2 --prefetch-multiplier=1 -Ofair
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+
   # 资源统计独立队列：线路/资源类定时任务与配置备份分离
   celery-worker-resource:
     <<: *celery-worker-base

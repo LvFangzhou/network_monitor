@@ -14,14 +14,28 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column("quality_probe_targets", sa.Column("device_id", sa.Integer(), nullable=True))
-    op.add_column("quality_probe_targets", sa.Column("probe_source", sa.String(30), nullable=False, server_default="server_icmp"))
-    op.add_column("quality_probe_targets", sa.Column("nqa_admin_name", sa.String(32), nullable=True))
-    op.add_column("quality_probe_targets", sa.Column("nqa_operation_tag", sa.String(32), nullable=True))
-    op.create_foreign_key(
-        "fk_quality_probe_targets_device_id", "quality_probe_targets", "devices", ["device_id"], ["id"], ondelete="SET NULL"
+    inspector = sa.inspect(op.get_bind())
+    columns = {column["name"] for column in inspector.get_columns("quality_probe_targets")}
+    additions = (
+        ("device_id", sa.Column("device_id", sa.Integer(), nullable=True)),
+        ("probe_source", sa.Column("probe_source", sa.String(30), nullable=False, server_default="server_icmp")),
+        ("nqa_admin_name", sa.Column("nqa_admin_name", sa.String(32), nullable=True)),
+        ("nqa_operation_tag", sa.Column("nqa_operation_tag", sa.String(32), nullable=True)),
     )
-    op.create_index("idx_quality_probe_targets_device", "quality_probe_targets", ["device_id"])
+    for name, column in additions:
+        if name not in columns:
+            op.add_column("quality_probe_targets", column)
+    foreign_keys = inspector.get_foreign_keys("quality_probe_targets")
+    has_device_foreign_key = any(
+        constraint.get("constrained_columns") == ["device_id"]
+        and constraint.get("referred_table") == "devices"
+        for constraint in foreign_keys
+    )
+    if not has_device_foreign_key:
+        op.create_foreign_key(
+            "fk_quality_probe_targets_device_id", "quality_probe_targets", "devices", ["device_id"], ["id"], ondelete="SET NULL"
+        )
+    op.execute("CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_device ON quality_probe_targets (device_id)")
 
 
 def downgrade():

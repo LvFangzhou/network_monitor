@@ -12,6 +12,7 @@ import {
   Popover,
   Segmented,
   Select,
+  Skeleton,
   Space,
   Spin,
   Switch,
@@ -22,6 +23,7 @@ import {
 } from 'antd'
 import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
+import { useSearchParams } from 'react-router-dom'
 import { CartesianGrid, Legend, Line, LineChart, ReferenceArea, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from 'recharts'
 import {
   createQualityProbeTarget,
@@ -108,6 +110,16 @@ const slaStyles: Record<QualityHealthLevel, { label: string; color: string; back
   notice: { label: 'SLA关注', color: '#614700', background: '#ffd666', border: '#d4b106', rank: 2 },
   healthy: { label: 'SLA正常', color: '#ffffff', background: '#4f9f50', border: '#357a38', rank: 3 },
   no_data: { label: '无有效样本', color: '#434343', background: '#d9d9d9', border: '#bfbfbf', rank: 4 },
+}
+
+const DATACENTER_TAG_COLORS = ['#722ed1', '#d46b08', '#08979c', '#c41d7f', '#389e0d']
+
+const getOperatorTagColor = (operatorName?: string | null) => {
+  const normalized = String(operatorName || '').trim().toLowerCase()
+  if (normalized.includes('电信') || normalized.includes('telecom')) return '#1677ff'
+  if (normalized.includes('联通') || normalized.includes('unicom')) return '#d4380d'
+  if (normalized.includes('移动') || normalized.includes('mobile') || normalized.includes('cmcc')) return '#389e0d'
+  return '#595959'
 }
 
 const getSlaLevel = (record: QualityProbeTarget): QualityHealthLevel => {
@@ -339,7 +351,7 @@ const LINKED_TRAFFIC_CHART_MARGIN = { top: 10, right: 88, left: 8, bottom: 8 }
 const QUALITY_LEFT_AXIS_WIDTH = 82
 const QUALITY_RIGHT_AXIS_WIDTH = 56
 
-const QualityChartPanel = ({ target, initialRange = '-1h' }: { target: QualityProbeTarget; initialRange?: string }) => {
+const QualityChartPanel = ({ target, memberTarget, initialRange = '-1h' }: { target: QualityProbeTarget; memberTarget?: string; initialRange?: string }) => {
   const [rangeValue, setRangeValue] = useState(initialRange)
   const [customRange, setCustomRange] = useState<[dayjs.Dayjs | null, dayjs.Dayjs | null] | null>([dayjs().subtract(1, 'hour'), dayjs()])
   const [historyLoading, setHistoryLoading] = useState(false)
@@ -368,7 +380,7 @@ const QualityChartPanel = ({ target, initialRange = '-1h' }: { target: QualityPr
       : buildQualityHistoryParams(rangeValue, customRange)
     if (!silent) setHistoryLoading(true)
     try {
-      const response = await getQualityProbeHistory(target.id, params)
+      const response = await getQualityProbeHistory(target.id, { ...params, member_target: memberTarget })
       if (historyRequestSeqRef.current !== requestSeq) return
       setHistoryData(response.data || [])
       setLoadedInterval(response.interval || params.interval)
@@ -379,7 +391,7 @@ const QualityChartPanel = ({ target, initialRange = '-1h' }: { target: QualityPr
     } finally {
       if (historyRequestSeqRef.current === requestSeq && !silent) setHistoryLoading(false)
     }
-  }, [rangeValue, customRange, target.id, target.interval_seconds, zoomDomain])
+  }, [rangeValue, customRange, memberTarget, target.id, target.interval_seconds, zoomDomain])
 
   const fetchLinkedTraffic = useCallback(async (silent = false) => {
     const hasCircuitBinding = Boolean(target.circuit_id)
@@ -426,9 +438,12 @@ const QualityChartPanel = ({ target, initialRange = '-1h' }: { target: QualityPr
 
   useEffect(() => {
     void fetchHistory()
-    void fetchLinkedTraffic()
     setRefreshCountdown(10)
-  }, [fetchHistory, fetchLinkedTraffic])
+  }, [fetchHistory])
+
+  useEffect(() => {
+    void fetchLinkedTraffic()
+  }, [fetchLinkedTraffic])
 
   useEffect(() => {
     setZoomDomain(null)
@@ -687,7 +702,7 @@ const QualityChartPanel = ({ target, initialRange = '-1h' }: { target: QualityPr
   return (
     <Card
       size="small"
-      title={`${target.name} / ${target.target} 质量变化`}
+      title={`${target.name} / ${memberTarget || target.target} 质量变化`}
       extra={(
         <Space wrap>
           <Segmented
@@ -1031,18 +1046,24 @@ const QualityChartPanel = ({ target, initialRange = '-1h' }: { target: QualityPr
 
 const QualityQuery = () => {
   const [form] = Form.useForm()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const initialProbeId = Number(searchParams.get('probe')) || null
+  const initialMemberTarget = searchParams.get('target') || ''
   const [loading, setLoading] = useState(false)
+  const [slaLoading, setSlaLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [testingId, setTestingId] = useState<number | null>(null)
   const [items, setItems] = useState<QualityProbeTarget[]>([])
   const [datacenters, setDatacenters] = useState<Datacenter[]>([])
   const [circuits, setCircuits] = useState<Circuit[]>([])
-  const [keyword, setKeyword] = useState('')
-  const [activeFilter, setActiveFilter] = useState<string>('all')
-  const [slaRange, setSlaRange] = useState('-1h')
+  const [keyword, setKeyword] = useState(searchParams.get('q') || '')
+  const [datacenterFilter, setDatacenterFilter] = useState(searchParams.get('dc') || 'all')
+  const [operatorFilter, setOperatorFilter] = useState(searchParams.get('operator') || 'all')
+  const [activeFilter, setActiveFilter] = useState<string>(searchParams.get('status') || 'all')
+  const [slaRange, setSlaRange] = useState(searchParams.get('sla') || '-1h')
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState<QualityProbeTarget | null>(null)
-  const [expandedRowKeys, setExpandedRowKeys] = useState<Key[]>([])
+  const [expandedRowKeys, setExpandedRowKeys] = useState<Key[]>(initialProbeId ? [initialProbeId] : [])
   const [openActionTargetId, setOpenActionTargetId] = useState<number | null>(null)
   const [mtrLoadingId, setMtrLoadingId] = useState<number | null>(null)
   const [mtrOpen, setMtrOpen] = useState(false)
@@ -1052,6 +1073,14 @@ const QualityQuery = () => {
   const [mtrObservationOpen, setMtrObservationOpen] = useState(false)
   const [mtrObservationLoading, setMtrObservationLoading] = useState(false)
   const [mtrObservationTarget, setMtrObservationTarget] = useState<QualityProbeTarget | null>(null)
+  const [selectedMemberTargets, setSelectedMemberTargets] = useState<Record<number, string>>(
+    initialProbeId && initialMemberTarget ? { [initialProbeId]: initialMemberTarget } : {},
+  )
+  const [mtrMemberTarget, setMtrMemberTarget] = useState('')
+  const [mtrDays, setMtrDays] = useState(7)
+  const [mtrPage, setMtrPage] = useState(1)
+  const [mtrPageSize, setMtrPageSize] = useState(20)
+  const [mtrSnapshotTotal, setMtrSnapshotTotal] = useState(0)
   const [mtrLatestSnapshot, setMtrLatestSnapshot] = useState<QualityMtrSnapshot | null>(null)
   const [mtrSnapshots, setMtrSnapshots] = useState<QualityMtrSnapshot[]>([])
   const [mtrEvents, setMtrEvents] = useState<QualityMtrEvent[]>([])
@@ -1064,8 +1093,27 @@ const QualityQuery = () => {
   const [nqaDeviceInterfaces, setNqaDeviceInterfaces] = useState<MonitorInterface[]>([])
   const [nqaDeviceInterfacesLoading, setNqaDeviceInterfacesLoading] = useState(false)
   const nqaDeviceSearchTimer = useRef<number | null>(null)
+  const fetchItemsSeqRef = useRef(0)
+  const slaSeqRef = useRef(0)
+  const slaRangeInitializedRef = useRef(false)
   const probeSource = Form.useWatch('probe_source', form) || 'server_icmp'
   const selectedNqaDeviceId = Form.useWatch('device_id', form)
+
+  useEffect(() => {
+    const next = new URLSearchParams()
+    if (keyword.trim()) next.set('q', keyword.trim())
+    if (datacenterFilter !== 'all') next.set('dc', datacenterFilter)
+    if (operatorFilter !== 'all') next.set('operator', operatorFilter)
+    if (activeFilter !== 'all') next.set('status', activeFilter)
+    if (slaRange !== '-1h') next.set('sla', slaRange)
+    const expandedId = Number(expandedRowKeys[0]) || 0
+    if (expandedId) {
+      next.set('probe', String(expandedId))
+      const memberTarget = selectedMemberTargets[expandedId]
+      if (memberTarget) next.set('target', memberTarget)
+    }
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [activeFilter, datacenterFilter, expandedRowKeys, keyword, operatorFilter, searchParams, selectedMemberTargets, setSearchParams, slaRange])
 
   const testTargetAlertRobot = async () => {
     const values = await form.validateFields(['alert_webhook_url', 'alert_mention_users_text'])
@@ -1084,20 +1132,40 @@ const QualityQuery = () => {
     }
   }
 
-  const fetchItems = async (silent = false) => {
+  const fetchSla = async (rangeValue = slaRange) => {
+    const requestSeq = slaSeqRef.current + 1
+    slaSeqRef.current = requestSeq
+    setSlaLoading(true)
+    try {
+      const response = await getQualityProbeTargetsSla(rangeValue)
+      if (slaSeqRef.current !== requestSeq) return
+      const slaById = new Map((response.items || []).map((item) => [item.id, item]))
+      setItems((current) => current.map((item) => ({ ...item, ...(slaById.get(item.id) || {}) })))
+    } catch (error: any) {
+      if (slaSeqRef.current === requestSeq) message.warning(error?.response?.data?.detail || 'SLA统计暂未加载，卡片实时状态不受影响')
+    } finally {
+      if (slaSeqRef.current === requestSeq) setSlaLoading(false)
+    }
+  }
+
+  const fetchItems = async (silent = false, withSla = true) => {
+    const requestSeq = fetchItemsSeqRef.current + 1
+    fetchItemsSeqRef.current = requestSeq
     if (!silent) setLoading(true)
     try {
       const response = await getQualityProbeTargets({
-        search: keyword.trim() || undefined,
         active: activeFilter === 'all' ? undefined : activeFilter === 'active',
       })
-      const slaResponse = await getQualityProbeTargetsSla(slaRange)
-      const slaById = new Map((slaResponse.items || []).map((item) => [item.id, item]))
-      const nextItems = (response.items || []).map((item) => ({ ...item, ...(slaById.get(item.id) || {}) }))
-      setItems(nextItems)
+      if (fetchItemsSeqRef.current !== requestSeq) return
+      setItems((current) => {
+        const currentById = new Map(current.map((item) => [item.id, item]))
+        return (response.items || []).map((item) => ({ ...(currentById.get(item.id) || {}), ...item }))
+      })
+      if (withSla) void fetchSla()
     } catch (error: any) {
       if (!silent) message.error(error?.response?.data?.detail || '获取质量探测目标失败')
-      setItems([])
+      // 自动刷新失败时保留上一次成功结果，避免整个页面瞬间变成 0 条。
+      setItems((current) => current)
     } finally {
       if (!silent) setLoading(false)
     }
@@ -1180,15 +1248,25 @@ const QualityQuery = () => {
 
   useEffect(() => {
     void fetchItems()
-  }, [activeFilter, slaRange])
+  }, [activeFilter])
+
+  useEffect(() => {
+    // 首次 SLA 请求由 fetchItems 在目标列表返回后触发，避免页面初始化时
+    // 对同一个范围并发执行两次昂贵的汇总查询。
+    if (!slaRangeInitializedRef.current) {
+      slaRangeInitializedRef.current = true
+      return
+    }
+    void fetchSla(slaRange)
+  }, [slaRange])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      void fetchItems(true)
+      void fetchItems(true, false)
     }, 10000)
     return () => window.clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeFilter, keyword, slaRange])
+  }, [activeFilter])
 
   const datacenterOptions = useMemo(
     () => datacenters.filter((item) => item.is_active !== false).map((item) => ({ label: item.name, value: item.id })),
@@ -1226,7 +1304,40 @@ const QualityQuery = () => {
     [nqaDeviceInterfaces]
   )
 
-  const summaryItems = useMemo(() => items.filter((item) => item.is_active), [items])
+  const filterDatacenterOptions = useMemo(
+    () => Array.from(new Set(items.map((item) => String(item.datacenter_name || '').trim()).filter(Boolean)))
+      .sort((left, right) => left.localeCompare(right, 'zh-CN'))
+      .map((name) => ({ label: name, value: name })),
+    [items],
+  )
+  const filterOperatorOptions = useMemo(
+    () => Array.from(new Set(items.map((item) => String(item.operator_name || '').trim()).filter(Boolean)))
+      .sort((left, right) => left.localeCompare(right, 'zh-CN'))
+      .map((name) => ({ label: name, value: name })),
+    [items],
+  )
+  const filteredItems = useMemo(() => {
+    const normalizedKeyword = keyword.trim().toLowerCase()
+    return items.filter((item) => {
+      if (datacenterFilter !== 'all' && String(item.datacenter_name || '') !== datacenterFilter) return false
+      if (operatorFilter !== 'all' && String(item.operator_name || '') !== operatorFilter) return false
+      if (!normalizedKeyword) return true
+      const searchableText = [
+        item.name,
+        item.target,
+        ...(item.target_addresses || []),
+        item.datacenter_name,
+        item.operator_name,
+        item.device_name,
+        item.device_ip,
+        item.circuit_name,
+        item.circuit_port_name,
+        item.probe_interface_name,
+      ].filter(Boolean).join(' ').toLowerCase()
+      return searchableText.includes(normalizedKeyword)
+    })
+  }, [datacenterFilter, items, keyword, operatorFilter])
+  const summaryItems = useMemo(() => filteredItems.filter((item) => item.is_active), [filteredItems])
   const slaItems = useMemo(
     () => [...summaryItems].sort((left, right) => {
       const leftLevel = slaStyles[getSlaLevel(left)]
@@ -1262,6 +1373,10 @@ const QualityQuery = () => {
   }, [summaryItems])
   const datacenterSlaGroups = useMemo(() => buildSlaGroups('datacenter_name'), [buildSlaGroups])
   const operatorSlaGroups = useMemo(() => buildSlaGroups('operator_name'), [buildSlaGroups])
+  const datacenterTagColors = useMemo(() => {
+    const names = Array.from(new Set(items.map((item) => String(item.datacenter_name || '').trim()).filter(Boolean))).sort((left, right) => left.localeCompare(right, 'zh-CN'))
+    return new Map(names.map((name, index) => [name, DATACENTER_TAG_COLORS[index % DATACENTER_TAG_COLORS.length]]))
+  }, [items])
   const lowestSlaItems = useMemo(
     () => slaItems.filter((item) => getQualityAvailability(item) !== null).slice(0, 8),
     [slaItems]
@@ -1301,7 +1416,7 @@ const QualityQuery = () => {
       loss_threshold_percent: 1,
       jitter_threshold_ms: 30,
       mtr_enabled: false,
-      mtr_interval_seconds: 300,
+      mtr_interval_seconds: 3600,
       is_active: true,
       alert_enabled: false,
       alert_loss_threshold_percent: 10,
@@ -1317,6 +1432,7 @@ const QualityQuery = () => {
     form.resetFields()
     form.setFieldsValue({
       ...record,
+      target_addresses: record.target_addresses?.length ? record.target_addresses : [record.target],
       probe_source: record.probe_source || 'server_icmp',
       nqa_instance_key: record.probe_source === 'device_nqa_snmp'
         ? nqaInstanceValue(record.nqa_admin_name, record.nqa_operation_tag)
@@ -1369,6 +1485,12 @@ const QualityQuery = () => {
       } = values
       const normalizedTargetValues = {
         ...targetValues,
+        target_addresses: targetValues.probe_source === 'server_icmp'
+          ? (targetValues.target_addresses || []).map((item: string) => String(item).trim()).filter(Boolean)
+          : [String(targetValues.target || '').trim()],
+        target: targetValues.probe_source === 'server_icmp'
+          ? String((targetValues.target_addresses || [])[0] || '').trim()
+          : String(targetValues.target || '').trim(),
         circuit_id: targetValues.circuit_id || null,
         probe_interface_name: targetValues.probe_interface_name || null,
       }
@@ -1416,6 +1538,43 @@ const QualityQuery = () => {
     setTestingId(record.id)
     try {
       const response = await testQualityProbeTarget(record.id)
+      if (response.summary && response.results) {
+        const testResults = Object.entries(response.results)
+        const modal = response.summary.abnormal > 0 ? Modal.warning : Modal.success
+        modal({
+          width: 620,
+          title: `测试完成：${response.summary.total}个目标，${response.summary.healthy}正常，${response.summary.abnormal}异常`,
+          content: (
+            <List
+              size="small"
+              dataSource={testResults}
+              renderItem={([address, result]) => {
+                const sent = Number(result.sent ?? 0)
+                const received = Number(result.received ?? 0)
+                const currentLoss = result.current_packet_loss_percent ?? result.packet_loss_percent
+                return (
+                  <List.Item>
+                    <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                      <Space wrap>
+                        <Text code>{address}</Text>
+                        <Tag color={result.success ? 'success' : 'error'}>
+                          {result.success ? '连通正常' : '无法连通'}
+                        </Tag>
+                      </Space>
+                      <Text type="secondary">
+                        发送 / 收到：{sent} / {received}　丢包率：{currentLoss ?? '-'}%
+                        {result.avg_latency_ms != null ? `　平均延迟：${result.avg_latency_ms} ms` : ''}
+                      </Text>
+                    </Space>
+                  </List.Item>
+                )
+              }}
+            />
+          ),
+        })
+        await fetchItems(true, false)
+        return
+      }
       const result = response.result
       if (result.success) {
         const currentLoss = result.current_packet_loss_percent ?? result.packet_loss_percent
@@ -1431,15 +1590,16 @@ const QualityQuery = () => {
     }
   }
 
-  const handleMtr = async (record: QualityProbeTarget) => {
+  const handleMtr = async (record: QualityProbeTarget, selectedAddress?: string) => {
+    const address = selectedAddress || selectedMemberTargets[record.id] || record.target_addresses?.[0] || record.target
     setOpenActionTargetId(null)
     setMtrLoadingId(record.id)
-    setMtrTitle(`${record.name} / ${record.target}`)
+    setMtrTitle(`${record.name} / ${address}`)
     setMtrCommand('')
     setMtrOutput('')
     setMtrOpen(true)
     try {
-      const result = await runQualityProbeMtr(record.id)
+      const result = await runQualityProbeMtr(record.id, address)
       setMtrCommand(result.command || result.tool || 'MTR')
       setMtrOutput(result.output || '无输出')
     } catch (error: any) {
@@ -1449,25 +1609,35 @@ const QualityQuery = () => {
     }
   }
 
-  const openMtrObservation = async (record: QualityProbeTarget) => {
-    setOpenActionTargetId(null)
-    setMtrObservationTarget(record)
-    setMtrLatestSnapshot(null)
-    setMtrSnapshots([])
-    setMtrEvents([])
-    setMtrObservationOpen(true)
+  const loadMtrObservation = async (record: QualityProbeTarget, address: string, days: number, page: number, pageSize: number) => {
     setMtrObservationLoading(true)
     try {
-      const result = await getQualityMtrObservation(record.id)
+      const result = await getQualityMtrObservation(record.id, { member_target: address, days, page, page_size: pageSize })
       setMtrObservationTarget(result.target)
       setMtrLatestSnapshot(result.latest_snapshot || null)
       setMtrSnapshots(result.snapshots || [])
       setMtrEvents(result.events || [])
+      setMtrSnapshotTotal(result.snapshot_total || 0)
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '读取路径观察失败')
     } finally {
       setMtrObservationLoading(false)
     }
+  }
+
+  const openMtrObservation = async (record: QualityProbeTarget, selectedAddress?: string) => {
+    const address = selectedAddress || selectedMemberTargets[record.id] || record.target_addresses?.[0] || record.target
+    setOpenActionTargetId(null)
+    setMtrObservationTarget(record)
+    setMtrLatestSnapshot(null)
+    setMtrSnapshots([])
+    setMtrEvents([])
+    setMtrMemberTarget(address)
+    setMtrDays(7)
+    setMtrPage(1)
+    setMtrSnapshotTotal(0)
+    setMtrObservationOpen(true)
+    await loadMtrObservation(record, address, 7, 1, mtrPageSize)
   }
 
   const renderTargetActions = (record: QualityProbeTarget) => (
@@ -1505,6 +1675,7 @@ const QualityQuery = () => {
     groups: Array<{ name: string; targets: number; noData: number; availability: number | null }>,
   ) => (
     <Card size="small" title={title} styles={{ body: { padding: 10 } }}>
+      {loading && items.length === 0 ? <Skeleton active title={false} paragraph={{ rows: 3 }} /> : null}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(145px, 1fr))', gap: 6 }}>
         {groups.slice(0, 12).map((group) => {
           const pseudoTarget = { sla_availability_percent: group.availability } as QualityProbeTarget
@@ -1534,7 +1705,7 @@ const QualityQuery = () => {
         const isExpanded = Number(expandedRowKeys[0]) === record.id
         const binding = source === 'private'
           ? [record.circuit_name || '未关联专线', record.circuit_device_ip || record.device_ip, record.circuit_port_name || record.probe_interface_name].filter(Boolean).join(' / ')
-          : [record.circuit_name, record.operator_name].filter(Boolean).join(' / ')
+          : record.circuit_name || ''
         return (
           <Popover
             key={record.id}
@@ -1584,10 +1755,29 @@ const QualityQuery = () => {
                 延迟 {record.last_avg_latency_ms == null ? '-' : `${Number(record.last_avg_latency_ms).toFixed(1)}ms`}
                 {' · '}丢包 {record.last_packet_loss_percent == null ? '-' : `${Number(record.last_packet_loss_percent).toFixed(2)}%`}
               </Text>
+              {(record.member_count || 1) > 1 ? (
+                <Text style={{ display: 'block', color: appearance.color, fontSize: 10, marginTop: 4, fontWeight: 600 }}>
+                  {record.member_count}个目标 · {record.abnormal_member_count || 0}个异常
+                </Text>
+              ) : null}
               <Text style={{ display: 'block', color: appearance.color, fontSize: 10, marginTop: 4, opacity: 0.85 }}>
                 {record.collection_health === 'healthy' ? '采集正常' : (record.collection_health_text || '采集状态未知')}
                 {record.root_cause_categories?.length ? ` · ${record.root_cause_categories.join('/')}` : ''}
               </Text>
+              {source === 'internet' && (record.operator_name || record.datacenter_name) ? (
+                <Space wrap size={[4, 4]} style={{ marginTop: 6 }}>
+                  {record.operator_name ? (
+                    <Tag color={getOperatorTagColor(record.operator_name)} style={{ margin: 0, fontSize: 10, lineHeight: '18px' }}>
+                      运营商 · {record.operator_name}
+                    </Tag>
+                  ) : null}
+                  {record.datacenter_name ? (
+                    <Tag color={datacenterTagColors.get(record.datacenter_name) || DATACENTER_TAG_COLORS[0]} style={{ margin: 0, fontSize: 10, lineHeight: '18px' }}>
+                      机房 · {record.datacenter_name}
+                    </Tag>
+                  ) : null}
+                </Space>
+              ) : null}
               <Text
                 ellipsis={{ tooltip: binding || record.target }}
                 style={{ display: 'block', color: appearance.color, fontSize: 10, marginTop: 5, opacity: 0.8 }}
@@ -1633,13 +1823,24 @@ const QualityQuery = () => {
                 { label: '停用', value: 'inactive' },
               ]}
             />
-            <Input.Search
+            <Select
+              value={datacenterFilter}
+              style={{ width: 180 }}
+              onChange={setDatacenterFilter}
+              options={[{ label: '全部机房', value: 'all' }, ...filterDatacenterOptions]}
+            />
+            <Select
+              value={operatorFilter}
+              style={{ width: 150 }}
+              onChange={setOperatorFilter}
+              options={[{ label: '全部运营商', value: 'all' }, ...filterOperatorOptions]}
+            />
+            <Input
               allowClear
               value={keyword}
               onChange={(event) => setKeyword(event.target.value)}
-              onSearch={() => fetchItems()}
-              placeholder="搜索名称、目标、机房、运营商"
-              style={{ width: 360 }}
+              placeholder="实时搜索名称、地址、设备、线路"
+              style={{ width: 300 }}
             />
             <Segmented
               value={slaRange}
@@ -1663,8 +1864,8 @@ const QualityQuery = () => {
             ].map((item) => (
               <div key={item.label} style={{ padding: '10px 12px', border: '1px solid #f0f0f0', borderRadius: 6, background: '#fff' }}>
                 <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>{item.label}</Text>
-                <Text strong style={{ color: item.color, fontSize: 22 }}>{item.value}</Text>
-                <Text type="secondary"> 条</Text>
+                <Text strong style={{ color: item.color, fontSize: 22 }}>{loading && items.length === 0 ? '-' : item.value}</Text>
+                <Text type="secondary">{loading && items.length === 0 ? ' 加载中' : ' 条'}</Text>
               </div>
             ))}
           </div>
@@ -1687,7 +1888,7 @@ const QualityQuery = () => {
                     </div>
                   )
                 })}
-                {!lowestSlaItems.length ? <Text type="secondary">当前范围暂无有效样本</Text> : null}
+                {!lowestSlaItems.length ? <Text type="secondary">{loading && items.length === 0 ? '目标列表加载中…' : '当前范围暂无有效样本'}</Text> : null}
               </Space>
             </Card>
             <Card size="small" title="较上一等长周期下降 Top 8" styles={{ body: { padding: 10 } }}>
@@ -1704,7 +1905,7 @@ const QualityQuery = () => {
                     </div>
                   )
                 })}
-                {!decliningSlaItems.length ? <Text type="secondary">上一周期暂无可比较样本</Text> : null}
+                {!decliningSlaItems.length ? <Text type="secondary">{loading && items.length === 0 ? '目标列表加载中…' : '上一周期暂无可比较样本'}</Text> : null}
               </Space>
             </Card>
           </div>
@@ -1726,11 +1927,17 @@ const QualityQuery = () => {
             <Text type="secondary" style={{ fontSize: 12 }}>低SLA线路自动排在前面</Text>
           </Space>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(520px, 1fr))', gap: 12, alignItems: 'start' }}>
+          {loading && items.length === 0 ? (
+            <Card size="small">
+              <Skeleton active title={{ width: 180 }} paragraph={{ rows: 5 }} />
+            </Card>
+          ) : null}
+
+          <div style={{ display: loading && items.length === 0 ? 'none' : 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(520px, 1fr))', gap: 12, alignItems: 'start' }}>
             <Card
               size="small"
               title={<Space><Tag color="blue">服务器 ICMP</Tag><Text strong>互联网质量</Text></Space>}
-              extra={<Text type="secondary">{internetSlaItems.length} 条</Text>}
+              extra={<Text type="secondary">{slaLoading ? '统计更新中…' : `${internetSlaItems.length} 条`}</Text>}
               styles={{ body: { padding: 12, maxHeight: 430, overflowY: 'auto' } }}
             >
               {renderSlaCards(internetSlaItems, 'internet')}
@@ -1738,7 +1945,7 @@ const QualityQuery = () => {
             <Card
               size="small"
               title={<Space><Tag color="purple">设备 NQA / SNMP</Tag><Text strong>专线质量</Text></Space>}
-              extra={<Text type="secondary">{privateSlaItems.length} 条</Text>}
+              extra={<Text type="secondary">{slaLoading ? '统计更新中…' : `${privateSlaItems.length} 条`}</Text>}
               styles={{ body: { padding: 12, maxHeight: 430, overflowY: 'auto' } }}
             >
               {renderSlaCards(privateSlaItems, 'private')}
@@ -1765,6 +1972,27 @@ const QualityQuery = () => {
                 </Space>
               )}
             >
+              {(expandedTarget.target_addresses?.length || 0) > 1 ? (
+                <div style={{ marginBottom: 12, padding: '12px 14px', border: '1px solid #91caff', borderRadius: 8, background: '#e6f4ff' }}>
+                  <Space wrap size={10}>
+                  <Tag color="blue" style={{ margin: 0, fontWeight: 600 }}>当前查看地址</Tag>
+                  <Select
+                    value={selectedMemberTargets[expandedTarget.id] || expandedTarget.target_addresses?.[0] || expandedTarget.target}
+                    style={{ width: 380, maxWidth: '100%' }}
+                    size="large"
+                    options={(expandedTarget.target_addresses || [expandedTarget.target]).map((address) => {
+                      const status = expandedTarget.target_statuses?.[address]
+                      return {
+                        value: address,
+                        label: `${address}${status ? ` · ${status.success ? '正常' : '异常'} · 丢包${status.rolling_packet_loss_percent ?? status.packet_loss_percent ?? '-'}%` : ''}`,
+                      }
+                    })}
+                    onChange={(address) => setSelectedMemberTargets((current) => ({ ...current, [expandedTarget.id]: address }))}
+                  />
+                  <Text style={{ color: '#0958d9' }}>选择后只展示该地址；每个地址独立采集、统计和告警</Text>
+                  </Space>
+                </div>
+              ) : null}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 8, marginBottom: 10 }}>
                 <div style={{ padding: '9px 10px', background: '#fafafa', borderRadius: 6 }}>
                   <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>采集健康</Text>
@@ -1811,7 +2039,11 @@ const QualityQuery = () => {
                   ))}
                 </div>
               ) : null}
-              <QualityChartPanel target={expandedTarget} initialRange={slaRange} />
+              <QualityChartPanel
+                target={expandedTarget}
+                memberTarget={selectedMemberTargets[expandedTarget.id] || expandedTarget.target_addresses?.[0] || expandedTarget.target}
+                initialRange={slaRange}
+              />
             </Card>
           ) : null}
         </Space>
@@ -1979,17 +2211,21 @@ const QualityQuery = () => {
             >
               <Input placeholder="例如：湖北宜昌-电信DNS" />
             </Form.Item>
-            <Form.Item
-              name="target"
-              label="目标 IP / 域名"
-              rules={[{ required: true, message: '请输入目标 IP 或域名' }]}
-              style={{ width: 330 }}
-            >
-              <Input
-                readOnly={probeSource === 'device_nqa_snmp'}
-                placeholder={probeSource === 'device_nqa_snmp' ? '选择NQA实例后自动带出' : '例如：114.114.114.114 或 www.example.com'}
-              />
-            </Form.Item>
+            {probeSource === 'server_icmp' ? (
+              <Form.Item
+                name="target_addresses"
+                label="目标 IP / 域名（可多个）"
+                rules={[{ required: true, message: '请至少输入一个目标 IP 或域名' }]}
+                style={{ width: 420 }}
+                extra="输入后按回车确认；每个地址独立探测、统计和告警，最多20个。"
+              >
+                <Select mode="tags" tokenSeparators={[',', '，', ';', '；', ' ']} maxCount={20} placeholder="输入IP或域名，按回车继续添加" />
+              </Form.Item>
+            ) : (
+              <Form.Item name="target" label="目标 IP / 域名" rules={[{ required: true }]} style={{ width: 330 }}>
+                <Input readOnly placeholder="选择NQA实例后自动带出" />
+              </Form.Item>
+            )}
           </Space>
 
           <Space size="middle" style={{ width: '100%' }} align="start">
@@ -2097,10 +2333,10 @@ const QualityQuery = () => {
                   <Switch checkedChildren="开启" unCheckedChildren="关闭" />
                 </Form.Item>
                 <Form.Item name="mtr_interval_seconds" label="观察间隔(秒)" rules={[{ required: true }]} style={{ width: 170 }}>
-                  <InputNumber min={60} max={86400} precision={0} style={{ width: '100%' }} />
+                  <InputNumber min={3600} max={86400} precision={0} style={{ width: '100%' }} />
                 </Form.Item>
               </Space>
-              <Text type="secondary">建议公网目标先使用 300 秒；系统会记录路径变化和目标延迟明显升高事件。</Text>
+              <Text type="secondary">默认每小时为每个目标地址采集一次，保留路径、AS号和延迟变化历史。</Text>
             </Card>
           ) : null}
 
@@ -2152,10 +2388,35 @@ const QualityQuery = () => {
         <Spin spinning={mtrObservationLoading}>
           <Space direction="vertical" size="middle" style={{ width: '100%' }}>
             <Card size="small">
-              <Space size="large" wrap>
-                <span>目标：<Text strong>{mtrObservationTarget?.target || '-'}</Text></span>
+              <Space size="large" wrap align="end">
+                <Space direction="vertical" size={2}>
+                  <Text type="secondary">目标地址</Text>
+                  <Select
+                    value={mtrMemberTarget}
+                    style={{ minWidth: 250 }}
+                    options={(mtrObservationTarget?.target_addresses || [mtrObservationTarget?.target].filter(Boolean)).map((address) => ({ label: address, value: address }))}
+                    onChange={(address) => {
+                      setMtrMemberTarget(address)
+                      setMtrPage(1)
+                      if (mtrObservationTarget) void loadMtrObservation(mtrObservationTarget, address, mtrDays, 1, mtrPageSize)
+                    }}
+                  />
+                </Space>
+                <Space direction="vertical" size={2}>
+                  <Text type="secondary">历史范围</Text>
+                  <Select
+                    value={mtrDays}
+                    style={{ width: 120 }}
+                    options={[1, 3, 7, 14, 30].map((days) => ({ label: `${days}天`, value: days }))}
+                    onChange={(days) => {
+                      setMtrDays(days)
+                      setMtrPage(1)
+                      if (mtrObservationTarget) void loadMtrObservation(mtrObservationTarget, mtrMemberTarget, days, 1, mtrPageSize)
+                    }}
+                  />
+                </Space>
                 <span>状态：{mtrObservationTarget?.mtr_enabled ? <Tag color="green">已开启</Tag> : <Tag>未开启</Tag>}</span>
-                <span>间隔：{mtrObservationTarget?.mtr_interval_seconds || 300} 秒</span>
+                <span>间隔：每 {Math.max(1, Math.round((mtrObservationTarget?.mtr_interval_seconds || 3600) / 3600))} 小时</span>
                 <span>最近观察：{formatTime(mtrObservationTarget?.last_mtr_at)}</span>
                 <span>最后一跳延迟：{mtrObservationTarget?.last_mtr_final_latency_ms ?? '-'} ms</span>
               </Space>
@@ -2210,7 +2471,18 @@ const QualityQuery = () => {
                 dataSource={mtrSnapshots}
                 rowKey="id"
                 locale={{ emptyText: '暂无快照' }}
-                pagination={{ pageSize: 8, showSizeChanger: false }}
+                pagination={{
+                  current: mtrPage,
+                  pageSize: mtrPageSize,
+                  total: mtrSnapshotTotal,
+                  showSizeChanger: true,
+                  showTotal: (total) => `共 ${total} 次采样`,
+                  onChange: (page, pageSize) => {
+                    setMtrPage(page)
+                    setMtrPageSize(pageSize)
+                    if (mtrObservationTarget) void loadMtrObservation(mtrObservationTarget, mtrMemberTarget, mtrDays, page, pageSize)
+                  },
+                }}
                 expandable={{
                   expandedRowRender: (snapshot) => renderMtrHopTable(snapshot.hops),
                   rowExpandable: (snapshot) => Boolean(snapshot.hops?.length),

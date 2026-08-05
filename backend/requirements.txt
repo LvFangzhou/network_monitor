@@ -37,6 +37,7 @@ python-dotenv==1.0.0
 httpx==0.25.2
 aiofiles==23.2.1
 psutil==5.9.8
+openpyxl==3.1.5
 
 # 日志与监控
 structlog==23.2.0

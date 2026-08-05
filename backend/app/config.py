@@ -74,9 +74,13 @@ class Settings(BaseSettings):
     # RabbitMQ配置
     RABBITMQ_HOST: str = "localhost"
     RABBITMQ_PORT: int = 5672
+    RABBITMQ_MANAGEMENT_PORT: int = 15672
     RABBITMQ_USER: str = "guest"
     RABBITMQ_PASSWORD: str = "guest"
     RABBITMQ_VHOST: str = "/"
+    EVENT_QUEUE_SYNC_FALLBACK: bool = True
+    # 服务器连接发现与网络配置执行严格解耦。生产启用前需逐厂商验收命令模板。
+    SERVER_NETWORK_CHANGE_EXECUTION_ENABLED: bool = False
     
     @property
     def CELERY_BROKER_URL(self) -> str:

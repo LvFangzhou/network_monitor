@@ -7,7 +7,9 @@ data/
 logs/
 backups/
 *.bak
+*.bak*
 *.backup
+*.orig
 
 # Database and local state
 *.db
@@ -37,6 +39,8 @@ yarn-error.log*
 
 # Docker / OS / editor
 .DS_Store
+._*
+**/._*
 Thumbs.db
 .idea/
 .vscode/
@@ -51,3 +55,18 @@ Thumbs.db
 # Local operational documents containing production server details
 docs/platform_quick_reference.md
 docs/system_features.md
+/deployment.md
+/platform_quick_reference.md
+/system_features.md
+/docs/system_quick_reference.md
+
+# Production-side scratch, rollback, and migration archives
+/tmp/
+/migration/
+/backup_qos_prewarm_*/
+/frontend/dist.prev/
+/codex-check.py
+/tacacs.ts
+/--duration
+/--pid
+/-o

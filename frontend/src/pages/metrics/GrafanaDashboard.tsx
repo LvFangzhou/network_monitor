@@ -3,16 +3,16 @@ import {
   FullscreenExitOutlined,
   FullscreenOutlined,
   PlusOutlined,
-  ReloadOutlined,
 } from '@ant-design/icons'
 import { AutoComplete, Button, Card, Empty, Select, Space, Spin, Tag, Typography, message } from 'antd'
 import dayjs from 'dayjs'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
   Area,
   AreaChart,
   CartesianGrid,
+  Legend,
   ReferenceArea,
   ResponsiveContainer,
   Tooltip as RechartsTooltip,
@@ -21,52 +21,100 @@ import {
 } from 'recharts'
 
 import {
-  getMonitorInterfaceHistory,
   getMonitorDeviceInterfaces,
+  getMonitorInterfaceHistory,
   MonitorDevice,
   MonitorDeviceSearchOption,
   MonitorHistoryPoint,
   MonitorInterface,
   searchMonitorDevices,
 } from '../../api/metrics'
+import AutoRefreshControl from '../../components/AutoRefreshControl'
 
 const { Text } = Typography
 
-interface GrafanaTarget {
+const INTERFACE_QUERY_STATE_KEY = 'network-monitor:interface-query:v1'
+
+type HistoryChartPoint = MonitorHistoryPoint & {
+  timestamp: number
+}
+
+interface InterfaceTarget {
   key: string
   device: MonitorDevice
   interface: MonitorInterface
   metricKey: string
   metricLabel: string
-  panelId: number
   timeFrom: string
-  timeTo: string
-  refreshInterval: string
-  reloadKey: number
-  trafficData?: TrafficChartPoint[]
-  trafficLoading?: boolean
-  trafficError?: string
+  historyData?: HistoryChartPoint[]
+  historyLoading?: boolean
+  historyError?: string
 }
 
-type TrafficChartPoint = {
-  timestamp: number
-  timeLabel: string
-  in_bps?: number | null
-  out_bps?: number | null
+type CircuitMonitorTarget = {
+  deviceId: number
+  deviceIp?: string
+  deviceName?: string
+  portName: string
 }
 
-type ChartScale = {
-  divisor: number
-  suffix: string
+type MetricSeries = {
+  key: string
+  name: string
+  color: string
 }
 
-const MONITOR_OPTIONS = [
-  { value: 'traffic', label: '接口流量', panelId: 1 },
-  { value: 'utilization', label: '接口利用率', panelId: 2 },
-  { value: 'discards', label: '接口丢弃包增量', panelId: 3 },
-  { value: 'errors', label: '接口错误包增量', panelId: 4 },
-  { value: 'pfc', label: 'PFC 收发包增量', panelId: 5 },
-  { value: 'ecn', label: 'ECN 标记包增量', panelId: 6 },
+type MetricDefinition = {
+  value: string
+  label: string
+  unit: 'bps' | 'percent' | 'packets'
+  emptyLabel: string
+  series: MetricSeries[]
+}
+
+const MONITOR_OPTIONS: MetricDefinition[] = [
+  {
+    value: 'traffic', label: '接口流量', unit: 'bps', emptyLabel: '当前时间范围暂无流量数据',
+    series: [
+      { key: 'in_bps', name: '入方向', color: '#35a800' },
+      { key: 'out_bps', name: '出方向', color: '#5f7fd8' },
+    ],
+  },
+  {
+    value: 'utilization', label: '接口利用率', unit: 'percent', emptyLabel: '当前时间范围暂无接口利用率数据',
+    series: [
+      { key: 'in_utilization_percent', name: '入向使用率', color: '#35a800' },
+      { key: 'out_utilization_percent', name: '出向使用率', color: '#5f7fd8' },
+    ],
+  },
+  {
+    value: 'discards', label: '接口丢弃包增量', unit: 'packets', emptyLabel: '当前时间范围暂无丢弃包增量数据',
+    series: [
+      { key: 'in_discards_delta', name: '接口入向丢弃', color: '#fa8c16' },
+      { key: 'out_discards_delta', name: '接口出向丢弃', color: '#f5222d' },
+      { key: 'queue_ingress_dropped_pkts_delta', name: '队列入向丢弃', color: '#722ed1' },
+      { key: 'queue_egress_dropped_pkts_delta', name: '队列出向丢弃', color: '#13c2c2' },
+    ],
+  },
+  {
+    value: 'errors', label: '接口错误包增量', unit: 'packets', emptyLabel: '当前时间范围暂无错误包增量数据',
+    series: [
+      { key: 'in_errors_delta', name: '入向错误包', color: '#f5222d' },
+      { key: 'out_errors_delta', name: '出向错误包', color: '#fa8c16' },
+      { key: 'crc_errors_delta', name: 'CRC 错误', color: '#722ed1' },
+    ],
+  },
+  {
+    value: 'pfc', label: 'PFC 收发包增量', unit: 'packets', emptyLabel: '当前时间范围暂无 PFC 增量数据',
+    series: [
+      { key: 'pfc_rx_pkts_delta', name: 'PFC 接收', color: '#1677ff' },
+      { key: 'pfc_tx_pkts_delta', name: 'PFC 发送', color: '#13c2c2' },
+    ],
+  },
+  {
+    value: 'ecn', label: 'ECN 标记包增量', unit: 'packets', emptyLabel: '当前时间范围暂无 ECN 标记增量数据',
+    series: [{ key: 'ecn_marked_pkts_delta', name: 'ECN 标记', color: '#722ed1' }],
+  },
 ]
 
 const RANGE_OPTIONS = [
@@ -77,7 +125,9 @@ const RANGE_OPTIONS = [
   { value: 'now-7d', label: '7天' },
 ]
 
-const getIntervalForGrafanaRange = (range: string) => {
+const getMetric = (metricKey?: string | null) => MONITOR_OPTIONS.find((item) => item.value === metricKey) || MONITOR_OPTIONS[0]
+
+const getIntervalForRange = (range: string) => {
   if (range === 'now-10m') return '10s'
   if (range === 'now-1h') return '30s'
   if (range === 'now-6h') return '1m'
@@ -86,7 +136,25 @@ const getIntervalForGrafanaRange = (range: string) => {
   return '1m'
 }
 
-const grafanaRangeToApiRange = (range: string) => range.startsWith('now-') ? `-${range.slice(4)}` : '-6h'
+const rangeToApiRange = (range: string) => range.startsWith('now-') ? `-${range.slice(4)}` : '-6h'
+
+const normalizeInterfaceName = (value?: string | null) => String(value || '')
+  .trim()
+  .toLowerCase()
+  .replace(/fourhundredgigabitethernet|fourhundredgige|fhgigabitethernet|fhgige|400ge/g, '400ge')
+  .replace(/hundredgigabitethernet|hundredgige|100ge/g, '100ge')
+  .replace(/twentyfivegigabitethernet|twentyfivegige|25ge/g, '25ge')
+  .replace(/ten-gigabitethernet|tengigabitethernet|ten-gige|10ge/g, '10ge')
+  .replace(/gigabitethernet|gige/g, 'ge')
+  .replace(/[\s._-]+/g, '')
+
+const statusRank = (item: MonitorInterface) => (String(item.oper_status).toLowerCase() === 'up' ? 0 : 1)
+
+const toHistoryPoint = (point: MonitorHistoryPoint): HistoryChartPoint | null => {
+  const rawTime = point._time || point.time
+  const timestamp = rawTime ? dayjs(rawTime).valueOf() : NaN
+  return Number.isFinite(timestamp) ? { ...point, timestamp } : null
+}
 
 const formatBps = (value?: number | null) => {
   const raw = Number(value || 0)
@@ -97,105 +165,69 @@ const formatBps = (value?: number | null) => {
   return `${raw.toFixed(0)} bps`
 }
 
-const normalizeChartData = (data: TrafficChartPoint[]) => data
-  .filter((point) => Number.isFinite(point.timestamp))
-  .map((point) => ({
-    ...point,
-    in_bps: Number.isFinite(Number(point.in_bps)) ? Number(point.in_bps) : 0,
-    out_bps: Number.isFinite(Number(point.out_bps)) ? Number(point.out_bps) : 0,
-  }))
-  .sort((a, b) => a.timestamp - b.timestamp)
-
-const getChartScale = (data: TrafficChartPoint[]): ChartScale => {
-  const maxValue = Math.max(0, ...data.flatMap((point) => [Math.abs(Number(point.in_bps || 0)), Math.abs(Number(point.out_bps || 0))]))
-  if (maxValue >= 1_000_000_000) return { divisor: 1_000_000_000, suffix: 'Gbps' }
-  if (maxValue >= 1_000_000) return { divisor: 1_000_000, suffix: 'Mbps' }
-  if (maxValue >= 1_000) return { divisor: 1_000, suffix: 'Kbps' }
-  return { divisor: 1, suffix: 'bps' }
+const formatPackets = (value?: number | null) => {
+  const raw = Number(value || 0)
+  const safe = Math.abs(raw)
+  if (safe >= 1_000_000_000) return `${(raw / 1_000_000_000).toFixed(2)}G 包`
+  if (safe >= 1_000_000) return `${(raw / 1_000_000).toFixed(2)}M 包`
+  if (safe >= 1_000) return `${(raw / 1_000).toFixed(2)}K 包`
+  return `${raw.toFixed(0)} 包`
 }
 
-const formatScaledAxisValue = (value: number, scale: ChartScale) => {
-  const scaled = Number(value) / scale.divisor
-  const abs = Math.abs(scaled)
-  const formatted = scaled.toFixed(abs >= 100 ? 0 : abs >= 10 ? 1 : 2).replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1')
-  return `${formatted}${scale.suffix}`
+const formatValue = (value: number, unit: MetricDefinition['unit']) => {
+  if (unit === 'bps') return formatBps(value)
+  if (unit === 'percent') return `${Number(value).toFixed(2)}%`
+  return formatPackets(value)
 }
 
-const formatTimeAxisValue = (value: number, data: TrafficChartPoint[]) => {
-  const first = data[0]?.timestamp
-  const last = data[data.length - 1]?.timestamp
-  const span = Number.isFinite(first) && Number.isFinite(last) ? Math.abs(last - first) : 0
+const formatTimeAxisValue = (value: number, data: HistoryChartPoint[]) => {
+  const span = Math.abs((data[data.length - 1]?.timestamp || 0) - (data[0]?.timestamp || 0))
   if (span <= 60 * 60 * 1000) return dayjs(value).format('HH:mm:ss')
-  if (span <= 24 * 60 * 60 * 1000) return dayjs(value).format('MM-DD HH:mm')
   return dayjs(value).format('MM-DD HH:mm')
 }
 
-const toTrafficChartPoint = (point: MonitorHistoryPoint): TrafficChartPoint | null => {
-  const rawTime = point._time || point.time
-  const timestamp = rawTime ? dayjs(rawTime).valueOf() : NaN
-  if (!Number.isFinite(timestamp)) return null
-  return {
-    timestamp,
-    timeLabel: dayjs(timestamp).format('MM-DD HH:mm'),
-    in_bps: point.in_bps ?? null,
-    out_bps: point.out_bps ?? null,
-  }
-}
-
-const TrafficChart = ({ data }: { data: TrafficChartPoint[] }) => {
+const MetricChart = ({ data, metric }: { data: HistoryChartPoint[]; metric: MetricDefinition }) => {
   const [left, setLeft] = useState<number | null>(null)
   const [right, setRight] = useState<number | null>(null)
   const [domain, setDomain] = useState<[number | 'dataMin', number | 'dataMax']>(['dataMin', 'dataMax'])
-  const chartData = useMemo(() => normalizeChartData(data), [data])
-  const scale = useMemo(() => getChartScale(chartData), [chartData])
+  const chartData = useMemo(() => [...data].filter((point) => Number.isFinite(point.timestamp)).sort((a, b) => a.timestamp - b.timestamp), [data])
+  const availableSeries = useMemo(
+    () => metric.series.filter((series) => chartData.some((point) => point[series.key] !== null && point[series.key] !== undefined && Number.isFinite(Number(point[series.key])))),
+    [chartData, metric],
+  )
 
   useEffect(() => {
     setDomain(['dataMin', 'dataMax'])
     setLeft(null)
     setRight(null)
-  }, [data])
-
-  const areaData = chartData.map((point) => ({
-    ...point,
-    in_area_bps: Math.max(Number(point.in_bps || 0), 0),
-    out_line_bps: Math.max(Number(point.out_bps || 0), 0),
-  }))
+  }, [data, metric.value])
 
   const zoom = () => {
-    if (left === null || right === null || left === right) {
-      setLeft(null)
-      setRight(null)
-      return
-    }
-    setDomain(left < right ? [left, right] : [right, left])
+    if (left !== null && right !== null && left !== right) setDomain(left < right ? [left, right] : [right, left])
     setLeft(null)
     setRight(null)
   }
 
-  const resetZoom = () => {
-    setDomain(['dataMin', 'dataMax'])
-    setLeft(null)
-    setRight(null)
+  if (!chartData.length || !availableSeries.length) {
+    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={metric.emptyLabel} />
   }
-
-  if (!chartData.length) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前时间范围暂无流量数据" />
 
   return (
     <div style={{ height: '100%', position: 'relative' }}>
       {domain[0] !== 'dataMin' ? (
-        <Button size="small" type="link" onClick={resetZoom} style={{ position: 'absolute', top: 2, right: 8, zIndex: 2 }}>
+        <Button size="small" type="link" onClick={() => setDomain(['dataMin', 'dataMax'])} style={{ position: 'absolute', top: 2, right: 8, zIndex: 2 }}>
           还原
         </Button>
       ) : null}
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart
-          data={areaData}
+          data={chartData}
           margin={{ top: 18, right: 30, bottom: 28, left: 8 }}
           onMouseDown={(event) => setLeft(Number(event?.activeLabel) || null)}
           onMouseMove={(event) => left !== null ? setRight(Number(event?.activeLabel) || null) : undefined}
           onMouseUp={zoom}
         >
-          <CartesianGrid strokeDasharray="3 3" stroke="#d9f7be" />
+          <CartesianGrid strokeDasharray="3 3" stroke="#edf0f2" />
           <XAxis
             dataKey="timestamp"
             type="number"
@@ -205,53 +237,37 @@ const TrafficChart = ({ data }: { data: TrafficChartPoint[] }) => {
             minTickGap={36}
             tick={{ fontSize: 12 }}
           />
-          <YAxis tickFormatter={(value) => formatScaledAxisValue(Number(value), scale)} width={82} tick={{ fontSize: 12 }} />
+          <YAxis
+            domain={metric.unit === 'percent' ? [0, (max: number) => Math.max(100, Math.ceil(max))] : [0, 'auto']}
+            tickFormatter={(value) => formatValue(Number(value), metric.unit)}
+            width={88}
+            tick={{ fontSize: 12 }}
+          />
+          <Legend verticalAlign="top" height={28} />
           <RechartsTooltip
             labelFormatter={(value) => dayjs(Number(value)).format('YYYY-MM-DD HH:mm:ss')}
-            formatter={(value: any, name: string, props: any) => [formatBps(Number(value)), props?.dataKey === 'in_area_bps' ? '入方向' : name || '出方向']}
+            formatter={(value: any, name: string) => [formatValue(Number(value), metric.unit), name]}
           />
-          <Area type="monotone" dataKey="in_area_bps" name="入方向" stroke="#35a800" fill="#35a800" fillOpacity={0.82} strokeWidth={1.2} dot={false} connectNulls={false} />
-          <Area type="monotone" dataKey="out_line_bps" name="出方向" stroke="#5f7fd8" fill="transparent" strokeWidth={1.5} dot={false} connectNulls={false} />
+          {availableSeries.map((series, index) => (
+            <Area
+              key={series.key}
+              type="monotone"
+              dataKey={series.key}
+              name={series.name}
+              stroke={series.color}
+              fill={index === 0 ? series.color : 'transparent'}
+              fillOpacity={index === 0 ? 0.16 : 0}
+              strokeWidth={1.6}
+              dot={false}
+              connectNulls={false}
+              isAnimationActive={false}
+            />
+          ))}
           {left !== null && right !== null ? <ReferenceArea x1={left} x2={right} strokeOpacity={0.2} fill="#1677ff" fillOpacity={0.12} /> : null}
         </AreaChart>
       </ResponsiveContainer>
     </div>
   )
-}
-
-const statusRank = (item: MonitorInterface) => (String(item.oper_status).toLowerCase() === 'up' ? 0 : 1)
-
-const normalizeInterfaceName = (value?: string | null) => String(value || '')
-  .trim()
-  .toLowerCase()
-  .replace(/fourhundredgigabitethernet|fourhundredgige|fhgigabitethernet|fhgige|400ge/g, '400ge')
-  .replace(/hundredgigabitethernet|hundredgige|100ge/g, '100ge')
-  .replace(/twentyfivegigabitethernet|twentyfivegige|25ge/g, '25ge')
-  .replace(/ten-gigabitethernet|tengigabitethernet|ten-gige|10ge/g, '10ge')
-  .replace(/gigabitethernet|gigabitethernet|gige/g, 'ge')
-  .replace(/[\s._-]+/g, '')
-
-type CircuitMonitorTarget = {
-  deviceId: number
-  deviceIp?: string
-  deviceName?: string
-  portName: string
-}
-
-const buildPanelUrl = (target: GrafanaTarget) => {
-  const params = new URLSearchParams({
-    orgId: '1',
-    from: target.timeFrom,
-    to: target.timeTo,
-    refresh: target.refreshInterval,
-    theme: 'light',
-    'var-device_name': target.device.name,
-    'var-device_ip': target.device.ip_address,
-    'var-interface_name': target.interface.name,
-    viewPanel: String(target.panelId),
-    _: String(target.reloadKey),
-  })
-  return `/grafana-app/d/network-interface-overview/network-interface-overview?${params.toString()}&kiosk`
 }
 
 const GrafanaDashboard = () => {
@@ -263,64 +279,60 @@ const GrafanaDashboard = () => {
   const [interfaces, setInterfaces] = useState<MonitorInterface[]>([])
   const [selectedInterfaceIndex, setSelectedInterfaceIndex] = useState<number | null>(null)
   const [selectedMetricKey, setSelectedMetricKey] = useState('traffic')
-  const [targets, setTargets] = useState<GrafanaTarget[]>([])
+  const [targets, setTargets] = useState<InterfaceTarget[]>([])
   const [loadingDevices, setLoadingDevices] = useState(false)
   const [loadingInterfaces, setLoadingInterfaces] = useState(false)
   const [expandedTargetKey, setExpandedTargetKey] = useState<string | null>(null)
-  const iframeRefs = useRef(new Map<string, HTMLIFrameElement>())
-  const routeTargetsHandledRef = useRef(false)
+  const initializedRef = useRef(false)
 
-  const loadTrafficTarget = async (target: GrafanaTarget, silent = false) => {
-    const apiRange = grafanaRangeToApiRange(target.timeFrom)
-    const interval = getIntervalForGrafanaRange(target.timeFrom)
-    if (!silent) {
-      setTargets((current) => current.map((item) => item.key === target.key ? { ...item, trafficLoading: true, trafficError: undefined } : item))
+  const makeTarget = useCallback((device: MonitorDevice, selectedInterface: MonitorInterface, metricKey = selectedMetricKey, timeFrom = 'now-6h'): InterfaceTarget => {
+    const metric = getMetric(metricKey)
+    return {
+      key: `${device.id}:${selectedInterface.index}`,
+      device,
+      interface: selectedInterface,
+      metricKey: metric.value,
+      metricLabel: metric.label,
+      timeFrom,
+      historyLoading: true,
+    }
+  }, [selectedMetricKey])
+
+  const loadTargetHistory = useCallback(async (target: InterfaceTarget, background = false) => {
+    if (!background) {
+      setTargets((current) => current.map((item) => item.key === target.key ? { ...item, historyLoading: true, historyError: undefined } : item))
     }
     try {
       const response = await getMonitorInterfaceHistory(target.device.id, target.interface.index, {
-        range: apiRange,
-        interval,
-        group: 'traffic',
+        range: rangeToApiRange(target.timeFrom),
+        interval: getIntervalForRange(target.timeFrom),
+        group: target.metricKey === 'traffic' ? 'traffic' : 'errors',
       })
-      const trafficData = response.data.map(toTrafficChartPoint).filter(Boolean) as TrafficChartPoint[]
+      const historyData = response.data.map(toHistoryPoint).filter(Boolean) as HistoryChartPoint[]
       setTargets((current) => current.map((item) => item.key === target.key ? {
         ...item,
-        trafficData,
-        trafficLoading: false,
-        trafficError: undefined,
+        historyData,
+        historyLoading: false,
+        historyError: undefined,
       } : item))
     } catch (error: any) {
       setTargets((current) => current.map((item) => item.key === target.key ? {
         ...item,
-        trafficLoading: false,
-        trafficError: error?.response?.data?.detail || '读取接口流量失败',
+        historyLoading: false,
+        historyError: error?.response?.data?.detail || '读取接口历史指标失败',
       } : item))
     }
-  }
+  }, [])
 
-  const makeTarget = (
-    device: MonitorDevice,
-    selectedInterface: MonitorInterface,
-    metric = MONITOR_OPTIONS.find((item) => item.value === selectedMetricKey) || MONITOR_OPTIONS[0],
-    offset = 0,
-  ): GrafanaTarget => ({
-    key: `${device.id}:${selectedInterface.index}`,
-    device,
-    interface: selectedInterface,
-    metricKey: metric.value,
-    metricLabel: metric.label,
-    panelId: metric.panelId,
-    timeFrom: 'now-6h',
-    timeTo: 'now',
-    refreshInterval: '30s',
-    reloadKey: Date.now() + offset,
-    trafficLoading: metric.value === 'traffic',
-  })
-
-  const sortedInterfaces = useMemo(
-    () => [...interfaces].sort((a, b) => statusRank(a) - statusRank(b) || a.index - b.index),
-    [interfaces],
-  )
+  const applyTargets = useCallback((nextTargets: InterfaceTarget[]) => {
+    setTargets(nextTargets)
+    nextTargets.forEach((target) => void loadTargetHistory(target, true))
+    if (nextTargets[0]) {
+      setSelectedDevice(nextTargets[0].device)
+      setDeviceKeyword(`${nextTargets[0].device.ip_address} / ${nextTargets[0].device.name}`)
+      setSelectedInterfaceIndex(nextTargets[0].interface.index)
+    }
+  }, [loadTargetHistory])
 
   useEffect(() => {
     const keyword = deviceKeyword.trim()
@@ -343,52 +355,120 @@ const GrafanaDashboard = () => {
   }, [deviceKeyword, selectedDevice])
 
   useEffect(() => {
-    const routeTargets = (location.state?.circuitMonitorTargets || []) as CircuitMonitorTarget[]
-    if (!routeTargets.length || routeTargetsHandledRef.current) return
-    routeTargetsHandledRef.current = true
+    if (initializedRef.current) return
+    initializedRef.current = true
 
-    const loadRouteTargets = async () => {
-      const metric = MONITOR_OPTIONS.find((item) => item.value === selectedMetricKey) || MONITOR_OPTIONS[0]
-      const nextTargets: GrafanaTarget[] = []
-      const missing: string[] = []
-      const byDevice = new Map<number, CircuitMonitorTarget[]>()
-      routeTargets.forEach((item) => byDevice.set(item.deviceId, [...(byDevice.get(item.deviceId) || []), item]))
+    const restore = async () => {
+      const routeTargets = (location.state?.circuitMonitorTargets || []) as CircuitMonitorTarget[]
+      const params = new URLSearchParams(location.search)
+      const urlDeviceIp = params.get('device')
+      const urlInterface = params.get('interface')
+      const metric = getMetric(params.get('metric'))
+      setSelectedMetricKey(metric.value)
 
-      for (const [deviceId, requestedTargets] of byDevice.entries()) {
+      if (routeTargets.length) {
+        const restored: InterfaceTarget[] = []
+        const missing: string[] = []
+        const byDevice = new Map<number, CircuitMonitorTarget[]>()
+        routeTargets.forEach((item) => byDevice.set(item.deviceId, [...(byDevice.get(item.deviceId) || []), item]))
+        for (const [deviceId, requestedTargets] of byDevice.entries()) {
+          try {
+            const response = await getMonitorDeviceInterfaces(deviceId)
+            requestedTargets.forEach((requested) => {
+              const requestedKey = normalizeInterfaceName(requested.portName)
+              const matched = response.interfaces.find((item) => [item.name, item.alias, item.description]
+                .some((value) => normalizeInterfaceName(value) === requestedKey))
+              if (matched) restored.push(makeTarget(response.device, matched, metric.value))
+              else missing.push(`${requested.deviceIp || response.device.ip_address} / ${requested.portName}`)
+            })
+          } catch {
+            requestedTargets.forEach((item) => missing.push(`${item.deviceIp || item.deviceName || deviceId} / ${item.portName}`))
+          }
+        }
+        if (restored.length) applyTargets(restored)
+        if (missing.length) message.warning(`以下线路接口未识别：${missing.join('；')}`)
+        return
+      }
+
+      if (urlDeviceIp && urlInterface) {
         try {
-          const response = await getMonitorDeviceInterfaces(deviceId)
-          requestedTargets.forEach((requested) => {
-            const requestedKey = normalizeInterfaceName(requested.portName)
-            const matched = response.interfaces.find((item) => [item.name, item.alias, item.description]
-              .some((value) => normalizeInterfaceName(value) === requestedKey))
-            if (!matched) {
-              missing.push(`${requested.deviceIp || response.device.ip_address} / ${requested.portName}`)
-              return
-            }
-            nextTargets.push(makeTarget(response.device, matched, metric, nextTargets.length))
-          })
-        } catch {
-          requestedTargets.forEach((item) => missing.push(`${item.deviceIp || item.deviceName || deviceId} / ${item.portName}`))
+          const options = await searchMonitorDevices(urlDeviceIp)
+          const deviceOption = options.find((item) => item.ip_address === urlDeviceIp) || options[0]
+          if (!deviceOption) throw new Error('设备不存在或未加入监控')
+          const response = await getMonitorDeviceInterfaces(deviceOption.id)
+          const requestedKey = normalizeInterfaceName(urlInterface)
+          const matched = response.interfaces.find((item) => [item.name, item.alias, item.description]
+            .some((value) => normalizeInterfaceName(value) === requestedKey))
+          if (!matched) throw new Error(`未识别接口 ${urlInterface}`)
+          setInterfaces(response.interfaces)
+          applyTargets([makeTarget(response.device, matched, metric.value)])
+          return
+        } catch (error: any) {
+          message.error(error?.response?.data?.detail || error?.message || '无法按 URL 打开接口')
         }
       }
 
-      if (nextTargets.length) {
-        setTargets((current) => {
-          const existing = new Set(current.map((item) => item.key))
-          return [...current, ...nextTargets.filter((item) => !existing.has(item.key))]
-        })
-        nextTargets.filter((item) => item.metricKey === 'traffic').forEach((item) => void loadTrafficTarget(item, true))
-        setSelectedDevice(nextTargets[0].device)
-        setDeviceKeyword(`${nextTargets[0].device.ip_address} / ${nextTargets[0].device.name}`)
-        setInterfaces([])
-        setSelectedInterfaceIndex(null)
+      try {
+        const persisted = JSON.parse(localStorage.getItem(INTERFACE_QUERY_STATE_KEY) || 'null') as { metricKey?: string; targets?: InterfaceTarget[] } | null
+        if (persisted?.targets?.length) {
+          const persistedMetric = getMetric(persisted.metricKey)
+          setSelectedMetricKey(persistedMetric.value)
+          const restored: InterfaceTarget[] = []
+          const byDevice = new Map<number, InterfaceTarget[]>()
+          persisted.targets.forEach((target) => byDevice.set(target.device.id, [...(byDevice.get(target.device.id) || []), target]))
+          let primaryInterfaces: MonitorInterface[] = []
+          for (const [deviceId, savedTargets] of byDevice.entries()) {
+            try {
+              const response = await getMonitorDeviceInterfaces(deviceId)
+              if (!primaryInterfaces.length) primaryInterfaces = response.interfaces
+              savedTargets.forEach((saved) => {
+                const matched = response.interfaces.find((item) => item.index === saved.interface.index)
+                  || response.interfaces.find((item) => normalizeInterfaceName(item.name) === normalizeInterfaceName(saved.interface.name))
+                if (matched) restored.push(makeTarget(response.device, matched, persistedMetric.value, saved.timeFrom))
+              })
+            } catch {
+              savedTargets.forEach((saved) => restored.push(makeTarget(saved.device, saved.interface, persistedMetric.value, saved.timeFrom)))
+            }
+          }
+          if (restored.length) {
+            setInterfaces(primaryInterfaces)
+            applyTargets(restored)
+          }
+        }
+      } catch {
+        localStorage.removeItem(INTERFACE_QUERY_STATE_KEY)
       }
-      if (missing.length) message.warning(`以下线路接口未识别：${missing.join('；')}`)
-      navigate('/grafana', { replace: true, state: null })
     }
 
-    void loadRouteTargets()
-  }, [location.state, navigate, selectedMetricKey])
+    void restore()
+  }, [applyTargets, location.search, location.state, makeTarget])
+
+  useEffect(() => {
+    if (!initializedRef.current || !targets.length) return
+    const persisted = {
+      metricKey: selectedMetricKey,
+      targets: targets.map(({ device, interface: targetInterface, metricKey, metricLabel, timeFrom, key }) => ({
+        device, interface: targetInterface, metricKey, metricLabel, timeFrom, key,
+      })),
+    }
+    localStorage.setItem(INTERFACE_QUERY_STATE_KEY, JSON.stringify(persisted))
+
+    const primary = targets[targets.length - 1]
+    const params = new URLSearchParams({
+      device: primary.device.ip_address,
+      interface: primary.interface.name,
+      metric: selectedMetricKey,
+    })
+    const nextUrl = `/grafana?${params.toString()}`
+    if (`${location.pathname}${location.search}` !== nextUrl || location.state) {
+      navigate(nextUrl, { replace: true, state: null })
+    }
+  }, [location.pathname, location.search, location.state, navigate, selectedMetricKey, targets])
+
+  const sortedInterfaces = useMemo(
+    () => [...interfaces].sort((a, b) => statusRank(a) - statusRank(b) || a.index - b.index),
+    [interfaces],
+  )
 
   const selectDevice = async (deviceId: number) => {
     const option = deviceOptions.find((item) => item.id === deviceId)
@@ -418,54 +498,45 @@ const GrafanaDashboard = () => {
     }
     const selectedInterface = interfaces.find((item) => item.index === selectedInterfaceIndex)
     if (!selectedInterface) return
-    const metric = MONITOR_OPTIONS.find((item) => item.value === selectedMetricKey) || MONITOR_OPTIONS[0]
     const key = `${selectedDevice.id}:${selectedInterface.index}`
     if (targets.some((item) => item.key === key)) {
       message.info('该接口已经添加')
       return
     }
-    const target = makeTarget(selectedDevice, selectedInterface, metric)
+    const target = makeTarget(selectedDevice, selectedInterface)
     setTargets((current) => [...current, target])
-    if (target.metricKey === 'traffic') void loadTrafficTarget(target, true)
+    void loadTargetHistory(target, true)
   }
 
   const changeMonitorMetric = (metricKey: string) => {
-    const metric = MONITOR_OPTIONS.find((item) => item.value === metricKey) || MONITOR_OPTIONS[0]
-    const now = Date.now()
+    const metric = getMetric(metricKey)
     setSelectedMetricKey(metric.value)
-    const nextTargets = targets.map((target, index) => {
-      let timeFrom = target.timeFrom
-      let timeTo = target.timeTo
-      try {
-        const frameUrl = iframeRefs.current.get(target.key)?.contentWindow?.location.href
-        if (frameUrl) {
-          const params = new URL(frameUrl).searchParams
-          timeFrom = params.get('from') || timeFrom
-          timeTo = params.get('to') || timeTo
-        }
-      } catch {
-        // 同源代理正常时可读取当前缩放范围；读取失败则保留上一次范围。
-      }
-      return {
-        ...target,
-        metricKey: metric.value,
-        metricLabel: metric.label,
-        panelId: metric.panelId,
-        timeFrom,
-        timeTo,
-        reloadKey: now + index,
-        trafficLoading: metric.value === 'traffic',
-        trafficError: undefined,
-      }
-    })
+    const nextTargets = targets.map((target) => ({
+      ...target,
+      metricKey: metric.value,
+      metricLabel: metric.label,
+      historyLoading: true,
+      historyError: undefined,
+    }))
     setTargets(nextTargets)
-    nextTargets.filter((item) => item.metricKey === 'traffic').forEach((item) => void loadTrafficTarget(item, true))
+    nextTargets.forEach((target) => void loadTargetHistory(target, true))
   }
 
-  const changeTrafficRange = (target: GrafanaTarget, timeFrom: string) => {
-    const nextTarget = { ...target, timeFrom, timeTo: 'now', reloadKey: Date.now(), trafficLoading: true, trafficError: undefined }
+  const changeTargetRange = (target: InterfaceTarget, timeFrom: string) => {
+    const nextTarget = { ...target, timeFrom, historyLoading: true, historyError: undefined }
     setTargets((current) => current.map((item) => item.key === target.key ? nextTarget : item))
-    void loadTrafficTarget(nextTarget, true)
+    void loadTargetHistory(nextTarget, true)
+  }
+
+  const removeTarget = (targetKey: string) => {
+    setTargets((current) => {
+      const next = current.filter((item) => item.key !== targetKey)
+      if (!next.length) {
+        localStorage.removeItem(INTERFACE_QUERY_STATE_KEY)
+        navigate('/grafana', { replace: true })
+      }
+      return next
+    })
   }
 
   return (
@@ -474,10 +545,7 @@ const GrafanaDashboard = () => {
         <Space.Compact style={{ width: '100%', maxWidth: 1320 }}>
           <AutoComplete
             value={deviceKeyword}
-            options={deviceOptions.map((item) => ({
-              value: String(item.id),
-              label: `${item.ip_address} / ${item.name}`,
-            }))}
+            options={deviceOptions.map((item) => ({ value: String(item.id), label: `${item.ip_address} / ${item.name}` }))}
             onSearch={(value) => {
               setDeviceKeyword(value)
               if (selectedDevice && value !== `${selectedDevice.ip_address} / ${selectedDevice.name}`) {
@@ -505,36 +573,27 @@ const GrafanaDashboard = () => {
               status: String(item.oper_status || 'unknown').toLowerCase(),
               adminStatus: String(item.admin_status || 'unknown').toLowerCase(),
             }))}
-            optionRender={(option) => {
-              const status = String(option.data.status)
-              const adminStatus = String(option.data.adminStatus)
-              return (
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                  <span>{String(option.label)}</span>
-                  <Space size={4}>
-                    <Tag color={status === 'up' ? 'success' : 'default'} style={{ marginInlineEnd: 0 }}>
-                      {status === 'up' ? 'UP' : 'DOWN'}
-                    </Tag>
-                    {adminStatus === 'down' ? <Tag style={{ marginInlineEnd: 0 }}>管理DOWN</Tag> : null}
-                  </Space>
-                </div>
-              )
-            }}
+            optionRender={(option) => (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                <span>{String(option.label)}</span>
+                <Space size={4}>
+                  <Tag color={String(option.data.status) === 'up' ? 'success' : 'default'} style={{ marginInlineEnd: 0 }}>
+                    {String(option.data.status) === 'up' ? 'UP' : 'DOWN'}
+                  </Tag>
+                  {String(option.data.adminStatus) === 'down' ? <Tag style={{ marginInlineEnd: 0 }}>管理DOWN</Tag> : null}
+                </Space>
+              </div>
+            )}
             style={{ width: 390 }}
           />
-          <Select
-            value={selectedMetricKey}
-            options={MONITOR_OPTIONS}
-            onChange={changeMonitorMetric}
-            style={{ width: 220 }}
-          />
+          <Select value={selectedMetricKey} options={MONITOR_OPTIONS} onChange={changeMonitorMetric} style={{ width: 220 }} />
           <Button type="primary" icon={<PlusOutlined />} onClick={addTarget} disabled={!selectedDevice || selectedInterfaceIndex === null}>
             添加图表
           </Button>
         </Space.Compact>
         {selectedDevice ? (
           <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
-            已识别 {interfaces.length} 个接口，列表按 UP、DOWN 排序；切换监控项会同步更新全部已添加图表。
+            已识别 {interfaces.length} 个接口，列表按 UP、DOWN 排序；选择和图表会自动保存，当前接口也会写入浏览器地址。
           </Text>
         ) : null}
       </Card>
@@ -545,89 +604,61 @@ const GrafanaDashboard = () => {
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
           {targets.map((target) => {
             const expanded = expandedTargetKey === target.key
+            const metric = getMetric(target.metricKey)
             return (
-            <Card
-              key={target.key}
-              size="small"
-              title={(
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={`${target.device.ip_address} / ${target.interface.name}`}>
-                    {target.device.ip_address} / {target.interface.name}
+              <Card
+                key={target.key}
+                size="small"
+                title={(
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={`${target.device.ip_address} / ${target.interface.name}`}>
+                      {target.device.ip_address} / {target.interface.name}
+                    </div>
+                    <div style={{ marginTop: 2, fontSize: 12, color: '#8c8c8c' }}>{target.metricLabel}</div>
                   </div>
-                  <div style={{ marginTop: 2, fontSize: 12, color: '#8c8c8c' }}>{target.metricLabel}</div>
-                </div>
-              )}
-              extra={(
-                <Space size={6} wrap={false}>
-                  {target.metricKey === 'traffic' && !expanded ? (
-                    <Select
-                      size="small"
-                      value={target.timeFrom}
-                      options={RANGE_OPTIONS}
-                      onChange={(value) => changeTrafficRange(target, value)}
-                      style={{ width: 86 }}
-                    />
-                  ) : null}
-                  {target.metricKey === 'traffic' && !expanded ? (
-                    <Button size="small" icon={<ReloadOutlined />} onClick={() => void loadTrafficTarget(target)} />
-                  ) : null}
-                  {!expanded ? (
-                    <Tag color={String(target.interface.oper_status).toLowerCase() === 'up' ? 'success' : 'default'} style={{ marginInlineEnd: 0 }}>
-                      {String(target.interface.oper_status).toLowerCase() === 'up' ? 'UP' : 'DOWN'}
-                    </Tag>
-                  ) : null}
-                  <Button
-                    size="small"
-                    title={expanded ? '退出全屏' : '当前页面全屏'}
-                    icon={expanded ? <FullscreenExitOutlined /> : <FullscreenOutlined />}
-                    onClick={() => setExpandedTargetKey(expanded ? null : target.key)}
-                  />
-                  {!expanded ? (
+                )}
+                extra={(
+                  <Space size={6} wrap={false}>
+                    {!expanded ? (
+                      <AutoRefreshControl
+                        onRefresh={() => loadTargetHistory(target, true)}
+                        tip="只刷新当前接口图表，不改变监控项和时间范围，也不影响其他图表。"
+                      />
+                    ) : null}
+                    {!expanded ? (
+                      <Select size="small" value={target.timeFrom} options={RANGE_OPTIONS} onChange={(value) => changeTargetRange(target, value)} style={{ width: 86 }} />
+                    ) : null}
+                    {!expanded ? (
+                      <Tag color={String(target.interface.oper_status).toLowerCase() === 'up' ? 'success' : 'default'} style={{ marginInlineEnd: 0 }}>
+                        {String(target.interface.oper_status).toLowerCase() === 'up' ? 'UP' : 'DOWN'}
+                      </Tag>
+                    ) : null}
                     <Button
                       size="small"
-                      danger
-                      icon={<DeleteOutlined />}
-                      onClick={() => setTargets((current) => current.filter((item) => item.key !== target.key))}
+                      title={expanded ? '退出全屏' : '当前页面全屏'}
+                      icon={expanded ? <FullscreenExitOutlined /> : <FullscreenOutlined />}
+                      onClick={() => setExpandedTargetKey(expanded ? null : target.key)}
                     />
-                  ) : null}
-                </Space>
-              )}
-              style={expanded ? {
-                position: 'fixed',
-                top: 58,
-                right: 12,
-                bottom: 12,
-                left: 12,
-                zIndex: 1200,
-                boxShadow: '0 12px 36px rgba(0, 0, 0, 0.24)',
-              } : undefined}
-              styles={{
-                header: { minHeight: 54, padding: '8px 12px' },
-                body: { padding: target.metricKey === 'traffic' ? '6px 8px 8px' : 0, height: expanded ? 'calc(100vh - 116px)' : 470, overflow: 'hidden', position: 'relative' },
-              }}
-            >
-              {target.metricKey === 'traffic' ? (
-                target.trafficLoading ? (
-                  <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Spin tip="读取清洗后的接口流量" /></div>
-                ) : target.trafficError ? (
-                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={target.trafficError} />
+                    {!expanded ? <Button size="small" danger icon={<DeleteOutlined />} onClick={() => removeTarget(target.key)} /> : null}
+                  </Space>
+                )}
+                style={expanded ? {
+                  position: 'fixed', top: 58, right: 12, bottom: 12, left: 12, zIndex: 1200,
+                  boxShadow: '0 12px 36px rgba(0, 0, 0, 0.24)',
+                } : undefined}
+                styles={{
+                  header: { minHeight: 54, padding: '8px 12px' },
+                  body: { padding: '6px 8px 8px', height: expanded ? 'calc(100vh - 116px)' : 470, overflow: 'hidden', position: 'relative' },
+                }}
+              >
+                {target.historyLoading ? (
+                  <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Spin tip="读取接口历史指标" /></div>
+                ) : target.historyError ? (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={target.historyError} />
                 ) : (
-                  <TrafficChart data={target.trafficData || []} />
-                )
-              ) : (
-                <iframe
-                  key={target.reloadKey}
-                  ref={(element) => {
-                    if (element) iframeRefs.current.set(target.key, element)
-                    else iframeRefs.current.delete(target.key)
-                  }}
-                  title={`${target.device.ip_address} / ${target.interface.name}`}
-                  src={buildPanelUrl(target)}
-                  style={{ width: '100%', height: '100%', border: 0, display: 'block' }}
-                  allowFullScreen
-                />
-              )}
-            </Card>
+                  <MetricChart data={target.historyData || []} metric={metric} />
+                )}
+              </Card>
             )
           })}
         </div>

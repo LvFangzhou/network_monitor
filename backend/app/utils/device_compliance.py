@@ -16,11 +16,15 @@ TACACS_LOG_FILE = Path("/app/data/tacacs/logs/tacacs.log")
 TACACS_LOG_PATTERN = re.compile(
     r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+\w+\s+\S+\s+\S+.*?cmd="
 )
-DEFAULT_REQUIRED_CHECKS = ["model_profile", "version", "snmp", "syslog", "tacacs"]
+DEFAULT_REQUIRED_CHECKS = ["model_profile", "version", "hardware", "snmp", "syslog", "tacacs"]
 CHECK_LABELS = {
     "model_profile": "型号能力模板",
+    "device_name": "设备名称一致性",
+    "device_model": "设备型号一致性",
+    "serial_number": "序列号一致性",
     "version": "版本基线",
     "patch": "补丁基线",
+    "hardware": "硬件运行状态",
     "snmp": "SNMP",
     "exporter": "Exporter",
     "syslog": "Syslog",
@@ -168,6 +172,51 @@ def _version_matches(version: str, patterns: Iterable[str]) -> bool:
     return False
 
 
+def _extract_h3c_version(value: Any) -> Dict[str, Optional[str]]:
+    """将H3C回显拆为Comware平台版本和Release设备软件版本。"""
+    text = str(value or "").strip()
+    platform_match = re.search(
+        r"(?:Software\s+)?Version\s+([0-9]+(?:\.[0-9A-Za-z]+)+)",
+        text,
+        re.IGNORECASE,
+    )
+    if not platform_match:
+        platform_match = re.search(r"^\s*([0-9]+(?:\.[0-9A-Za-z]+)+)\b", text)
+    release_match = re.search(r"\bRelease\s+([0-9A-Za-z._-]+)", text, re.IGNORECASE)
+    return {
+        "platform_version": platform_match.group(1).strip() if platform_match else None,
+        "software_release": release_match.group(1).strip() if release_match else None,
+    }
+
+
+def _is_h3c(device: Device, baseline: Optional[VersionBaseline]) -> bool:
+    return "h3c" in _normalize(device.vendor) or (baseline is not None and "h3c" in _normalize(baseline.vendor))
+
+
+def _extract_ruijie_version(value: Any) -> Dict[str, Optional[str]]:
+    """将锐捷回显拆为RGOS平台版本和设备软件版本。
+
+    Typical values:
+    - Software Version S6980_RGOS 12.5(2)B0605
+    - Software Version S6500-X86_RGOS 11.0(5)B9P62
+    """
+    text = str(value or "").strip()
+    version_match = re.search(r"RGOS\s+([0-9]+(?:\.[0-9]+)*(?:\([^)]*\))?[A-Za-z0-9._-]*)", text, re.IGNORECASE)
+    if not version_match:
+        version_match = re.search(r"\b([0-9]+(?:\.[0-9]+)*(?:\([^)]*\))?[A-Za-z0-9._-]*)\b", text)
+    software_version = version_match.group(1).strip() if version_match else None
+    platform_match = re.match(r"([0-9]+(?:\.[0-9]+)*)", software_version or "")
+    return {
+        "platform_version": platform_match.group(1).strip() if platform_match else None,
+        "software_release": software_version,
+    }
+
+
+def _is_ruijie(device: Device, baseline: Optional[VersionBaseline]) -> bool:
+    vendor = f"{_normalize(device.vendor)} {_normalize(baseline.vendor if baseline else '')}"
+    return any(marker in vendor for marker in ("ruijie", "锐捷", "rgos"))
+
+
 def _check(key: str, status: str, message: str, evidence: Any = None, required: bool = True) -> Dict[str, Any]:
     return {
         "key": key,
@@ -177,6 +226,37 @@ def _check(key: str, status: str, message: str, evidence: Any = None, required: 
         "evidence": evidence,
         "required": required,
     }
+
+
+def _identity_check(
+    key: str,
+    expected: Any,
+    observed: Any,
+    *,
+    model: bool = False,
+    vendor: Any = None,
+) -> Dict[str, Any]:
+    """比较CMDB录入值与设备实际上报值；缺任一侧时不猜测为正常。"""
+    expected_text = str(expected or "").strip()
+    observed_text = str(observed or "").strip()
+    evidence = {"recorded": expected_text or None, "observed": observed_text or None}
+    if not expected_text:
+        return _check(key, "pending", f"尚未录入{CHECK_LABELS[key].removesuffix('一致性')}", evidence, True)
+    if not observed_text:
+        return _check(key, "pending", f"Exporter尚未上报{CHECK_LABELS[key].removesuffix('一致性')}", evidence, True)
+    if model:
+        matched = _normalize(canonical_model_name(expected_text, vendor)) == _normalize(
+            canonical_model_name(observed_text, vendor)
+        )
+    else:
+        matched = _normalize(expected_text) == _normalize(observed_text)
+    return _check(
+        key,
+        "passed" if matched else "failed",
+        f"{CHECK_LABELS[key].removesuffix('一致性')}与录入信息一致" if matched else f"{CHECK_LABELS[key].removesuffix('一致性')}与录入信息不一致",
+        evidence,
+        True,
+    )
 
 
 def evaluate_device(
@@ -194,8 +274,14 @@ def evaluate_device(
     observed_vendor = str(device.vendor or "").strip() or None
     observed_version = _extract_version(system_info)
     custom_fields = device.custom_fields if isinstance(device.custom_fields, dict) else {}
-    patch_evidence_available = "software_patches" in custom_fields or "patches" in custom_fields
-    observed_patches = custom_fields.get("software_patches")
+    patch_evidence_available = (
+        "software_patches" in system_info
+        or "software_patches" in custom_fields
+        or "patches" in custom_fields
+    )
+    observed_patches = system_info.get("software_patches")
+    if observed_patches is None:
+        observed_patches = custom_fields.get("software_patches")
     if observed_patches is None:
         observed_patches = custom_fields.get("patches")
     if observed_patches is None:
@@ -209,10 +295,20 @@ def evaluate_device(
         "snmp": not asternos,
         "exporter": asternos,
         "syslog": True,
-        "tacacs": not asternos,
+        "tacacs": True,
     }
     effective_capabilities = {**inferred_capabilities, **capabilities}
     required_checks = list(profile.required_checks or DEFAULT_REQUIRED_CHECKS) if profile else DEFAULT_REQUIRED_CHECKS.copy()
+    # Part Number has been retired from asset entry and onboarding. Ignore it
+    # on profiles created before the field was removed.
+    required_checks = [key for key in required_checks if key != "part_number"]
+    if asternos:
+        # Asteros准入固定要求Exporter、Syslog和TACACS，不能被旧型号模板中的
+        # tacacs=false静默降级为“不适用”。
+        effective_capabilities.update({"exporter": True, "syslog": True, "tacacs": True})
+        for key in ("device_name", "device_model", "serial_number", "version", "patch", "hardware", "exporter", "syslog", "tacacs"):
+            if key not in required_checks:
+                required_checks.append(key)
     if baseline and baseline.required_patches and "patch" not in required_checks:
         required_checks.append("patch")
 
@@ -225,6 +321,13 @@ def evaluate_device(
         "model_profile" in required_checks,
     ))
 
+    if asternos:
+        checks.extend([
+            _identity_check("device_name", device.name, system_info.get("sys_name")),
+            _identity_check("device_model", device.model, system_info.get("snmp_model"), model=True, vendor=device.vendor),
+            _identity_check("serial_number", device.serial_number, system_info.get("serial_number")),
+        ])
+
     if "version" not in required_checks:
         checks.append(_check("version", "skipped", "该型号未要求版本检查", required=False))
     elif not baseline:
@@ -232,25 +335,66 @@ def evaluate_device(
     elif not observed_version:
         checks.append(_check("version", "pending", "尚未采集到软件版本", None, True))
     else:
-        forbidden = _version_matches(observed_version, baseline.forbidden_versions or [])
-        allowed = not baseline.allowed_versions or _version_matches(observed_version, baseline.allowed_versions or [])
-        minimum_ok = True
-        if baseline.minimum_version:
-            current_numbers = _version_numbers(observed_version)
-            minimum_numbers = _version_numbers(baseline.minimum_version)
-            minimum_ok = bool(current_numbers and minimum_numbers and current_numbers >= minimum_numbers)
-        version_ok = allowed and minimum_ok and not forbidden
-        checks.append(_check(
-            "version",
-            "passed" if version_ok else "failed",
-            "软件版本符合基线" if version_ok else "软件版本不符合基线",
-            {
+        use_structured_fields = (_is_h3c(device, baseline) or _is_ruijie(device, baseline)) and bool(
+            baseline.platform_version or baseline.allowed_releases
+        )
+        if use_structured_fields:
+            is_ruijie = _is_ruijie(device, baseline)
+            parsed_version = _extract_ruijie_version(observed_version) if is_ruijie else _extract_h3c_version(observed_version)
+            observed_platform = parsed_version["platform_version"]
+            observed_release = parsed_version["software_release"]
+            platform_ok = (
+                not baseline.platform_version
+                or _version_matches(observed_platform or "", [baseline.platform_version])
+            )
+            release_ok = (
+                not baseline.allowed_releases
+                or _version_matches(observed_release or "", baseline.allowed_releases or [])
+            )
+            forbidden = _version_matches(observed_release or observed_version, baseline.forbidden_versions or [])
+            version_ok = bool(observed_platform and observed_release and platform_ok and release_ok and not forbidden)
+            evidence = {
+                "current": observed_version,
+                "current_platform_version": observed_platform,
+                "current_device_version": observed_release,
+                "baseline": baseline.name,
+                "required_platform_version": baseline.platform_version,
+                "allowed_device_versions": baseline.allowed_releases or [],
+                "forbidden_device_versions": baseline.forbidden_versions or [],
+            }
+            if is_ruijie:
+                message = "RGOS平台和设备版本符合基线" if version_ok else "RGOS平台或设备版本不符合基线"
+            else:
+                evidence.update({
+                    "current_comware_platform": observed_platform,
+                    "current_software_release": observed_release,
+                    "required_comware_platform": baseline.platform_version,
+                    "allowed_software_releases": baseline.allowed_releases or [],
+                    "forbidden_software_releases": baseline.forbidden_versions or [],
+                })
+                message = "Comware平台和Release软件版本符合基线" if version_ok else "Comware平台或Release软件版本不符合基线"
+        else:
+            forbidden = _version_matches(observed_version, baseline.forbidden_versions or [])
+            allowed = not baseline.allowed_versions or _version_matches(observed_version, baseline.allowed_versions or [])
+            minimum_ok = True
+            if baseline.minimum_version:
+                current_numbers = _version_numbers(observed_version)
+                minimum_numbers = _version_numbers(baseline.minimum_version)
+                minimum_ok = bool(current_numbers and minimum_numbers and current_numbers >= minimum_numbers)
+            version_ok = allowed and minimum_ok and not forbidden
+            evidence = {
                 "current": observed_version,
                 "baseline": baseline.name,
                 "allowed_versions": baseline.allowed_versions or [],
                 "minimum_version": baseline.minimum_version,
                 "forbidden_versions": baseline.forbidden_versions or [],
-            },
+            }
+            message = "软件版本符合基线" if version_ok else "软件版本不符合基线"
+        checks.append(_check(
+            "version",
+            "passed" if version_ok else "failed",
+            message,
+            evidence,
             True,
         ))
 
@@ -276,9 +420,58 @@ def evaluate_device(
             "patch",
             "failed" if missing else "passed",
             f"缺少补丁：{', '.join(missing)}" if missing else "必需补丁完整",
-            {"required": required_patches, "observed": observed_patches, "missing": missing},
+            {
+                "required": required_patches,
+                "observed": observed_patches,
+                "packages": system_info.get("software_patch_packages") or [],
+                "missing": missing,
+            },
             True,
         ))
+
+    hardware = overview.get("hardware") if isinstance(overview.get("hardware"), dict) else {}
+    fan_total = int(hardware.get("fan_total") or 0)
+    fan_expected_total = int(hardware.get("fan_expected_total") or fan_total)
+    fan_absent = int(hardware.get("fan_absent") or 0)
+    fan_down = int(hardware.get("fan_down") or 0)
+    power_total = int(hardware.get("power_total") or 0)
+    power_down = int(hardware.get("power_down") or 0)
+    fan_known = bool(hardware.get("fan_status_known", fan_total > 0))
+    power_known = bool(hardware.get("power_status_known", power_total > 0))
+    hardware_evidence = {
+        "fan_total": fan_total,
+        "fan_expected_total": fan_expected_total,
+        "fan_absent": fan_absent,
+        "fan_abnormal": fan_down,
+        "power_total": power_total,
+        "power_abnormal": power_down,
+        "collected_at": overview.get("collected_at"),
+    }
+    hardware_required = "hardware" in required_checks
+    if fan_absent or fan_down or power_down:
+        abnormal_parts = []
+        if fan_absent:
+            abnormal_parts.append(f"风扇缺位 {fan_absent} 个")
+        if fan_down:
+            abnormal_parts.append(f"风扇异常 {fan_down} 个")
+        if power_down:
+            abnormal_parts.append(f"电源异常 {power_down} 个")
+        checks.append(_check("hardware", "failed", "，".join(abnormal_parts), hardware_evidence, hardware_required))
+    elif fan_total <= 0 and power_total <= 0:
+        checks.append(_check("hardware", "pending", "尚未采集到风扇或电源运行状态", hardware_evidence, hardware_required))
+    elif (fan_total > 0 and not fan_known) or (power_total > 0 and not power_known):
+        checks.append(_check("hardware", "pending", "已发现硬件组件，但运行状态无法确认", hardware_evidence, hardware_required))
+    else:
+        normal_parts = []
+        if fan_total > 0:
+            normal_parts.append(f"风扇 {fan_total} 个运行正常")
+        else:
+            normal_parts.append("风扇指标未上报")
+        if power_total > 0:
+            normal_parts.append(f"电源 {power_total} 个运行正常")
+        else:
+            normal_parts.append("电源指标未上报")
+        checks.append(_check("hardware", "passed", "；".join(normal_parts), hardware_evidence, hardware_required))
 
     if asternos:
         exporter_ok = (

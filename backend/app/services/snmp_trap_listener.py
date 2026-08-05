@@ -6,10 +6,13 @@ SNMP Trap UDP 监听器。
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 import socket
+import time
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
@@ -35,6 +38,7 @@ IGNORED_IPV6_TRAP_OIDS = {
     f"{HILLSTONE_TRAP_BASE}.74",
     f"{HILLSTONE_TRAP_BASE}.75",
 }
+CONFIG_TRAP_AGGREGATION_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,7 @@ HILLSTONE_TRAPS: Dict[str, TrapDefinition] = {
     f"{HILLSTONE_TRAP_BASE}.17": TrapDefinition("山石接口带宽超阈值Trap", "P0", clear_oid=f"{HILLSTONE_TRAP_BASE}.54", category="bandwidth"),
     f"{HILLSTONE_TRAP_BASE}.54": TrapDefinition("山石接口带宽恢复Trap", "P2", firing_oid=f"{HILLSTONE_TRAP_BASE}.17", category="bandwidth"),
     f"{HILLSTONE_TRAP_BASE}.18": TrapDefinition("山石策略数量超阈值Trap", "P0", category="policy"),
-    f"{HILLSTONE_TRAP_BASE}.19": TrapDefinition("山石配置变更Trap", "P3", category="config"),
+    f"{HILLSTONE_TRAP_BASE}.19": TrapDefinition("【Hillstone】山石配置变更Trap", "P3", category="config"),
     f"{HILLSTONE_TRAP_BASE}.20": TrapDefinition("山石板卡上线Trap", "P1", category="slot"),
     f"{HILLSTONE_TRAP_BASE}.21": TrapDefinition("山石板卡下线Trap", "P0", category="slot"),
     f"{HILLSTONE_TRAP_BASE}.22": TrapDefinition("山石SNAT资源超阈值Trap", "P0", category="snat"),
@@ -106,9 +110,33 @@ class _SnmpTrapProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
         source_ip, _ = addr
         try:
-            _handle_trap_datagram(source_ip, data)
+            _enqueue_trap_event(source_ip, data)
         except Exception as exc:
             logger.error("处理SNMP Trap失败", source_ip=source_ip, error=str(exc))
+
+
+def _enqueue_trap_event(source_ip: str, data: bytes) -> None:
+    from app.tasks.event_tasks import process_snmp_trap_event, record_event_queue_metric
+
+    event_id = uuid.uuid4().hex
+    received_at = time.time()
+    payload_b64 = base64.b64encode(data).decode("ascii")
+    try:
+        process_snmp_trap_event.apply_async(
+            args=[source_ip, payload_b64, event_id, received_at],
+            queue="events_trap",
+            expires=600,
+            retry=False,
+        )
+        record_event_queue_metric("events_trap", "submitted")
+        record_event_queue_metric("events_trap", "last_submitted_at", int(received_at))
+    except Exception as exc:
+        record_event_queue_metric("events_trap", "enqueue_failed")
+        record_event_queue_metric("events_trap", "last_error", str(exc)[:500])
+        logger.error("SNMP Trap事件入队失败", source_ip=source_ip, error=str(exc))
+        if settings.EVENT_QUEUE_SYNC_FALLBACK:
+            record_event_queue_metric("events_trap", "sync_fallback")
+            _handle_trap_datagram(source_ip, data)
 
 
 def _parse_snmp_trap(data: bytes) -> Dict[str, Any]:
@@ -216,7 +244,7 @@ def _resolve_device(db, source_ip: str, sys_name: Optional[str]) -> Optional[Dev
     ).first()
 
 
-def _trap_detail_text(varbinds: List[Tuple[str, str]]) -> str:
+def _trap_detail_text(varbinds: List[Tuple[str, str]], *, preserve_full_text: bool = False) -> str:
     ignored_oids = {SNMP_TRAP_OID, SYS_NAME_OID, HILLSTONE_TRAP_SEVERITY_OID, HILLSTONE_TRAP_TIME_OID}
     details = []
     for oid, value in varbinds:
@@ -229,7 +257,8 @@ def _trap_detail_text(varbinds: List[Tuple[str, str]]) -> str:
         normalized = _normalize_trap_value(str(value).strip())
         if normalized:
             details.append(normalized)
-    return " / ".join(dict.fromkeys(details))[:500]
+    detail_text = " / ".join(dict.fromkeys(details))
+    return detail_text if preserve_full_text else detail_text[:500]
 
 
 def _normalize_trap_value(value: str) -> str:
@@ -253,16 +282,31 @@ def _decode_hex_text(value: str) -> str:
     return decoded
 
 
+def _clean_config_trap_detail(detail_text: str, *device_identifiers: Optional[str]) -> str:
+    """Remove device identity fields without discarding the actual config payload."""
+    detail = (detail_text or "").strip()
+    identifiers = {
+        str(value).strip().casefold()
+        for value in device_identifiers
+        if value is not None and str(value).strip()
+    }
+    if not detail:
+        return ""
+
+    # Hillstone commonly sends ``hostname / operation detail``.  The hostname
+    # VarBind is not guaranteed to be present, so compare against both sysName
+    # and the device identity resolved from the source address.
+    parts = [part.strip() for part in re.split(r"\s+/\s+", detail) if part.strip()]
+    while len(parts) > 1 and parts[0].casefold() in identifiers:
+        parts.pop(0)
+    parts = [part for part in parts if part.casefold() not in identifiers]
+    return " / ".join(parts).strip(" /\r\n\t")
+
+
 def _summarize_trap_target(definition: TrapDefinition, sys_name: Optional[str], detail_text: str) -> str:
     detail = (detail_text or "").strip()
     if definition.category == "config":
-        if sys_name and detail.startswith(sys_name):
-            detail = detail[len(sys_name):].lstrip(" /")
-        if " / " in detail:
-            parts = [part.strip() for part in detail.split(" / ") if part.strip()]
-            detail = next((part for part in parts if part != sys_name), parts[-1] if parts else detail)
-        if sys_name and detail == sys_name:
-            detail = ""
+        detail = _clean_config_trap_detail(detail, sys_name)
         return (detail or "配置变更")[:180]
     return (detail or definition.category or definition.name)[:180]
 
@@ -271,6 +315,11 @@ def _canonical_target_key(definition: TrapDefinition, trap_oid: str, detail_text
     pair_oid = definition.firing_oid or trap_oid
     category = definition.category or pair_oid
     detail = detail_text or "device"
+    if definition.category == "config":
+        # A single configuration commit can emit many Trap packets with slightly
+        # different details.  Use one device-level key and bound reuse by the
+        # aggregation window in _handle_trap_datagram.
+        return f"hillstone_trap:{category}:device"
     if definition.category == "bfd":
         local_match = re.search(r"\blocal\s*:\s*([0-9a-fA-F:.]+)", detail, re.IGNORECASE)
         neighbor_match = re.search(r"\bneighbor\s*:\s*([0-9a-fA-F:.]+)", detail, re.IGNORECASE)
@@ -317,6 +366,41 @@ def _build_trap_message(
     return "\n".join(lines)
 
 
+def _config_batch_message(
+    device: Device,
+    source_ip: str,
+    definition: TrapDefinition,
+    trap_oid: str,
+    trap_time: Optional[str],
+    details: List[str],
+) -> str:
+    device_name = device.name or source_ip
+    device_ip = device.ip_address or source_ip
+    unique_details = list(dict.fromkeys(item.strip() for item in details if item and item.strip()))
+    lines = [
+        f"设备 {device_name} ({device_ip}) 收到山石Trap",
+        f"规则: {definition.name}",
+        f"Trap OID: {trap_oid}",
+    ]
+    if trap_time:
+        lines.append(f"设备时间: {trap_time}")
+    lines.append("Trap内容:")
+    lines.extend(f"- {item}" for item in unique_details)
+    return "\n".join(lines)
+
+
+def _config_batch_details(message: Optional[str]) -> List[str]:
+    text = (message or "").strip()
+    if "Trap内容:" not in text:
+        return []
+    detail_text = text.split("Trap内容:", 1)[1].strip()
+    return [
+        line.removeprefix("- ").strip()
+        for line in detail_text.splitlines()
+        if line.strip() and not line.strip().startswith("- 其余 ")
+    ]
+
+
 def _is_clear_trap(definition: TrapDefinition) -> bool:
     return bool(definition.firing_oid)
 
@@ -340,7 +424,7 @@ def _handle_trap_datagram(source_ip: str, data: bytes) -> None:
     sys_name = varbind_map.get(SYS_NAME_OID)
     severity = varbind_map.get(HILLSTONE_TRAP_SEVERITY_OID)
     trap_time = varbind_map.get(HILLSTONE_TRAP_TIME_OID)
-    detail_text = _trap_detail_text(varbinds)
+    detail_text = _trap_detail_text(varbinds, preserve_full_text=definition.category == "config")
     target_key = _canonical_target_key(definition, trap_oid, detail_text)
     target_name = _summarize_trap_target(definition, sys_name, detail_text)
 
@@ -377,12 +461,44 @@ def _handle_trap_datagram(source_ip: str, data: bytes) -> None:
             return
 
         message = _build_trap_message(device, source_ip, definition, trap_oid, severity, trap_time, detail_text)
-        existing = db.query(AlertHistory).filter(
+        existing_query = db.query(AlertHistory).filter(
             AlertHistory.rule_id == rule.id,
             AlertHistory.device_id == device.id,
             AlertHistory.alert_target_key == target_key,
             AlertHistory.status.in_(["firing", "acknowledged", "ignored", "snoozed"]),
-        ).first()
+        )
+        if definition.category == "config":
+            aggregation_started_at = datetime.now(timezone.utc) - timedelta(seconds=CONFIG_TRAP_AGGREGATION_SECONDS)
+            existing_query = existing_query.filter(AlertHistory.started_at >= aggregation_started_at)
+        existing = existing_query.order_by(AlertHistory.started_at.desc()).first()
+
+        if definition.category == "config":
+            detail_summary = _clean_config_trap_detail(
+                detail_text,
+                sys_name,
+                device.name,
+                device.ip_address,
+                source_ip,
+            ) or "配置变更（Trap未携带详细内容）"
+            device_identifiers = {
+                str(value).strip().casefold()
+                for value in (sys_name, device.name, device.ip_address, source_ip)
+                if value is not None and str(value).strip()
+            }
+            previous_details = [
+                item for item in (_config_batch_details(existing.message) if existing else [])
+                if item.casefold() not in device_identifiers
+            ]
+            batch_details = list(dict.fromkeys([*previous_details, detail_summary]))
+            message = _config_batch_message(
+                device,
+                source_ip,
+                definition,
+                trap_oid,
+                trap_time,
+                batch_details,
+            )
+            target_name = f"配置变更（{len(batch_details)}条）"
 
         if _is_silenced(db, rule, device, target):
             if existing:
@@ -439,7 +555,10 @@ def _handle_trap_datagram(source_ip: str, data: bytes) -> None:
         db.commit()
         db.refresh(alert)
         _ensure_alarm_id(db, alert)
-        enqueue_alert_notification(alert.id)
+        enqueue_alert_notification(
+            alert.id,
+            countdown_seconds=CONFIG_TRAP_AGGREGATION_SECONDS if definition.category == "config" else 0,
+        )
         logger.info("山石Trap已转换为告警", source_ip=source_ip, trap_oid=trap_oid, alert_id=alert.id)
     except Exception as exc:
         db.rollback()

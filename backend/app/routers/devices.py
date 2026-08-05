@@ -23,6 +23,8 @@ from app.utils.redis_client import redis_client
 from app.utils import influx_client
 from app.utils.asternos_exporter_client import asternos_exporter_client
 from app.utils.monitor_profile import normalize_monitoring_profile
+from app.utils.tacacs_time import parse_tacacs_log_time
+from app.utils.tacacs_commands import extract_tacacs_command, is_tacacs_user_command
 from app.schemas import (
     DeviceCreate, DeviceUpdate, DeviceResponse,
     DeviceGroupCreate, DeviceGroupUpdate, DeviceGroupResponse,
@@ -45,12 +47,6 @@ DEVICE_OVERVIEW_REVISION_KEY = "monitor:cache:overview_revision"
 DEVICE_DETAIL_LLDP_CACHE_TTL_SECONDS = 24 * 60 * 60
 TACACS_LOG_FILE = Path("/app/data/tacacs/logs/tacacs.log")
 TACACS_LOG_PATTERN = re.compile(r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
-TACACS_MONTH_MAP = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-}
-
-
 def _invalidate_device_overview_response_cache() -> None:
     try:
         keys = []
@@ -108,25 +104,7 @@ def _parse_time_filter(value: Optional[str]) -> Optional[datetime]:
 
 
 def _format_tacacs_time(raw_time: str) -> Optional[str]:
-    try:
-        month_text, day, time_text = raw_time.split()
-        hour, minute, second = [int(item) for item in time_text.split(":")]
-        parsed = datetime(datetime.now().year, TACACS_MONTH_MAP[month_text], int(day), hour, minute, second)
-        return (parsed + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
-
-
-def _extract_tacacs_command(raw_command: str) -> str:
-    text = (raw_command or "").strip()
-    if not text:
-        return ""
-    marker_match = re.search(r"\s+(cmd-arg|err_msg|start_time)=", text)
-    command = text[:marker_match.start()].strip() if marker_match else text
-    rest = text[marker_match.start():] if marker_match else ""
-    arg_match = re.search(r"\bcmd-arg=(.*?)(?=\s+(?:err_msg|start_time)=|$)", rest)
-    cmd_arg = arg_match.group(1).strip() if arg_match else ""
-    return f"{command} {cmd_arg}".strip() if cmd_arg else command
+    return parse_tacacs_log_time(raw_time)
 
 
 def _normalize_interface_key(value: Any) -> str:
@@ -141,6 +119,11 @@ def _normalize_interface_key(value: Any) -> str:
         "fourhundredge": "400g",
         "fhgigabitethernet": "400g",
         "400ge": "400g",
+        "twohundred-gigabitethernet": "200g",
+        "twohundredgigabitethernet": "200g",
+        "twohundredgige": "200g",
+        "twohundredge": "200g",
+        "200ge": "200g",
         "hundred-gigabitethernet": "hge",
         "hundredgigabitethernet": "hge",
         "hundredgige": "hge",
@@ -155,12 +138,17 @@ def _normalize_interface_key(value: Any) -> str:
         "xge": "tengige",
         "fh": "400g",
         "te": "tengige",
+        "inloopback": "inloop",
+        "loopback": "loop",
+        "register-tunnel": "reg",
+        "registertunnel": "reg",
     }
-    # 必须先替换长前缀，再替换短前缀。否则 FourHundredGigE 会先命中
-    # HundredGigE，导致 FourHundredGigE1/0/1 和 400GE1/0/1 不能被识别为同一接口。
+    # 只替换接口名前缀，避免 TwoHundredGigE 中间的 HundredGigE 被误替换。
     for src, dst in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
-        normalized = normalized.replace(src, dst)
-    return re.sub(r"[^a-z0-9/._-]", "", normalized)
+        if normalized.startswith(src):
+            normalized = f"{dst}{normalized[len(src):]}"
+            break
+    return re.sub(r"[^a-z0-9/._:-]", "", normalized)
 
 
 def _interface_config_lookup_keys(interface_name: Any) -> List[str]:
@@ -368,6 +356,21 @@ def _is_default_interface_description(name: str, description: Any) -> bool:
     return normalized_text in default_values or _normalize_interface_key(text) == _normalize_interface_key(name)
 
 
+def _looks_like_generated_interface_summary(description: Any) -> bool:
+    """Return True for generated port-mode/VLAN summaries, not operator descriptions."""
+    text = str(description or "").strip()
+    if not text:
+        return False
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    generated_patterns = (
+        r"^(access|trunk|hybrid)(\s*/\s*|$)",
+        r"^(access|trunk|hybrid)\s+vlan\b",
+        r"^(permit|undo permit)\s+vlan\b",
+        r"^pvid\s+\d+\b",
+    )
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in generated_patterns)
+
+
 def _clean_interface_description(name: str, description: Any) -> str:
     """Return only real operator-configured interface descriptions.
 
@@ -377,6 +380,8 @@ def _clean_interface_description(name: str, description: Any) -> str:
     """
     text = str(description or "").strip()
     if not text:
+        return ""
+    if _looks_like_generated_interface_summary(text):
         return ""
     if _is_default_interface_description(name, text):
         return ""
@@ -516,7 +521,7 @@ def _display_interface_name(value: Any) -> str:
         return ""
     compact = re.sub(r"\s+", "", text)
     interface_match = re.search(
-        r"((?:FourHundredGigE|FourHundredGigabitEthernet|400GE|FHGigabitEthernet|FH|TwoHundredGigE|TwoHundredGigabitEthernet|200GE|HundredGigE|HundredGigabitEthernet|100GE|HGE|FiftyGigE|FiftyGigabitEthernet|50GE|Twenty-?FiveGigE|Twenty-?FiveGigabitEthernet|25GE|Ten-?GigabitEthernet|TenGigE|XGigabitEthernet|XGE|M-?GigabitEthernet|MGE|GigabitEthernet|GE|xethernet|cethernet|ethernet|loopback|vlanif|vlan|aggregate|bridge-aggregation|null|mgmt|mgt)\d+(?:/\d+)*(?:\.\d+)?)",
+        r"((?:FourHundredGigE|FourHundredGigabitEthernet|400GE|FHGigabitEthernet|FH|TwoHundredGigE|TwoHundredGigabitEthernet|200GE|HundredGigE|HundredGigabitEthernet|100GE|HGE|FiftyGigE|FiftyGigabitEthernet|50GE|Twenty-?FiveGigE|Twenty-?FiveGigabitEthernet|25GE|Ten-?GigabitEthernet|TenGigE|XGigabitEthernet|XGE|M-?GigabitEthernet|MGE|GigabitEthernet|GE|xethernet|cethernet|ethernet|loopback|vlanif|vlan|aggregate|bridge-aggregation|null|mgmt|mgt)\d+(?:/\d+)*(?::\d+)?(?:\.\d+)?)",
         compact,
         flags=re.IGNORECASE,
     )
@@ -2215,7 +2220,9 @@ async def get_device_detail_tacacs(
             continue
         if match.group(2) != device.ip_address:
             continue
-        command_text = _extract_tacacs_command(match.group(6))
+        command_text = extract_tacacs_command(match.group(6))
+        if not is_tacacs_user_command(command_text):
+            continue
         parsed_time = _format_tacacs_time(match.group(1)) or match.group(1)
         item = {
             "time": parsed_time,

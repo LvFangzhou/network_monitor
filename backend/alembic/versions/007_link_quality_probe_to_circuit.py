@@ -15,19 +15,26 @@ depends_on = None
 
 
 def upgrade() -> None:
-    columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("quality_probe_targets")}
-    if "circuit_id" in columns:
-        return
-    op.add_column("quality_probe_targets", sa.Column("circuit_id", sa.Integer(), nullable=True))
-    op.create_foreign_key(
-        "fk_quality_probe_targets_circuit_id",
-        "quality_probe_targets",
-        "circuits",
-        ["circuit_id"],
-        ["id"],
-        ondelete="SET NULL",
+    inspector = sa.inspect(op.get_bind())
+    columns = {column["name"] for column in inspector.get_columns("quality_probe_targets")}
+    if "circuit_id" not in columns:
+        op.add_column("quality_probe_targets", sa.Column("circuit_id", sa.Integer(), nullable=True))
+    foreign_keys = inspector.get_foreign_keys("quality_probe_targets")
+    has_circuit_foreign_key = any(
+        constraint.get("constrained_columns") == ["circuit_id"]
+        and constraint.get("referred_table") == "circuits"
+        for constraint in foreign_keys
     )
-    op.create_index("idx_quality_probe_targets_circuit", "quality_probe_targets", ["circuit_id"])
+    if not has_circuit_foreign_key:
+        op.create_foreign_key(
+            "fk_quality_probe_targets_circuit_id",
+            "quality_probe_targets",
+            "circuits",
+            ["circuit_id"],
+            ["id"],
+            ondelete="SET NULL",
+        )
+    op.execute("CREATE INDEX IF NOT EXISTS idx_quality_probe_targets_circuit ON quality_probe_targets (circuit_id)")
 
 
 def downgrade() -> None:

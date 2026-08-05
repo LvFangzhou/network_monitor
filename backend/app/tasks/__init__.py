@@ -1,6 +1,7 @@
 from celery import Celery
 from app.config import settings
 from app.tasks.celerybeat_schedule import beat_schedule
+from app.tasks import task_monitoring  # noqa: F401 - registers Celery signals
 
 # 创建Celery应用
 celery_app = Celery(
@@ -17,6 +18,7 @@ celery_app = Celery(
         "app.tasks.config_backup_tasks",
         "app.tasks.menu_cache_tasks",
         "app.tasks.quality_tasks",
+        "app.tasks.event_tasks",
     ]
 )
 
@@ -34,6 +36,7 @@ celery_app.conf.update(
         "app.tasks.snmp_tasks.collect_all_snmp": {"queue": "snmp_realtime"},
         "app.tasks.snmp_tasks.collect_snmp_for_device": {"queue": "snmp_realtime"},
         "app.tasks.snmp_tasks.collect_all_snmp_interface_realtime": {"queue": "snmp_interface_realtime"},
+        "app.tasks.snmp_tasks.collect_h3c_vlan_statistics": {"queue": "snmp_interface_realtime"},
         "app.tasks.snmp_tasks.collect_h3c_s9867_roce_interface_health": {"queue": "snmp_interface_realtime"},
         "app.tasks.snmp_tasks.collect_circuit_interface_realtime": {"queue": "snmp_circuit_realtime"},
         "app.tasks.snmp_tasks.collect_incident_interface_realtime": {"queue": "snmp_circuit_realtime"},
@@ -53,12 +56,14 @@ celery_app.conf.update(
         "app.tasks.snmp_tasks.collect_all_asternos_interface_realtime": {"queue": "asternos_realtime"},
         "app.tasks.snmp_tasks.collect_all_asternos_exporter": {"queue": "asternos"},
         "app.tasks.snmp_tasks.collect_asternos_for_device": {"queue": "asternos"},
+        "app.tasks.snmp_tasks.collect_asternos_software_patches": {"queue": "system"},
         "app.tasks.alert_tasks.check_reachability_alerts": {"queue": "alerts_health"},
         "app.tasks.alert_tasks.check_protocol_alerts": {"queue": "alerts_protocol"},
         "app.tasks.alert_tasks.reconcile_hillstone_bfd_trap_alerts": {"queue": "alerts_protocol"},
         "app.tasks.alert_tasks.reconcile_hillstone_bgp_trap_alerts": {"queue": "alerts_protocol"},
         "app.tasks.alert_tasks.check_device_health_alerts": {"queue": "alerts_health"},
         "app.tasks.alert_tasks.check_optical_alerts": {"queue": "alerts_general"},
+        "app.tasks.alert_tasks.reconcile_syslog_optical_power_alerts": {"queue": "alerts_health"},
         "app.tasks.alert_tasks.check_alerts": {"queue": "alerts_general"},
         "app.tasks.alert_tasks.prewarm_alert_rule_status_cache": {"queue": "alerts_prewarm"},
         "app.tasks.alert_tasks.prewarm_alert_silence_match_counts": {"queue": "alerts_prewarm"},
@@ -73,8 +78,11 @@ celery_app.conf.update(
         "app.tasks.menu_cache_tasks.prewarm_fast_menu_caches": {"queue": "system"},
         "app.tasks.menu_cache_tasks.prewarm_device_overview_cache": {"queue": "system"},
         "app.tasks.menu_cache_tasks.prewarm_traffic_query_cache": {"queue": "system"},
-        "app.tasks.quality_tasks.collect_quality_probes": {"queue": "system"},
-        "app.tasks.quality_tasks.collect_quality_mtr_paths": {"queue": "system"},
+        "app.tasks.quality_tasks.collect_quality_probes": {"queue": "quality_regular"},
+        "app.tasks.quality_tasks.collect_quality_fast_outages": {"queue": "quality_fast"},
+        "app.tasks.quality_tasks.collect_quality_mtr_paths": {"queue": "quality_mtr"},
+        "app.tasks.event_tasks.process_syslog_event": {"queue": "events_syslog"},
+        "app.tasks.event_tasks.process_snmp_trap_event": {"queue": "events_trap"},
         "app.tasks.config_backup_tasks.run_config_backup": {"queue": "config_backup"},
         "app.tasks.config_backup_tasks.run_scheduled_config_backup": {"queue": "config_backup"},
     },

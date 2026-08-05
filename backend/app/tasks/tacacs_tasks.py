@@ -5,7 +5,6 @@ import asyncio
 import json
 import re
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -14,6 +13,8 @@ from celery import shared_task
 from app.config import settings
 from app.core import get_logger
 from app.utils import notification_manager, redis_client
+from app.utils.tacacs_commands import extract_tacacs_command, is_tacacs_user_command
+from app.utils.tacacs_time import parse_tacacs_log_time
 
 logger = get_logger(__name__)
 
@@ -26,51 +27,16 @@ BUFFER_KEY = "tacacs:log:buffer"
 BUFFER_FIRST_SEEN_KEY = "tacacs:log:buffer:first_seen"
 BATCH_DELAY_SECONDS = 20
 LOG_PATTERN = re.compile(r"(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\w+)\s+(\S+)\s+(\S+).*?cmd=(.*)")
-MONTH_MAP = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-}
-
-
 def _parse_log_time(raw_time: str) -> str:
-    try:
-        month_text, day, time_text = raw_time.split()
-        hour, minute, second = [int(item) for item in time_text.split(":")]
-        parsed = datetime(datetime.now().year, MONTH_MAP[month_text], int(day), hour, minute, second)
-        return (parsed + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return raw_time
-
-
-def _extract_command(raw_command: str) -> str:
-    """
-    Tacacs accounting 行里 cmd 后面可能带 cmd-arg/err_msg/start_time 等字段。
-    机器人和前端只展示真实命令，附加字段留在 raw 日志里。
-    """
-    text = (raw_command or "").strip()
-    if not text:
-        return ""
-
-    marker_match = re.search(r"\s+(cmd-arg|err_msg|start_time)=", text)
-    command = text[:marker_match.start()].strip() if marker_match else text
-    rest = text[marker_match.start():] if marker_match else ""
-
-    arg_match = re.search(
-        r"\bcmd-arg=(.*?)(?=\s+(?:err_msg|start_time)=|$)",
-        rest,
-    )
-    cmd_arg = arg_match.group(1).strip() if arg_match else ""
-    if cmd_arg:
-        return f"{command} {cmd_arg}".strip()
-    return command
+    return parse_tacacs_log_time(raw_time) or raw_time
 
 
 def _parse_line(line: str) -> Optional[Dict[str, str]]:
     match = LOG_PATTERN.search(line)
     if not match:
         return None
-    command = _extract_command(match.group(6))
-    if not command or command in {"startup"}:
+    command = extract_tacacs_command(match.group(6))
+    if not is_tacacs_user_command(command):
         return None
     return {
         "time": _parse_log_time(match.group(1)),
@@ -127,11 +93,12 @@ async def _send_robot_notification(title: str, content: str, card_data: Dict[str
     for channel in _load_notification_channels():
         channel_type = str(channel.get("type") or "").strip()
         webhook = str(channel.get("webhook") or channel.get("url") or "").strip()
-        if channel_type not in {"wechat", "dingtalk", "feishu"} or not webhook:
+        if channel_type not in {"wechat", "dingtalk", "feishu", "webhook"} or not webhook:
             continue
+        channel_config = {"url": webhook} if channel_type == "webhook" else {"webhook": webhook}
         if await notification_manager.send_notification(
             channel_type,
-            {"webhook": webhook, "url": webhook},
+            channel_config,
             title,
             content,
             card_data,

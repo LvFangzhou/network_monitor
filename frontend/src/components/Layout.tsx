@@ -93,6 +93,7 @@ const Layout = () => {
       children: [
         { key: '/device-dictionaries', label: '字典管理' },
         { key: '/devices', label: '网络设备' },
+        { key: '/servers', label: '服务器管理' },
         { key: '/device-compliance', label: '上线合规' },
         { key: '/customers', label: '客户管理' },
         { key: '/public-circuits', label: '公网管理' },
