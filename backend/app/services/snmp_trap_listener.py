@@ -6,8 +6,11 @@ SNMP Trap UDP 监听器。
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 import socket
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -107,9 +110,33 @@ class _SnmpTrapProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
         source_ip, _ = addr
         try:
-            _handle_trap_datagram(source_ip, data)
+            _enqueue_trap_event(source_ip, data)
         except Exception as exc:
             logger.error("处理SNMP Trap失败", source_ip=source_ip, error=str(exc))
+
+
+def _enqueue_trap_event(source_ip: str, data: bytes) -> None:
+    from app.tasks.event_tasks import process_snmp_trap_event, record_event_queue_metric
+
+    event_id = uuid.uuid4().hex
+    received_at = time.time()
+    payload_b64 = base64.b64encode(data).decode("ascii")
+    try:
+        process_snmp_trap_event.apply_async(
+            args=[source_ip, payload_b64, event_id, received_at],
+            queue="events_trap",
+            expires=600,
+            retry=False,
+        )
+        record_event_queue_metric("events_trap", "submitted")
+        record_event_queue_metric("events_trap", "last_submitted_at", int(received_at))
+    except Exception as exc:
+        record_event_queue_metric("events_trap", "enqueue_failed")
+        record_event_queue_metric("events_trap", "last_error", str(exc)[:500])
+        logger.error("SNMP Trap事件入队失败", source_ip=source_ip, error=str(exc))
+        if settings.EVENT_QUEUE_SYNC_FALLBACK:
+            record_event_queue_metric("events_trap", "sync_fallback")
+            _handle_trap_datagram(source_ip, data)
 
 
 def _parse_snmp_trap(data: bytes) -> Dict[str, Any]:

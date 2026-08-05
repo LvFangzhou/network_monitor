@@ -72,6 +72,7 @@ from app.utils.server_resources import (
     load_host_resource_history,
     store_host_resource_sample,
 )
+from app.utils.queue_health import load_queue_health
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -4835,6 +4836,12 @@ async def get_server_resource_history(
     except Exception as exc:
         logger.error("获取服务器资源历史失败", error=str(exc))
         raise HTTPException(status_code=500, detail=f"获取服务器资源历史失败: {exc}")
+
+
+@router.get("/server/queues")
+async def get_server_queue_health():
+    """返回 RabbitMQ 关键队列积压、消费者和事件处理延迟。"""
+    return await asyncio.to_thread(load_queue_health)
 
 
 @router.get("/quality/probe-targets")

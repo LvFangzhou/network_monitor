@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
+import uuid
 from typing import Optional, Tuple
 
 from app.config import settings
@@ -45,9 +47,32 @@ class _SyslogProtocol(asyncio.DatagramProtocol):
             raw = _sanitize_text_for_postgres(data.decode("utf-8", errors="replace")).strip()
             if not raw:
                 return
-            _persist_syslog_event(source_ip, raw)
+            _enqueue_syslog_event(source_ip, raw)
         except Exception as exc:
             logger.error("处理Syslog消息失败", source_ip=source_ip, error=str(exc))
+
+
+def _enqueue_syslog_event(source_ip: str, raw_message: str) -> None:
+    from app.tasks.event_tasks import process_syslog_event, record_event_queue_metric
+
+    event_id = uuid.uuid4().hex
+    received_at = time.time()
+    try:
+        process_syslog_event.apply_async(
+            args=[source_ip, raw_message, event_id, received_at],
+            queue="events_syslog",
+            expires=600,
+            retry=False,
+        )
+        record_event_queue_metric("events_syslog", "submitted")
+        record_event_queue_metric("events_syslog", "last_submitted_at", int(received_at))
+    except Exception as exc:
+        record_event_queue_metric("events_syslog", "enqueue_failed")
+        record_event_queue_metric("events_syslog", "last_error", str(exc)[:500])
+        logger.error("Syslog事件入队失败", source_ip=source_ip, error=str(exc))
+        if settings.EVENT_QUEUE_SYNC_FALLBACK:
+            record_event_queue_metric("events_syslog", "sync_fallback")
+            _persist_syslog_event(source_ip, raw_message)
 
 
 def _parse_syslog_message(raw: str) -> tuple[Optional[int], Optional[int], Optional[str], Optional[str], str]:

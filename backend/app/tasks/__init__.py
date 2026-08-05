@@ -1,6 +1,7 @@
 from celery import Celery
 from app.config import settings
 from app.tasks.celerybeat_schedule import beat_schedule
+from app.tasks import task_monitoring  # noqa: F401 - registers Celery signals
 
 # 创建Celery应用
 celery_app = Celery(
@@ -17,6 +18,7 @@ celery_app = Celery(
         "app.tasks.config_backup_tasks",
         "app.tasks.menu_cache_tasks",
         "app.tasks.quality_tasks",
+        "app.tasks.event_tasks",
     ]
 )
 
@@ -76,9 +78,11 @@ celery_app.conf.update(
         "app.tasks.menu_cache_tasks.prewarm_fast_menu_caches": {"queue": "system"},
         "app.tasks.menu_cache_tasks.prewarm_device_overview_cache": {"queue": "system"},
         "app.tasks.menu_cache_tasks.prewarm_traffic_query_cache": {"queue": "system"},
-        "app.tasks.quality_tasks.collect_quality_probes": {"queue": "system"},
-        "app.tasks.quality_tasks.collect_quality_fast_outages": {"queue": "system"},
-        "app.tasks.quality_tasks.collect_quality_mtr_paths": {"queue": "system"},
+        "app.tasks.quality_tasks.collect_quality_probes": {"queue": "quality_regular"},
+        "app.tasks.quality_tasks.collect_quality_fast_outages": {"queue": "quality_fast"},
+        "app.tasks.quality_tasks.collect_quality_mtr_paths": {"queue": "quality_mtr"},
+        "app.tasks.event_tasks.process_syslog_event": {"queue": "events_syslog"},
+        "app.tasks.event_tasks.process_snmp_trap_event": {"queue": "events_trap"},
         "app.tasks.config_backup_tasks.run_config_backup": {"queue": "config_backup"},
         "app.tasks.config_backup_tasks.run_scheduled_config_backup": {"queue": "config_backup"},
     },

@@ -80,6 +80,42 @@ export const getServerResourceHistory = async (range = '1h'): Promise<ServerReso
   return await request.get('/metrics/server/resources/history', { params: { range } }) as ServerResourceHistory
 }
 
+export type QueueHealthStatus = 'healthy' | 'warning' | 'critical' | 'unavailable'
+
+export interface QueueHealthItem {
+  name: string
+  display_name: string
+  messages: number
+  ready: number
+  unacked: number
+  consumers: number
+  publish_rate: number
+  deliver_rate: number
+  state: string
+  status: Exclude<QueueHealthStatus, 'unavailable'>
+  processing_lag_seconds?: number
+  last_latency_ms?: number
+  failed?: number
+}
+
+export interface QueueHealth {
+  status: QueueHealthStatus
+  checked_at: number
+  message?: string | null
+  broker: {
+    reachable: boolean
+    total_messages: number
+    total_ready: number
+    total_unacked: number
+    consumers: number
+  }
+  queues: QueueHealthItem[]
+}
+
+export const getServerQueueHealth = async (): Promise<QueueHealth> => {
+  return await request.get('/metrics/server/queues') as QueueHealth
+}
+
 export const getLosslessTelemetryDevices = () =>
   request.get<any, { total: number; items: any[] }>('/metrics/lossless/telemetry/devices')
 

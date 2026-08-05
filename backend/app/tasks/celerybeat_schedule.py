@@ -349,6 +349,7 @@ beat_schedule = {
         'schedule': 1.0,
         'options': {
             'expires': 5.0,
+            'queue': 'quality_regular',
         },
     },
     # 公网严重丢包/不可达快速探测：两轮短探针复核，目标在约5秒内发现。
@@ -357,6 +358,7 @@ beat_schedule = {
         'schedule': 5.0,
         'options': {
             'expires': 5.0,
+            'queue': 'quality_fast',
         },
     },
     # 公网路径观察 - 只处理开启了MTR观察的公网质量目标，目标自身控制执行间隔
@@ -365,6 +367,7 @@ beat_schedule = {
         'schedule': 300.0,
         'options': {
             'expires': 240.0,
+            'queue': 'quality_mtr',
         },
     },
 }

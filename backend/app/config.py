@@ -74,9 +74,11 @@ class Settings(BaseSettings):
     # RabbitMQ配置
     RABBITMQ_HOST: str = "localhost"
     RABBITMQ_PORT: int = 5672
+    RABBITMQ_MANAGEMENT_PORT: int = 15672
     RABBITMQ_USER: str = "guest"
     RABBITMQ_PASSWORD: str = "guest"
     RABBITMQ_VHOST: str = "/"
+    EVENT_QUEUE_SYNC_FALLBACK: bool = True
     
     @property
     def CELERY_BROKER_URL(self) -> str:
