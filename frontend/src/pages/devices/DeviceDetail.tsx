@@ -1,5 +1,5 @@
 import { Suspense, lazy, type MouseEvent as ReactMouseEvent, type UIEvent, useEffect, useMemo, useRef, useState } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { Alert, Button, Card, Checkbox, Col, DatePicker, Descriptions, Empty, Input, InputNumber, Modal, Popover, Progress, Row, Select, Space, Spin, Table, Tabs, Tag, Typography, message } from 'antd'
 import { ArrowLeftOutlined, CopyOutlined, DownloadOutlined, EditOutlined, FileTextOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
@@ -347,11 +347,14 @@ const loadConnectionColumnWidths = (): ConnectionColumnWidths => {
 const DeviceDetail = () => {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const deviceId = Number(id)
   const canModify = !useAuthStore((state) => state.user?.read_only)
   const [device, setDevice] = useState<Device | null>(null)
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState('connections')
+  const supportedTabs = ['connections', 'traffic', 'syslog', 'config', 'bmp', 'performance', 'hardware', 'forwarding', 'tacacs']
+  const requestedTab = searchParams.get('tab') || 'connections'
+  const [activeTab, setActiveTab] = useState(supportedTabs.includes(requestedTab) ? requestedTab : 'connections')
   const [currentConfigOpen, setCurrentConfigOpen] = useState(false)
   const [currentConfigLoading, setCurrentConfigLoading] = useState(false)
   const [currentConfig, setCurrentConfig] = useState<DeviceCurrentConfig | null>(null)
@@ -361,6 +364,20 @@ const DeviceDetail = () => {
     fetchDevice()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id])
+
+  useEffect(() => {
+    const nextTab = searchParams.get('tab') || 'connections'
+    if (supportedTabs.includes(nextTab) && nextTab !== activeTab) setActiveTab(nextTab)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
+
+  const changeActiveTab = (tab: string) => {
+    setActiveTab(tab)
+    const next = new URLSearchParams(searchParams)
+    if (tab === 'connections') next.delete('tab')
+    else next.set('tab', tab)
+    setSearchParams(next, { replace: true })
+  }
 
   const fetchDevice = async () => {
     setLoading(true)
@@ -456,7 +473,7 @@ const DeviceDetail = () => {
 
       <Tabs
         activeKey={activeTab}
-        onChange={setActiveTab}
+        onChange={changeActiveTab}
         style={{ marginTop: 16 }}
         items={[
           { key: 'connections', label: '连接', children: <ConnectionsTab deviceId={device.id} /> },

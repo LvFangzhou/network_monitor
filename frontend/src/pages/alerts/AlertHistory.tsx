@@ -29,6 +29,8 @@ import {
 } from '../../api/alerts'
 import { getDatacenters, type Datacenter } from '../../api/devices'
 import { useAuthStore } from '../../store/auth'
+import { useSearchParams } from 'react-router-dom'
+import { readUrlNumber, replaceUrlValues } from '../../utils/urlState'
 
 const statusColors: Record<string, string> = {
   firing: 'red',
@@ -226,6 +228,7 @@ interface AlertHistoryProps {
 }
 
 const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
+  const [searchParams, setSearchParams] = useSearchParams()
   const { token: themeToken } = theme.useToken()
   const [items, setItems] = useState<AlertHistoryItem[]>([])
   const [summary, setSummary] = useState<AlertHistorySummary | null>(null)
@@ -233,15 +236,15 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [clearing, setClearing] = useState(false)
   const [quickSilenceLoadingId, setQuickSilenceLoadingId] = useState<number | null>(null)
-  const [statusFilter, setStatusFilter] = useState<string>()
-  const [severityFilter, setSeverityFilter] = useState<string>()
-  const [datacenterFilter, setDatacenterFilter] = useState<string>()
+  const [statusFilter, setStatusFilter] = useState<string | undefined>(searchParams.get('status') || undefined)
+  const [severityFilter, setSeverityFilter] = useState<string | undefined>(searchParams.get('severity') || undefined)
+  const [datacenterFilter, setDatacenterFilter] = useState<string | undefined>(searchParams.get('datacenter') || undefined)
   const [datacenters, setDatacenters] = useState<Datacenter[]>([])
-  const [searchText, setSearchText] = useState<string>('')
+  const [searchText, setSearchText] = useState<string>(searchParams.get('q') || '')
   const [datacenterChartType, setDatacenterChartType] = useState<'pie' | 'bar'>('pie')
   const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(20)
+  const [page, setPage] = useState(readUrlNumber(searchParams, 'page', 1)!)
+  const [pageSize, setPageSize] = useState(readUrlNumber(searchParams, 'page_size', 20)!)
   const token = useAuthStore((state) => state.token)
   const currentUser = useAuthStore((state) => state.user)
   const canModify = Boolean(token && !currentUser?.read_only)
@@ -355,6 +358,18 @@ const AlertHistory = ({ mode = 'active' }: AlertHistoryProps) => {
     return () => window.clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, page, pageSize, statusFilter, severityFilter, datacenterFilter, searchText])
+
+  useEffect(() => {
+    const next = replaceUrlValues(searchParams, {
+      status: statusFilter,
+      severity: severityFilter,
+      datacenter: datacenterFilter,
+      q: searchText,
+      page,
+      page_size: pageSize,
+    }, { page: 1, page_size: 20 })
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [datacenterFilter, page, pageSize, searchParams, searchText, setSearchParams, severityFilter, statusFilter])
 
   const handleResetFilters = () => {
     setStatusFilter(undefined)

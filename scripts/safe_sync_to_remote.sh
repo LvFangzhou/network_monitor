@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE_HOST="${REMOTE_HOST:-172.18.16.92}"
+REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/AI_python/network_monitor}"
+
+if [[ -z "${REMOTE_HOST}" ]]; then
+  echo "REMOTE_HOST is required. Example: REMOTE_HOST=<server-address> scripts/safe_sync_to_remote.sh" >&2
+  exit 2
+fi
 
 cd "$(dirname "$0")/.."
 

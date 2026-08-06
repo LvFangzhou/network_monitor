@@ -138,6 +138,32 @@ const getIntervalForRange = (range: string) => {
 
 const rangeToApiRange = (range: string) => range.startsWith('now-') ? `-${range.slice(4)}` : '-6h'
 
+const isSupportedRange = (value?: string | null) => RANGE_OPTIONS.some((item) => item.value === value)
+
+type UrlTarget = {
+  deviceIp: string
+  interfaceName: string
+  timeFrom: string
+}
+
+const serializeUrlTarget = (target: Pick<InterfaceTarget, 'device' | 'interface' | 'timeFrom'>) => (
+  `${target.device.ip_address}|${target.interface.name}|${target.timeFrom}`
+)
+
+const parseUrlTarget = (value: string): UrlTarget | null => {
+  const parts = value.split('|')
+  if (parts.length < 2) return null
+  const deviceIp = parts.shift()?.trim() || ''
+  const timeCandidate = parts.length > 1 ? parts.pop() : null
+  const interfaceName = parts.join('|').trim()
+  if (!deviceIp || !interfaceName) return null
+  return {
+    deviceIp,
+    interfaceName,
+    timeFrom: isSupportedRange(timeCandidate) ? String(timeCandidate) : 'now-6h',
+  }
+}
+
 const normalizeInterfaceName = (value?: string | null) => String(value || '')
   .trim()
   .toLowerCase()
@@ -363,6 +389,8 @@ const GrafanaDashboard = () => {
       const params = new URLSearchParams(location.search)
       const urlDeviceIp = params.get('device')
       const urlInterface = params.get('interface')
+      const urlTargets = params.getAll('target').map(parseUrlTarget).filter(Boolean) as UrlTarget[]
+      const expandedUrlTarget = params.get('expanded') ? parseUrlTarget(params.get('expanded') || '') : null
       const metric = getMetric(params.get('metric'))
       setSelectedMetricKey(metric.value)
 
@@ -387,6 +415,45 @@ const GrafanaDashboard = () => {
         }
         if (restored.length) applyTargets(restored)
         if (missing.length) message.warning(`以下线路接口未识别：${missing.join('；')}`)
+        return
+      }
+
+      if (urlTargets.length) {
+        const restored: InterfaceTarget[] = []
+        const missing: string[] = []
+        let primaryInterfaces: MonitorInterface[] = []
+        const byDeviceIp = new Map<string, UrlTarget[]>()
+        urlTargets.forEach((item) => byDeviceIp.set(item.deviceIp, [...(byDeviceIp.get(item.deviceIp) || []), item]))
+        for (const [deviceIp, requestedTargets] of byDeviceIp.entries()) {
+          try {
+            const options = await searchMonitorDevices(deviceIp)
+            const deviceOption = options.find((item) => item.ip_address === deviceIp)
+            if (!deviceOption) throw new Error('设备不存在或未加入监控')
+            const response = await getMonitorDeviceInterfaces(deviceOption.id)
+            if (!primaryInterfaces.length) primaryInterfaces = response.interfaces
+            requestedTargets.forEach((requested) => {
+              const requestedKey = normalizeInterfaceName(requested.interfaceName)
+              const matched = response.interfaces.find((item) => [item.name, item.alias, item.description]
+                .some((value) => normalizeInterfaceName(value) === requestedKey))
+              if (matched) restored.push(makeTarget(response.device, matched, metric.value, requested.timeFrom))
+              else missing.push(`${deviceIp} / ${requested.interfaceName}`)
+            })
+          } catch (error: any) {
+            requestedTargets.forEach((item) => missing.push(`${deviceIp} / ${item.interfaceName}`))
+          }
+        }
+        if (restored.length) {
+          setInterfaces(primaryInterfaces)
+          applyTargets(restored)
+          if (expandedUrlTarget) {
+            const expanded = restored.find((item) => (
+              item.device.ip_address === expandedUrlTarget.deviceIp
+              && normalizeInterfaceName(item.interface.name) === normalizeInterfaceName(expandedUrlTarget.interfaceName)
+            ))
+            setExpandedTargetKey(expanded?.key || null)
+          }
+        }
+        if (missing.length) message.warning(`以下接口未识别：${missing.join('；')}`)
         return
       }
 
@@ -453,17 +520,16 @@ const GrafanaDashboard = () => {
     }
     localStorage.setItem(INTERFACE_QUERY_STATE_KEY, JSON.stringify(persisted))
 
-    const primary = targets[targets.length - 1]
-    const params = new URLSearchParams({
-      device: primary.device.ip_address,
-      interface: primary.interface.name,
-      metric: selectedMetricKey,
-    })
+    const params = new URLSearchParams()
+    params.set('metric', selectedMetricKey)
+    targets.forEach((target) => params.append('target', serializeUrlTarget(target)))
+    const expandedTarget = targets.find((target) => target.key === expandedTargetKey)
+    if (expandedTarget) params.set('expanded', serializeUrlTarget(expandedTarget))
     const nextUrl = `/grafana?${params.toString()}`
     if (`${location.pathname}${location.search}` !== nextUrl || location.state) {
       navigate(nextUrl, { replace: true, state: null })
     }
-  }, [location.pathname, location.search, location.state, navigate, selectedMetricKey, targets])
+  }, [expandedTargetKey, location.pathname, location.search, location.state, navigate, selectedMetricKey, targets])
 
   const sortedInterfaces = useMemo(
     () => [...interfaces].sort((a, b) => statusRank(a) - statusRank(b) || a.index - b.index),

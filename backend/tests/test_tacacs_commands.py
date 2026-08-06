@@ -23,6 +23,7 @@ def test_asteros_login_helpers_are_filtered():
         "/usr/sbin/cli/clish_start",
         "sudo /usr/bin/cat /etc/passwd",
         "startup",
+        "xml",
     ):
         assert not is_tacacs_user_command(command)
 
@@ -31,6 +32,7 @@ def test_parse_line_filters_system_helpers():
     prefix = "Aug  3 16:19:18 10.242.2.11 lvfz pts/0 192.168.1.10 "
     assert tacacs_tasks._parse_line(prefix + "cmd=show cmd-arg=ip route") is not None
     assert tacacs_tasks._parse_line(prefix + "cmd=/usr/bin/id cmd-arg=-u") is None
+    assert tacacs_tasks._parse_line(prefix + "cmd=xml") is None
 
 
 def test_generic_webhook_channel_is_sent(monkeypatch):

@@ -25,12 +25,14 @@ def extract_tacacs_command(raw_command: str) -> str:
 
 
 def is_tacacs_system_command(command: str) -> bool:
-    """识别 Asteros 登录初始化产生的 Linux 辅助命令。"""
+    """识别登录辅助命令和 NETCONF 自动化会话标记。"""
     text = (command or "").strip()
     if not text:
         return True
     tokens = text.split()
     first = tokens[0].lower()
+    # 部分设备把 NETCONF 配置下发记为一条纯 ``xml`` accounting 命令。
+    # 它应继续保留在 tacacs.log 中用于原始审计，但不进入页面摘要和机器人通知。
     if len(tokens) == 1 and first == "xml":
         return True
     if first == "startup":

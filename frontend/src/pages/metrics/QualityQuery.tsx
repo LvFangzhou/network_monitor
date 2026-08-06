@@ -1057,8 +1057,10 @@ const QualityQuery = () => {
   const [datacenters, setDatacenters] = useState<Datacenter[]>([])
   const [circuits, setCircuits] = useState<Circuit[]>([])
   const [keyword, setKeyword] = useState(searchParams.get('q') || '')
+  const [resourceFilter, setResourceFilter] = useState(searchParams.get('resource') || 'all')
   const [datacenterFilter, setDatacenterFilter] = useState(searchParams.get('dc') || 'all')
   const [operatorFilter, setOperatorFilter] = useState(searchParams.get('operator') || 'all')
+  const [customerFilter, setCustomerFilter] = useState(searchParams.get('customer') || 'all')
   const [activeFilter, setActiveFilter] = useState<string>(searchParams.get('status') || 'all')
   const [slaRange, setSlaRange] = useState(searchParams.get('sla') || '-1h')
   const [modalOpen, setModalOpen] = useState(false)
@@ -1102,8 +1104,10 @@ const QualityQuery = () => {
   useEffect(() => {
     const next = new URLSearchParams()
     if (keyword.trim()) next.set('q', keyword.trim())
+    if (resourceFilter !== 'all') next.set('resource', resourceFilter)
     if (datacenterFilter !== 'all') next.set('dc', datacenterFilter)
     if (operatorFilter !== 'all') next.set('operator', operatorFilter)
+    if (customerFilter !== 'all') next.set('customer', customerFilter)
     if (activeFilter !== 'all') next.set('status', activeFilter)
     if (slaRange !== '-1h') next.set('sla', slaRange)
     const expandedId = Number(expandedRowKeys[0]) || 0
@@ -1113,7 +1117,7 @@ const QualityQuery = () => {
       if (memberTarget) next.set('target', memberTarget)
     }
     if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
-  }, [activeFilter, datacenterFilter, expandedRowKeys, keyword, operatorFilter, searchParams, selectedMemberTargets, setSearchParams, slaRange])
+  }, [activeFilter, customerFilter, datacenterFilter, expandedRowKeys, keyword, operatorFilter, resourceFilter, searchParams, selectedMemberTargets, setSearchParams, slaRange])
 
   const testTargetAlertRobot = async () => {
     const values = await form.validateFields(['alert_webhook_url', 'alert_mention_users_text'])
@@ -1154,7 +1158,7 @@ const QualityQuery = () => {
     if (!silent) setLoading(true)
     try {
       const response = await getQualityProbeTargets({
-        active: activeFilter === 'all' ? undefined : activeFilter === 'active',
+        active: undefined,
       })
       if (fetchItemsSeqRef.current !== requestSeq) return
       setItems((current) => {
@@ -1248,7 +1252,7 @@ const QualityQuery = () => {
 
   useEffect(() => {
     void fetchItems()
-  }, [activeFilter])
+  }, [])
 
   useEffect(() => {
     // 首次 SLA 请求由 fetchItems 在目标列表返回后触发，避免页面初始化时
@@ -1266,7 +1270,7 @@ const QualityQuery = () => {
     }, 10000)
     return () => window.clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeFilter])
+  }, [])
 
   const datacenterOptions = useMemo(
     () => datacenters.filter((item) => item.is_active !== false).map((item) => ({ label: item.name, value: item.id })),
@@ -1316,11 +1320,22 @@ const QualityQuery = () => {
       .map((name) => ({ label: name, value: name })),
     [items],
   )
+  const filterCustomerOptions = useMemo(
+    () => Array.from(new Set(items.map((item) => String(item.circuit_customer_name || '').trim()).filter(Boolean)))
+      .sort((left, right) => left.localeCompare(right, 'zh-CN'))
+      .map((name) => ({ label: name, value: name })),
+    [items],
+  )
   const filteredItems = useMemo(() => {
     const normalizedKeyword = keyword.trim().toLowerCase()
     return items.filter((item) => {
+      const resourceType = (item.probe_source || 'server_icmp') === 'device_nqa_snmp' ? 'private_line' : 'internet'
+      if (resourceFilter !== 'all' && resourceType !== resourceFilter) return false
       if (datacenterFilter !== 'all' && String(item.datacenter_name || '') !== datacenterFilter) return false
       if (operatorFilter !== 'all' && String(item.operator_name || '') !== operatorFilter) return false
+      if (customerFilter !== 'all' && String(item.circuit_customer_name || '') !== customerFilter) return false
+      if (activeFilter === 'active' && !item.is_active) return false
+      if (activeFilter === 'inactive' && item.is_active) return false
       if (!normalizedKeyword) return true
       const searchableText = [
         item.name,
@@ -1328,6 +1343,7 @@ const QualityQuery = () => {
         ...(item.target_addresses || []),
         item.datacenter_name,
         item.operator_name,
+        item.circuit_customer_name,
         item.device_name,
         item.device_ip,
         item.circuit_name,
@@ -1336,8 +1352,8 @@ const QualityQuery = () => {
       ].filter(Boolean).join(' ').toLowerCase()
       return searchableText.includes(normalizedKeyword)
     })
-  }, [datacenterFilter, items, keyword, operatorFilter])
-  const summaryItems = useMemo(() => filteredItems.filter((item) => item.is_active), [filteredItems])
+  }, [activeFilter, customerFilter, datacenterFilter, items, keyword, operatorFilter, resourceFilter])
+  const summaryItems = filteredItems
   const slaItems = useMemo(
     () => [...summaryItems].sort((left, right) => {
       const leftLevel = slaStyles[getSlaLevel(left)]
@@ -1640,6 +1656,43 @@ const QualityQuery = () => {
     await loadMtrObservation(record, address, 7, 1, mtrPageSize)
   }
 
+  const renderFilterChips = (params: {
+    label: string
+    value: string
+    onChange: (value: string) => void
+    options: Array<{ value: string; label: string }>
+  }) => {
+    const { label, value, onChange, options } = params
+    return (
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+        <div style={{ minWidth: 64, fontWeight: 700, color: '#333', fontSize: 12, lineHeight: '30px' }}>
+          {label}
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 0, flex: 1 }}>
+          <Button
+            size="small"
+            type={value === 'all' ? 'primary' : 'default'}
+            onClick={() => onChange('all')}
+            style={{ borderRadius: 0, minWidth: 40, marginRight: -1, marginBottom: -1, fontSize: 12 }}
+          >
+            全部
+          </Button>
+          {options.map((option) => (
+            <Button
+              key={option.value}
+              size="small"
+              type={value === option.value ? 'primary' : 'default'}
+              onClick={() => onChange(value === option.value ? 'all' : option.value)}
+              style={{ borderRadius: 0, marginRight: -1, marginBottom: -1, fontSize: 12 }}
+            >
+              {option.label}
+            </Button>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
   const renderTargetActions = (record: QualityProbeTarget) => (
     <Space direction="vertical" size={8} onClick={(event) => event.stopPropagation()}>
       <Text type="secondary" style={{ fontSize: 12 }}>
@@ -1812,62 +1865,107 @@ const QualityQuery = () => {
         )}
       >
         <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-          <Space wrap>
-            <Select
-              value={activeFilter}
-              style={{ width: 120 }}
-              onChange={setActiveFilter}
-              options={[
-                { label: '全部状态', value: 'all' },
-                { label: '启用', value: 'active' },
-                { label: '停用', value: 'inactive' },
-              ]}
-            />
-            <Select
-              value={datacenterFilter}
-              style={{ width: 180 }}
-              onChange={setDatacenterFilter}
-              options={[{ label: '全部机房', value: 'all' }, ...filterDatacenterOptions]}
-            />
-            <Select
-              value={operatorFilter}
-              style={{ width: 150 }}
-              onChange={setOperatorFilter}
-              options={[{ label: '全部运营商', value: 'all' }, ...filterOperatorOptions]}
-            />
-            <Input
-              allowClear
-              value={keyword}
-              onChange={(event) => setKeyword(event.target.value)}
-              placeholder="实时搜索名称、地址、设备、线路"
-              style={{ width: 300 }}
-            />
-            <Segmented
-              value={slaRange}
-              onChange={(value) => setSlaRange(String(value))}
-              options={[
-                { label: '1小时', value: '-1h' },
-                { label: '6小时', value: '-6h' },
-                { label: '24小时', value: '-24h' },
-                { label: '7天', value: '-7d' },
-                { label: '30天', value: '-30d' },
-              ]}
-            />
-          </Space>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
-            {[
-              { label: '当前SLA异常', value: qualityOverview.abnormal, color: '#cf1322' },
-              { label: '采集状态异常', value: qualityOverview.collectionIssues, color: '#722ed1' },
-              { label: '错误预算已耗尽', value: qualityOverview.budgetExceeded, color: '#d46b08' },
-              { label: '已关联设备侧原因', value: qualityOverview.correlated, color: '#1677ff' },
-            ].map((item) => (
-              <div key={item.label} style={{ padding: '10px 12px', border: '1px solid #f0f0f0', borderRadius: 6, background: '#fff' }}>
-                <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>{item.label}</Text>
-                <Text strong style={{ color: item.color, fontSize: 22 }}>{loading && items.length === 0 ? '-' : item.value}</Text>
-                <Text type="secondary">{loading && items.length === 0 ? ' 加载中' : ' 条'}</Text>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 560px), 1fr))',
+              gap: 16,
+              padding: 12,
+              background: '#fafafa',
+              border: '1px solid #f0f0f0',
+              borderRadius: 4,
+            }}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {renderFilterChips({
+                label: '资源',
+                value: resourceFilter,
+                onChange: setResourceFilter,
+                options: [
+                  { label: '互联网', value: 'internet' },
+                  { label: '专线', value: 'private_line' },
+                ],
+              })}
+              {renderFilterChips({ label: '机房', value: datacenterFilter, onChange: setDatacenterFilter, options: filterDatacenterOptions })}
+              {renderFilterChips({ label: '运营商', value: operatorFilter, onChange: setOperatorFilter, options: filterOperatorOptions })}
+              {filterCustomerOptions.length ? renderFilterChips({
+                label: '客户',
+                value: customerFilter,
+                onChange: setCustomerFilter,
+                options: filterCustomerOptions,
+              }) : null}
+              {renderFilterChips({
+                label: '状态',
+                value: activeFilter,
+                onChange: setActiveFilter,
+                options: [
+                  { label: '启用', value: 'active' },
+                  { label: '停用', value: 'inactive' },
+                ],
+              })}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{ minWidth: 64, fontWeight: 700, color: '#333', fontSize: 12 }}>搜索</div>
+                <Input
+                  allowClear
+                  value={keyword}
+                  onChange={(event) => setKeyword(event.target.value)}
+                  placeholder="实时搜索名称、地址、设备、线路、客户"
+                  style={{ width: 360, maxWidth: 'calc(100% - 76px)' }}
+                />
               </div>
-            ))}
+            </div>
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 12,
+                paddingLeft: 16,
+                borderLeft: '1px solid #e8e8e8',
+              }}
+            >
+              <Space wrap>
+                <Text strong style={{ fontSize: 12 }}>统计周期</Text>
+                <Segmented
+                  value={slaRange}
+                  onChange={(value) => setSlaRange(String(value))}
+                  options={[
+                    { label: '1小时', value: '-1h' },
+                    { label: '6小时', value: '-6h' },
+                    { label: '24小时', value: '-24h' },
+                    { label: '7天', value: '-7d' },
+                    { label: '30天', value: '-30d' },
+                  ]}
+                />
+              </Space>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(150px, 1fr))', gap: 8, flex: 1 }}>
+                {[
+                  { label: '当前SLA异常', value: qualityOverview.abnormal, color: '#cf1322' },
+                  { label: '采集状态异常', value: qualityOverview.collectionIssues, color: '#722ed1' },
+                  { label: '错误预算已耗尽', value: qualityOverview.budgetExceeded, color: '#d46b08' },
+                  { label: '已关联设备侧原因', value: qualityOverview.correlated, color: '#1677ff' },
+                ].map((item) => (
+                  <div
+                    key={item.label}
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      justifyContent: 'center',
+                      minHeight: 74,
+                      padding: '10px 14px',
+                      border: '1px solid #f0f0f0',
+                      borderRadius: 6,
+                      background: '#fff',
+                    }}
+                  >
+                    <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>{item.label}</Text>
+                    <div>
+                      <Text strong style={{ color: item.color, fontSize: 22 }}>{loading && items.length === 0 ? '-' : item.value}</Text>
+                      <Text type="secondary">{loading && items.length === 0 ? ' 加载中' : ' 条'}</Text>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 10 }}>

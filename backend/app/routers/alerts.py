@@ -433,6 +433,8 @@ def _build_alert_history_query(
 ):
     query = (
         db.query(AlertHistory)
+        # 公网质量探测不一定绑定网络设备，device_id 合法为空。
+        # 使用内连接会让已经入库的质量告警从历史列表和统计中消失。
         .outerjoin(Device, Device.id == AlertHistory.device_id)
         .outerjoin(AlertRule, AlertHistory.rule_id == AlertRule.id)
         .outerjoin(Datacenter, Device.datacenter_id == Datacenter.id)

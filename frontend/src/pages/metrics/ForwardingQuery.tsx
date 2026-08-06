@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Card, Input, Select, Space, Spin, Statistic, Table, Tabs, Tag, Typography, message } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { useSearchParams } from 'react-router-dom'
 import {
   getForwardingArp,
   getForwardingDevices,
@@ -11,6 +12,7 @@ import {
   refreshForwardingDevice,
   type ForwardingDevice,
 } from '../../api/metrics'
+import { readUrlNumber, replaceUrlValues } from '../../utils/urlState'
 
 const { Text, Title } = Typography
 
@@ -58,10 +60,13 @@ interface ForwardingQueryProps {
 }
 
 const ForwardingQuery = ({ fixedDeviceId, embedded = false }: ForwardingQueryProps) => {
+  const [searchParams, setSearchParams] = useSearchParams()
   const [devices, setDevices] = useState<ForwardingDevice[]>([])
-  const [selectedDeviceId, setSelectedDeviceId] = useState<number>()
-  const [activeTab, setActiveTab] = useState('arp')
-  const [keyword, setKeyword] = useState('')
+  const [selectedDeviceId, setSelectedDeviceId] = useState<number | undefined>(readUrlNumber(searchParams, embedded ? 'forwarding_device' : 'device'))
+  const [activeTab, setActiveTab] = useState(searchParams.get(embedded ? 'forwarding_tab' : 'table') === 'ipv4' ? 'ipv4' : 'arp')
+  const [keyword, setKeyword] = useState(searchParams.get(embedded ? 'forwarding_q' : 'q') || '')
+  const [tablePage, setTablePage] = useState(readUrlNumber(searchParams, embedded ? 'forwarding_page' : 'page', 1)!)
+  const [tablePageSize, setTablePageSize] = useState(readUrlNumber(searchParams, embedded ? 'forwarding_page_size' : 'page_size', 50)!)
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [summary, setSummary] = useState<any>({ tables: {} })
@@ -146,6 +151,18 @@ const ForwardingQuery = ({ fixedDeviceId, embedded = false }: ForwardingQueryPro
     setTotal(0)
     void loadData('', activeTab)
   }, [deviceId, activeTab])
+
+  useEffect(() => {
+    const prefix = embedded ? 'forwarding_' : ''
+    const next = replaceUrlValues(searchParams, {
+      [`${prefix}device`]: fixedDeviceId ? undefined : selectedDeviceId,
+      [`${prefix}${embedded ? 'tab' : 'table'}`]: activeTab,
+      [`${prefix}q`]: keyword,
+      [`${prefix}page`]: tablePage,
+      [`${prefix}page_size`]: tablePageSize,
+    }, { [`${prefix}${embedded ? 'tab' : 'table'}`]: 'arp', [`${prefix}page`]: 1, [`${prefix}page_size`]: 50 })
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [activeTab, embedded, fixedDeviceId, keyword, searchParams, selectedDeviceId, setSearchParams, tablePage, tablePageSize])
 
   const currentTable = activeTab === 'ipv4' ? summary.tables?.ipv4_routes : summary.tables?.arp
   const currentSummary = currentTable?.summary || {}
@@ -266,7 +283,7 @@ const ForwardingQuery = ({ fixedDeviceId, embedded = false }: ForwardingQueryPro
         <Card style={{ marginTop: 12 }}>
           <Tabs
             activeKey={activeTab}
-            onChange={(value) => { setKeyword(''); setActiveTab(value) }}
+            onChange={(value) => { setKeyword(''); setTablePage(1); setActiveTab(value) }}
             items={[
               { key: 'arp', label: 'ARP邻居表' },
               { key: 'ipv4', label: 'IPv4 FIB/路由' },
@@ -300,7 +317,14 @@ const ForwardingQuery = ({ fixedDeviceId, embedded = false }: ForwardingQueryPro
               ),
             }}
             scroll={{ x: activeTab === 'arp' ? 850 : 1350 }}
-            pagination={{ showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200], defaultPageSize: 50, showTotal: (value) => `共 ${value} 条` }}
+            pagination={{
+              current: tablePage,
+              pageSize: tablePageSize,
+              showSizeChanger: true,
+              pageSizeOptions: [20, 50, 100, 200],
+              showTotal: (value) => `共 ${value} 条`,
+              onChange: (page, size) => { setTablePage(page); setTablePageSize(size) },
+            }}
           />
         </Card>
 

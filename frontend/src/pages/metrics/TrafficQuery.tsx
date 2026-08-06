@@ -2,6 +2,7 @@ import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } fro
 import { Button, Card, DatePicker, Empty, Input, Select, Space, Spin, message } from 'antd'
 import { CloseOutlined, HolderOutlined, LockOutlined, ReloadOutlined, SearchOutlined, UnlockOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
+import { useSearchParams } from 'react-router-dom'
 import {
   Area,
   AreaChart,
@@ -438,21 +439,24 @@ const TrafficChart = ({
 
 const TrafficQuery = () => {
   const currentUser = useAuthStore((state) => state.user)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const urlCircuitIds = searchParams.getAll('circuit').map(Number).filter((value) => Number.isInteger(value) && value > 0)
+  const urlPresetKeys = searchParams.getAll('summary').filter(Boolean)
   const [optionsLoading, setOptionsLoading] = useState(false)
   const [dashboardLoading, setDashboardLoading] = useState(false)
-  const [keyword, setKeyword] = useState('')
+  const [keyword, setKeyword] = useState(searchParams.get('q') || '')
   const [selectedLineId, setSelectedLineId] = useState<number | undefined>()
-  const [lineType, setLineType] = useState<'internet' | 'private_line'>('internet')
-  const [datacenterId, setDatacenterId] = useState<number | undefined>()
-  const [providerKey, setProviderKey] = useState<string | undefined>()
-  const [customerId, setCustomerId] = useState<number | undefined>()
+  const [lineType, setLineType] = useState<'internet' | 'private_line'>(searchParams.get('type') === 'private_line' ? 'private_line' : 'internet')
+  const [datacenterId, setDatacenterId] = useState<number | undefined>(Number(searchParams.get('datacenter')) || undefined)
+  const [providerKey, setProviderKey] = useState<string | undefined>(searchParams.get('provider') || undefined)
+  const [customerId, setCustomerId] = useState<number | undefined>(Number(searchParams.get('customer')) || undefined)
   const [datacenters, setDatacenters] = useState<Datacenter[]>([])
   const [customers, setCustomers] = useState<Customer[]>([])
   const [filterOptionItems, setFilterOptionItems] = useState<Circuit[]>([])
   const [dashboardCards, setDashboardCards] = useState<Record<number, CircuitTrafficCard>>({})
   const [cardQueryStates, setCardQueryStates] = useState<Record<number, CardQueryState>>({})
-  const [visibleCircuitIds, setVisibleCircuitIds] = useState<number[]>([])
-  const [selectedPresetKeys, setSelectedPresetKeys] = useState<string[]>(DEFAULT_SUMMARY_PRESETS.map((item) => item.key))
+  const [visibleCircuitIds, setVisibleCircuitIds] = useState<number[]>(urlCircuitIds)
+  const [selectedPresetKeys, setSelectedPresetKeys] = useState<string[]>(urlPresetKeys.length ? urlPresetKeys : DEFAULT_SUMMARY_PRESETS.map((item) => item.key))
   const [layoutLocked, setLayoutLocked] = useState(false)
   const [draggingId, setDraggingId] = useState<number | null>(null)
   const trafficRequestSeqRef = useRef<Record<number, number>>({})
@@ -636,14 +640,16 @@ const TrafficQuery = () => {
   const loadDefaultDashboard = useCallback(async () => {
     const prefs = readTrafficPrefs(prefsKey)
     const defaults = (prefs.defaultCircuitIds || []).filter(Boolean)
-    const visible = (prefs.visibleCircuitIds || defaults).filter(Boolean)
+    const urlVisible = searchParams.getAll('circuit').map(Number).filter((value) => Number.isInteger(value) && value > 0)
+    const visible = (urlVisible.length ? urlVisible : (prefs.visibleCircuitIds || defaults)).filter(Boolean)
     setVisibleCircuitIds(visible)
     setLayoutLocked(Boolean(prefs.locked))
 
     setDashboardLoading(true)
     try {
       const requiredDefaultKeys = DEFAULT_SUMMARY_PRESETS.map((item) => item.key)
-      const savedDefaultOrder = (prefs.summaryPresetKeys || []).filter((key) => requiredDefaultKeys.includes(key))
+      const urlSummaryKeys = searchParams.getAll('summary').filter(Boolean)
+      const savedDefaultOrder = (urlSummaryKeys.length ? urlSummaryKeys : (prefs.summaryPresetKeys || [])).filter((key) => requiredDefaultKeys.includes(key))
       const defaultPresetKeys = [...savedDefaultOrder, ...requiredDefaultKeys.filter((key) => !savedDefaultOrder.includes(key))]
       setSelectedPresetKeys(defaultPresetKeys)
       await Promise.all(defaultPresetKeys.map((key) => DEFAULT_SUMMARY_PRESETS.find((preset) => preset.key === key)).filter(Boolean).map((preset) => loadSummaryTrafficCard(preset as SummaryPreset)))
@@ -656,7 +662,7 @@ const TrafficQuery = () => {
     } finally {
       setDashboardLoading(false)
     }
-  }, [ensureTrafficCard, loadSummaryTrafficCard, prefsKey])
+  }, [ensureTrafficCard, loadSummaryTrafficCard, prefsKey, searchParams])
 
   useEffect(() => {
     void loadOptions()
@@ -671,6 +677,18 @@ const TrafficQuery = () => {
   useEffect(() => {
     void loadFilterOptionItems()
   }, [loadFilterOptionItems])
+
+  useEffect(() => {
+    const next = new URLSearchParams()
+    if (lineType !== 'internet') next.set('type', lineType)
+    if (datacenterId) next.set('datacenter', String(datacenterId))
+    if (providerKey) next.set('provider', providerKey)
+    if (customerId) next.set('customer', String(customerId))
+    if (keyword.trim()) next.set('q', keyword.trim())
+    visibleCircuitIds.forEach((id) => next.append('circuit', String(id)))
+    selectedPresetKeys.forEach((key) => next.append('summary', key))
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [customerId, datacenterId, keyword, lineType, providerKey, searchParams, selectedPresetKeys, setSearchParams, visibleCircuitIds])
 
   useEffect(() => {
     setProviderKey(undefined)

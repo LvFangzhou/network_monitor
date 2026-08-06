@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Button, Card, DatePicker, Divider, Form, Input, InputNumber, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, Tooltip, Typography, message, theme } from 'antd'
 import { DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
+import dayjs from 'dayjs'
 import {
   getTacacsConfig,
   getTacacsLogs,
@@ -16,6 +17,8 @@ import {
   type TacacsSettings,
 } from '../api/tacacs'
 import { useAuthStore } from '../store/auth'
+import { useSearchParams } from 'react-router-dom'
+import { readUrlNumber, replaceUrlValues } from '../utils/urlState'
 
 const { Text } = Typography
 const { RangePicker } = DatePicker
@@ -132,6 +135,7 @@ type TacacsManagerProps = {
 }
 
 const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
+  const [searchParams, setSearchParams] = useSearchParams()
   const [configForm] = Form.useForm()
   const [loadingConfig, setLoadingConfig] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -144,14 +148,18 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
   const [stopping, setStopping] = useState(false)
   const [testingWebhook, setTestingWebhook] = useState<Record<number, boolean>>({})
   const [savingWebhook, setSavingWebhook] = useState<Record<number, boolean>>({})
-  const [activeRoleKey, setActiveRoleKey] = useState('0')
-  const [search, setSearch] = useState('')
-  const [logDevice, setLogDevice] = useState('')
-  const [logUser, setLogUser] = useState('')
-  const [logCommand, setLogCommand] = useState('')
-  const [logTimeRange, setLogTimeRange] = useState<any>(null)
-  const [logPage, setLogPage] = useState(1)
-  const [logPageSize, setLogPageSize] = useState(20)
+  const [activeRoleKey, setActiveRoleKey] = useState(searchParams.get('role') || '0')
+  const [search, setSearch] = useState(searchParams.get('q') || '')
+  const [logDevice, setLogDevice] = useState(searchParams.get('device') || '')
+  const [logUser, setLogUser] = useState(searchParams.get('user') || '')
+  const [logCommand, setLogCommand] = useState(searchParams.get('command') || '')
+  const [logTimeRange, setLogTimeRange] = useState<any>(() => {
+    const start = searchParams.get('start')
+    const end = searchParams.get('end')
+    return start && end ? [dayjs(start), dayjs(end)] : null
+  })
+  const [logPage, setLogPage] = useState(readUrlNumber(searchParams, 'page', 1)!)
+  const [logPageSize, setLogPageSize] = useState(readUrlNumber(searchParams, 'page_size', 20)!)
   const [logTotal, setLogTotal] = useState(0)
   const [logPath, setLogPath] = useState('')
   const canModify = !useAuthStore((state) => state.user?.read_only)
@@ -232,6 +240,21 @@ const TacacsManager = ({ activeTab = 'config' }: TacacsManagerProps) => {
     return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, search, logDevice, logUser, logCommand, logTimeRange])
+
+  useEffect(() => {
+    const next = replaceUrlValues(searchParams, {
+      role: activeTab === 'config' ? activeRoleKey : undefined,
+      q: activeTab === 'logs' ? search : undefined,
+      device: activeTab === 'logs' ? logDevice : undefined,
+      user: activeTab === 'logs' ? logUser : undefined,
+      command: activeTab === 'logs' ? logCommand : undefined,
+      start: activeTab === 'logs' ? logTimeRange?.[0]?.format?.('YYYY-MM-DD HH:mm:ss') : undefined,
+      end: activeTab === 'logs' ? logTimeRange?.[1]?.format?.('YYYY-MM-DD HH:mm:ss') : undefined,
+      page: activeTab === 'logs' ? logPage : undefined,
+      page_size: activeTab === 'logs' ? logPageSize : undefined,
+    }, { role: '0', page: 1, page_size: 20 })
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [activeRoleKey, activeTab, logCommand, logDevice, logPage, logPageSize, logTimeRange, logUser, search, searchParams, setSearchParams])
 
   const handleSave = async () => {
     const values = await configForm.validateFields()

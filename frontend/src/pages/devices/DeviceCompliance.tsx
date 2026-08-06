@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Button, Card, Checkbox, Col, Descriptions, Drawer, Form, Input, InputNumber,
   Modal, Popconfirm, Progress, Row, Select, Space, Statistic, Switch, Table,
@@ -18,6 +18,8 @@ import type {
   CheckStatus, ComplianceStatus, DeviceCompliance, DeviceModelProfile, VersionBaseline,
 } from '../../api/compliance'
 import { getDatacenters, type Datacenter } from '../../api/devices'
+import { useSearchParams } from 'react-router-dom'
+import { readUrlNumber, replaceUrlValues } from '../../utils/urlState'
 
 
 const STATUS_META: Record<ComplianceStatus, { label: string; color: string }> = {
@@ -77,7 +79,9 @@ const vendorVersionLabel = (vendor?: string) => {
 
 const DeviceCompliancePage = () => {
   const canModify = !useAuthStore((state) => state.user?.read_only)
-  const [activeTab, setActiveTab] = useState('devices')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedTab = searchParams.get('tab') || 'devices'
+  const [activeTab, setActiveTab] = useState(['devices', 'profiles', 'baselines'].includes(requestedTab) ? requestedTab : 'devices')
   const [loading, setLoading] = useState(false)
   const [evaluating, setEvaluating] = useState(false)
   const [profiles, setProfiles] = useState<DeviceModelProfile[]>([])
@@ -86,13 +90,14 @@ const DeviceCompliancePage = () => {
   const [devices, setDevices] = useState<DeviceCompliance[]>([])
   const [summary, setSummary] = useState({ total: 0, evaluated: 0, unevaluated: 0, counts: {} as Record<string, number>, compliance_rate: 0 })
   const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(50)
-  const [statusFilter, setStatusFilter] = useState<string>()
-  const [vendorFilter, setVendorFilter] = useState<string>()
-  const [datacenterFilter, setDatacenterFilter] = useState<number>()
-  const [search, setSearch] = useState('')
+  const [page, setPage] = useState(readUrlNumber(searchParams, 'page', 1)!)
+  const [pageSize, setPageSize] = useState(readUrlNumber(searchParams, 'page_size', 50)!)
+  const [statusFilter, setStatusFilter] = useState<string | undefined>(searchParams.get('status') || undefined)
+  const [vendorFilter, setVendorFilter] = useState<string | undefined>(searchParams.get('vendor') || undefined)
+  const [datacenterFilter, setDatacenterFilter] = useState<number | undefined>(readUrlNumber(searchParams, 'datacenter'))
+  const [search, setSearch] = useState(searchParams.get('q') || '')
   const [selected, setSelected] = useState<DeviceCompliance>()
+  const suppressedDeviceIdRef = useRef<number | null>(null)
   const [profileModal, setProfileModal] = useState(false)
   const [baselineModal, setBaselineModal] = useState(false)
   const [editingProfile, setEditingProfile] = useState<DeviceModelProfile>()
@@ -139,6 +144,39 @@ const DeviceCompliancePage = () => {
   useEffect(() => {
     void loadAll()
   }, [])
+
+  useEffect(() => {
+    const next = replaceUrlValues(searchParams, {
+      tab: activeTab,
+      q: search,
+      status: statusFilter,
+      vendor: vendorFilter,
+      datacenter: datacenterFilter,
+      page,
+      page_size: pageSize,
+      device: selected?.device_id,
+    }, { tab: 'devices', page: 1, page_size: 50 })
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [activeTab, datacenterFilter, page, pageSize, search, searchParams, selected?.device_id, setSearchParams, statusFilter, vendorFilter])
+
+  useEffect(() => {
+    const selectedId = readUrlNumber(searchParams, 'device')
+    if (!selectedId) {
+      suppressedDeviceIdRef.current = null
+      return
+    }
+    if (suppressedDeviceIdRef.current === selectedId || selected?.device_id === selectedId) return
+    void getDeviceCompliance(selectedId).then(setSelected).catch(() => undefined)
+  }, [searchParams, selected?.device_id])
+
+  const closeSelectedDevice = () => {
+    const selectedId = selected?.device_id || readUrlNumber(searchParams, 'device') || null
+    suppressedDeviceIdRef.current = selectedId
+    const next = new URLSearchParams(searchParams)
+    next.delete('device')
+    setSearchParams(next, { replace: true })
+    setSelected(undefined)
+  }
 
   useEffect(() => {
     if (activeTab !== 'devices') return
@@ -436,7 +474,7 @@ const DeviceCompliancePage = () => {
         ]}
       />
 
-      <Drawer title="设备上线检查清单" width={920} open={Boolean(selected)} onClose={() => setSelected(undefined)}
+      <Drawer title="设备上线检查清单" width={920} open={Boolean(selected)} onClose={closeSelectedDevice}
         extra={selected && canModify ? <Button loading={evaluating} onClick={() => void runEvaluation(selected.device_id)}>立即核验</Button> : null}>
         {selected && (
           <>

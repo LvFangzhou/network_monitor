@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import { Button, Card, Col, Drawer, Form, Input, Progress, Row, Select, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message, theme } from 'antd'
 import { CloudDownloadOutlined, EyeOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
+import { useSearchParams } from 'react-router-dom'
+import { readUrlNumber, replaceUrlValues } from '../utils/urlState'
 import {
   cancelConfigBackupJob,
   getConfigBackupFilters,
@@ -115,24 +117,26 @@ const ipToNumber = (value?: string) => {
 }
 
 const ConfigBackups = () => {
+  const [searchParams, setSearchParams] = useSearchParams()
   const {
     token: { colorBgContainer, colorFillQuaternary },
   } = theme.useToken()
   const [latestJob, setLatestJob] = useState<ConfigBackupJob | null>(null)
   const [jobs, setJobs] = useState<ConfigBackupJob[]>([])
   const [jobsTotal, setJobsTotal] = useState(0)
-  const [jobsPage, setJobsPage] = useState(1)
-  const [jobsPageSize, setJobsPageSize] = useState(10)
+  const [jobsPage, setJobsPage] = useState(readUrlNumber(searchParams, 'page', 1)!)
+  const [jobsPageSize, setJobsPageSize] = useState(readUrlNumber(searchParams, 'page_size', 10)!)
   const [jobsLoading, setJobsLoading] = useState(false)
   const [triggering, setTriggering] = useState(false)
-  const [keyword, setKeyword] = useState('')
-  const [datacenter, setDatacenter] = useState<string>()
-  const [deviceIp, setDeviceIp] = useState('')
+  const [keyword, setKeyword] = useState(searchParams.get('q') || '')
+  const [datacenter, setDatacenter] = useState<string | undefined>(searchParams.get('datacenter') || undefined)
+  const [deviceIp, setDeviceIp] = useState(searchParams.get('device') || '')
   const [datacenters, setDatacenters] = useState<Array<{ name: string }>>([])
   const [searchLoading, setSearchLoading] = useState(false)
   const [searchItems, setSearchItems] = useState<ConfigSearchMatch[]>([])
   const [searchJob, setSearchJob] = useState<ConfigBackupJob | null>(null)
   const [resultDrawerOpen, setResultDrawerOpen] = useState(false)
+  const suppressedResultIdRef = useRef<number | null>(null)
   const [resultLoading, setResultLoading] = useState(false)
   const [resultDetail, setResultDetail] = useState<ConfigBackupResult | null>(null)
   const [highlightLine, setHighlightLine] = useState<number | null>(null)
@@ -626,6 +630,37 @@ const ConfigBackups = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keyword, datacenter, deviceIp])
 
+  useEffect(() => {
+    const next = replaceUrlValues(searchParams, {
+      q: keyword,
+      datacenter,
+      device: deviceIp,
+      page: jobsPage,
+      page_size: jobsPageSize,
+      result: resultDrawerOpen ? resultDetail?.id : undefined,
+    }, { page: 1, page_size: 10 })
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true })
+  }, [datacenter, deviceIp, jobsPage, jobsPageSize, keyword, resultDetail?.id, resultDrawerOpen, searchParams, setSearchParams])
+
+  useEffect(() => {
+    const resultId = readUrlNumber(searchParams, 'result')
+    if (!resultId) {
+      suppressedResultIdRef.current = null
+      return
+    }
+    if (suppressedResultIdRef.current !== resultId && !resultDrawerOpen) void openResult(resultId)
+  }, [resultDrawerOpen, searchParams])
+
+  const closeResultDrawer = () => {
+    const resultId = resultDetail?.id || readUrlNumber(searchParams, 'result') || null
+    suppressedResultIdRef.current = resultId
+    const next = new URLSearchParams(searchParams)
+    next.delete('result')
+    setSearchParams(next, { replace: true })
+    setResultDrawerOpen(false)
+    setResultDetail(null)
+  }
+
   return (
     <div className="modern-page">
       <Row gutter={[16, 16]}>
@@ -903,7 +938,7 @@ const ConfigBackups = () => {
       <Drawer
         title={resultDetail ? `${resultDetail.device_name} (${resultDetail.device_ip}) 配置` : '配置详情'}
         open={resultDrawerOpen}
-        onClose={() => setResultDrawerOpen(false)}
+        onClose={closeResultDrawer}
         width="min(1380px, 92vw)"
       >
         <Spin spinning={resultLoading}>
